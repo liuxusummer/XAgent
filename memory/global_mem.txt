@@ -1,0 +1,15 @@
+## 项目结构
+- XAgent 核心代码位于 src/core/，工具位于 src/tools/
+- 配置通过 .env 加载，Session 类型由变量名路由
+- 设计文档在 docs/，改动前先读对应文档
+
+## 工具约束
+- 工具是无状态纯函数，状态由 Handler 的 AgentContext 管理
+- file_patch 遵循唯一性契约：0 匹配或 >1 匹配均报错
+- 代码执行在子进程隔离区，超时即 kill
+- 工具失败必须返回诊断信息，禁止静默吞错
+
+## LLM 接入
+- 4 种 Session：OpenAITextSession / ClaudeTextSession / OpenAINativeSession / ClaudeNativeSession
+- 模型协议差异内聚于接入层，对外暴露统一 ChatResponse
+- 历史裁剪阈值：context_window_chars * 3 字符

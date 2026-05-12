@@ -1,0 +1,6 @@
+{
+  "name": "code-review",
+  "description": "Use when reviewing code changes for bugs, regressions, missing tests, and maintainability risks.",
+  "triggers": ["review", "code review", "regression", "bug", "risk"],
+  "max_inject_chars": 4000
+}

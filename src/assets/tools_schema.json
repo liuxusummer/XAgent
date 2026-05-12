@@ -1,0 +1,265 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "code_run",
+      "description": "Run a short Python or shell script.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "script": {
+            "type": "string",
+            "description": "Script content to execute."
+          },
+          "language": {
+            "type": "string",
+            "enum": ["python", "shell"],
+            "description": "Execution language."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Timeout in seconds."
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "file_read",
+      "description": "Read a file or list a directory. Supports keyword search with context lines.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute or relative path."
+          },
+          "start_line": {
+            "type": "integer",
+            "description": "Optional 1-based start line."
+          },
+          "end_line": {
+            "type": "integer",
+            "description": "Optional 1-based end line."
+          },
+          "keyword": {
+            "type": "string",
+            "description": "Case-insensitive keyword to search. Returns matching lines with context."
+          }
+        },
+        "required": ["path"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "file_write",
+      "description": "Write content to a file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute or relative path."
+          },
+          "content": {
+            "type": "string",
+            "description": "File content to write."
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["overwrite", "append", "prepend"],
+            "description": "Write mode."
+          }
+        },
+        "required": ["path", "content"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "file_patch",
+      "description": "Replace unique old content in a file with new content.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute or relative path."
+          },
+          "old_content": {
+            "type": "string",
+            "description": "Existing content that must match exactly once."
+          },
+          "new_content": {
+            "type": "string",
+            "description": "Replacement content."
+          }
+        },
+        "required": ["path", "old_content", "new_content"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "web_scan",
+      "description": "Observe browser state. Returns tab sessions plus a compressed page snapshot. Prefer one broad scan, then use web_execute_js for precise DOM queries.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Optional URL to navigate to. Omit to scan the current or selected session."
+          },
+          "session_id": {
+            "type": "string",
+            "description": "Optional stable tab session id returned by web_scan."
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["summary", "elements", "simplified_html", "text"],
+            "description": "summary returns visible text plus key controls; elements returns interactive elements; simplified_html returns compressed HTML; text returns visible text only."
+          },
+          "max_chars": {
+            "type": "integer",
+            "description": "Maximum content characters to return. Defaults to 8000."
+          },
+          "tab_index": {
+            "type": "integer",
+            "description": "Deprecated compatibility field. Prefer session_id."
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "web_execute_js",
+      "description": "Execute JavaScript in a browser tab session. Use JS as the unified action/query language; save long results to file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "script": {
+            "type": "string",
+            "description": "JavaScript code to execute."
+          },
+          "session_id": {
+            "type": "string",
+            "description": "Optional stable tab session id returned by web_scan. Omit for current active tab."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Execution timeout in seconds. Defaults to 10."
+          },
+          "save_to_file": {
+            "type": "string",
+            "description": "If set, save the full JS result under the workspace and return only path, bytes, and summary."
+          },
+          "no_monitor": {
+            "type": "boolean",
+            "description": "Deprecated compatibility field. Set true to skip navigation diagnostics."
+          },
+          "await_navigation": {
+            "type": "boolean",
+            "description": "Whether to report navigation/reload diagnostics. Defaults to true."
+          }
+        },
+        "required": ["script"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "ask_user",
+      "description": "Interrupt and request user input.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "Question or clarification for the user."
+          }
+        },
+        "required": ["message"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_working_checkpoint",
+      "description": "Update short-term working memory (key_info and related_sop). Updated content is injected into every subsequent turn.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key_info": {
+            "type": "string",
+            "description": "Key information to remember for the current task."
+          },
+          "related_sop": {
+            "type": "string",
+            "description": "Related SOP reference or hint."
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "start_long_term_update",
+      "description": "Trigger a long-term memory settlement. Reads the memory management SOP and instructs the agent to summarize key findings into persistent memory.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "skill_activate",
+      "description": "Activate one or more local prompt skills by name. This only loads skill instructions into future turns; it does not execute code or register new tools.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Skill names to activate. Use names from the available skills list."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why these skills are useful for the current task."
+          }
+        },
+        "required": ["names"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "plan_update",
+      "description": "Read or overwrite plan.md in the task directory. Use this for long-horizon tasks to maintain a visible plan that survives across turns. Call with no args to read; pass `content` to overwrite the full file. The system will periodically inject a plan preview as alignment reminder.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "Full markdown content to write. Omit this field to read current plan.md instead."
+          }
+        }
+      }
+    }
+  }
+]

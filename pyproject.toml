@@ -1,0 +1,19 @@
+[project]
+name = "xagent"
+version = "0.1.0"
+description = "Physical execution agent with tool-call loop and observability."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[project.optional-dependencies]
+observability = [
+    "langfuse>=3.0.0",
+]
+web = [
+    "gradio>=5.0.0",
+    "selenium>=4.0.0",
+]
+
+[dependency-groups]
+dev = []
