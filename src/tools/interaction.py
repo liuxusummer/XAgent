@@ -4,6 +4,8 @@ from pathlib import Path
 from queue import Queue
 from typing import Any, Callable
 
+from src.core.memory import load_memory_sop
+
 
 MEMORY_DIR = Path(__file__).resolve().parent.parent.parent / "memory"
 
@@ -59,11 +61,7 @@ def update_working_checkpoint(
 
 
 def start_long_term_update() -> dict[str, str]:
-    sop_path = MEMORY_DIR / "memory_management_sop.md"
-    if sop_path.exists():
-        sop_content = sop_path.read_text(encoding="utf-8").strip()
-    else:
-        sop_content = ""
+    sop_content = load_memory_sop(MEMORY_DIR).content
     return {
         "status": "OK",
         "sop_content": sop_content,
