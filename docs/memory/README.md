@@ -2,7 +2,10 @@
 
 > 对现有 `memory/`、`AgentContext`、`turn_end_hooks`、`Session.history` 的记忆能力做体系化梳理。本文只定义优化方向和边界，不改变当前运行时代码。
 
-相关文档：[memory-provider-read-spec.md](memory-provider-read-spec.md) 定义下一步具体优化：Memory Provider 读路径收敛 Spec。
+相关文档：
+
+- [memory-provider-read-spec.md](memory-provider-read-spec.md)：定义 Memory Provider 读路径收敛。
+- [memory-telemetry-spec.md](memory-telemetry-spec.md)：定义下一步具体改进，为 memory 读取与注入补齐结构化观测事件。
 
 ## 1. 背景与目标
 
