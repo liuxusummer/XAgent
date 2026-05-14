@@ -44,14 +44,26 @@ function appendToolCall(toolCalls: ToolCall[] | undefined, toolCall: ToolCall): 
   return [...current, toolCall];
 }
 
+function completeStreamingAgentMessages(messages: Message[]): Message[] {
+  return messages.map(message =>
+    message.role === 'agent' && message.status === 'streaming'
+      ? { ...message, status: 'complete' as const }
+      : message
+  );
+}
+
 export function useChat() {
-  const [session, setSession] = useState<ChatSession>({
-    id: generateId(),
-    title: 'New Chat',
-    messages: [],
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    status: 'idle',
+  const [session, setSession] = useState<ChatSession>(() => {
+    const now = Date.now();
+
+    return {
+      id: generateId(),
+      title: 'New Chat',
+      messages: [],
+      createdAt: now,
+      updatedAt: now,
+      status: 'idle',
+    };
   });
 
   const [agentStatus, setAgentStatus] = useState<AgentStatus>({
@@ -114,9 +126,11 @@ export function useChat() {
           setIsWaitingForUser(true);
           setAskPrompt(prompt);
           setAgentStatus({ state: 'waiting_for_user' });
-          setSession(prev => ({ ...prev, status: 'waiting_for_user' }));
-
-          addMessage(createMessage('system', `[Agent asks] ${prompt}`));
+          setSession(prev => ({
+            ...prev,
+            messages: completeStreamingAgentMessages(prev.messages),
+            status: 'waiting_for_user',
+          }));
           break;
         }
 

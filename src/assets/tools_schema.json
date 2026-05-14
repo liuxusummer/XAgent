@@ -107,6 +107,27 @@
   {
     "type": "function",
     "function": {
+      "name": "file_delete",
+      "description": "Delete a file or, when recursive is true, a directory inside the workspace. Always asks the user for explicit authorization before deleting. Outside-workspace deletion is not supported.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute or relative path to delete."
+          },
+          "recursive": {
+            "type": "boolean",
+            "description": "Set true only to delete a directory recursively."
+          }
+        },
+        "required": ["path"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "web_scan",
       "description": "Observe browser state. Returns tab sessions plus a compressed page snapshot. Prefer one broad scan, then use web_execute_js for precise DOM queries.",
       "parameters": {
@@ -178,13 +199,20 @@
     "type": "function",
     "function": {
       "name": "ask_user",
-      "description": "Interrupt and request user input.",
+      "description": "Interrupt and request user input. Provide options when the user should choose from known answers; omit options for free-form input.",
       "parameters": {
         "type": "object",
         "properties": {
           "message": {
             "type": "string",
             "description": "Question or clarification for the user."
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional answer choices to present to the user. When omitted, the user can type a free-form answer."
           }
         },
         "required": ["message"]

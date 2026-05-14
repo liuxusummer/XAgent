@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from src.tools.file_ops import resolve_path, truncate_text
+from src.tools.file_ops import WorkspacePermissionError, resolve_path, truncate_text
 
 
 WEB_CHAR_LIMIT = 8000
@@ -318,9 +318,12 @@ def serialize_result(result: Any) -> str:
 
 
 def save_result(result_str: str, save_to_file: str, cwd: str | None) -> dict[str, Any]:
-    path = resolve_path(save_to_file, cwd)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(result_str, encoding="utf-8")
+    try:
+        path = resolve_path(save_to_file, cwd, operation="write")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(result_str, encoding="utf-8")
+    except WorkspacePermissionError as exc:
+        return exc.to_result()
     return {
         "saved_to": str(path),
         "bytes": len(result_str.encode("utf-8")),

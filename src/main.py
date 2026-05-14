@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from src.core.XAgent import XAgent, resolve_workspace_dir
+from src.core.memory import load_boot_memory
 from src.core.observability import build_langfuse_sink
 from src.core.skills import SkillRegistry
 from src.core.telemetry import EventSink, JsonlSink, MultiSink, NullSink, StderrSink
@@ -24,13 +25,7 @@ def load_tools_schema(path: Path) -> list[dict]:
 
 
 def load_memory_content(project_root: Path) -> str:
-    memory_dir = project_root / "memory"
-    parts: list[str] = []
-    for name in ("global_mem_insight.txt", "insight_fixed_structure.txt"):
-        p = memory_dir / name
-        if p.exists():
-            parts.append(p.read_text(encoding="utf-8").strip())
-    return "\n\n".join(parts)
+    return load_boot_memory(project_root / "memory").content
 
 
 def build_system_prompt(
