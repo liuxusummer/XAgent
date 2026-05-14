@@ -110,7 +110,7 @@ LLM 生成的内容不是总能干净地放进参数里。比如 `file_write` �
 │   ├── start_long_term_update     # 触发长期记忆结算
 │   └── plan_update                # 读写 workspace/plan.md（读：不传 content；写：传 content 覆盖）
 └── 交互域
-    └── ask_user          # 中断循环，等待用户输入
+    └── ask_user          # 中断循环，等待用户输入；可附带选项
 ```
 
 ### 域间关系
@@ -118,7 +118,7 @@ LLM 生成的内容不是总能干净地放进参数里。比如 `file_write` �
 - 代码执行域和文件操作域是独立的，互不依赖
 - 浏览器操作域依赖 `BrowserDriver` 接口，默认使用 Selenium fallback；工具只暴露 `web_scan` / `web_execute_js`，底层可替换为 WebSocket / HTTP Long-Poll 浏览器桥
 - 记忆管理域只操作 Handler 内部状态和 memory 目录文件，不依赖其他域
-- 交互域（ask_user）是特殊的——它不执行任何物理操作，只产生中断信号；当前桥接为进程级单例（`_bridge_display_queue` / `_bridge_reply_queue`），多 Agent 场景需在上层串行化
+- 交互域（ask_user）是特殊的——它不执行任何物理操作，只产生中断信号；可提供 `options` 供用户选择，未提供选项时用户自由输入；当前桥接为进程级单例（`_bridge_display_queue` / `_bridge_reply_queue`），多 Agent 场景需在上层串行化
 - Plan 模式、外部干预文件（如 `_keyinfo`、`_intervene`）与相对路径文件操作统一落在工作区内
 
 ### 浏览器操作闭环

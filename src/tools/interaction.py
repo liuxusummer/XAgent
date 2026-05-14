@@ -31,21 +31,60 @@ def make_user_input_bridge(
     return _bridge_input
 
 
-def ask_user(message: str, input_fn: Callable[[str], str] | None = None) -> dict[str, str]:
+def ask_user(
+    message: str,
+    options: list[str] | None = None,
+    input_fn: Callable[[str], str] | None = None,
+) -> dict[str, Any]:
     fn = input_fn or _default_input_fn
+    clean_options = [str(option).strip() for option in options or [] if str(option).strip()]
+    prompt_message = format_user_prompt(message, clean_options)
     try:
-        user_reply = fn(f"\n🤖 {message}\n👤 ")
-        return {
+        raw_reply = fn(f"\n🤖 {prompt_message}\n👤 ")
+        user_reply, selected_option = resolve_user_reply(raw_reply, clean_options)
+        result: dict[str, Any] = {
             "status": "OK",
             "message": message,
-            "user_reply": user_reply.strip(),
+            "user_reply": user_reply,
         }
+        if clean_options:
+            result["options"] = clean_options
+            result["raw_user_reply"] = raw_reply.strip()
+            if selected_option is not None:
+                result["selected_option"] = selected_option
+        return result
     except (EOFError, KeyboardInterrupt):
-        return {
+        result = {
             "status": "SKIP",
             "message": message,
             "user_reply": "",
         }
+        if clean_options:
+            result["options"] = clean_options
+        return result
+
+
+def format_user_prompt(message: str, options: list[str]) -> str:
+    if not options:
+        return message
+    option_lines = "\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1))
+    option_hint = " / ".join(options)
+    return f"{message}\n\n选项：\n{option_lines}\n请回复：{option_hint}"
+
+
+def resolve_user_reply(raw_reply: str, options: list[str]) -> tuple[str, str | None]:
+    reply = raw_reply.strip()
+    if not options:
+        return reply, None
+    if reply.isdigit():
+        index = int(reply)
+        if 1 <= index <= len(options):
+            selected = options[index - 1]
+            return selected, selected
+    for option in options:
+        if reply == option:
+            return option, option
+    return reply, None
 
 
 def update_working_checkpoint(

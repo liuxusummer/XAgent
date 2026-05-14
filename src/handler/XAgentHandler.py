@@ -10,7 +10,8 @@ from src.core.agent_loop import ActionResult, AgentContext, BaseHandler, TurnEnd
 from src.core.memory import load_global_memory
 from src.core.skills import SkillRegistry, dedupe_skill_names, render_active_skills
 from src.core.telemetry import Event
-from src.tools import ask_user, patch_file, plan_update, read_file, start_long_term_update, update_working_checkpoint, web_execute_js, web_scan, write_file
+from src.tools import ask_user, delete_file, patch_file, plan_update, read_file, start_long_term_update, update_working_checkpoint, web_execute_js, web_scan, write_file
+from src.tools.file_ops import resolve_path_for_operation
 from src.tools.code_run import run_code_stream
 
 
@@ -21,6 +22,19 @@ MAX_HISTORY_INFO_ENTRIES = 60
 PLAN_REMIND_INTERVAL = 15
 PLAN_PREVIEW_CHARS = 400
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_delete_authorized(user_reply: str) -> bool:
+    normalized = user_reply.strip().lower()
+    return normalized in {"yes", "y", "ok", "confirm", "confirmed", "delete", "确认", "授权", "同意", "删除"}
 
 
 class XAgentHandler(BaseHandler):
@@ -315,9 +329,72 @@ class XAgentHandler(BaseHandler):
             next_prompt="文件 patch 执行完成，请基于 tool_results 判断是否需要 file_read 验证或继续修改。",
         )
 
+    def exec_file_delete(self, args: dict[str, Any]) -> ActionResult:
+        path = str(args.get("path", ""))
+        recursive = bool(args.get("recursive", False))
+        if not path:
+            return ActionResult(
+                data={"status": "ERROR", "error": "path is required"},
+                next_prompt="文件删除未执行，请基于错误信息决定是否修正参数或停止。",
+            )
+
+        try:
+            target = resolve_path_for_operation(path, self.ctx.cwd or None, operation="read")
+            workspace = Path(self.ctx.cwd or os.getcwd()).resolve()
+            location = "工作区内" if _is_relative_to(target, workspace) else "工作区外"
+        except (OSError, ValueError) as exc:
+            return ActionResult(
+                data={"status": "ERROR", "error": str(exc)},
+                next_prompt="文件删除未执行，请基于错误信息决定是否修正路径或停止。",
+            )
+
+        auth = ask_user(
+            (
+                "请确认是否授权删除以下路径：\n"
+                f"- 路径：{target}\n"
+                f"- 位置：{location}\n"
+                f"- 递归删除：{'是' if recursive else '否'}\n"
+                "- 注意：删除后系统无法自动回滚。\n"
+                "如确认删除，请回复 yes / 确认 / 授权。"
+            ),
+            input_fn=self.ctx.user_input_fn,
+        )
+        if not _is_delete_authorized(auth.get("user_reply", "")):
+            return ActionResult(
+                data={
+                    "status": "SKIP",
+                    "error": "delete not authorized by user",
+                    "path": str(target),
+                    "authorization": auth,
+                },
+                next_prompt="用户未授权删除，文件删除未执行。请基于已有信息继续或停止。",
+            )
+
+        if location == "工作区外":
+            return ActionResult(
+                data={
+                    "status": "ERROR",
+                    "error": "outside-workspace deletion is not supported",
+                    "path": str(target),
+                    "workspace": str(workspace),
+                    "operation": "delete",
+                    "authorization": auth,
+                },
+                next_prompt="用户已授权，但第一版不支持删除工作区外路径。请停止删除或改用工作区内路径。",
+            )
+
+        result = delete_file(path=path, cwd=self.ctx.cwd or None, recursive=recursive)
+        result["authorization"] = auth
+        return ActionResult(
+            data=result,
+            next_prompt="文件删除流程完成，请基于 tool_results 判断是否需要验证或继续操作。",
+        )
+
     def exec_ask_user(self, args: dict[str, Any]) -> ActionResult:
         message = str(args.get("message", ""))
-        result = ask_user(message, input_fn=self.ctx.user_input_fn)
+        raw_options = args.get("options")
+        options = [str(item) for item in raw_options] if isinstance(raw_options, list) else None
+        result = ask_user(message, options=options, input_fn=self.ctx.user_input_fn)
         if result.get("status") == "SKIP":
             return ActionResult(
                 data=result,

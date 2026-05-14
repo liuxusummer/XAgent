@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,25 @@ from typing import Any
 FILE_READ_CHAR_LIMIT = 20000
 FILE_REF_PATTERN = re.compile(r"\{\{file:(.+?):(\d+):(\d+)}}")
 KEYWORD_CONTEXT_LINES = 3
+READ_OPERATIONS = {"read"}
+WRITE_OPERATIONS = {"create", "update", "write", "patch", "delete"}
+
+
+class WorkspacePermissionError(ValueError):
+    def __init__(self, message: str, path: Path, workspace: Path, operation: str) -> None:
+        super().__init__(message)
+        self.path = path
+        self.workspace = workspace
+        self.operation = operation
+
+    def to_result(self) -> dict[str, Any]:
+        return {
+            "status": "ERROR",
+            "error": str(self),
+            "path": str(self.path),
+            "workspace": str(self.workspace),
+            "operation": self.operation,
+        }
 
 
 def read_file(
@@ -18,7 +38,9 @@ def read_file(
     keyword: str | None = None,
 ) -> dict[str, Any]:
     try:
-        file_path = resolve_path(path, cwd)
+        file_path = resolve_path(path, cwd, operation="read")
+    except WorkspacePermissionError as exc:
+        return exc.to_result()
     except (OSError, ValueError) as exc:
         return {"status": "ERROR", "error": str(exc)}
     if not file_path.exists():
@@ -106,7 +128,9 @@ def write_file(
     cwd: str | None = None,
 ) -> dict[str, Any]:
     try:
-        file_path = resolve_path(path, cwd)
+        file_path = resolve_path(path, cwd, operation="write")
+    except WorkspacePermissionError as exc:
+        return exc.to_result()
     except (OSError, ValueError) as exc:
         return {"status": "ERROR", "error": str(exc)}
     if file_path.exists() and file_path.is_dir():
@@ -147,7 +171,9 @@ def patch_file(
     cwd: str | None = None,
 ) -> dict[str, Any]:
     try:
-        file_path = resolve_path(path, cwd)
+        file_path = resolve_path(path, cwd, operation="patch")
+    except WorkspacePermissionError as exc:
+        return exc.to_result()
     except (OSError, ValueError) as exc:
         return {"status": "ERROR", "error": str(exc)}
     if not file_path.exists():
@@ -201,7 +227,37 @@ def patch_file(
     }
 
 
-def resolve_path(path: str, cwd: str | None = None) -> Path:
+def delete_file(path: str, cwd: str | None = None, recursive: bool = False) -> dict[str, Any]:
+    try:
+        file_path = resolve_path(path, cwd, operation="delete")
+    except WorkspacePermissionError as exc:
+        return exc.to_result()
+    except (OSError, ValueError) as exc:
+        return {"status": "ERROR", "error": str(exc)}
+    if not file_path.exists():
+        return {"status": "ERROR", "error": f"file not found: {file_path}", "path": str(file_path)}
+
+    try:
+        if file_path.is_dir():
+            if not recursive:
+                return {
+                    "status": "ERROR",
+                    "error": f"path is a directory; recursive=true is required: {file_path}",
+                    "path": str(file_path),
+                }
+            shutil.rmtree(file_path)
+            return {"status": "OK", "path": str(file_path), "deleted": True, "recursive": True}
+        file_path.unlink()
+    except OSError as exc:
+        return {"status": "ERROR", "error": f"failed to delete file: {exc}", "path": str(file_path)}
+    return {"status": "OK", "path": str(file_path), "deleted": True, "recursive": False}
+
+
+def resolve_path(path: str, cwd: str | None = None, operation: str = "write") -> Path:
+    return resolve_path_for_operation(path, cwd, operation)
+
+
+def resolve_path_for_operation(path: str, cwd: str | None = None, operation: str = "read") -> Path:
     base = Path(cwd or Path.cwd()).resolve()
     candidate = Path(path).expanduser()
     if candidate.is_absolute():
@@ -211,7 +267,16 @@ def resolve_path(path: str, cwd: str | None = None) -> Path:
     try:
         resolved.relative_to(base)
     except ValueError as exc:
-        raise ValueError(f"path escapes workspace: {resolved} (workspace: {base})") from exc
+        if operation in READ_OPERATIONS:
+            return resolved
+        if operation in WRITE_OPERATIONS:
+            raise WorkspacePermissionError(
+                f"path outside workspace is read-only: {resolved} (workspace: {base}, operation: {operation})",
+                resolved,
+                base,
+                operation,
+            ) from exc
+        raise ValueError(f"unsupported operation: {operation}") from exc
     return resolved
 
 
@@ -225,7 +290,7 @@ def expand_file_refs(content: str, cwd: str | None = None) -> str:
                 f"invalid file ref range: {{file:{ref_path}:{start_line}:{end_line}}}"
             )
 
-        file_path = resolve_path(ref_path, cwd)
+        file_path = resolve_path(ref_path, cwd, operation="read")
         if not file_path.exists():
             raise FileNotFoundError(f"file ref not found: {file_path}")
         if file_path.is_dir():

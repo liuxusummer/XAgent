@@ -2,6 +2,7 @@ import { useRef, useEffect } from 'react';
 import { MessageCard } from './MessageCard';
 import { StatusBar } from './StatusBar';
 import { InputArea } from './InputArea';
+import { AskUserCard } from './AskUserCard';
 import type { Message, AgentStatus } from '../types';
 import { Bot } from 'lucide-react';
 
@@ -103,12 +104,9 @@ export function ChatArea({
         </div>
       )}
 
-      {/* Ask User Banner */}
+      {/* Ask User Card */}
       {isWaitingForUser && askPrompt && (
-        <div className="mx-4 mb-2 px-4 py-3 rounded-card bg-status-warning/10 border border-status-warning/20">
-          <div className="text-sm text-status-warning font-medium mb-1">Agent asks:</div>
-          <div className="text-sm text-text-secondary">{askPrompt}</div>
-        </div>
+        <AskUserCard prompt={askPrompt} onSubmit={onSendReply} />
       )}
 
       {/* Input Area */}
