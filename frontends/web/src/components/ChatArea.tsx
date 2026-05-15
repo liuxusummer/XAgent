@@ -14,6 +14,7 @@ interface ChatAreaProps {
   onSubmitTask: (task: string) => void;
   onSendReply: (reply: string) => void;
   onStopTask: () => void;
+  view: 'chat' | 'agents' | 'skills';
 }
 
 function EmptyState({ onSuggestion }: { onSuggestion: (text: string) => void }) {
@@ -60,6 +61,7 @@ export function ChatArea({
   onSubmitTask,
   onSendReply,
   onStopTask,
+  view,
 }: ChatAreaProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -82,15 +84,19 @@ export function ChatArea({
 
   const isRunning = agentStatus.state !== 'idle' && agentStatus.state !== 'error';
 
+  const showChat = view === 'chat';
+
   return (
     <div className="flex-1 flex flex-col min-w-0 bg-bg-primary">
       {/* Status Bar */}
       <StatusBar status={agentStatus} />
 
       {/* Messages Area */}
-      {messages.length === 0 ? (
+      {showChat && messages.length === 0 && (
         <EmptyState onSuggestion={handleSubmit} />
-      ) : (
+      )}
+
+      {showChat && messages.length > 0 && (
         <div
           ref={scrollContainerRef}
           className="flex-1 overflow-y-auto px-4 py-6"
@@ -105,18 +111,20 @@ export function ChatArea({
       )}
 
       {/* Ask User Card */}
-      {isWaitingForUser && askPrompt && (
+      {showChat && isWaitingForUser && askPrompt && (
         <AskUserCard prompt={askPrompt} onSubmit={onSendReply} />
       )}
 
-      {/* Input Area */}
-      <InputArea
-        onSubmit={handleSubmit}
-        onStop={onStopTask}
-        isRunning={isRunning}
-        isWaitingForUser={isWaitingForUser}
-        placeholder={isWaitingForUser ? 'Reply to the agent...' : 'Tell XAgent what to do...'}
-      />
+      {/* Input Area - only show in chat view */}
+      {showChat && (
+        <InputArea
+          onSubmit={handleSubmit}
+          onStop={onStopTask}
+          isRunning={isRunning}
+          isWaitingForUser={isWaitingForUser}
+          placeholder={isWaitingForUser ? 'Reply to the agent...' : 'Tell XAgent what to do...'}
+        />
+      )}
     </div>
   );
 }

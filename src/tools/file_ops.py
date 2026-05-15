@@ -11,6 +11,8 @@ FILE_REF_PATTERN = re.compile(r"\{\{file:(.+?):(\d+):(\d+)}}")
 KEYWORD_CONTEXT_LINES = 3
 READ_OPERATIONS = {"read"}
 WRITE_OPERATIONS = {"create", "update", "write", "patch", "delete"}
+SUPPORTED_OPERATIONS = READ_OPERATIONS | WRITE_OPERATIONS
+WORKSPACE_SYSTEM_DIR = "system"
 
 
 class WorkspacePermissionError(ValueError):
@@ -258,6 +260,8 @@ def resolve_path(path: str, cwd: str | None = None, operation: str = "write") ->
 
 
 def resolve_path_for_operation(path: str, cwd: str | None = None, operation: str = "read") -> Path:
+    if operation not in SUPPORTED_OPERATIONS:
+        raise ValueError(f"unsupported operation: {operation}")
     base = Path(cwd or Path.cwd()).resolve()
     candidate = Path(path).expanduser()
     if candidate.is_absolute():
@@ -276,8 +280,27 @@ def resolve_path_for_operation(path: str, cwd: str | None = None, operation: str
                 base,
                 operation,
             ) from exc
-        raise ValueError(f"unsupported operation: {operation}") from exc
+    if operation in WRITE_OPERATIONS and _is_workspace_system_path(resolved, base):
+        if operation == "delete":
+            message = "workspace system files cannot be deleted by agent file tools"
+        else:
+            message = "workspace system files are read-only for agent file tools"
+        raise WorkspacePermissionError(
+            f"{message}: {resolved} (workspace: {base}, operation: {operation})",
+            resolved,
+            base,
+            operation,
+        )
     return resolved
+
+
+def _is_workspace_system_path(path: Path, workspace: Path) -> bool:
+    system_root = workspace / WORKSPACE_SYSTEM_DIR
+    try:
+        path.relative_to(system_root)
+    except ValueError:
+        return False
+    return True
 
 
 def expand_file_refs(content: str, cwd: str | None = None) -> str:
