@@ -13,11 +13,16 @@ from src.web_ui_new import (
     _queue_state,
     _resolve_workspace_dir_input,
     _sessions,
+    parse_agent_markdown,
     read_workspace_file,
+    read_agent_profile,
+    serialize_agent_markdown,
     send_reply,
     stop_task,
     stream_chat,
+    write_agent_profile,
     write_workspace_file,
+    AgentProfileWriteRequest,
 )
 
 
@@ -228,6 +233,110 @@ class WebUINewWorkspaceFileTests(unittest.IsolatedAsyncioTestCase):
                 resolved = _resolve_workspace_dir_input("default.ws")
 
             self.assertEqual(resolved, str(Path(tmp_dir) / "default.ws"))
+
+    def test_parse_agent_markdown_with_frontmatter(self) -> None:
+        content = """---
+name: "main"
+description: "日常对话分析"
+tools:
+  - "Read"
+  - "Write"
+model: "minimax-m2.7" # comment
+runtime_model: "claude-sonnet"
+maxTurns: 300
+memory: "project"
+skills: []
+project_agents:
+  - "coding"
+---
+
+# Main Agent
+"""
+
+        result = parse_agent_markdown(content, "main")
+
+        self.assertEqual(result["profile"]["name"], "main")
+        self.assertEqual(result["profile"]["description"], "日常对话分析")
+        self.assertEqual(result["profile"]["tools"], ["Read", "Write"])
+        self.assertEqual(result["profile"]["model"], "minimax-m2.7")
+        self.assertEqual(result["profile"]["runtime_model"], "claude-sonnet")
+        self.assertEqual(result["profile"]["maxTurns"], 300)
+        self.assertEqual(result["profile"]["memory"], "project")
+        self.assertEqual(result["profile"]["skills"], [])
+        self.assertEqual(result["profile"]["project_agents"], ["coding"])
+        self.assertEqual(result["body"], "# Main Agent\n")
+
+    def test_parse_agent_markdown_without_frontmatter_uses_defaults(self) -> None:
+        result = parse_agent_markdown("# Legacy Agent\n", "legacy")
+
+        self.assertEqual(result["profile"]["name"], "legacy")
+        self.assertEqual(result["profile"]["description"], "")
+        self.assertEqual(result["profile"]["tools"], [])
+        self.assertEqual(result["body"], "# Legacy Agent\n")
+
+    def test_serialize_agent_markdown_preserves_body(self) -> None:
+        profile = {
+            "name": "main",
+            "description": "日常对话分析",
+            "tools": ["Read"],
+            "model": "minimax-m2.7",
+            "runtime_model": "claude-sonnet",
+            "maxTurns": 300,
+            "memory": "project",
+            "skills": [],
+            "project_agents": ["coding"],
+        }
+
+        content = serialize_agent_markdown(profile, "# Main Agent\n")
+
+        self.assertIn('name: "main"', content)
+        self.assertIn('  - "Read"', content)
+        self.assertTrue(content.endswith("# Main Agent\n"))
+
+    async def test_list_agents_returns_profile_description(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "default.ws" / "system" / "agents" / "main" / "AGENT.md"
+            target.parent.mkdir(parents=True)
+            target.write_text(
+                '---\nname: "main"\ndescription: "日常对话分析"\ntools: []\nmodel: ""\nruntime_model: ""\nmaxTurns: 300\nmemory: ""\nskills: []\nproject_agents: []\n---\n\n# Main\n',
+                encoding="utf-8",
+            )
+
+            from src.web_ui_new import list_agents
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                result = await list_agents("default.ws")
+
+            self.assertTrue(result["success"])
+            self.assertEqual(result["data"][0]["description"], "日常对话分析")
+            self.assertEqual(result["data"][0]["profile"]["name"], "main")
+
+    async def test_agent_profile_endpoint_reads_and_writes_agent_md(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "default.ws" / "system" / "agents" / "main" / "AGENT.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("# Main\n", encoding="utf-8")
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                read_result = await read_agent_profile("default.ws", "main")
+                self.assertTrue(read_result["success"])
+                self.assertEqual(read_result["data"]["profile"]["name"], "main")
+
+                profile = dict(read_result["data"]["profile"])
+                profile["description"] = "日常对话分析"
+                profile["tools"] = ["Read"]
+                write_result = await write_agent_profile(
+                    AgentProfileWriteRequest(
+                        ws="default.ws",
+                        agent="main",
+                        profile=profile,
+                        body="# Updated\n",
+                    )
+                )
+
+            self.assertTrue(write_result["success"])
+            self.assertIn('description: "日常对话分析"', target.read_text(encoding="utf-8"))
+            self.assertIn("# Updated\n", target.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

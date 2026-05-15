@@ -8,9 +8,10 @@ import {
   Plus,
   RefreshCw,
   MessageSquare,
-  ChevronDown,
-  ChevronUp,
   FolderOpen,
+  Wrench,
+  Hammer,
+  Settings,
 } from 'lucide-react';
 import { api } from '../api/client';
 import type { WorkspaceAgent, WorkspaceSkill } from '../types';
@@ -35,9 +36,6 @@ export function WorkspacePanel({
   const [skills, setSkills] = useState<WorkspaceSkill[]>([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
-  const [expandedAgent, setExpandedAgent] = useState<string | null>(null);
-  const [viewingFile, setViewingFile] = useState<string | null>(null);
-  const [fileContent, setFileContent] = useState<string | null>(null);
 
   const loadData = useCallback(() => {
     if (!workspace) return;
@@ -75,22 +73,7 @@ export function WorkspacePanel({
     return skills.filter((s) => s.name.toLowerCase().includes(q));
   }, [skills, search]);
 
-  const handleViewFile = useCallback(
-    (agentName: string, fileName: string) => {
-      const filePath = `system/agents/${agentName}/${fileName}`;
-      if (viewingFile === filePath) {
-        setViewingFile(null);
-        setFileContent(null);
-        return;
-      }
-      setViewingFile(filePath);
-      setFileContent(null);
-      api.readWorkspaceFile(workspace, filePath).then((res) => {
-        if (res.success && res.data) setFileContent(res.data.content);
-      });
-    },
-    [workspace, viewingFile]
-  );
+
 
   if (!isOpen) return null;
 
@@ -163,75 +146,59 @@ export function WorkspacePanel({
                 onClick={() => onSelectAgent?.(agent.name)}
                 className="bg-bg-secondary border border-border rounded-card p-4 hover:shadow-lg hover:-translate-y-0.5 hover:border-accent/20 transition-all duration-200 cursor-pointer"
               >
-                <div className="flex items-start gap-3">
-                  <div className="w-10 h-10 rounded-xl bg-accent/10 flex items-center justify-center shrink-0">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-lg bg-accent/10 flex items-center justify-center shrink-0">
                     <span className="text-sm font-bold text-accent">
                       {agent.name.charAt(0).toUpperCase()}
                     </span>
                   </div>
-                  <div className="flex-1 min-w-0">
-                    <h3 className="text-sm font-semibold text-text-primary truncate">
-                      {agent.name}
-                    </h3>
-                    <p className="text-xs text-text-muted mt-0.5">日常对话分析</p>
+                  <h3 className="text-base font-semibold text-text-primary truncate">
+                    {agent.name}
+                  </h3>
+                </div>
+
+                {/* Description */}
+                <p className="text-sm text-text-secondary mt-3 leading-relaxed">
+                  {agent.description || '未配置描述'}
+                </p>
+
+                {/* Bottom row: icons + chat button */}
+                <div className="flex items-center justify-between mt-4 pt-3 border-t border-border">
+                  <div className="flex items-center gap-3">
+                    <span
+                      title={`${agent.files.length} 个文件`}
+                      className="flex items-center gap-1 text-xs text-text-muted"
+                    >
+                      <FileText className="w-4 h-4" />
+                      <span className="font-medium">{agent.files.length}</span>
+                    </span>
+                    <span
+                      title="已配置技能"
+                      className="flex items-center gap-1 text-xs text-text-muted"
+                    >
+                      <Wrench className="w-4 h-4" />
+                    </span>
+                    <span
+                      title="已配置工具"
+                      className="flex items-center gap-1 text-xs text-text-muted"
+                    >
+                      <Hammer className="w-4 h-4" />
+                    </span>
+                    <span
+                      title="已配置参数"
+                      className="flex items-center gap-1 text-xs text-text-muted"
+                    >
+                      <Settings className="w-4 h-4" />
+                    </span>
                   </div>
-                </div>
-
-                <div className="flex items-center gap-4 mt-3 text-xs text-text-muted">
-                  <span className="flex items-center gap-1">
-                    <FileText className="w-3 h-3" />
-                    {agent.files.length}
-                  </span>
-                </div>
-
-                <div className="flex items-center justify-between mt-3 pt-3 border-t border-border">
                   <button
-                    onClick={() =>
-                      setExpandedAgent(expandedAgent === agent.name ? null : agent.name)
-                    }
-                    className="flex items-center gap-1 text-xs text-text-muted hover:text-text-secondary transition-colors"
+                    onClick={(e) => e.stopPropagation()}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-button border border-border text-xs text-text-secondary hover:bg-bg-tertiary transition-colors"
                   >
-                    {expandedAgent === agent.name ? (
-                      <ChevronUp className="w-3 h-3" />
-                    ) : (
-                      <ChevronDown className="w-3 h-3" />
-                    )}
-                    <span>文件</span>
-                  </button>
-                  <button className="flex items-center gap-1.5 px-3 py-1.5 rounded-button border border-border text-xs text-text-secondary hover:bg-bg-tertiary transition-colors">
                     <MessageSquare className="w-3 h-3" />
                     <span>对话</span>
                   </button>
                 </div>
-
-                {expandedAgent === agent.name && (
-                  <div className="mt-2 space-y-1">
-                    {agent.files.map((file) => (
-                      <div key={file}>
-                        <button
-                          onClick={() => handleViewFile(agent.name, file)}
-                          className={`flex items-center gap-2 w-full px-2 py-1.5 rounded text-xs transition-colors ${
-                            viewingFile === `system/agents/${agent.name}/${file}`
-                              ? 'bg-accent/10 text-accent'
-                              : 'text-text-secondary hover:bg-bg-tertiary hover:text-text-primary'
-                          }`}
-                        >
-                          <FileText className="w-3 h-3 shrink-0" />
-                          <span className="truncate">{file}</span>
-                        </button>
-                        {viewingFile === `system/agents/${agent.name}/${file}` &&
-                          fileContent !== null && (
-                            <div className="mt-1 p-2 bg-bg-tertiary border border-border rounded text-xs font-mono text-text-secondary whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed">
-                              {fileContent}
-                            </div>
-                          )}
-                      </div>
-                    ))}
-                    {agent.files.length === 0 && (
-                      <p className="text-xs text-text-muted italic px-2 py-1">暂无文件</p>
-                    )}
-                  </div>
-                )}
               </div>
             ))}
             {filteredAgents.length === 0 && !loading && (

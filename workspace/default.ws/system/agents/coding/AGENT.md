@@ -1,3 +1,20 @@
+---
+name: "coding"
+description: "编码实现与调试的 Agent"
+tools:
+  - "file_read"
+  - "file_write"
+  - "file_patch"
+  - "file_delete"
+  - "code_run"
+  - "web_scan"
+model: "deepseek-v4-pro"
+maxTurns: 300
+memory: "project"
+skills: []
+project_agents: []
+---
+
 # Coding Agent
 
 ## 角色

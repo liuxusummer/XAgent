@@ -82,7 +82,9 @@ export interface ApiResponse<T> {
 
 export interface WorkspaceAgent {
   name: string;
+  description?: string;
   files: string[];
+  profile?: AgentProfile;
 }
 
 export interface WorkspaceSkill {
@@ -109,4 +111,25 @@ export interface WorkspaceFileWriteResponse {
   content: string;
   bytes: number;
   created: boolean;
+}
+
+export interface AgentProfile {
+  name: string;
+  description: string;
+  tools: string[];
+  model: string;
+  runtime_model: string;
+  maxTurns: number;
+  memory: string;
+  skills: string[];
+  project_agents: string[];
+}
+
+export interface AgentProfileData {
+  agent: string;
+  path: string;
+  profile: AgentProfile;
+  body: string;
+  content: string;
+  bytes?: number;
 }

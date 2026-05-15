@@ -7,6 +7,8 @@ import type {
   WorkspaceTool,
   WorkspaceFile,
   WorkspaceFileWriteResponse,
+  AgentProfile,
+  AgentProfileData,
 } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_BASE || '';
@@ -99,6 +101,22 @@ class ApiClient {
     return this.fetch('/api/workspace/file', {
       method: 'PUT',
       body: JSON.stringify({ ws, path, content }),
+    });
+  }
+
+  async readAgentProfile(ws: string, agent: string): Promise<ApiResponse<AgentProfileData>> {
+    return this.fetch(`/api/workspace/agent-profile?ws=${encodeURIComponent(ws)}&agent=${encodeURIComponent(agent)}`);
+  }
+
+  async writeAgentProfile(
+    ws: string,
+    agent: string,
+    profile: AgentProfile,
+    body: string
+  ): Promise<ApiResponse<AgentProfileData>> {
+    return this.fetch('/api/workspace/agent-profile', {
+      method: 'PUT',
+      body: JSON.stringify({ ws, agent, profile, body }),
     });
   }
 }
