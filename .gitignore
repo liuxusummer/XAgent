@@ -54,7 +54,6 @@ dist-ssr/
 *.local
 
 # Runtime output
-workspace/
 temp/
 logs/
 *.log
@@ -62,4 +61,5 @@ logs/
 
 AGENTS.md
 .trae/
+.codex/
 CLAUDE.md
