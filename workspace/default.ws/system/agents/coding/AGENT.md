@@ -3,12 +3,8 @@ name: "coding"
 description: "编码实现与调试的 Agent"
 tools:
   - "file_read"
-  - "file_write"
-  - "file_patch"
-  - "file_delete"
-  - "code_run"
-  - "web_scan"
 model: "deepseek-v4-pro"
+runtime_model: ""
 maxTurns: 300
 memory: "project"
 skills: []

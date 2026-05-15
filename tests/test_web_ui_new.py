@@ -5,11 +5,17 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from src.core.agent_loop import AgentContext, exhaust
+from src.core.skills import SkillRegistry
+from src.handler import XAgentHandler
+from src.main import build_system_prompt, filter_tools_schema
 from src.tools.file_ops import write_file
 from src.web_ui_new import (
+    SubmitTaskRequest,
     ReplyRequest,
     UISession,
     WorkspaceFileWriteRequest,
+    _agent_runtime_config,
     _queue_state,
     _resolve_workspace_dir_input,
     _sessions,
@@ -18,6 +24,7 @@ from src.web_ui_new import (
     read_agent_profile,
     serialize_agent_markdown,
     send_reply,
+    submit_task,
     stop_task,
     stream_chat,
     write_agent_profile,
@@ -61,6 +68,14 @@ class _StreamRequest:
 
     async def is_disconnected(self) -> bool:
         return False
+
+
+class _NoopThread:
+    def __init__(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+    def start(self) -> None:
+        return None
 
 
 class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
@@ -337,6 +352,138 @@ project_agents:
             self.assertTrue(write_result["success"])
             self.assertIn('description: "日常对话分析"', target.read_text(encoding="utf-8"))
             self.assertIn("# Updated\n", target.read_text(encoding="utf-8"))
+
+    def test_agent_runtime_config_reads_prompt_soul_and_frontmatter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            agent_dir = Path(tmp_dir) / "default.ws" / "system" / "agents" / "coding"
+            agent_dir.mkdir(parents=True)
+            (agent_dir / "AGENT.md").write_text(
+                '---\nname: "coding"\ndescription: ""\ntools:\n  - "file_read"\nmodel: "dev-model"\nruntime_model: "runtime-model"\nmaxTurns: 12\nmemory: ""\nskills:\n  - "review"\nproject_agents: []\n---\n\n# Coding Agent\n',
+                encoding="utf-8",
+            )
+            (agent_dir / "SOUL.md").write_text("# Soul\n", encoding="utf-8")
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                runtime, error = _agent_runtime_config("default.ws", "coding")
+
+            self.assertIsNone(error)
+            self.assertEqual(runtime["agent_prompt"], "# Coding Agent\n")
+            self.assertEqual(runtime["agent_soul"], "# Soul\n")
+            self.assertEqual(runtime["tools_allowlist"], ["file_read"])
+            self.assertEqual(runtime["skill_allowlist"], ["review"])
+            self.assertEqual(runtime["model_override"], "runtime-model")
+            self.assertEqual(runtime["max_turns"], 12)
+
+    async def test_submit_task_passes_selected_agent_runtime_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            agent_dir = Path(tmp_dir) / "default.ws" / "system" / "agents" / "coding"
+            agent_dir.mkdir(parents=True)
+            (agent_dir / "AGENT.md").write_text(
+                '---\nname: "coding"\ndescription: ""\ntools:\n  - "file_read"\nmodel: "dev-model"\nruntime_model: "runtime-model"\nmaxTurns: 12\nmemory: ""\nskills: []\nproject_agents: []\n---\n\n# Coding Agent\n',
+                encoding="utf-8",
+            )
+            (agent_dir / "SOUL.md").write_text("# Soul\n", encoding="utf-8")
+
+            fake_agent = _FakeAgent()
+            fake_agent.handler = type("H", (), {"ctx": type("C", (), {"verbose": False})()})()
+            captured: dict[str, object] = {}
+
+            def _fake_build_agent(**kwargs):
+                captured.update(kwargs)
+                return fake_agent
+
+            _sessions.clear()
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
+                patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
+                patch("src.web_ui_new.threading.Thread", _NoopThread),
+            ):
+                result = await submit_task(
+                    SubmitTaskRequest(task="hello", workspace_dir="default.ws", agent="coding")
+                )
+
+            self.assertTrue(result["success"])
+            self.assertEqual(captured["agent_name"], "coding")
+            self.assertEqual(captured["agent_prompt"], "# Coding Agent\n")
+            self.assertEqual(captured["agent_soul"], "# Soul\n")
+            self.assertEqual(captured["tools_allowlist"], ["file_read"])
+            self.assertEqual(captured["model_override"], "runtime-model")
+            self.assertEqual(captured["max_turns"], 12)
+
+    async def test_submit_task_rejects_invalid_agent_without_starting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir()
+            _sessions.clear()
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
+                patch("src.web_ui_new.build_agent") as build_agent_mock,
+                patch("src.web_ui_new.threading.Thread", _NoopThread),
+            ):
+                result = await submit_task(
+                    SubmitTaskRequest(task="hello", workspace_dir="default.ws", agent="../bad")
+                )
+
+            self.assertFalse(result["success"])
+            build_agent_mock.assert_not_called()
+
+    def test_filter_tools_schema_keeps_only_agent_allowed_tools(self) -> None:
+        schema = [
+            {"type": "function", "function": {"name": "file_read"}},
+            {"type": "function", "function": {"name": "code_run"}},
+        ]
+
+        filtered = filter_tools_schema(schema, ["file_read"])
+
+        self.assertEqual([item["function"]["name"] for item in filtered], ["file_read"])
+
+    def test_agent_prompt_replaces_global_base_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            assets = root / "assets"
+            memory = root / "memory"
+            assets.mkdir()
+            memory.mkdir()
+            (assets / "sys_prompt.txt").write_text("global base", encoding="utf-8")
+            (memory / "global_mem_insight.txt").write_text("insight", encoding="utf-8")
+            (memory / "insight_fixed_structure.txt").write_text("fixed", encoding="utf-8")
+
+            prompt = build_system_prompt(
+                assets,
+                root,
+                "/workspace",
+                agent_name="coding",
+                agent_prompt="# Coding Agent",
+                agent_soul="# Soul",
+            )
+
+            self.assertEqual(prompt, "# Coding Agent\n\n# Soul")
+            self.assertNotIn("global base", prompt)
+            self.assertNotIn("[动态注入]", prompt)
+            self.assertNotIn("[Memory]", prompt)
+
+    def test_handler_rejects_tools_outside_agent_allowlist(self) -> None:
+        handler = XAgentHandler(ctx=AgentContext(allowed_tools={"file_read"}))
+
+        result = exhaust(handler.dispatch("code_run", {"script": "print(1)"}))
+
+        self.assertEqual(result.data["status"], "ERROR")
+        self.assertIn("not allowed", result.data["error"])
+
+    def test_skill_activate_respects_agent_skill_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            for name in ("allowed", "blocked"):
+                skill_dir = root / name
+                skill_dir.mkdir()
+                (skill_dir / "SKILL.md").write_text(f"# {name}\nUse for {name}.", encoding="utf-8")
+            registry = SkillRegistry.load([root])
+            handler = XAgentHandler(ctx=AgentContext(skills=registry, skill_allowlist={"allowed"}))
+
+            result = handler.exec_skill_activate({"names": ["allowed", "blocked"]})
+
+            self.assertEqual(result.data["activated"], ["allowed"])
+            self.assertEqual(result.data["disallowed"], ["blocked"])
+            self.assertEqual(handler.ctx.active_skills, ["allowed"])
 
 
 if __name__ == "__main__":

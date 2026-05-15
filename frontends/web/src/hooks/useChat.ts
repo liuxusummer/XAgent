@@ -280,6 +280,7 @@ export function useChat() {
     configPath?: string;
     observabilityConfigPath?: string;
     workspaceDir?: string;
+    agent?: string;
   }) => {
     if (!task.trim()) return;
 
@@ -307,6 +308,7 @@ export function useChat() {
         config_path: config?.configPath,
         observability_config_path: config?.observabilityConfigPath,
         workspace_dir: config?.workspaceDir,
+        agent: config?.agent,
       });
 
       if (!response.success) {

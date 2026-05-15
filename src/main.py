@@ -24,6 +24,18 @@ def load_tools_schema(path: Path) -> list[dict]:
     return json.loads(read_text(path))
 
 
+def filter_tools_schema(tools_schema: list[dict], allowed_tools: list[str] | set[str] | None) -> list[dict]:
+    if allowed_tools is None:
+        return tools_schema
+    allowed = {str(name).strip() for name in allowed_tools if str(name).strip()}
+    return [
+        item
+        for item in tools_schema
+        if item.get("type") == "function"
+        and item.get("function", {}).get("name") in allowed
+    ]
+
+
 def load_memory_content(project_root: Path) -> str:
     return load_boot_memory(project_root / "memory").content
 
@@ -33,7 +45,18 @@ def build_system_prompt(
     project_root: Path,
     workspace_dir: str,
     skill_registry: SkillRegistry | None = None,
+    agent_name: str = "",
+    agent_prompt: str = "",
+    agent_soul: str = "",
 ) -> str:
+    if agent_prompt.strip() or agent_soul.strip():
+        agent_parts: list[str] = []
+        if agent_prompt.strip():
+            agent_parts.append(agent_prompt.strip())
+        if agent_soul.strip():
+            agent_parts.append(agent_soul.strip())
+        return "\n\n".join(agent_parts)
+
     base = read_text(assets_dir / "sys_prompt.txt")
     memory_content = load_memory_content(project_root)
     today = datetime.now().strftime("%Y-%m-%d %a")
@@ -93,19 +116,40 @@ def build_agent(
     observability_config_path: str | None = None,
     skills_dir: str | None = None,
     workspace_dir: str | None = None,
+    agent_name: str = "",
+    agent_prompt: str = "",
+    agent_soul: str = "",
+    tools_allowlist: list[str] | None = None,
+    skill_allowlist: list[str] | None = None,
+    model_override: str = "",
+    max_turns: int | None = None,
 ) -> XAgent:
     project_root = Path(__file__).resolve().parent.parent
     assets_dir = Path(__file__).resolve().parent / "assets"
     workspace = resolve_workspace_dir(workspace_dir, project_root)
     observability_config = load_observability_config(observability_config_path)
     skill_registry = SkillRegistry.load([Path(skills_dir)] if skills_dir else [project_root / "skills"])
+    prompt_skill_registry = skill_registry
+    if skill_allowlist is not None:
+        allowed_skills = {str(name).strip() for name in skill_allowlist if str(name).strip()}
+        prompt_skill_registry = SkillRegistry(
+            {name: manifest for name, manifest in skill_registry.skills.items() if name in allowed_skills}
+        )
 
-    system_prompt = build_system_prompt(assets_dir, project_root, workspace, skill_registry=skill_registry)
-    tools_schema = load_tools_schema(assets_dir / "tools_schema.json")
+    system_prompt = build_system_prompt(
+        assets_dir,
+        project_root,
+        workspace,
+        skill_registry=prompt_skill_registry,
+        agent_name=agent_name,
+        agent_prompt=agent_prompt,
+        agent_soul=agent_soul,
+    )
+    tools_schema = filter_tools_schema(load_tools_schema(assets_dir / "tools_schema.json"), tools_allowlist)
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
     base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions")
-    model = os.environ.get("OPENAI_MODEL", "gpt-4o")
+    model = model_override or os.environ.get("OPENAI_MODEL", "gpt-4o")
 
     agent = XAgent(
         system_prompt=system_prompt,
@@ -117,7 +161,11 @@ def build_agent(
         config_path=config_path,
         sink=build_sink(observability_config),
         skills_dir=skills_dir,
+        max_turns=max_turns or 40,
     )
+    allowed_tools = {item["function"]["name"] for item in tools_schema if item.get("type") == "function"}
+    agent.handler.ctx.allowed_tools = allowed_tools if tools_allowlist is not None else None
+    agent.handler.ctx.skill_allowlist = set(skill_allowlist or []) if skill_allowlist is not None else None
     agent.skill_registry = skill_registry
     agent.handler.ctx.skills = skill_registry
     return agent

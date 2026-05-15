@@ -76,6 +76,7 @@ class XAgent:
     _running: threading.Event = field(default_factory=threading.Event)
     sink: EventSink = field(default_factory=NullSink)
     skills_dir: str | None = None
+    max_turns: int = 40
 
     def __post_init__(self) -> None:
         self.workspace_dir = resolve_workspace_dir(self.workspace_dir or self.cwd)
@@ -109,6 +110,8 @@ class XAgent:
             configs = load_config(self.config_path)
             if configs:
                 first_config = next(iter(configs.values()))
+                if self.model:
+                    first_config.model = self.model
                 client = create_client(first_config)
                 self._attach_stream_callback(client)
                 return client
@@ -171,7 +174,16 @@ class XAgent:
         # Phase 8：每次任务刷新 session_id，便于事件流按会话归集
         self.handler.ctx.session_id = uuid.uuid4().hex[:16]
         skill_registry = getattr(self, "skill_registry", SkillRegistry())
-        auto_skills = select_skills(query, skill_registry)
+        skill_allowlist = getattr(self.handler.ctx, "skill_allowlist", None)
+        if skill_allowlist is None:
+            auto_skills = select_skills(query, skill_registry)
+        elif skill_allowlist:
+            allowed_registry = SkillRegistry(
+                {name: manifest for name, manifest in skill_registry.skills.items() if name in skill_allowlist}
+            )
+            auto_skills = select_skills(query, allowed_registry)
+        else:
+            auto_skills = []
         self.handler.ctx.active_skills = dedupe_skill_names(auto_skills)
         self.handler.ctx.sink.emit(
             Event(
@@ -190,6 +202,7 @@ class XAgent:
                     user_input=query,
                     handler=self.handler,
                     tools_schema=self.tools_schema,
+                    max_turns=getattr(self, "max_turns", 40),
                     stop_event=self.stop_event,
                 )
             except Exception as exc:  # noqa: BLE001

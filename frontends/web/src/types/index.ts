@@ -32,6 +32,7 @@ export interface ChatSession {
     configPath?: string;
     observabilityConfigPath?: string;
     workspaceDir?: string;
+    agent?: string;
   };
 }
 
@@ -67,6 +68,7 @@ export interface SubmitTaskRequest {
   config_path?: string;
   observability_config_path?: string;
   workspace_dir?: string;
+  agent?: string;
 }
 
 export interface ReplyRequest {

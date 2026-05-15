@@ -434,9 +434,13 @@ class XAgentHandler(BaseHandler):
 
         activated: list[str] = []
         missing: list[str] = []
+        disallowed: list[str] = []
+        allowlist = getattr(self.ctx, "skill_allowlist", None)
         if isinstance(registry, SkillRegistry):
             for name in dedupe_skill_names(requested):
-                if registry.get(name) is None:
+                if allowlist is not None and name not in allowlist:
+                    disallowed.append(name)
+                elif registry.get(name) is None:
                     missing.append(name)
                 else:
                     activated.append(name)
@@ -450,11 +454,11 @@ class XAgentHandler(BaseHandler):
                 turn=self.ctx.current_turn,
                 kind="skill_activated",
                 name="skill_activate",
-                data={"activated": activated, "missing": missing},
+                data={"activated": activated, "missing": missing, "disallowed": disallowed},
             )
         )
         return ActionResult(
-            data={"status": "OK", "activated": activated, "missing": missing},
+            data={"status": "OK", "activated": activated, "missing": missing, "disallowed": disallowed},
             next_prompt="Skill activation updated. Future turns will include active skill instructions.",
         )
 

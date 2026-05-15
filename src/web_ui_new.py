@@ -40,6 +40,7 @@ class SubmitTaskRequest(BaseModel):
     config_path: str = ""
     observability_config_path: str = ""
     workspace_dir: str = ""
+    agent: str = ""
 
 
 class ReplyRequest(BaseModel):
@@ -70,6 +71,7 @@ class UISession:
     config_path: str = ""
     observability_config_path: str = ""
     workspace_dir: str = ""
+    agent_name: str = ""
     session_id: str = ""
     event_queue: queue.Queue[dict[str, Any]] = field(default_factory=lambda: queue.Queue(maxsize=1))
     llm_stream_buffer: str = ""
@@ -245,23 +247,40 @@ def _resolve_workspace_dir_input(value: str) -> str:
     return normalized
 
 
-def _ensure_agent(session: UISession, config_path: str, observability_config_path: str, workspace_dir: str):
+def _ensure_agent(
+    session: UISession,
+    config_path: str,
+    observability_config_path: str,
+    workspace_dir: str,
+    agent_name: str,
+    runtime_config: dict[str, Any] | None = None,
+):
     if (
         session.agent is None
         or session.config_path != config_path
         or session.observability_config_path != observability_config_path
         or session.workspace_dir != workspace_dir
+        or session.agent_name != agent_name
     ):
         _close_agent(session)
+        runtime_config = runtime_config or {}
         session.agent = build_agent(
             config_path=config_path or None,
             observability_config_path=observability_config_path or None,
             workspace_dir=_resolve_workspace_dir_input(workspace_dir) or None,
+            agent_name=agent_name,
+            agent_prompt=str(runtime_config.get("agent_prompt", "")),
+            agent_soul=str(runtime_config.get("agent_soul", "")),
+            tools_allowlist=runtime_config.get("tools_allowlist"),
+            skill_allowlist=runtime_config.get("skill_allowlist"),
+            model_override=str(runtime_config.get("model_override", "")),
+            max_turns=runtime_config.get("max_turns"),
         )
         session.agent.handler.ctx.verbose = True
         session.config_path = config_path
         session.observability_config_path = observability_config_path
         session.workspace_dir = workspace_dir
+        session.agent_name = agent_name
     return session.agent
 
 
@@ -379,6 +398,10 @@ async def submit_task(request: SubmitTaskRequest):
     config_path = _normalize_path_input(request.config_path)
     observability_config_path = _normalize_path_input(request.observability_config_path)
     workspace_dir = _normalize_path_input(request.workspace_dir)
+    agent_name = _normalize_path_input(request.agent)
+    runtime_config, runtime_error = _agent_runtime_config(workspace_dir, agent_name)
+    if runtime_error:
+        return {"success": False, "error": runtime_error}
 
     # Build agent
     _ensure_agent(
@@ -386,6 +409,8 @@ async def submit_task(request: SubmitTaskRequest):
         config_path,
         observability_config_path,
         workspace_dir,
+        agent_name,
+        runtime_config,
     )
 
     # Start background task
@@ -762,6 +787,70 @@ def _read_agent_profile(agent_dir: str, agent_name: str) -> dict[str, Any]:
         "body": parsed["body"],
         "content": content,
     }
+
+
+def _agent_dir_from_workspace_input(workspace_dir: str, agent_name: str) -> tuple[str | None, str | None]:
+    if not agent_name:
+        return None, None
+    if not _is_child_name(agent_name):
+        return None, "Invalid agent name"
+    workspace_input = _normalize_path_input(workspace_dir) or "default.ws"
+    if _is_workspace_name(workspace_input):
+        return _agent_dir(workspace_input, agent_name)
+
+    ws_root = os.path.realpath(workspace_input)
+    if not os.path.isdir(ws_root):
+        return None, "Workspace not found"
+    agents_root = os.path.realpath(os.path.join(ws_root, "system", "agents"))
+    agent_dir = os.path.realpath(os.path.join(agents_root, agent_name))
+    if os.path.commonpath([agents_root, agent_dir]) != agents_root:
+        return None, "Path traversal not allowed"
+    if not os.path.isdir(agent_dir):
+        return None, "Agent not found"
+    return agent_dir, None
+
+
+def _read_optional_text(path: str) -> str:
+    if not os.path.isfile(path):
+        return ""
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _agent_runtime_config(workspace_dir: str, agent_name: str) -> tuple[dict[str, Any] | None, str | None]:
+    if not agent_name:
+        return None, None
+    agent_dir, error = _agent_dir_from_workspace_input(workspace_dir, agent_name)
+    if error or agent_dir is None:
+        return None, error
+    try:
+        profile_data = _read_agent_profile(agent_dir, agent_name)
+        profile = profile_data["profile"]
+        model_override = str(profile.get("runtime_model") or profile.get("model") or "").strip()
+        return {
+            "agent_prompt": profile_data["body"],
+            "agent_soul": _read_optional_text(os.path.join(agent_dir, "SOUL.md")),
+            "tools_allowlist": _string_list(profile.get("tools")),
+            "skill_allowlist": _string_list(profile.get("skills")),
+            "model_override": model_override,
+            "max_turns": _positive_int(profile.get("maxTurns")),
+        }, None
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, str(exc)
 
 
 @app.get("/api/workspace/list")

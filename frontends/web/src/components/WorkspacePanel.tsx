@@ -23,6 +23,7 @@ interface WorkspacePanelProps {
   workspace: string;
   defaultTab?: PanelTab;
   onSelectAgent?: (agentName: string) => void;
+  onChatWithAgent?: (agentName: string) => void;
 }
 
 export function WorkspacePanel({
@@ -30,6 +31,7 @@ export function WorkspacePanel({
   workspace,
   defaultTab = 'agents',
   onSelectAgent,
+  onChatWithAgent,
 }: WorkspacePanelProps) {
   const [activeTab, setActiveTab] = useState<PanelTab>(defaultTab);
   const [agents, setAgents] = useState<WorkspaceAgent[]>([]);
@@ -192,8 +194,11 @@ export function WorkspacePanel({
                     </span>
                   </div>
                   <button
-                    onClick={(e) => e.stopPropagation()}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-button border border-border text-xs text-text-secondary hover:bg-bg-tertiary transition-colors"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onChatWithAgent?.(agent.name);
+                    }}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-button border border-border text-xs text-text-secondary hover:bg-bg-tertiary hover:border-accent/30 transition-colors"
                   >
                     <MessageSquare className="w-3 h-3" />
                     <span>对话</span>
