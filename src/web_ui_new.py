@@ -553,7 +553,6 @@ _AGENT_PROFILE_FIELDS = (
     "description",
     "tools",
     "model",
-    "runtime_model",
     "maxTurns",
     "memory",
     "skills",
@@ -632,7 +631,6 @@ def _default_agent_profile(agent_name: str) -> dict[str, Any]:
         "description": "",
         "tools": [],
         "model": "",
-        "runtime_model": "",
         "maxTurns": 300,
         "memory": "",
         "skills": [],
@@ -840,7 +838,7 @@ def _agent_runtime_config(workspace_dir: str, agent_name: str) -> tuple[dict[str
     try:
         profile_data = _read_agent_profile(agent_dir, agent_name)
         profile = profile_data["profile"]
-        model_override = str(profile.get("runtime_model") or profile.get("model") or "").strip()
+        model_override = str(profile.get("model") or "").strip()
         return {
             "agent_prompt": profile_data["body"],
             "agent_soul": _read_optional_text(os.path.join(agent_dir, "SOUL.md")),

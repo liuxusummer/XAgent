@@ -4,7 +4,6 @@ description: "编码实现与调试的 Agent"
 tools:
   - "file_read"
 model: "deepseek-v4-pro"
-runtime_model: ""
 maxTurns: 300
 memory: "project"
 skills: []

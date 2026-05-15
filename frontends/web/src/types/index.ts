@@ -120,7 +120,6 @@ export interface AgentProfile {
   description: string;
   tools: string[];
   model: string;
-  runtime_model: string;
   maxTurns: number;
   memory: string;
   skills: string[];

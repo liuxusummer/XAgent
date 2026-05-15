@@ -25,7 +25,6 @@ description: "日常对话分析"
 tools:
   - "file_read"
 model: "minimax-m2.7"
-runtime_model: "claude-sonnet"
 maxTurns: 300
 memory: "project"
 skills: []

@@ -26,7 +26,6 @@ function defaultProfile(agentName: string): AgentProfile {
     description: '',
     tools: [],
     model: '',
-    runtime_model: '',
     maxTurns: 300,
     memory: '',
     skills: [],
@@ -696,19 +695,6 @@ export function AgentDetail({ workspace, agentName, onBack }: AgentDetailProps) 
                         value={profile.model}
                         onChange={(event) => updateProfile({ model: event.target.value })}
                         placeholder="例如：minimax-m2.7"
-                        className="w-full px-3 py-2 rounded-lg border border-border bg-bg-primary text-sm text-text-primary outline-none focus:border-accent transition-colors"
-                      />
-                    </div>
-
-                    <div className="bg-bg-secondary border border-border rounded-card p-4">
-                      <label className="block text-xs font-medium text-text-muted uppercase tracking-wider mb-2">
-                        运行态模型
-                      </label>
-                      <input
-                        type="text"
-                        value={profile.runtime_model}
-                        onChange={(event) => updateProfile({ runtime_model: event.target.value })}
-                        placeholder="例如：claude-sonnet"
                         className="w-full px-3 py-2 rounded-lg border border-border bg-bg-primary text-sm text-text-primary outline-none focus:border-accent transition-colors"
                       />
                     </div>

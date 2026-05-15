@@ -149,7 +149,7 @@ def build_agent(
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
     base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions")
-    model = model_override or os.environ.get("OPENAI_MODEL", "gpt-4o")
+    model = model_override
 
     agent = XAgent(
         system_prompt=system_prompt,

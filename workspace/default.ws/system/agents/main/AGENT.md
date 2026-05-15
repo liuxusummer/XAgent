@@ -11,7 +11,6 @@ tools:
   - "web_execute_js"
   - "ask_user"
 model: "minimax-m2.7"
-runtime_model: "claude-sonnet"
 maxTurns: 300
 memory: "project"
 skills: []

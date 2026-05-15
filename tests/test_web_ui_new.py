@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.core.agent_loop import AgentContext, exhaust
+from src.core.XAgent import XAgent
 from src.core.skills import SkillRegistry
 from src.handler import XAgentHandler
 from src.main import build_system_prompt, filter_tools_schema
@@ -257,7 +258,6 @@ tools:
   - "Read"
   - "Write"
 model: "minimax-m2.7" # comment
-runtime_model: "claude-sonnet"
 maxTurns: 300
 memory: "project"
 skills: []
@@ -274,7 +274,6 @@ project_agents:
         self.assertEqual(result["profile"]["description"], "日常对话分析")
         self.assertEqual(result["profile"]["tools"], ["Read", "Write"])
         self.assertEqual(result["profile"]["model"], "minimax-m2.7")
-        self.assertEqual(result["profile"]["runtime_model"], "claude-sonnet")
         self.assertEqual(result["profile"]["maxTurns"], 300)
         self.assertEqual(result["profile"]["memory"], "project")
         self.assertEqual(result["profile"]["skills"], [])
@@ -295,7 +294,6 @@ project_agents:
             "description": "日常对话分析",
             "tools": ["Read"],
             "model": "minimax-m2.7",
-            "runtime_model": "claude-sonnet",
             "maxTurns": 300,
             "memory": "project",
             "skills": [],
@@ -313,7 +311,7 @@ project_agents:
             target = Path(tmp_dir) / "default.ws" / "system" / "agents" / "main" / "AGENT.md"
             target.parent.mkdir(parents=True)
             target.write_text(
-                '---\nname: "main"\ndescription: "日常对话分析"\ntools: []\nmodel: ""\nruntime_model: ""\nmaxTurns: 300\nmemory: ""\nskills: []\nproject_agents: []\n---\n\n# Main\n',
+                '---\nname: "main"\ndescription: "日常对话分析"\ntools: []\nmodel: ""\nmaxTurns: 300\nmemory: ""\nskills: []\nproject_agents: []\n---\n\n# Main\n',
                 encoding="utf-8",
             )
 
@@ -358,7 +356,7 @@ project_agents:
             agent_dir = Path(tmp_dir) / "default.ws" / "system" / "agents" / "coding"
             agent_dir.mkdir(parents=True)
             (agent_dir / "AGENT.md").write_text(
-                '---\nname: "coding"\ndescription: ""\ntools:\n  - "file_read"\nmodel: "dev-model"\nruntime_model: "runtime-model"\nmaxTurns: 12\nmemory: ""\nskills:\n  - "review"\nproject_agents: []\n---\n\n# Coding Agent\n',
+                '---\nname: "coding"\ndescription: ""\ntools:\n  - "file_read"\nmodel: "dev-model"\nmaxTurns: 12\nmemory: ""\nskills:\n  - "review"\nproject_agents: []\n---\n\n# Coding Agent\n',
                 encoding="utf-8",
             )
             (agent_dir / "SOUL.md").write_text("# Soul\n", encoding="utf-8")
@@ -371,7 +369,7 @@ project_agents:
             self.assertEqual(runtime["agent_soul"], "# Soul\n")
             self.assertEqual(runtime["tools_allowlist"], ["file_read"])
             self.assertEqual(runtime["skill_allowlist"], ["review"])
-            self.assertEqual(runtime["model_override"], "runtime-model")
+            self.assertEqual(runtime["model_override"], "dev-model")
             self.assertEqual(runtime["max_turns"], 12)
 
     async def test_submit_task_passes_selected_agent_runtime_config(self) -> None:
@@ -379,7 +377,7 @@ project_agents:
             agent_dir = Path(tmp_dir) / "default.ws" / "system" / "agents" / "coding"
             agent_dir.mkdir(parents=True)
             (agent_dir / "AGENT.md").write_text(
-                '---\nname: "coding"\ndescription: ""\ntools:\n  - "file_read"\nmodel: "dev-model"\nruntime_model: "runtime-model"\nmaxTurns: 12\nmemory: ""\nskills: []\nproject_agents: []\n---\n\n# Coding Agent\n',
+                '---\nname: "coding"\ndescription: ""\ntools:\n  - "file_read"\nmodel: "dev-model"\nmaxTurns: 12\nmemory: ""\nskills: []\nproject_agents: []\n---\n\n# Coding Agent\n',
                 encoding="utf-8",
             )
             (agent_dir / "SOUL.md").write_text("# Soul\n", encoding="utf-8")
@@ -407,7 +405,7 @@ project_agents:
             self.assertEqual(captured["agent_prompt"], "# Coding Agent\n")
             self.assertEqual(captured["agent_soul"], "# Soul\n")
             self.assertEqual(captured["tools_allowlist"], ["file_read"])
-            self.assertEqual(captured["model_override"], "runtime-model")
+            self.assertEqual(captured["model_override"], "dev-model")
             self.assertEqual(captured["max_turns"], 12)
 
     async def test_submit_task_rejects_invalid_agent_without_starting(self) -> None:
@@ -460,6 +458,44 @@ project_agents:
             self.assertNotIn("global base", prompt)
             self.assertNotIn("[动态注入]", prompt)
             self.assertNotIn("[Memory]", prompt)
+
+    def test_config_model_is_preserved_without_agent_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            config_path.write_text(
+                '{"openai_text": {"apikey": "", "apibase": "https://example.com/chat/completions", "model": "config-model"}}',
+                encoding="utf-8",
+            )
+            agent = XAgent(
+                system_prompt="",
+                tools_schema=[],
+                config_path=str(config_path),
+                model="",
+                workspace_dir=str(Path(tmp_dir) / "default.ws"),
+            )
+            try:
+                self.assertEqual(agent.client.backend.model, "config-model")
+            finally:
+                agent.close()
+
+    def test_agent_model_overrides_config_model_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            config_path.write_text(
+                '{"openai_text": {"apikey": "", "apibase": "https://example.com/chat/completions", "model": "config-model"}}',
+                encoding="utf-8",
+            )
+            agent = XAgent(
+                system_prompt="",
+                tools_schema=[],
+                config_path=str(config_path),
+                model="agent-model",
+                workspace_dir=str(Path(tmp_dir) / "default.ws"),
+            )
+            try:
+                self.assertEqual(agent.client.backend.model, "agent-model")
+            finally:
+                agent.close()
 
     def test_handler_rejects_tools_outside_agent_allowlist(self) -> None:
         handler = XAgentHandler(ctx=AgentContext(allowed_tools={"file_read"}))
