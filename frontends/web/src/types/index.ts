@@ -79,3 +79,34 @@ export interface ApiResponse<T> {
   data?: T;
   error?: string;
 }
+
+export interface WorkspaceAgent {
+  name: string;
+  files: string[];
+}
+
+export interface WorkspaceSkill {
+  name: string;
+}
+
+export interface WorkspaceTool {
+  name: string;
+}
+
+export interface WorkspaceFile {
+  path: string;
+  content: string;
+}
+
+export interface WorkspaceFileWriteRequest {
+  ws: string;
+  path: string;
+  content: string;
+}
+
+export interface WorkspaceFileWriteResponse {
+  path: string;
+  content: string;
+  bytes: number;
+  created: boolean;
+}

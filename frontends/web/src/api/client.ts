@@ -1,4 +1,13 @@
-import type { SubmitTaskRequest, ReplyRequest, ApiResponse } from '../types';
+import type {
+  SubmitTaskRequest,
+  ReplyRequest,
+  ApiResponse,
+  WorkspaceAgent,
+  WorkspaceSkill,
+  WorkspaceTool,
+  WorkspaceFile,
+  WorkspaceFileWriteResponse,
+} from '../types';
 
 const API_BASE = import.meta.env.VITE_API_BASE || '';
 
@@ -64,6 +73,33 @@ class ApiClient {
       : '/api/chat/stream';
     const url = this.baseUrl ? `${this.baseUrl}${path}` : path;
     return new EventSource(url);
+  }
+
+  async listWorkspaces(): Promise<ApiResponse<string[]>> {
+    return this.fetch('/api/workspace/list');
+  }
+
+  async listAgents(ws: string = 'default.ws'): Promise<ApiResponse<WorkspaceAgent[]>> {
+    return this.fetch(`/api/workspace/agents?ws=${encodeURIComponent(ws)}`);
+  }
+
+  async listSkills(ws: string = 'default.ws'): Promise<ApiResponse<WorkspaceSkill[]>> {
+    return this.fetch(`/api/workspace/skills?ws=${encodeURIComponent(ws)}`);
+  }
+
+  async listTools(): Promise<ApiResponse<WorkspaceTool[]>> {
+    return this.fetch('/api/workspace/tools');
+  }
+
+  async readWorkspaceFile(ws: string, path: string): Promise<ApiResponse<WorkspaceFile>> {
+    return this.fetch(`/api/workspace/file?ws=${encodeURIComponent(ws)}&path=${encodeURIComponent(path)}`);
+  }
+
+  async writeWorkspaceFile(ws: string, path: string, content: string): Promise<ApiResponse<WorkspaceFileWriteResponse>> {
+    return this.fetch('/api/workspace/file', {
+      method: 'PUT',
+      body: JSON.stringify({ ws, path, content }),
+    });
   }
 }
 

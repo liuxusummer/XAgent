@@ -19,16 +19,42 @@ from src.tools.interaction import make_progress_emitter, make_user_input_bridge
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 MEMORY_ROOT = PROJECT_ROOT / "memory"
+DEFAULT_WORKSPACE_NAME = "default.ws"
+WORKSPACE_LAYOUT_DIRS = (
+    "business",
+    "runtime",
+    "system/agents/main",
+    "system/agents/coding",
+    "system/memory",
+    "system/skills",
+    "system/templates",
+)
+WORKSPACE_LAYOUT_FILES = (
+    "system/agents/main/AGENT.md",
+    "system/agents/main/SOUL.md",
+    "system/agents/coding/AGENT.md",
+    "system/agents/coding/SOUL.md",
+)
+
+
+def ensure_workspace_layout(workspace_dir: str | Path) -> None:
+    workspace = Path(workspace_dir)
+    for rel_dir in WORKSPACE_LAYOUT_DIRS:
+        (workspace / rel_dir).mkdir(parents=True, exist_ok=True)
+    for rel_file in WORKSPACE_LAYOUT_FILES:
+        file_path = workspace / rel_file
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.touch(exist_ok=True)
 
 
 def resolve_workspace_dir(workspace_dir: str | None = None, code_root: str | Path | None = None) -> str:
-    root = Path(code_root) if code_root is not None else PROJECT_ROOT
+    root = Path(code_root).expanduser() if code_root is not None else PROJECT_ROOT
     if workspace_dir:
         path = Path(workspace_dir).expanduser()
     else:
-        path = root / "workspace"
+        path = root / "workspace" / DEFAULT_WORKSPACE_NAME
     path = path.resolve()
-    path.mkdir(parents=True, exist_ok=True)
+    ensure_workspace_layout(path)
     return str(path)
 
 

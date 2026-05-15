@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import queue
 import re
 import threading
@@ -44,6 +45,12 @@ class SubmitTaskRequest(BaseModel):
 class ReplyRequest(BaseModel):
     reply: str
     session_id: str = ""
+
+
+class WorkspaceFileWriteRequest(BaseModel):
+    ws: str = "default.ws"
+    path: str = ""
+    content: str = ""
 
 
 @dataclass
@@ -222,6 +229,15 @@ def _normalize_path_input(value: str | None) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _resolve_workspace_dir_input(value: str) -> str:
+    normalized = _normalize_path_input(value)
+    if not normalized:
+        return ""
+    if _is_workspace_name(normalized):
+        return os.path.join(_WORKSPACE_ROOT, normalized)
+    return normalized
+
+
 def _ensure_agent(session: UISession, config_path: str, observability_config_path: str, workspace_dir: str):
     if (
         session.agent is None
@@ -233,7 +249,7 @@ def _ensure_agent(session: UISession, config_path: str, observability_config_pat
         session.agent = build_agent(
             config_path=config_path or None,
             observability_config_path=observability_config_path or None,
-            workspace_dir=workspace_dir or None,
+            workspace_dir=_resolve_workspace_dir_input(workspace_dir) or None,
         )
         session.agent.handler.ctx.verbose = True
         session.config_path = config_path
@@ -496,10 +512,182 @@ async def stream_chat(request: Request):
     )
 
 
+# === Workspace Management API ===
+
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_WORKSPACE_ROOT = os.path.join(_PROJECT_ROOT, "workspace")
+
+
+def _is_workspace_name(ws: str) -> bool:
+    return (
+        bool(ws)
+        and ws.endswith(".ws")
+        and not os.path.isabs(ws)
+        and os.path.basename(ws) == ws
+        and ws not in {".ws", "..ws"}
+        and ".." not in ws.split(".")
+    )
+
+
+def _workspace_root(ws: str) -> tuple[str | None, str | None]:
+    if not _is_workspace_name(ws):
+        return None, "Invalid workspace name"
+    root = os.path.realpath(os.path.join(_WORKSPACE_ROOT, ws))
+    workspace_parent = os.path.realpath(_WORKSPACE_ROOT)
+    if os.path.commonpath([workspace_parent, root]) != workspace_parent:
+        return None, "Path traversal not allowed"
+    if not os.path.isdir(root):
+        return None, "Workspace not found"
+    return root, None
+
+
+def _resolve_system_file_path(ws: str, path: str) -> tuple[str | None, str | None, str | None]:
+    if not path:
+        return None, None, "Path is required"
+    if os.path.isabs(path):
+        return None, None, "Absolute paths are not allowed"
+    normalized_path = path.replace("\\", "/")
+    if not normalized_path.startswith("system/"):
+        return None, None, "Only system/ files can be managed via this endpoint"
+
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return None, None, error
+
+    real_path = os.path.realpath(os.path.join(ws_root, normalized_path))
+    if os.path.commonpath([ws_root, real_path]) != ws_root:
+        return None, None, "Path traversal not allowed"
+    system_root = os.path.realpath(os.path.join(ws_root, "system"))
+    if os.path.commonpath([system_root, real_path]) != system_root:
+        return None, None, "Only system/ files can be managed via this endpoint"
+    return real_path, normalized_path, None
+
+
+@app.get("/api/workspace/list")
+async def list_workspaces():
+    """List all .ws workspace folders"""
+    workspaces = []
+    if os.path.isdir(_WORKSPACE_ROOT):
+        for name in sorted(os.listdir(_WORKSPACE_ROOT)):
+            if name.endswith(".ws") and os.path.isdir(os.path.join(_WORKSPACE_ROOT, name)):
+                workspaces.append(name)
+    return {"success": True, "data": workspaces}
+
+
+@app.get("/api/workspace/agents")
+async def list_agents(ws: str = "default.ws"):
+    """List agents in a workspace's system/agents/ directory"""
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    agents_dir = os.path.join(ws_root, "system", "agents")
+    agents = []
+    if os.path.isdir(agents_dir):
+        for name in sorted(os.listdir(agents_dir)):
+            agent_path = os.path.join(agents_dir, name)
+            if os.path.isdir(agent_path):
+                agent_info: dict[str, Any] = {"name": name, "files": []}
+                for fname in sorted(os.listdir(agent_path)):
+                    if fname.endswith(".md"):
+                        agent_info["files"].append(fname)
+                agents.append(agent_info)
+    return {"success": True, "data": agents}
+
+
+@app.get("/api/workspace/skills")
+async def list_skills(ws: str = "default.ws"):
+    """List skills in a workspace's system/skills/ directory"""
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    skills_dir = os.path.join(ws_root, "system", "skills")
+    skills = []
+    if os.path.isdir(skills_dir):
+        for name in sorted(os.listdir(skills_dir)):
+            skill_path = os.path.join(skills_dir, name)
+            if os.path.isdir(skill_path):
+                skills.append({"name": name})
+    return {"success": True, "data": skills}
+
+
+# Built-in tools from schema
+_BUILTIN_TOOLS: list[dict[str, str]] | None = None
+
+
+def _load_builtin_tools() -> list[dict[str, str]]:
+    global _BUILTIN_TOOLS
+    if _BUILTIN_TOOLS is not None:
+        return _BUILTIN_TOOLS
+    schema_path = os.path.join(os.path.dirname(__file__), "assets", "tools_schema.json")
+    tools: list[dict[str, str]] = []
+    if os.path.isfile(schema_path):
+        try:
+            with open(schema_path, "r", encoding="utf-8") as f:
+                schema = json.load(f)
+            for item in schema:
+                if isinstance(item, dict) and item.get("type") == "function":
+                    func = item.get("function", {})
+                    name = func.get("name", "")
+                    if name:
+                        tools.append({"name": name})
+        except (OSError, json.JSONDecodeError):
+            pass
+    _BUILTIN_TOOLS = tools
+    return tools
+
+
+@app.get("/api/workspace/tools")
+async def list_tools():
+    """List built-in tools available to agents"""
+    return {"success": True, "data": _load_builtin_tools()}
+
+
+@app.get("/api/workspace/file")
+async def read_workspace_file(ws: str = "default.ws", path: str = ""):
+    """Read a file from workspace system/ directory"""
+    real_path, normalized_path, error = _resolve_system_file_path(ws, path)
+    if error or real_path is None or normalized_path is None:
+        return {"success": False, "error": error}
+    if not os.path.isfile(real_path):
+        return {"success": False, "error": "File not found"}
+    try:
+        with open(real_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return {"success": True, "data": {"path": normalized_path, "content": content}}
+    except (OSError, UnicodeDecodeError) as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.put("/api/workspace/file")
+async def write_workspace_file(request: WorkspaceFileWriteRequest):
+    """Write a file to workspace system/ directory"""
+    real_path, normalized_path, error = _resolve_system_file_path(request.ws, request.path)
+    if error or real_path is None or normalized_path is None:
+        return {"success": False, "error": error}
+    if os.path.isdir(real_path):
+        return {"success": False, "error": "Path is a directory"}
+
+    created = not os.path.exists(real_path)
+    try:
+        os.makedirs(os.path.dirname(real_path), exist_ok=True)
+        with open(real_path, "w", encoding="utf-8") as f:
+            f.write(request.content)
+        return {
+            "success": True,
+            "data": {
+                "path": normalized_path,
+                "content": request.content,
+                "bytes": len(request.content.encode("utf-8")),
+                "created": created,
+            },
+        }
+    except (OSError, UnicodeError) as e:
+        return {"success": False, "error": str(e)}
+
+
 # Serve static files (frontend build)
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-import os
 
 # Check if build directory exists
 build_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../frontends/web/dist"))

@@ -148,6 +148,21 @@
       box-shadow: 0 0 0 8px rgba(99, 102, 241, 0);
     }
   }
+
+  .animate-slide-in-right {
+    animation: slideInRight 0.25s ease-out;
+  }
+
+  @keyframes slideInRight {
+    from {
+      opacity: 0;
+      transform: translateX(20px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
 }
 
 @layer utilities {
