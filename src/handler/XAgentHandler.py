@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from src.core.agent_loop import ActionResult, AgentContext, BaseHandler, TurnEndHook
-from src.core.memory import load_global_memory
+from src.core.memory import load_effective_memory, load_global_memory
 from src.core.skills import SkillRegistry, dedupe_skill_names, render_active_skills
 from src.core.telemetry import Event
 from src.tools import ask_user, delete_file, patch_file, plan_update, read_file, start_long_term_update, update_working_checkpoint, web_execute_js, web_scan, write_file
@@ -108,8 +108,15 @@ class XAgentHandler(BaseHandler):
                 "若无有效进展，必须切换策略或调用 ask_user 请求用户指导。"
             )
         if turn % 10 == 0 and turn > 0:
-            memory_root = Path(ctx.memory_root) if ctx.memory_root else PROJECT_ROOT / "memory"
-            mem_content = load_global_memory(memory_root).content
+            memory_root = Path(ctx.memory_root) if ctx.memory_root else PROJECT_ROOT / "workspace" / "default.ws"
+            if (memory_root / "system").is_dir():
+                mem_content = load_effective_memory(
+                    memory_root,
+                    getattr(ctx, "agent_name", ""),
+                    getattr(ctx, "memory_mode", "project"),
+                ).content
+            else:
+                mem_content = load_global_memory(memory_root).content
             if mem_content:
                 parts.append(f"[Memory Refresh]\n{mem_content}")
         if turn % 65 == 0 and turn > 0:
@@ -434,9 +441,13 @@ class XAgentHandler(BaseHandler):
 
         activated: list[str] = []
         missing: list[str] = []
+        disallowed: list[str] = []
+        allowlist = getattr(self.ctx, "skill_allowlist", None)
         if isinstance(registry, SkillRegistry):
             for name in dedupe_skill_names(requested):
-                if registry.get(name) is None:
+                if allowlist is not None and name not in allowlist:
+                    disallowed.append(name)
+                elif registry.get(name) is None:
                     missing.append(name)
                 else:
                     activated.append(name)
@@ -450,11 +461,11 @@ class XAgentHandler(BaseHandler):
                 turn=self.ctx.current_turn,
                 kind="skill_activated",
                 name="skill_activate",
-                data={"activated": activated, "missing": missing},
+                data={"activated": activated, "missing": missing, "disallowed": disallowed},
             )
         )
         return ActionResult(
-            data={"status": "OK", "activated": activated, "missing": missing},
+            data={"status": "OK", "activated": activated, "missing": missing, "disallowed": disallowed},
             next_prompt="Skill activation updated. Future turns will include active skill instructions.",
         )
 

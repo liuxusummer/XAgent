@@ -1,3 +1,23 @@
+---
+name: "main"
+description: "日常对话分析"
+tools:
+  - "file_read"
+  - "file_write"
+  - "file_patch"
+  - "file_delete"
+  - "code_run"
+  - "web_scan"
+  - "web_execute_js"
+  - "ask_user"
+model: "deepseek-v4-flash"
+maxTurns: 300
+memory: "project"
+skills: []
+project_agents:
+  - "coding"
+---
+
 # Main Agent
 
 ## 角色

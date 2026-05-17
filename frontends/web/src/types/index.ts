@@ -32,6 +32,7 @@ export interface ChatSession {
     configPath?: string;
     observabilityConfigPath?: string;
     workspaceDir?: string;
+    agent?: string;
   };
 }
 
@@ -67,6 +68,7 @@ export interface SubmitTaskRequest {
   config_path?: string;
   observability_config_path?: string;
   workspace_dir?: string;
+  agent?: string;
 }
 
 export interface ReplyRequest {
@@ -82,7 +84,9 @@ export interface ApiResponse<T> {
 
 export interface WorkspaceAgent {
   name: string;
+  description?: string;
   files: string[];
+  profile?: AgentProfile;
 }
 
 export interface WorkspaceSkill {
@@ -109,4 +113,33 @@ export interface WorkspaceFileWriteResponse {
   content: string;
   bytes: number;
   created: boolean;
+}
+
+export interface AgentProfile {
+  name: string;
+  description: string;
+  tools: string[];
+  model: string;
+  maxTurns: number;
+  memory: string;
+  skills: string[];
+  project_agents: string[];
+}
+
+export interface AgentProfileData {
+  agent: string;
+  path: string;
+  profile: AgentProfile;
+  body: string;
+  content: string;
+  bytes?: number;
+}
+
+export interface MemoryEntry {
+  id: string;
+  content: string;
+  category?: string;
+  tags?: string[];
+  createdAt: string;
+  updatedAt?: string;
 }

@@ -4,6 +4,7 @@
 
 相关文档：
 
+- [workspace-agent-memory-spec.md](workspace-agent-memory-spec.md)：定义工作区全局记忆与 Agent 私有记忆的读取边界。
 - [memory-provider-read-spec.md](memory-provider-read-spec.md)：定义 Memory Provider 读路径收敛。
 - [memory-telemetry-spec.md](memory-telemetry-spec.md)：定义下一步具体改进，为 memory 读取与注入补齐结构化观测事件。
 

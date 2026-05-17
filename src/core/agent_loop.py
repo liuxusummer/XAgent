@@ -35,6 +35,8 @@ class AgentContext:
     )
     cwd: str = ""
     memory_root: str = ""
+    agent_name: str = ""
+    memory_mode: str = "project"
     current_turn: int = 0
     history_info: list[str] = field(default_factory=list)
     # 代码执行级中断信号。语义：由代码执行子模块（例如未来的 web_execute_js 长任务
@@ -50,6 +52,8 @@ class AgentContext:
     stop_signal: threading.Event | None = None
     skills: Any | None = None
     active_skills: list[str] = field(default_factory=list)
+    allowed_tools: set[str] | None = None
+    skill_allowlist: set[str] | None = None
     # Phase 8 观测性：每次 run_task 刷新 session_id；sink 默认 NullSink 零开销
     session_id: str = ""
     sink: EventSink = field(default_factory=NullSink)
@@ -153,6 +157,16 @@ class BaseHandler:
                 data={"error": "invalid tool json", "raw": args.get("raw", "")},
                 next_prompt="工具调用 JSON 非法，请只输出一个合法的 <tool_use> 块。",
                 flags=frozenset({"retry"}),
+            )
+            _emit_tool_end(result)
+            return result
+
+        allowed_tools = getattr(self.ctx, "allowed_tools", None)
+        if allowed_tools is not None and tool_name not in allowed_tools:
+            result = ActionResult(
+                data={"status": "ERROR", "error": f"tool not allowed for active agent: {tool_name}"},
+                next_prompt=f"当前 Agent 未启用工具 {tool_name}，请改用已启用工具继续，或停止并说明缺少能力。",
+                flags=frozenset({"reset_tools"}),
             )
             _emit_tool_end(result)
             return result

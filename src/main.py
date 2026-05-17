@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from src.core.XAgent import XAgent, resolve_workspace_dir
-from src.core.memory import load_boot_memory
+from src.core.memory import load_boot_memory, load_effective_memory
 from src.core.observability import build_langfuse_sink
 from src.core.skills import SkillRegistry
 from src.core.telemetry import EventSink, JsonlSink, MultiSink, NullSink, StderrSink
@@ -24,8 +24,28 @@ def load_tools_schema(path: Path) -> list[dict]:
     return json.loads(read_text(path))
 
 
+def filter_tools_schema(tools_schema: list[dict], allowed_tools: list[str] | set[str] | None) -> list[dict]:
+    if allowed_tools is None:
+        return tools_schema
+    allowed = {str(name).strip() for name in allowed_tools if str(name).strip()}
+    return [
+        item
+        for item in tools_schema
+        if item.get("type") == "function"
+        and item.get("function", {}).get("name") in allowed
+    ]
+
+
 def load_memory_content(project_root: Path) -> str:
     return load_boot_memory(project_root / "memory").content
+
+
+def load_workspace_memory_content(
+    workspace_dir: str | Path,
+    agent_name: str = "",
+    memory_mode: str = "project",
+) -> str:
+    return load_effective_memory(workspace_dir, agent_name, memory_mode).content
 
 
 def build_system_prompt(
@@ -33,9 +53,28 @@ def build_system_prompt(
     project_root: Path,
     workspace_dir: str,
     skill_registry: SkillRegistry | None = None,
+    agent_name: str = "",
+    agent_prompt: str = "",
+    agent_soul: str = "",
+    memory_mode: str = "project",
 ) -> str:
-    base = read_text(assets_dir / "sys_prompt.txt")
-    memory_content = load_memory_content(project_root)
+    base_parts: list[str] = []
+    if agent_prompt.strip() or agent_soul.strip():
+        if agent_prompt.strip():
+            base_parts.append(agent_prompt.strip())
+        if agent_soul.strip():
+            base_parts.append(agent_soul.strip())
+    else:
+        base_parts.append(read_text(assets_dir / "sys_prompt.txt"))
+
+    workspace_path = Path(workspace_dir)
+    workspace_memory = load_workspace_memory_content(workspace_path, agent_name, memory_mode)
+    if str(memory_mode or "project").strip().lower() == "none":
+        memory_content = ""
+    elif (workspace_path / "system").is_dir():
+        memory_content = workspace_memory
+    else:
+        memory_content = workspace_memory if workspace_memory else load_memory_content(project_root)
     today = datetime.now().strftime("%Y-%m-%d %a")
     dynamic = (
         f"\n\n[动态注入]\nToday: {today}\n[Memory]\n{memory_content}"
@@ -49,7 +88,7 @@ def build_system_prompt(
             "Skills are prompt instruction packs only. Activate relevant skills with skill_activate if needed.\n"
             f"{skill_registry.list_index()}"
         )
-    return base + dynamic
+    return "\n\n".join(base_parts) + dynamic
 
 
 def load_observability_config(path: str | None) -> dict[str, Any]:
@@ -93,19 +132,42 @@ def build_agent(
     observability_config_path: str | None = None,
     skills_dir: str | None = None,
     workspace_dir: str | None = None,
+    agent_name: str = "",
+    agent_prompt: str = "",
+    agent_soul: str = "",
+    tools_allowlist: list[str] | None = None,
+    skill_allowlist: list[str] | None = None,
+    model_override: str = "",
+    max_turns: int | None = None,
+    memory_mode: str = "project",
 ) -> XAgent:
     project_root = Path(__file__).resolve().parent.parent
     assets_dir = Path(__file__).resolve().parent / "assets"
     workspace = resolve_workspace_dir(workspace_dir, project_root)
     observability_config = load_observability_config(observability_config_path)
     skill_registry = SkillRegistry.load([Path(skills_dir)] if skills_dir else [project_root / "skills"])
+    prompt_skill_registry = skill_registry
+    if skill_allowlist is not None:
+        allowed_skills = {str(name).strip() for name in skill_allowlist if str(name).strip()}
+        prompt_skill_registry = SkillRegistry(
+            {name: manifest for name, manifest in skill_registry.skills.items() if name in allowed_skills}
+        )
 
-    system_prompt = build_system_prompt(assets_dir, project_root, workspace, skill_registry=skill_registry)
-    tools_schema = load_tools_schema(assets_dir / "tools_schema.json")
+    system_prompt = build_system_prompt(
+        assets_dir,
+        project_root,
+        workspace,
+        skill_registry=prompt_skill_registry,
+        agent_name=agent_name,
+        agent_prompt=agent_prompt,
+        agent_soul=agent_soul,
+        memory_mode=memory_mode,
+    )
+    tools_schema = filter_tools_schema(load_tools_schema(assets_dir / "tools_schema.json"), tools_allowlist)
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
     base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions")
-    model = os.environ.get("OPENAI_MODEL", "gpt-4o")
+    model = model_override
 
     agent = XAgent(
         system_prompt=system_prompt,
@@ -117,7 +179,13 @@ def build_agent(
         config_path=config_path,
         sink=build_sink(observability_config),
         skills_dir=skills_dir,
+        max_turns=max_turns or 40,
+        agent_name=agent_name,
+        memory_mode=memory_mode,
     )
+    allowed_tools = {item["function"]["name"] for item in tools_schema if item.get("type") == "function"}
+    agent.handler.ctx.allowed_tools = allowed_tools if tools_allowlist is not None else None
+    agent.handler.ctx.skill_allowlist = set(skill_allowlist or []) if skill_allowlist is not None else None
     agent.skill_registry = skill_registry
     agent.handler.ctx.skills = skill_registry
     return agent
