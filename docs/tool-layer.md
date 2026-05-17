@@ -100,6 +100,7 @@ LLM 生成的内容不是总能干净地放进参数里。比如 `file_write` �
 │   └── code_run          # 子进程执行代码，支持 python / shell
 ├── 文件操作域
 │   ├── file_read         # 读文件（行范围 / 关键词搜索）
+│   ├── file_search       # 基于 workspace 文件索引做路径/全文检索
 │   ├── file_patch        # 精确替换（唯一性校验）
 │   └── file_write        # 写文件（覆盖 / 追加 / 前插）
 ├── 浏览器操作域
@@ -116,6 +117,7 @@ LLM 生成的内容不是总能干净地放进参数里。比如 `file_write` �
 ### 域间关系
 
 - 代码执行域和文件操作域是独立的，互不依赖
+- 文件索引检索域由 `file_search` 暴露，索引文件落在当前 workspace 的 `runtime/file_index.sqlite3`，属于运行时元数据；工具只返回候选路径和短片段，依赖精确内容或修改文件前仍必须使用 `file_read` 验证
 - 浏览器操作域依赖 `BrowserDriver` 接口，默认使用 Selenium fallback；工具只暴露 `web_scan` / `web_execute_js`，底层可替换为 WebSocket / HTTP Long-Poll 浏览器桥
 - 记忆管理域只操作 Handler 内部状态和 memory 目录文件，不依赖其他域
 - 交互域（ask_user）是特殊的——它不执行任何物理操作，只产生中断信号；可提供 `options` 供用户选择，未提供选项时用户自由输入；当前桥接为进程级单例（`_bridge_display_queue` / `_bridge_reply_queue`），多 Agent 场景需在上层串行化
@@ -173,7 +175,19 @@ patch 是最危险的操作——改错一行可能破坏整个文件。唯一�
 
 这比"全文搜索替换第一个匹配"安全得多。LLM 看到错误信息后会主动 file_read 再 patch，形成探测-确认-修改的安全闭环。
 
-### 4.3 文件引用展开
+### 4.3 文件索引检索
+
+`file_search` 用于在当前 workspace 内快速定位文件名、路径片段、符号或文本片段。首版使用 Python 标准库 `sqlite3` 的 FTS5 能力，不引入向量库或后台任务。
+
+关键契约：
+
+- 索引文件位于 `<ctx.cwd>/runtime/file_index.sqlite3`，`runtime/` 视为 workspace 运行时元数据，不参与业务文件读写语义
+- 首次搜索或 `refresh=true` 时扫描并增量更新索引；增量依据 `relative_path + mtime_ns + size`
+- 只索引 UTF-8 文本文件，跳过二进制、超大文件、常见依赖/构建目录和 `runtime/**`
+- `root` 必须位于当前 workspace 内，避免检索工作区外路径
+- 返回结果只作为候选，修改前必须继续 `file_read` 精读目标文件
+
+### 4.4 文件引用展开
 
 `{{file:path:startLine:endLine}}` 语法允许工具参数引用文件内容，而不是把大段文本塞进 JSON。
 
@@ -183,7 +197,7 @@ patch 是最危险的操作——改错一行可能破坏整个文件。唯一�
 
 其中 `path` 若为相对路径，同样以 `ctx.cwd` 为基准解析。
 
-### 4.4 工作记忆的轮次注入
+### 4.5 工作记忆的轮次注入
 
 `update_working_checkpoint` 更新的 `key_info` 不是存在就完了——它每轮通过 `get_anchor_prompt` 注入到 prompt 中。
 
@@ -191,7 +205,7 @@ patch 是最危险的操作——改错一行可能破坏整个文件。唯一�
 - LLM 每轮都能看到当前工作记忆，不需要从历史中翻找
 - 工作记忆是增量更新的：LLM 先 review 现有内容，再决定 keep / add / remove
 
-### 4.5 无工具调用处理（handle_no_tool_call）
+### 4.6 无工具调用处理（handle_no_tool_call）
 
 当 LLM 一轮回复中没有调用任何工具时，这不是工具级事件，而是循环级事件。处理逻辑位于主循环的 `handle_no_tool_call` 函数中，不走 Handler 分发。
 

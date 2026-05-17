@@ -4,11 +4,12 @@ import { WorkspacePanel } from './components/WorkspacePanel';
 import { AgentDetail } from './components/AgentDetail';
 import { ChatArea } from './components/ChatArea';
 import { MemoryPanel } from './components/MemoryPanel';
+import { SystemPanel } from './components/SystemPanel';
 import { SettingsModal, loadConfig, type AgentConfig } from './components/SettingsModal';
 import { useChat } from './hooks/useChat';
 import { ThemeProvider } from './hooks/useTheme.tsx';
 
-type MainView = 'chat' | 'agents' | 'skills' | 'memory' | 'agent-detail';
+type MainView = 'chat' | 'agents' | 'skills' | 'memory' | 'system' | 'agent-detail';
 
 function App() {
   const {
@@ -107,6 +108,14 @@ function App() {
       return (
         <div className="flex-1 flex flex-col min-w-0 bg-bg-primary">
           <MemoryPanel workspace={currentWorkspace} agentName={selectedAgent} />
+        </div>
+      );
+    }
+
+    if (mainView === 'system') {
+      return (
+        <div className="flex-1 flex flex-col min-w-0 bg-bg-primary">
+          <SystemPanel workspace={currentWorkspace} />
         </div>
       );
     }

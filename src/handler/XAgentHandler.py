@@ -10,7 +10,7 @@ from src.core.agent_loop import ActionResult, AgentContext, BaseHandler, TurnEnd
 from src.core.memory import load_effective_memory, load_global_memory
 from src.core.skills import SkillRegistry, dedupe_skill_names, render_active_skills
 from src.core.telemetry import Event
-from src.tools import ask_user, delete_file, patch_file, plan_update, read_file, start_long_term_update, update_working_checkpoint, web_execute_js, web_scan, write_file
+from src.tools import ask_user, delete_file, patch_file, plan_update, read_file, search_file_index, start_long_term_update, update_working_checkpoint, web_execute_js, web_scan, write_file
 from src.tools.file_ops import resolve_path_for_operation
 from src.tools.code_run import run_code_stream
 
@@ -298,6 +298,26 @@ class XAgentHandler(BaseHandler):
         return ActionResult(
             data=result,
             next_prompt=next_prompt,
+        )
+
+    def exec_file_search(self, args: dict[str, Any]) -> ActionResult:
+        query = str(args.get("query", ""))
+        root = str(args.get("root", ""))
+        try:
+            limit = int(args.get("limit", 20))
+        except (TypeError, ValueError):
+            limit = 20
+        result = search_file_index(
+            query=query,
+            cwd=self.ctx.cwd or None,
+            root=root,
+            limit=limit,
+            refresh=bool(args.get("refresh", False)),
+            path_only=bool(args.get("path_only", False)),
+        )
+        return ActionResult(
+            data=result,
+            next_prompt="文件索引检索完成。搜索结果只用于定位；修改或依赖具体内容前，必须用 file_read 精读候选文件。",
         )
 
     @staticmethod
