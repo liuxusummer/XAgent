@@ -8,7 +8,13 @@ import {
   Check,
   Wrench,
   Hammer,
-} from 'lucide-react';
+  FolderOpen,
+  FileCode,
+   BarChart3,
+   Layers,
+   Zap,
+   Cpu,
+ } from 'lucide-react';
 import { api } from '../api/client';
 import type { AgentProfile, AgentProfileData, WorkspaceSkill, WorkspaceTool } from '../types';
 
@@ -546,7 +552,7 @@ export function AgentDetail({ workspace, agentName, onBack }: AgentDetailProps) 
                   ) : (
                     <Save className="w-3.5 h-3.5" />
                   )}
-                  <span>{skillsSaving ? '保存中' : '保存到 AGENT.md'}</span>
+                  <span>{skillsSaving ? '保存中' : '保存'}</span>
                 </button>
               </div>
             </div>
@@ -643,7 +649,7 @@ export function AgentDetail({ workspace, agentName, onBack }: AgentDetailProps) 
                   ) : (
                     <Save className="w-3.5 h-3.5" />
                   )}
-                  <span>{toolsSaving ? '保存中' : '保存到 AGENT.md'}</span>
+                  <span>{toolsSaving ? '保存中' : '保存'}</span>
                 </button>
               </div>
             </div>
@@ -781,7 +787,7 @@ export function AgentDetail({ workspace, agentName, onBack }: AgentDetailProps) 
                       ) : (
                         <Save className="w-3.5 h-3.5" />
                       )}
-                      <span>{profileSaving ? '保存中' : '保存到 AGENT.md'}</span>
+                      <span>{profileSaving ? '保存中' : '保存'}</span>
                     </button>
                   </div>
                 </>
@@ -792,34 +798,109 @@ export function AgentDetail({ workspace, agentName, onBack }: AgentDetailProps) 
 
         {activeTab === 'overview' && (
           <div className="flex-1 overflow-y-auto px-6 py-6">
-            <div className="max-w-2xl">
-              <h3 className="text-lg font-semibold text-text-primary mb-4">Agent 信息</h3>
-              <div className="space-y-4">
-                <div className="bg-bg-secondary border border-border rounded-card p-4">
-                  <label className="text-xs font-medium text-text-muted uppercase tracking-wider">
-                    名称
-                  </label>
-                  <p className="text-sm text-text-primary mt-1 font-mono">{agentName}</p>
+            <div className="max-w-3xl mx-auto space-y-5">
+              {/* Hero Card */}
+              <div className="relative overflow-hidden bg-bg-secondary border border-border rounded-card p-6">
+                <div className="absolute top-0 right-0 w-32 h-32 bg-accent/5 rounded-full -translate-y-1/2 translate-x-1/2" />
+                <div className="relative flex items-center gap-4">
+                  <div className="w-16 h-16 rounded-2xl bg-accent/10 flex items-center justify-center shrink-0 ring-2 ring-accent/20">
+                    <span className="text-2xl font-bold text-accent">
+                      {agentName.charAt(0).toUpperCase()}
+                    </span>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <h2 className="text-2xl font-bold text-text-primary">{agentName}</h2>
+                    <p className="text-sm text-text-secondary mt-1.5 leading-relaxed">
+                      {profile.description || '未配置描述'}
+                    </p>
+                  </div>
                 </div>
-                <div className="bg-bg-secondary border border-border rounded-card p-4">
-                  <label className="text-xs font-medium text-text-muted uppercase tracking-wider">
-                    描述
-                  </label>
-                  <p className="text-sm text-text-primary mt-1">{profile.description || '未配置'}</p>
+              </div>
+
+              {/* Stats Row */}
+              <div className="grid grid-cols-3 gap-3">
+                <div className="bg-bg-secondary border border-border rounded-card p-4 text-center hover:border-accent/20 transition-colors">
+                  <div className="flex items-center justify-center gap-1.5 mb-2">
+                    <Layers className="w-4 h-4 text-accent" />
+                    <span className="text-xs font-medium text-text-muted">文件</span>
+                  </div>
+                  <p className="text-2xl font-bold text-text-primary">{files.length}</p>
                 </div>
-                <div className="bg-bg-secondary border border-border rounded-card p-4">
-                  <label className="text-xs font-medium text-text-muted uppercase tracking-wider">
-                    路径
-                  </label>
-                  <p className="text-sm text-text-primary mt-1 font-mono">
+                <div className="bg-bg-secondary border border-border rounded-card p-4 text-center hover:border-accent/20 transition-colors">
+                  <div className="flex items-center justify-center gap-1.5 mb-2">
+                    <Zap className="w-4 h-4 text-accent" />
+                    <span className="text-xs font-medium text-text-muted">技能</span>
+                  </div>
+                  <p className="text-2xl font-bold text-text-primary">{selectedSkills.size}</p>
+                </div>
+                <div className="bg-bg-secondary border border-border rounded-card p-4 text-center hover:border-accent/20 transition-colors">
+                  <div className="flex items-center justify-center gap-1.5 mb-2">
+                    <Cpu className="w-4 h-4 text-accent" />
+                    <span className="text-xs font-medium text-text-muted">工具</span>
+                  </div>
+                  <p className="text-2xl font-bold text-text-primary">{selectedTools.size}</p>
+                </div>
+              </div>
+
+              {/* Progress Bars */}
+              <div className="bg-bg-secondary border border-border rounded-card p-5 space-y-4">
+                <div className="flex items-center gap-2 mb-1">
+                  <BarChart3 className="w-4 h-4 text-accent" />
+                  <span className="text-sm font-semibold text-text-primary">配置概览</span>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-xs text-text-muted">模型</span>
+                    <span className="text-xs font-medium text-text-primary">{profile.model || '默认'}</span>
+                  </div>
+                  <div className="h-2 bg-bg-tertiary rounded-full overflow-hidden">
+                    <div className="h-full bg-accent/60 rounded-full" style={{ width: profile.model ? '100%' : '0%' }} />
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-xs text-text-muted">最大轮数</span>
+                    <span className="text-xs font-medium text-text-primary">{profile.maxTurns || 300}</span>
+                  </div>
+                  <div className="h-2 bg-bg-tertiary rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-accent/60 rounded-full transition-all"
+                      style={{ width: `${Math.min(((profile.maxTurns || 300) / 500) * 100, 100)}%` }}
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-xs text-text-muted">描述</span>
+                    <span className="text-xs font-medium text-text-primary">{profile.description ? '已配置' : '未配置'}</span>
+                  </div>
+                  <div className="h-2 bg-bg-tertiary rounded-full overflow-hidden">
+                    <div className="h-full bg-accent/60 rounded-full" style={{ width: profile.description ? '100%' : '0%' }} />
+                  </div>
+                </div>
+              </div>
+
+              {/* Info Grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="bg-bg-secondary border border-border rounded-card p-4 hover:border-accent/20 transition-colors">
+                  <div className="flex items-center gap-2 mb-2">
+                    <FolderOpen className="w-4 h-4 text-accent" />
+                    <span className="text-xs font-medium text-text-muted">路径</span>
+                  </div>
+                  <p className="text-sm text-text-primary font-mono leading-relaxed">
                     workspace/{workspace}/system/agents/{agentName}
                   </p>
                 </div>
-                <div className="bg-bg-secondary border border-border rounded-card p-4">
-                  <label className="text-xs font-medium text-text-muted uppercase tracking-wider">
-                    配置来源
-                  </label>
-                  <p className="text-sm text-text-primary mt-1 font-mono">AGENT.md frontmatter</p>
+
+                <div className="bg-bg-secondary border border-border rounded-card p-4 hover:border-accent/20 transition-colors">
+                  <div className="flex items-center gap-2 mb-2">
+                    <FileCode className="w-4 h-4 text-accent" />
+                    <span className="text-xs font-medium text-text-muted">配置来源</span>
+                  </div>
+                  <p className="text-sm text-text-primary font-mono">AGENT.md frontmatter</p>
                 </div>
               </div>
             </div>

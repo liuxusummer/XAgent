@@ -362,7 +362,7 @@ BaseSession
 
 ### 5.1 XAgentHandler 类结构
 
-继承 `BaseHandler`，持有 `parent`（XAgent 实例）和 `ctx`（`AgentContext` 实例）。`AgentContext` 集中管理所有可变状态：`working`（工作记忆）、`cwd`（当前工作区）、`memory_root`（代码目录下的 memory 资源根）、`current_turn`、`history_info`（对话摘要）、`code_stop_signal`、`done_hooks`、`empty_count`（连续空响应计数）。
+继承 `BaseHandler`，持有 `parent`（XAgent 实例）和 `ctx`（`AgentContext` 实例）。`AgentContext` 集中管理所有可变状态：`working`（工作记忆）、`cwd`（当前工作区）、`memory_root`（工作区记忆解析根）、`agent_name`、`memory_mode`、`current_turn`、`history_info`（对话摘要）、`code_stop_signal`、`done_hooks`、`empty_count`（连续空响应计数）。
 
 Handler 具有双重身份：分发器（`exec_*` 命名约定分发工具调用）+ 上下文管理器（通过 `ctx` 管理状态）。`ctx` 只在 Handler 的 `exec_*` 方法中使用，不传入 `tools/` 下的纯函数。
 

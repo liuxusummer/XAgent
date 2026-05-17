@@ -134,3 +134,12 @@ export interface AgentProfileData {
   content: string;
   bytes?: number;
 }
+
+export interface MemoryEntry {
+  id: string;
+  content: string;
+  category?: string;
+  tags?: string[];
+  createdAt: string;
+  updatedAt?: string;
+}

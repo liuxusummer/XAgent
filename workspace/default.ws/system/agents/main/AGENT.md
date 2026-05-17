@@ -10,7 +10,7 @@ tools:
   - "web_scan"
   - "web_execute_js"
   - "ask_user"
-model: "minimax-m2.7"
+model: "deepseek-v4-flash"
 maxTurns: 300
 memory: "project"
 skills: []

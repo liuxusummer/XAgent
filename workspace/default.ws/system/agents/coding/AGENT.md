@@ -3,10 +3,11 @@ name: "coding"
 description: "编码实现与调试的 Agent"
 tools:
   - "file_read"
-model: "deepseek-v4-pro"
+model: "deepseek-v4-flash"
 maxTurns: 300
 memory: "project"
-skills: []
+skills:
+  - "skill-creator"
 project_agents: []
 ---
 

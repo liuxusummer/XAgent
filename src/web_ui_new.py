@@ -72,6 +72,7 @@ class UISession:
     observability_config_path: str = ""
     workspace_dir: str = ""
     agent_name: str = ""
+    runtime_config_key: str = ""
     session_id: str = ""
     event_queue: queue.Queue[dict[str, Any]] = field(default_factory=lambda: queue.Queue(maxsize=1))
     llm_stream_buffer: str = ""
@@ -255,15 +256,17 @@ def _ensure_agent(
     agent_name: str,
     runtime_config: dict[str, Any] | None = None,
 ):
+    runtime_config = runtime_config or {}
+    runtime_config_key = json.dumps(runtime_config, ensure_ascii=False, sort_keys=True, default=str)
     if (
         session.agent is None
         or session.config_path != config_path
         or session.observability_config_path != observability_config_path
         or session.workspace_dir != workspace_dir
         or session.agent_name != agent_name
+        or session.runtime_config_key != runtime_config_key
     ):
         _close_agent(session)
-        runtime_config = runtime_config or {}
         session.agent = build_agent(
             config_path=config_path or None,
             observability_config_path=observability_config_path or None,
@@ -275,12 +278,14 @@ def _ensure_agent(
             skill_allowlist=runtime_config.get("skill_allowlist"),
             model_override=str(runtime_config.get("model_override", "")),
             max_turns=runtime_config.get("max_turns"),
+            memory_mode=str(runtime_config.get("memory_mode", "project")),
         )
         session.agent.handler.ctx.verbose = True
         session.config_path = config_path
         session.observability_config_path = observability_config_path
         session.workspace_dir = workspace_dir
         session.agent_name = agent_name
+        session.runtime_config_key = runtime_config_key
     return session.agent
 
 
@@ -846,6 +851,7 @@ def _agent_runtime_config(workspace_dir: str, agent_name: str) -> tuple[dict[str
             "skill_allowlist": _string_list(profile.get("skills")),
             "model_override": model_override,
             "max_turns": _positive_int(profile.get("maxTurns")),
+            "memory_mode": str(profile.get("memory") or "project").strip() or "project",
         }, None
     except (OSError, UnicodeDecodeError) as exc:
         return None, str(exc)

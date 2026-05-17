@@ -3,11 +3,12 @@ import { Sidebar, type PanelTab } from './components/Sidebar';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import { AgentDetail } from './components/AgentDetail';
 import { ChatArea } from './components/ChatArea';
+import { MemoryPanel } from './components/MemoryPanel';
 import { SettingsModal, loadConfig, type AgentConfig } from './components/SettingsModal';
 import { useChat } from './hooks/useChat';
 import { ThemeProvider } from './hooks/useTheme.tsx';
 
-type MainView = 'chat' | 'agents' | 'skills' | 'agent-detail';
+type MainView = 'chat' | 'agents' | 'skills' | 'memory' | 'agent-detail';
 
 function App() {
   const {
@@ -99,6 +100,14 @@ function App() {
           agentName={selectedAgent}
           onBack={handleBackFromDetail}
         />
+      );
+    }
+
+    if (mainView === 'memory') {
+      return (
+        <div className="flex-1 flex flex-col min-w-0 bg-bg-primary">
+          <MemoryPanel workspace={currentWorkspace} agentName={selectedAgent} />
+        </div>
       );
     }
 

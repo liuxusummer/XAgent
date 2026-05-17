@@ -18,7 +18,6 @@ from src.tools.interaction import make_progress_emitter, make_user_input_bridge
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-MEMORY_ROOT = PROJECT_ROOT / "memory"
 DEFAULT_WORKSPACE_NAME = "default.ws"
 WORKSPACE_LAYOUT_DIRS = (
     "business",
@@ -32,8 +31,10 @@ WORKSPACE_LAYOUT_DIRS = (
 WORKSPACE_LAYOUT_FILES = (
     "system/agents/main/AGENT.md",
     "system/agents/main/SOUL.md",
+    "system/agents/main/MEMORY.md",
     "system/agents/coding/AGENT.md",
     "system/agents/coding/SOUL.md",
+    "system/agents/coding/MEMORY.md",
 )
 
 
@@ -77,6 +78,8 @@ class XAgent:
     sink: EventSink = field(default_factory=NullSink)
     skills_dir: str | None = None
     max_turns: int = 40
+    agent_name: str = ""
+    memory_mode: str = "project"
 
     def __post_init__(self) -> None:
         self.workspace_dir = resolve_workspace_dir(self.workspace_dir or self.cwd)
@@ -93,7 +96,9 @@ class XAgent:
                 display_fn=progress_fn,
                 user_input_fn=user_input_fn,
                 skills=self.skill_registry,
-                memory_root=str(MEMORY_ROOT),
+                memory_root=self.cwd,
+                agent_name=self.agent_name,
+                memory_mode=self.memory_mode,
             ),
             task_dir=self.workspace_dir,
         )

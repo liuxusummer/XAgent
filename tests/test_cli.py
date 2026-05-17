@@ -155,8 +155,10 @@ class WorkspaceTests(unittest.TestCase):
             self.assertTrue((workspace_path / "system" / "templates").is_dir())
             self.assertTrue((workspace_path / "system" / "agents" / "main" / "AGENT.md").is_file())
             self.assertTrue((workspace_path / "system" / "agents" / "main" / "SOUL.md").is_file())
+            self.assertTrue((workspace_path / "system" / "agents" / "main" / "MEMORY.md").is_file())
             self.assertTrue((workspace_path / "system" / "agents" / "coding" / "AGENT.md").is_file())
             self.assertTrue((workspace_path / "system" / "agents" / "coding" / "SOUL.md").is_file())
+            self.assertTrue((workspace_path / "system" / "agents" / "coding" / "MEMORY.md").is_file())
 
     def test_xagent_uses_explicit_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

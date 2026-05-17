@@ -35,6 +35,8 @@ class AgentContext:
     )
     cwd: str = ""
     memory_root: str = ""
+    agent_name: str = ""
+    memory_mode: str = "project"
     current_turn: int = 0
     history_info: list[str] = field(default_factory=list)
     # 代码执行级中断信号。语义：由代码执行子模块（例如未来的 web_execute_js 长任务

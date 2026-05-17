@@ -9,6 +9,7 @@ import type {
   WorkspaceFileWriteResponse,
   AgentProfile,
   AgentProfileData,
+  MemoryEntry,
 } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_BASE || '';
@@ -117,6 +118,29 @@ class ApiClient {
     return this.fetch('/api/workspace/agent-profile', {
       method: 'PUT',
       body: JSON.stringify({ ws, agent, profile, body }),
+    });
+  }
+
+  async listMemoryEntries(ws: string): Promise<ApiResponse<MemoryEntry[]>> {
+    return this.fetch(`/api/workspace/memory?ws=${encodeURIComponent(ws)}`);
+  }
+
+  async createMemoryEntry(ws: string, entry: Omit<MemoryEntry, 'id' | 'createdAt'>): Promise<ApiResponse<MemoryEntry>> {
+    return this.fetch('/api/workspace/memory', {
+      method: 'POST',
+      body: JSON.stringify({ ws, ...entry }),
+    });
+  }
+
+  async deleteMemoryEntry(ws: string, id: string): Promise<ApiResponse<void>> {
+    return this.fetch(`/api/workspace/memory?ws=${encodeURIComponent(ws)}&id=${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async deleteWorkspaceFile(ws: string, path: string): Promise<ApiResponse<void>> {
+    return this.fetch(`/api/workspace/file?ws=${encodeURIComponent(ws)}&path=${encodeURIComponent(path)}`, {
+      method: 'DELETE',
     });
   }
 }

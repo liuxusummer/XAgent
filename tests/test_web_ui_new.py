@@ -46,6 +46,9 @@ class _FakeAgent:
     def stop(self) -> None:
         self.stopped = True
 
+    def close(self) -> None:
+        self.stopped = True
+
 
 class _Queue:
     def __init__(self) -> None:
@@ -371,6 +374,7 @@ project_agents:
             self.assertEqual(runtime["skill_allowlist"], ["review"])
             self.assertEqual(runtime["model_override"], "dev-model")
             self.assertEqual(runtime["max_turns"], 12)
+            self.assertEqual(runtime["memory_mode"], "project")
 
     async def test_submit_task_passes_selected_agent_runtime_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -407,6 +411,53 @@ project_agents:
             self.assertEqual(captured["tools_allowlist"], ["file_read"])
             self.assertEqual(captured["model_override"], "dev-model")
             self.assertEqual(captured["max_turns"], 12)
+            self.assertEqual(captured["memory_mode"], "project")
+
+    async def test_submit_task_rebuilds_agent_when_runtime_config_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            agent_dir = Path(tmp_dir) / "default.ws" / "system" / "agents" / "coding"
+            agent_dir.mkdir(parents=True)
+            agent_file = agent_dir / "AGENT.md"
+            agent_file.write_text(
+                '---\nname: "coding"\ndescription: ""\ntools:\n  - "file_read"\nmodel: "dev-model"\nmaxTurns: 12\nmemory: "project"\nskills: []\nproject_agents: []\n---\n\n# Coding Agent\n',
+                encoding="utf-8",
+            )
+            (agent_dir / "SOUL.md").write_text("# Soul\n", encoding="utf-8")
+
+            built_agents = []
+
+            def _fake_build_agent(**_kwargs):
+                fake_agent = _FakeAgent()
+                fake_agent.handler = type("H", (), {"ctx": type("C", (), {"verbose": False})()})()
+                built_agents.append(fake_agent)
+                return fake_agent
+
+            _sessions.clear()
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
+                patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
+                patch("src.web_ui_new.threading.Thread", _NoopThread),
+            ):
+                first = await submit_task(
+                    SubmitTaskRequest(task="hello", workspace_dir="default.ws", agent="coding")
+                )
+                agent_file.write_text(
+                    '---\nname: "coding"\ndescription: ""\ntools:\n  - "file_read"\nmodel: "dev-model"\nmaxTurns: 12\nmemory: "private"\nskills: []\nproject_agents: []\n---\n\n# Coding Agent\n',
+                    encoding="utf-8",
+                )
+                second = await submit_task(
+                    SubmitTaskRequest(
+                        task="again",
+                        session_id=first["data"]["session_id"],
+                        workspace_dir="default.ws",
+                        agent="coding",
+                    )
+                )
+
+            self.assertTrue(first["success"])
+            self.assertTrue(second["success"])
+            self.assertEqual(len(built_agents), 2)
+            self.assertTrue(built_agents[0].stopped)
 
     async def test_submit_task_rejects_invalid_agent_without_starting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -454,10 +505,10 @@ project_agents:
                 agent_soul="# Soul",
             )
 
-            self.assertEqual(prompt, "# Coding Agent\n\n# Soul")
+            self.assertIn("# Coding Agent\n\n# Soul", prompt)
             self.assertNotIn("global base", prompt)
-            self.assertNotIn("[动态注入]", prompt)
-            self.assertNotIn("[Memory]", prompt)
+            self.assertIn("[动态注入]", prompt)
+            self.assertIn("[Memory]\ninsight\n\nfixed", prompt)
 
     def test_config_model_is_preserved_without_agent_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

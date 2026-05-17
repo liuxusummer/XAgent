@@ -7,7 +7,14 @@ from unittest.mock import patch
 
 from src.core.agent_loop import AgentContext
 from src.core.llm import ChatResponse
-from src.core.memory import load_boot_memory, load_global_memory, load_memory_sop
+from src.core.memory import (
+    load_agent_memory,
+    load_boot_memory,
+    load_effective_memory,
+    load_global_memory,
+    load_memory_sop,
+    load_workspace_memory,
+)
 from src.handler import XAgentHandler
 from src.main import build_system_prompt
 from src.tools import interaction
@@ -70,6 +77,70 @@ class MemoryProviderTests(unittest.TestCase):
             self.assertFalse(result.files[0].exists)
             self.assertTrue(result.files[0].empty)
 
+    def test_load_workspace_memory_reads_system_memory_files_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            memory = root / "system" / "memory"
+            memory.mkdir(parents=True)
+            (memory / "b.md").write_text("bravo", encoding="utf-8")
+            (memory / "a.txt").write_text("alpha", encoding="utf-8")
+            (memory / ".DS_Store").write_text("ignored", encoding="utf-8")
+
+            result = load_workspace_memory(root)
+
+            self.assertEqual(result.content, "alpha\n\nbravo")
+            self.assertEqual([item.name for item in result.files], ["a.txt", "b.md"])
+
+    def test_load_agent_memory_reads_only_named_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            main_dir = root / "system" / "agents" / "main"
+            coding_dir = root / "system" / "agents" / "coding"
+            main_dir.mkdir(parents=True)
+            coding_dir.mkdir(parents=True)
+            (main_dir / "MEMORY.md").write_text("main private", encoding="utf-8")
+            (coding_dir / "MEMORY.md").write_text("coding private", encoding="utf-8")
+
+            result = load_agent_memory(root, "main")
+
+            self.assertEqual(result.content, "main private")
+            self.assertNotIn("coding private", result.content)
+
+    def test_load_agent_memory_missing_is_non_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            result = load_agent_memory(Path(tmp_dir), "main")
+
+            self.assertEqual(result.content, "")
+            self.assertFalse(result.files[0].exists)
+
+    def test_load_effective_memory_project_combines_global_and_private(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            memory = root / "system" / "memory"
+            agent = root / "system" / "agents" / "main"
+            memory.mkdir(parents=True)
+            agent.mkdir(parents=True)
+            (memory / "global.md").write_text("workspace global", encoding="utf-8")
+            (agent / "MEMORY.md").write_text("main private", encoding="utf-8")
+
+            result = load_effective_memory(root, "main", "project")
+
+            self.assertEqual(result.content, "workspace global\n\nmain private")
+
+    def test_load_effective_memory_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            memory = root / "system" / "memory"
+            agent = root / "system" / "agents" / "main"
+            memory.mkdir(parents=True)
+            agent.mkdir(parents=True)
+            (memory / "global.md").write_text("workspace global", encoding="utf-8")
+            (agent / "MEMORY.md").write_text("main private", encoding="utf-8")
+
+            self.assertEqual(load_effective_memory(root, "main", "private").content, "main private")
+            self.assertEqual(load_effective_memory(root, "main", "global").content, "workspace global")
+            self.assertEqual(load_effective_memory(root, "main", "none").content, "")
+
     def test_load_memory_sop_reads_default_sop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -105,11 +176,82 @@ class MemoryProviderIntegrationTests(unittest.TestCase):
             self.assertIn("[Memory]\ninsight\n\nfixed", prompt)
             self.assertIn("workspace = /workspace", prompt)
 
+    def test_build_system_prompt_prefers_workspace_effective_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            assets = root / "assets"
+            workspace = root / "workspace" / "default.ws"
+            global_memory = workspace / "system" / "memory"
+            agent_memory = workspace / "system" / "agents" / "main"
+            assets.mkdir()
+            global_memory.mkdir(parents=True)
+            agent_memory.mkdir(parents=True)
+            (assets / "sys_prompt.txt").write_text("base", encoding="utf-8")
+            (global_memory / "global.md").write_text("workspace global", encoding="utf-8")
+            (agent_memory / "MEMORY.md").write_text("main private", encoding="utf-8")
+
+            prompt = build_system_prompt(assets, root, str(workspace), agent_name="main", memory_mode="project")
+
+            self.assertIn("[Memory]\nworkspace global\n\nmain private", prompt)
+
+    def test_build_system_prompt_agent_prompt_keeps_dynamic_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            assets = root / "assets"
+            workspace = root / "workspace" / "default.ws"
+            agent_memory = workspace / "system" / "agents" / "coding"
+            assets.mkdir()
+            agent_memory.mkdir(parents=True)
+            (assets / "sys_prompt.txt").write_text("base", encoding="utf-8")
+            (agent_memory / "MEMORY.md").write_text("coding private", encoding="utf-8")
+
+            prompt = build_system_prompt(
+                assets,
+                root,
+                str(workspace),
+                agent_name="coding",
+                agent_prompt="# Coding Agent",
+                agent_soul="# Soul",
+                memory_mode="private",
+            )
+
+            self.assertTrue(prompt.startswith("# Coding Agent\n\n# Soul"))
+            self.assertIn("[Memory]\ncoding private", prompt)
+
+    def test_build_system_prompt_private_mode_does_not_fallback_to_repo_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            assets = root / "assets"
+            repo_memory = root / "memory"
+            workspace = root / "workspace" / "default.ws"
+            (workspace / "system").mkdir(parents=True)
+            assets.mkdir()
+            repo_memory.mkdir()
+            (assets / "sys_prompt.txt").write_text("base", encoding="utf-8")
+            (repo_memory / "global_mem_insight.txt").write_text("repo insight", encoding="utf-8")
+
+            prompt = build_system_prompt(assets, root, str(workspace), agent_name="main", memory_mode="private")
+
+            self.assertIn("[Memory]\n", prompt)
+            self.assertNotIn("repo insight", prompt)
+
     def test_periodic_inject_uses_global_memory_when_non_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            (root / "global_mem.txt").write_text("remember this", encoding="utf-8")
-            handler = XAgentHandler(ctx=AgentContext(memory_root=str(root), current_turn=10))
+            memory = root / "system" / "memory"
+            agent = root / "system" / "agents" / "main"
+            memory.mkdir(parents=True)
+            agent.mkdir(parents=True)
+            (memory / "global.md").write_text("remember this", encoding="utf-8")
+            (agent / "MEMORY.md").write_text("main private", encoding="utf-8")
+            handler = XAgentHandler(
+                ctx=AgentContext(
+                    memory_root=str(root),
+                    agent_name="main",
+                    memory_mode="project",
+                    current_turn=10,
+                )
+            )
 
             prompt = handler._periodic_inject_hook(  # noqa: SLF001
                 response=ChatResponse(thinking="", content="", tool_calls=[]),
@@ -117,12 +259,12 @@ class MemoryProviderIntegrationTests(unittest.TestCase):
                 ctx=handler.ctx,
             )
 
-            self.assertEqual(prompt, "[Memory Refresh]\nremember this")
+            self.assertEqual(prompt, "[Memory Refresh]\nremember this\n\nmain private")
 
     def test_periodic_inject_skips_empty_global_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            (root / "global_mem.txt").write_text("  \n", encoding="utf-8")
+            (root / "system" / "memory").mkdir(parents=True)
             handler = XAgentHandler(ctx=AgentContext(memory_root=str(root), current_turn=10))
 
             prompt = handler._periodic_inject_hook(  # noqa: SLF001

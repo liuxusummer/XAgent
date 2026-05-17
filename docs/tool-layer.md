@@ -59,7 +59,7 @@ class AgentContext:
 
 - `ctx.cwd` 表示 Agent 当前工作区，不再表示代码目录
 - Agent 启动时若用户未指定工作区，默认使用 `<code_root>/workspace`，不存在则自动创建
-- `memory_root` 指向代码目录下的 `memory/`，供长期记忆与 SOP 文件读取，避免随工作区切换漂移
+- `memory_root` 指向当前工作区根目录，Memory Provider 负责在其下解析 `system/memory/` 与 `system/agents/<agent>/MEMORY.md`
 
 结果截断不是可选项，是必需品。一个 10000 行的文件读出来全塞给 LLM 会撑爆上下文。截断策略按工具域不同：
 

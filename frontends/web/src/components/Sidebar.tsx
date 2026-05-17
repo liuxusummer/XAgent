@@ -10,10 +10,11 @@ import {
   FolderOpen,
   User,
   Zap,
+  Brain,
 } from 'lucide-react';
 import { api } from '../api/client';
 
-export type PanelTab = 'agents' | 'skills';
+export type PanelTab = 'agents' | 'skills' | 'memory';
 
 interface SidebarProps {
   onNewChat: () => void;
@@ -23,7 +24,7 @@ interface SidebarProps {
   currentWorkspace: string;
   onWorkspaceChange: (ws: string) => void;
   onOpenPanel: (tab: PanelTab) => void;
-  activeView: 'chat' | PanelTab;
+  activeView: 'chat' | PanelTab | 'agent-detail';
 }
 
 export function Sidebar({
@@ -89,6 +90,17 @@ export function Sidebar({
             title="Skills"
           >
             <Zap className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => onOpenPanel('memory')}
+            className={`flex items-center justify-center w-9 h-9 rounded-button transition-colors ${
+              activeView === 'memory'
+                ? 'bg-accent/10 text-accent'
+                : 'text-text-muted hover:bg-bg-tertiary hover:text-text-secondary'
+            }`}
+            title="Memory"
+          >
+            <Brain className="w-4 h-4" />
           </button>
         </div>
         <div className="p-3 border-t border-border">
@@ -178,6 +190,19 @@ export function Sidebar({
             <Zap className="w-3.5 h-3.5 text-accent" />
           </div>
           <span className="font-medium">Skills</span>
+        </button>
+        <button
+          onClick={() => onOpenPanel('memory')}
+          className={`flex items-center gap-2.5 w-full px-3 py-2 rounded-button text-sm transition-colors ${
+            activeView === 'memory'
+              ? 'bg-accent/10 text-accent'
+              : 'text-text-secondary hover:bg-bg-tertiary hover:text-text-primary'
+          }`}
+        >
+          <div className="w-7 h-7 rounded-lg bg-accent/10 flex items-center justify-center shrink-0">
+            <Brain className="w-3.5 h-3.5 text-accent" />
+          </div>
+          <span className="font-medium">Memory</span>
         </button>
       </div>
 
