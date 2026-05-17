@@ -115,6 +115,70 @@ export interface WorkspaceFileWriteResponse {
   created: boolean;
 }
 
+export interface WorkspaceTreeNode {
+  name: string;
+  path: string;
+  type: 'file' | 'dir';
+  children?: WorkspaceTreeNode[];
+}
+
+export interface WorkspaceIndexStats {
+  status: 'OK';
+  exists: boolean;
+  workspace: string;
+  root: string;
+  index_path: string;
+  db_size_bytes: number;
+  file_count: number;
+  bytes: number;
+  last_indexed_at: number | null;
+}
+
+export interface WorkspaceIndexRefreshResult {
+  status: 'OK';
+  workspace: string;
+  root: string;
+  index_path: string;
+  scanned: number;
+  indexed: number;
+  updated: number;
+  unchanged: number;
+  removed: number;
+  skipped: Record<string, number>;
+}
+
+export interface WorkspaceIndexMatch {
+  path: string;
+  score: number;
+  match_type: 'path' | 'content';
+  line: number | null;
+  snippet: string;
+  size_bytes: number;
+  mtime: number;
+}
+
+export interface WorkspaceIndexSearchResult {
+  status: 'OK';
+  query: string;
+  root: string;
+  refreshed: boolean;
+  index_stats: {
+    file_count: number;
+    bytes: number;
+  };
+  refresh_stats?: WorkspaceIndexRefreshResult | null;
+  matches: WorkspaceIndexMatch[];
+}
+
+export interface WorkspacePreviewFile {
+  path: string;
+  content: string;
+  bytes: number;
+  size_bytes: number;
+  mtime: number;
+  read_only: boolean;
+}
+
 export interface AgentProfile {
   name: string;
   description: string;

@@ -22,15 +22,21 @@ from src.web_ui_new import (
     _sessions,
     parse_agent_markdown,
     read_workspace_file,
+    read_workspace_tree,
+    read_workspace_index_stats,
+    refresh_workspace_index,
     read_agent_profile,
+    search_workspace_index,
     serialize_agent_markdown,
     send_reply,
     submit_task,
     stop_task,
     stream_chat,
+    preview_workspace_file,
     write_agent_profile,
     write_workspace_file,
     AgentProfileWriteRequest,
+    WorkspaceIndexRefreshRequest,
 )
 
 
@@ -474,6 +480,118 @@ project_agents:
 
             self.assertFalse(result["success"])
             build_agent_mock.assert_not_called()
+
+    async def test_workspace_tree_returns_system_directory_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "default.ws"
+            agent_dir = root / "system" / "agents" / "main"
+            template_dir = root / "system" / "templates"
+            agent_dir.mkdir(parents=True)
+            template_dir.mkdir(parents=True)
+            (agent_dir / "AGENT.md").write_text("# Agent", encoding="utf-8")
+            (template_dir / "note.md").write_text("# Note", encoding="utf-8")
+            (template_dir / ".DS_Store").write_text("finder metadata", encoding="utf-8")
+            (root / "business").mkdir()
+            (root / "business" / "secret.txt").write_text("hidden", encoding="utf-8")
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                result = await read_workspace_tree("default.ws")
+
+            self.assertTrue(result["success"])
+            tree = result["data"]
+            self.assertEqual(tree["name"], "default.ws")
+            self.assertEqual(tree["path"], "default.ws")
+            self.assertEqual(tree["type"], "dir")
+            system = next(child for child in tree["children"] if child["name"] == "system")
+            agents = next(child for child in system["children"] if child["name"] == "agents")
+            main = next(child for child in agents["children"] if child["name"] == "main")
+            self.assertIn(
+                {"name": "AGENT.md", "path": "system/agents/main/AGENT.md", "type": "file"},
+                main["children"],
+            )
+            self.assertNotIn(".DS_Store", str(tree))
+            self.assertIn("business", str(tree))
+
+    async def test_workspace_tree_rejects_invalid_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                result = await read_workspace_tree("../bad.ws")
+
+            self.assertFalse(result["success"])
+            self.assertEqual(result["error"], "Invalid workspace name")
+
+    async def test_workspace_index_stats_returns_missing_index_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "default.ws"
+            root.mkdir()
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                result = await read_workspace_index_stats("default.ws")
+
+            self.assertTrue(result["success"])
+            self.assertFalse(result["data"]["exists"])
+            self.assertEqual(result["data"]["file_count"], 0)
+
+    async def test_workspace_index_refresh_and_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "default.ws"
+            root.mkdir()
+            (root / "business").mkdir()
+            (root / "business" / "note.txt").write_text("needle_token\n", encoding="utf-8")
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                refresh = await refresh_workspace_index(WorkspaceIndexRefreshRequest(ws="default.ws"))
+                search = await search_workspace_index(ws="default.ws", q="needle_token")
+
+            self.assertTrue(refresh["success"])
+            self.assertGreaterEqual(refresh["data"]["indexed"], 1)
+            self.assertTrue(search["success"])
+            self.assertEqual(search["data"]["matches"][0]["path"], "business/note.txt")
+
+    async def test_workspace_index_search_rejects_invalid_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                result = await search_workspace_index(ws="../bad.ws", q="anything")
+
+            self.assertFalse(result["success"])
+            self.assertEqual(result["error"], "Invalid workspace name")
+
+    async def test_workspace_preview_reads_workspace_text_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "default.ws"
+            root.mkdir()
+            (root / "business").mkdir()
+            (root / "business" / "note.txt").write_text("preview text", encoding="utf-8")
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                result = await preview_workspace_file("default.ws", "business/note.txt")
+
+            self.assertTrue(result["success"])
+            self.assertEqual(result["data"]["path"], "business/note.txt")
+            self.assertEqual(result["data"]["content"], "preview text")
+            self.assertTrue(result["data"]["read_only"])
+
+    async def test_workspace_preview_rejects_unsafe_or_unreadable_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "default.ws"
+            root.mkdir()
+            (root / "dir").mkdir()
+            (root / "binary.bin").write_bytes(b"\xff\xfe\x00")
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                outside = await preview_workspace_file("default.ws", "../outside.txt")
+                directory = await preview_workspace_file("default.ws", "dir")
+                missing = await preview_workspace_file("default.ws", "missing.txt")
+                binary = await preview_workspace_file("default.ws", "binary.bin")
+
+            self.assertFalse(outside["success"])
+            self.assertIn("traversal", outside["error"])
+            self.assertFalse(directory["success"])
+            self.assertIn("directory", directory["error"])
+            self.assertFalse(missing["success"])
+            self.assertEqual(missing["error"], "File not found")
+            self.assertFalse(binary["success"])
+            self.assertIn("UTF-8", binary["error"])
 
     def test_filter_tools_schema_keeps_only_agent_allowed_tools(self) -> None:
         schema = [

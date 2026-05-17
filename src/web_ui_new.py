@@ -21,6 +21,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.main import build_agent
+from src.tools.file_index import get_file_index_stats, refresh_file_index, search_file_index
 
 app = FastAPI(title="XAgent Web UI")
 
@@ -52,6 +53,11 @@ class WorkspaceFileWriteRequest(BaseModel):
     ws: str = "default.ws"
     path: str = ""
     content: str = ""
+
+
+class WorkspaceIndexRefreshRequest(BaseModel):
+    ws: str = "default.ws"
+    root: str = ""
 
 
 class AgentProfileWriteRequest(BaseModel):
@@ -611,6 +617,58 @@ def _resolve_system_file_path(ws: str, path: str) -> tuple[str | None, str | Non
     return real_path, normalized_path, None
 
 
+def _resolve_workspace_preview_path(ws: str, path: str) -> tuple[str | None, str | None, str | None]:
+    if not path:
+        return None, None, "Path is required"
+    if os.path.isabs(path):
+        return None, None, "Absolute paths are not allowed"
+    normalized_path = path.replace("\\", "/")
+
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return None, None, error
+
+    real_path = os.path.realpath(os.path.join(ws_root, normalized_path))
+    if os.path.commonpath([ws_root, real_path]) != ws_root:
+        return None, None, "Path traversal not allowed"
+    return real_path, normalized_path, None
+
+
+def _build_dir_tree(root_path: str, current_path: str = "") -> dict[str, Any]:
+    name = os.path.basename(current_path) if current_path else os.path.basename(root_path)
+    node: dict[str, Any] = {
+        "name": name,
+        "path": current_path or name,
+        "type": "dir",
+        "children": [],
+    }
+    try:
+        entries = sorted(
+            os.scandir(root_path),
+            key=lambda item: (not item.is_dir(follow_symlinks=False), item.name.lower()),
+        )
+    except OSError:
+        return node
+
+    children: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry.name == ".DS_Store" or entry.is_symlink():
+            continue
+        child_path = f"{current_path}/{entry.name}" if current_path else entry.name
+        if entry.is_dir(follow_symlinks=False):
+            children.append(_build_dir_tree(entry.path, child_path))
+        elif entry.is_file(follow_symlinks=False):
+            children.append(
+                {
+                    "name": entry.name,
+                    "path": child_path,
+                    "type": "file",
+                }
+            )
+    node["children"] = children
+    return node
+
+
 def _is_child_name(name: str) -> bool:
     return bool(name) and not os.path.isabs(name) and os.path.basename(name) == name and name not in {".", ".."}
 
@@ -950,6 +1008,106 @@ async def list_skills(ws: str = "default.ws"):
             if os.path.isdir(skill_path):
                 skills.append({"name": name})
     return {"success": True, "data": skills}
+
+
+@app.get("/api/workspace/tree")
+async def read_workspace_tree(ws: str = "default.ws"):
+    """Return the workspace directory tree for the frontend editor."""
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    if not os.path.isdir(ws_root):
+        return {"success": True, "data": {"name": ws, "path": ws, "type": "dir", "children": []}}
+    try:
+        return {"success": True, "data": _build_dir_tree(ws_root)}
+    except OSError as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@app.get("/api/workspace/index/stats")
+async def read_workspace_index_stats(ws: str = "default.ws"):
+    """Return file index status for a workspace."""
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    result = get_file_index_stats(cwd=ws_root)
+    if result.get("status") != "OK":
+        return {"success": False, "error": result.get("error", "failed to read index stats")}
+    return {"success": True, "data": result}
+
+
+@app.post("/api/workspace/index/refresh")
+async def refresh_workspace_index(request: WorkspaceIndexRefreshRequest):
+    """Refresh the file index for a workspace."""
+    ws_root, error = _workspace_root(request.ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    result = refresh_file_index(root=request.root, cwd=ws_root)
+    if result.get("status") != "OK":
+        return {"success": False, "error": result.get("error", "failed to refresh index"), "data": result}
+    return {"success": True, "data": result}
+
+
+@app.get("/api/workspace/index/search")
+async def search_workspace_index(
+    ws: str = "default.ws",
+    q: str = "",
+    root: str = "",
+    limit: int = 20,
+    refresh: bool = False,
+    path_only: bool = False,
+):
+    """Search the workspace file index."""
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    result = search_file_index(
+        query=q,
+        cwd=ws_root,
+        root=root,
+        limit=limit,
+        refresh=refresh,
+        path_only=path_only,
+    )
+    if result.get("status") != "OK":
+        return {"success": False, "error": result.get("error", "failed to search index"), "data": result}
+    return {"success": True, "data": result}
+
+
+@app.get("/api/workspace/preview")
+async def preview_workspace_file(ws: str = "default.ws", path: str = ""):
+    """Read a workspace text file for read-only preview."""
+    real_path, normalized_path, error = _resolve_workspace_preview_path(ws, path)
+    if error or real_path is None or normalized_path is None:
+        return {"success": False, "error": error}
+    if os.path.islink(real_path):
+        return {"success": False, "error": "Symlink preview is not supported"}
+    if not os.path.exists(real_path):
+        return {"success": False, "error": "File not found"}
+    if os.path.isdir(real_path):
+        return {"success": False, "error": "Path is a directory"}
+
+    try:
+        size_bytes = os.path.getsize(real_path)
+        if size_bytes > 1_000_000:
+            return {"success": False, "error": "File is too large to preview"}
+        with open(real_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return {
+            "success": True,
+            "data": {
+                "path": normalized_path,
+                "content": content,
+                "bytes": len(content.encode("utf-8")),
+                "size_bytes": size_bytes,
+                "mtime": os.path.getmtime(real_path),
+                "read_only": True,
+            },
+        }
+    except UnicodeDecodeError:
+        return {"success": False, "error": "File is not valid UTF-8 text"}
+    except OSError as exc:
+        return {"success": False, "error": str(exc)}
 
 
 # Built-in tools from schema

@@ -56,6 +56,39 @@
   {
     "type": "function",
     "function": {
+      "name": "file_search",
+      "description": "Search the current workspace file index by path and keyword content. Use this to locate candidate files quickly, then call file_read before relying on exact content or modifying files.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Keyword, symbol, or path fragment to search for."
+          },
+          "root": {
+            "type": "string",
+            "description": "Optional workspace-relative directory to search. Must stay inside the workspace."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum matches to return. Defaults to 20; capped at 100."
+          },
+          "refresh": {
+            "type": "boolean",
+            "description": "When true, rescan changed files before searching. First search creates the index automatically."
+          },
+          "path_only": {
+            "type": "boolean",
+            "description": "When true, search only file names and paths, not file contents."
+          }
+        },
+        "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "file_write",
       "description": "Write content to a file.",
       "parameters": {

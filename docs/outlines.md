@@ -322,33 +322,39 @@ BaseSession
 - 超长行截断：`L_MAX = min(max(100, 256000//行数), 8000)`
 - 文件不存在时模糊匹配建议
 
-#### 4.2.3 file_patch
+#### 4.2.3 file_search
+- 基于当前 workspace 的 `runtime/file_index.sqlite3` 做路径 / 全文关键词检索
+- 首次搜索或 `refresh=true` 时增量刷新索引，按 `relative_path + mtime_ns + size` 判断文件是否变化
+- 只返回候选路径、行号、短片段和基础元信息；修改或依赖精确内容前仍需 `file_read`
+- `root` 只能位于当前 workspace 内，索引跳过二进制、超大文件、依赖/构建目录和 `runtime/**`
+
+#### 4.2.4 file_patch
 - 精确替换，唯一性校验（0 匹配 / >1 匹配均报错）
 - 支持 `{{file:path:startLine:endLine}}` 引用展开
 - 失败时引导先 `file_read` 确认内容
 
-#### 4.2.4 file_write
+#### 4.2.5 file_write
 - 写文件（overwrite / append / prepend）
 - 内容提取优先级：`<file_content>` 标签 → 代码块兜底
 - 支持 `{{file:...}}` 引用展开
 
-#### 4.2.5 web_scan
+#### 4.2.6 web_scan
 - 扫描页面，返回简化 HTML 或纯文本
 - 支持标签页切换
 
-#### 4.2.6 web_execute_js
+#### 4.2.7 web_execute_js
 - 注入 JS 执行，`script` 与回复代码块互斥
 - `save_to_file`：长结果保存到文件
 - `no_monitor`：跳过页面变化监控
 
-#### 4.2.7 update_working_checkpoint
+#### 4.2.8 update_working_checkpoint
 - 短期工作记忆（`key_info`），每轮通过 `get_anchor_prompt` 注入 prompt
 - 增量更新：review → keep / add / remove
 
-#### 4.2.8 ask_user
+#### 4.2.9 ask_user
 - 中断循环等待用户输入，返回 `ActionResult(should_exit=True)`
 
-#### 4.2.9 start_long_term_update
+#### 4.2.10 start_long_term_update
 - 触发长期记忆结算：读取 SOP → 判断类型 → 最小化更新
 
 ### 4.3 中英文 Schema 切换
@@ -380,46 +386,51 @@ Handler 具有双重身份：分发器（`exec_*` 命名约定分发工具调用
 - memory/sop 文件注入 SOP 提示
 - 输出：`ActionResult(result, next_prompt)`
 
-### 5.4 exec_file_patch
+### 5.4 exec_file_search
+- Handler 只传入 `self.ctx.cwd`、`root`、`query`、`limit`、`refresh`、`path_only`，不持有索引状态
+- 纯函数在 workspace `runtime/file_index.sqlite3` 中维护 SQLite FTS5 索引
+- 输出：`ActionResult(result, next_prompt)`，next_prompt 提醒搜索结果只用于定位，精读候选文件仍用 `file_read`
+
+### 5.5 exec_file_patch
 - 绝对路径转换 → expand_file_refs → 唯一性校验 → replace → 写回
 - 相对路径默认基于 `ctx.cwd` 解析
 - 输出：`ActionResult(result, next_prompt)`
 
-### 5.5 exec_file_write
+### 5.6 exec_file_write
 - 内容提取：`<file_content>` 标签 → 代码块兜底 → expand_file_refs
 - mode=overwrite → 'w' / append → 'a' / prepend → 读旧+拼新+'w'
 - 相对路径默认基于 `ctx.cwd` 解析
 - 输出：`ActionResult({status, writed_bytes}, next_prompt)`
 
-### 5.6 exec_web_scan / exec_web_execute_js
+### 5.7 exec_web_scan / exec_web_execute_js
 - web_scan：懒初始化 WebDriver → 获取标签页 → 简化 HTML → smart_format 截断
 - web_execute_js：提取 JS 代码 → 执行 → save_to_file 保存长结果（相对路径基于 `ctx.cwd`）→ 截断至 8000 字符
 
-### 5.7 exec_update_working_checkpoint
+### 5.8 exec_update_working_checkpoint
 - 更新 `self.ctx.working['key_info']` / `['related_sop']`
 - 输出：`ActionResult({"result": "working key_info updated"}, next_prompt)`
 
-### 5.8 exec_ask_user
+### 5.9 exec_ask_user
 - 返回中断信号 `{status: "INTERRUPT", intent: "HUMAN_INTERVENTION"}`
 - 输出：`ActionResult(result, next_prompt="", should_exit=True)`
 
-### 5.9 handle_no_tool_call（循环级处理，非 exec_* 方法）
+### 5.10 handle_no_tool_call（循环级处理，非 exec_* 方法）
 - 不走 Handler 分发，由主循环直接调用
 - 空响应检测：连续3次空 → 退出（`empty_count` 存储在 `ctx` 中）
 - 流异常检测：末尾含 !!!Error / max_tokens → 返回 `ActionResult(flags={"retry"})`
 - Plan 模式拦截 / 代码块未调用检测 / Plan 完成检测
 - 正常结束：`next_prompt=None`
 
-### 5.10 exec_start_long_term_update
+### 5.11 exec_start_long_term_update
 - 构造记忆结算 prompt → 读取 memory_management_sop.md → 返回 SOP + 结算指令
 - 输出：`ActionResult(sop_content, next_prompt=结算prompt)`
 
-### 5.11 get_anchor_prompt（核心 prompt 构造）
+### 5.12 get_anchor_prompt（核心 prompt 构造）
 - `earlier_context`：ctx.history_info[:-30] 折叠（连续 [Agent] 行合并，超限时标注裁剪边界）
 - `history`：ctx.history_info[-30:] 原样展示
 - `current_turn` + `key_info` 注入 + `related_sop` 提示 + `workspace` 提示
 
-### 5.12 turn_end_callback（声明式钩子分发器）
+### 5.13 turn_end_callback（声明式钩子分发器）
 - 按 `_turn_end_hooks` 列表优先级降序执行各钩子
 - `summary_extract` 钩子：提取 `<summary>` 写入 ctx.history_info + 调用 `align_history_info` 对齐双历史
 - `periodic_inject` 钩子：每7轮防重试警告、每10轮全局记忆、每65轮强制 ask_user

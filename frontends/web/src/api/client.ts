@@ -7,6 +7,11 @@ import type {
   WorkspaceTool,
   WorkspaceFile,
   WorkspaceFileWriteResponse,
+  WorkspaceTreeNode,
+  WorkspaceIndexStats,
+  WorkspaceIndexRefreshResult,
+  WorkspaceIndexSearchResult,
+  WorkspacePreviewFile,
   AgentProfile,
   AgentProfileData,
   MemoryEntry,
@@ -142,6 +147,41 @@ class ApiClient {
     return this.fetch(`/api/workspace/file?ws=${encodeURIComponent(ws)}&path=${encodeURIComponent(path)}`, {
       method: 'DELETE',
     });
+  }
+
+  async getWorkspaceTree(ws: string): Promise<ApiResponse<WorkspaceTreeNode>> {
+    return this.fetch(`/api/workspace/tree?ws=${encodeURIComponent(ws)}`);
+  }
+
+  async getWorkspaceIndexStats(ws: string): Promise<ApiResponse<WorkspaceIndexStats>> {
+    return this.fetch(`/api/workspace/index/stats?ws=${encodeURIComponent(ws)}`);
+  }
+
+  async refreshWorkspaceIndex(ws: string, root: string = ''): Promise<ApiResponse<WorkspaceIndexRefreshResult>> {
+    return this.fetch('/api/workspace/index/refresh', {
+      method: 'POST',
+      body: JSON.stringify({ ws, root }),
+    });
+  }
+
+  async searchWorkspaceIndex(
+    ws: string,
+    query: string,
+    options: { root?: string; limit?: number; refresh?: boolean; pathOnly?: boolean } = {}
+  ): Promise<ApiResponse<WorkspaceIndexSearchResult>> {
+    const params = new URLSearchParams({
+      ws,
+      q: query,
+      root: options.root || '',
+      limit: String(options.limit ?? 20),
+      refresh: String(options.refresh ?? false),
+      path_only: String(options.pathOnly ?? false),
+    });
+    return this.fetch(`/api/workspace/index/search?${params.toString()}`);
+  }
+
+  async previewWorkspaceFile(ws: string, path: string): Promise<ApiResponse<WorkspacePreviewFile>> {
+    return this.fetch(`/api/workspace/preview?ws=${encodeURIComponent(ws)}&path=${encodeURIComponent(path)}`);
   }
 }
 
