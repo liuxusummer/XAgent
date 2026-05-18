@@ -22,7 +22,7 @@ DEFAULT_EXCLUDE_GLOBS = (
     "build/**",
     "runtime/**",
 )
-DEFAULT_MAX_FILE_BYTES = 1_000_000
+DEFAULT_MAX_FILE_BYTES: int | None = None
 SNIPPET_CONTEXT_CHARS = 80
 QUERY_TOKEN_PATTERN = re.compile(r"[\w\u4e00-\u9fff]+", re.UNICODE)
 
@@ -32,7 +32,7 @@ def refresh_file_index(
     cwd: str | None = None,
     include_globs: Iterable[str] | None = None,
     exclude_globs: Iterable[str] | None = None,
-    max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    max_file_bytes: int | None = DEFAULT_MAX_FILE_BYTES,
 ) -> dict[str, Any]:
     try:
         workspace = _workspace(cwd)
@@ -79,7 +79,7 @@ def refresh_file_index(
                 except OSError:
                     stats["skipped"]["errors"] += 1
                     continue
-                if stat.st_size > max_file_bytes:
+                if max_file_bytes is not None and max_file_bytes > 0 and stat.st_size > max_file_bytes:
                     stats["skipped"]["too_large"] += 1
                     continue
 

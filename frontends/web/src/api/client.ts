@@ -12,6 +12,11 @@ import type {
   WorkspaceIndexRefreshResult,
   WorkspaceIndexSearchResult,
   WorkspacePreviewFile,
+  EvalDataset,
+  EvalDatasetDownloadRequest,
+  EvalDatasetImportRequest,
+  EvalRunCreateRequest,
+  EvalRunResult,
   AgentProfile,
   AgentProfileData,
   MemoryEntry,
@@ -182,6 +187,50 @@ class ApiClient {
 
   async previewWorkspaceFile(ws: string, path: string): Promise<ApiResponse<WorkspacePreviewFile>> {
     return this.fetch(`/api/workspace/preview?ws=${encodeURIComponent(ws)}&path=${encodeURIComponent(path)}`);
+  }
+
+  async listEvalDatasets(ws: string): Promise<ApiResponse<EvalDataset[]>> {
+    return this.fetch(`/api/eval/datasets?ws=${encodeURIComponent(ws)}`);
+  }
+
+  async importEvalDataset(request: EvalDatasetImportRequest): Promise<ApiResponse<EvalDataset>> {
+    return this.fetch('/api/eval/datasets/import', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async downloadEvalDataset(request: EvalDatasetDownloadRequest): Promise<ApiResponse<EvalDataset>> {
+    return this.fetch('/api/eval/datasets/download', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async getEvalDataset(ws: string, datasetId: string): Promise<ApiResponse<EvalDataset>> {
+    return this.fetch(`/api/eval/datasets/${encodeURIComponent(datasetId)}?ws=${encodeURIComponent(ws)}`);
+  }
+
+  async createEvalRun(request: EvalRunCreateRequest): Promise<ApiResponse<EvalRunResult>> {
+    return this.fetch('/api/eval/runs', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async listEvalRuns(ws: string): Promise<ApiResponse<EvalRunResult[]>> {
+    return this.fetch(`/api/eval/runs?ws=${encodeURIComponent(ws)}`);
+  }
+
+  async getEvalRun(ws: string, runId: string): Promise<ApiResponse<EvalRunResult>> {
+    return this.fetch(`/api/eval/runs/${encodeURIComponent(runId)}?ws=${encodeURIComponent(ws)}`);
+  }
+
+  async cancelEvalRun(ws: string, runId: string): Promise<ApiResponse<EvalRunResult>> {
+    return this.fetch(`/api/eval/runs/${encodeURIComponent(runId)}/cancel?ws=${encodeURIComponent(ws)}`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
   }
 }
 
