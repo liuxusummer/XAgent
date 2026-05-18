@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from src.core.eval import create_eval_run, import_dataset_content
 from src.core.agent_loop import AgentContext, exhaust
 from src.core.XAgent import XAgent
 from src.core.skills import SkillRegistry
@@ -15,11 +17,23 @@ from src.web_ui_new import (
     SubmitTaskRequest,
     ReplyRequest,
     UISession,
+    EvalDatasetDownloadRequest,
+    EvalDatasetImportRequest,
+    EvalRunCreateRequest,
     WorkspaceFileWriteRequest,
     _agent_runtime_config,
+    _eval_cancel_events,
     _queue_state,
     _resolve_workspace_dir_input,
     _sessions,
+    api_cancel_eval_run,
+    api_create_eval_run,
+    api_download_eval_dataset,
+    api_get_eval_dataset,
+    api_get_eval_run,
+    api_import_eval_dataset,
+    api_list_eval_datasets,
+    api_list_eval_runs,
     parse_agent_markdown,
     read_workspace_file,
     read_workspace_tree,
@@ -85,6 +99,53 @@ class _NoopThread:
         del args, kwargs
 
     def start(self) -> None:
+        return None
+
+
+class _ImmediateThread:
+    def __init__(self, *args, **kwargs) -> None:
+        self.target = kwargs.get("target") or args[0]
+        self.args = kwargs.get("args", ())
+        self.kwargs = kwargs.get("kwargs", {})
+
+    def start(self) -> None:
+        self.target(*self.args, **self.kwargs)
+
+
+class _EvalFakeAgent:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def run_task(self, task: str) -> dict:
+        return {
+            "response": f"ok {task}",
+            "exit_reason": "CURRENT_TASK_DONE",
+            "tool_results": [{"tool_name": "file_read"}],
+            "turns": 1,
+        }
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeDownloadResponse:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.offset = 0
+        self.url = "https://example.test/eval.jsonl"
+        self.headers = {"Content-Length": str(len(data))}
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = len(self.data) - self.offset
+        chunk = self.data[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
         return None
 
 
@@ -592,6 +653,195 @@ project_agents:
             self.assertEqual(missing["error"], "File not found")
             self.assertFalse(binary["success"])
             self.assertIn("UTF-8", binary["error"])
+
+    async def test_eval_dataset_import_list_and_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir()
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                imported = await api_import_eval_dataset(
+                    EvalDatasetImportRequest(
+                        ws="default.ws",
+                        name="basic.jsonl",
+                        format="jsonl",
+                        content='{"id":"case-1","task":"say ok","assertions":{"contains":["ok"]}}\n',
+                    )
+                )
+                listed = await api_list_eval_datasets("default.ws")
+                detail = await api_get_eval_dataset(imported["data"]["id"], ws="default.ws")
+
+            self.assertTrue(imported["success"])
+            self.assertTrue(listed["success"])
+            self.assertEqual(listed["data"][0]["case_count"], 1)
+            self.assertTrue(detail["success"])
+            self.assertEqual(detail["data"]["cases"][0]["id"], "case-1")
+
+    async def test_eval_dataset_list_includes_workspace_eval_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            eval_dir = Path(tmp_dir) / "default.ws" / "system" / "eval" / "cranfield-small"
+            eval_dir.mkdir(parents=True)
+            dataset_path = eval_dir / "xagent-eval-full.jsonl"
+            dataset_path.write_text(
+                '{"id":"case-1","task":"search","assertions":{"tool_called":["file_search"]}}\n',
+                encoding="utf-8",
+            )
+            (eval_dir / "documents.jsonl").write_text('{"docno":"1","text":"not an eval case"}\n', encoding="utf-8")
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                listed = await api_list_eval_datasets("default.ws")
+
+            self.assertTrue(listed["success"])
+            self.assertEqual(len(listed["data"]), 1)
+            dataset = listed["data"][0]
+            self.assertEqual(dataset["name"], "xagent-eval-full")
+            self.assertEqual(dataset["source"]["type"], "workspace_path")
+            self.assertEqual(dataset["source"]["path"], "system/eval/cranfield-small/xagent-eval-full.jsonl")
+            self.assertFalse(dataset["imported"])
+            self.assertEqual(dataset["case_count"], 1)
+
+    async def test_eval_dataset_list_dedupes_imported_workspace_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ws_root = Path(tmp_dir) / "default.ws"
+            eval_dir = ws_root / "system" / "eval" / "cranfield-small"
+            eval_dir.mkdir(parents=True)
+            dataset_path = eval_dir / "xagent-eval-full.jsonl"
+            dataset_path.write_text(
+                '{"id":"case-1","task":"search","assertions":{"tool_called":["file_search"]}}\n',
+                encoding="utf-8",
+            )
+            import_dataset_content(
+                ws_root,
+                name="xagent-eval-full",
+                fmt="jsonl",
+                content=dataset_path.read_text(encoding="utf-8"),
+                source={"type": "path", "path": "system/eval/cranfield-small/xagent-eval-full.jsonl"},
+            )
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                listed = await api_list_eval_datasets("default.ws")
+
+            self.assertTrue(listed["success"])
+            self.assertEqual(len(listed["data"]), 1)
+            self.assertTrue(listed["data"][0]["imported"])
+
+    async def test_eval_dataset_list_prefers_workspace_when_source_newer_than_import(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ws_root = Path(tmp_dir) / "default.ws"
+            eval_dir = ws_root / "system" / "eval" / "cranfield-small"
+            eval_dir.mkdir(parents=True)
+            dataset_path = eval_dir / "xagent-eval-full.jsonl"
+            old_content = '{"id":"case-1","task":"old","assertions":{"tool_called":["file_search"]}}\n'
+            new_content = '{"id":"case-1","task":"new","assertions":{"tool_called":["file_search"]}}\n'
+            dataset_path.write_text(old_content, encoding="utf-8")
+            import_dataset_content(
+                ws_root,
+                name="xagent-eval-full",
+                fmt="jsonl",
+                content=old_content,
+                source={"type": "path", "path": "system/eval/cranfield-small/xagent-eval-full.jsonl"},
+            )
+            dataset_path.write_text(new_content, encoding="utf-8")
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                listed = await api_list_eval_datasets("default.ws")
+
+            self.assertTrue(listed["success"])
+            self.assertEqual(len(listed["data"]), 1)
+            self.assertFalse(listed["data"][0]["imported"])
+            self.assertEqual(listed["data"][0]["source"]["type"], "workspace_path")
+
+    async def test_eval_dataset_download_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir()
+            payload = b'{"task":"downloaded","assertions":{"contains":["ok"]}}\n'
+
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
+                patch("src.core.eval.urllib.request.urlopen", return_value=_FakeDownloadResponse(payload)),
+            ):
+                result = await api_download_eval_dataset(
+                    EvalDatasetDownloadRequest(
+                        ws="default.ws",
+                        url="https://example.test/eval.jsonl",
+                        format="jsonl",
+                    )
+                )
+
+            self.assertTrue(result["success"])
+            self.assertEqual(result["data"]["source"]["type"], "url")
+
+    async def test_eval_run_create_list_get_and_cancel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ws_root = Path(tmp_dir) / "default.ws"
+            ws_root.mkdir()
+            metadata = import_dataset_content(
+                ws_root,
+                name="basic.jsonl",
+                fmt="jsonl",
+                content='{"id":"case-1","task":"say ok","assertions":{"contains":["ok"],"tool_called":["file_read"]}}\n',
+            )
+            built: list[_EvalFakeAgent] = []
+
+            def fake_build_agent(**_kwargs):
+                agent = _EvalFakeAgent()
+                built.append(agent)
+                return agent
+
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
+                patch("src.web_ui_new.build_agent", side_effect=fake_build_agent),
+                patch("src.web_ui_new.threading.Thread", _ImmediateThread),
+            ):
+                created = await api_create_eval_run(
+                    EvalRunCreateRequest(ws="default.ws", dataset_id=metadata["id"], agent="")
+                )
+                listed = await api_list_eval_runs("default.ws")
+                detail = await api_get_eval_run(created["data"]["id"], ws="default.ws")
+
+            self.assertTrue(created["success"])
+            self.assertEqual(len(built), 1)
+            self.assertTrue(built[0].closed)
+            self.assertTrue(listed["success"])
+            self.assertEqual(listed["data"][0]["id"], created["data"]["id"])
+            self.assertTrue(detail["success"])
+            self.assertEqual(detail["data"]["status"], "completed")
+            self.assertEqual(detail["data"]["summary"]["passed"], 1)
+
+    async def test_eval_cancel_marks_active_run_canceling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ws_root = Path(tmp_dir) / "default.ws"
+            ws_root.mkdir()
+            metadata = import_dataset_content(
+                ws_root,
+                name="basic.jsonl",
+                fmt="jsonl",
+                content='{"task":"say ok"}\n',
+            )
+            run = create_eval_run(ws_root, workspace="default.ws", dataset_id=metadata["id"], agent="")
+            event = threading.Event()
+            _eval_cancel_events[run["id"]] = event
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                result = await api_cancel_eval_run(run["id"], ws="default.ws")
+                stored = await api_get_eval_run(run["id"], ws="default.ws")
+
+            self.assertTrue(result["success"])
+            self.assertTrue(event.is_set())
+            self.assertEqual(stored["data"]["status"], "canceling")
+            _eval_cancel_events.pop(run["id"], None)
+
+    async def test_eval_api_rejects_invalid_workspace_and_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir()
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                bad_ws = await api_list_eval_datasets("../bad.ws")
+                bad_dataset = await api_get_eval_dataset("../bad", ws="default.ws")
+                bad_run = await api_get_eval_run("../bad", ws="default.ws")
+
+            self.assertFalse(bad_ws["success"])
+            self.assertFalse(bad_dataset["success"])
+            self.assertFalse(bad_run["success"])
 
     def test_filter_tools_schema_keeps_only_agent_allowed_tools(self) -> None:
         schema = [

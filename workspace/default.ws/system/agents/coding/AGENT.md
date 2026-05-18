@@ -2,6 +2,7 @@
 name: "coding"
 description: "编码实现与调试的 Agent"
 tools:
+  - "file_search"
   - "file_read"
 model: "deepseek-v4-flash"
 maxTurns: 300

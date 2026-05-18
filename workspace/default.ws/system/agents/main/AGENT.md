@@ -2,6 +2,7 @@
 name: "main"
 description: "日常对话分析"
 tools:
+  - "file_search"
   - "file_read"
   - "file_write"
   - "file_patch"

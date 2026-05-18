@@ -179,6 +179,93 @@ export interface WorkspacePreviewFile {
   read_only: boolean;
 }
 
+export interface EvalDataset {
+  id: string;
+  name: string;
+  format: 'jsonl' | 'json' | 'csv' | string;
+  source: Record<string, unknown>;
+  created_at: number;
+  case_count: number;
+  size_bytes: number;
+  dataset_path: string;
+  imported?: boolean;
+  cases?: EvalCase[];
+}
+
+export interface EvalCase {
+  id: string;
+  name: string;
+  task: string;
+  tags: string[];
+  assertions: Record<string, unknown>;
+}
+
+export interface EvalRunSummary {
+  total: number;
+  completed: number;
+  passed: number;
+  failed: number;
+  error: number;
+  pass_rate: number;
+  avg_duration: number;
+  avg_turns: number;
+}
+
+export interface EvalCaseResult {
+  id: string;
+  name: string;
+  task: string;
+  tags: string[];
+  status: 'passed' | 'failed' | 'error' | string;
+  duration_sec: number;
+  turns: number;
+  exit_reason: string;
+  tool_calls: string[];
+  failures: string[];
+  response_excerpt: string;
+}
+
+export interface EvalRunResult {
+  version: number;
+  id: string;
+  workspace: string;
+  dataset_id: string;
+  dataset_name: string;
+  agent: string;
+  status: 'pending' | 'running' | 'canceling' | 'canceled' | 'completed' | 'error' | string;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+  case_limit: number;
+  summary: EvalRunSummary;
+  cases: EvalCaseResult[];
+  error: string;
+}
+
+export interface EvalDatasetImportRequest {
+  ws: string;
+  name?: string;
+  format?: string;
+  content?: string;
+  path?: string;
+}
+
+export interface EvalDatasetDownloadRequest {
+  ws: string;
+  name?: string;
+  format?: string;
+  url: string;
+}
+
+export interface EvalRunCreateRequest {
+  ws: string;
+  dataset_id: string;
+  agent?: string;
+  case_limit?: number;
+  config_path?: string;
+  observability_config_path?: string;
+}
+
 export interface AgentProfile {
   name: string;
   description: string;

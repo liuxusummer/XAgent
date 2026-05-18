@@ -20,6 +20,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from src.core.eval import (
+    EvalError,
+    create_eval_run,
+    download_dataset,
+    execute_eval_run,
+    get_dataset_detail,
+    import_dataset_content,
+    import_dataset_path,
+    list_datasets,
+    list_workspace_eval_datasets,
+    list_eval_runs,
+    read_eval_run,
+    write_eval_run,
+)
 from src.main import build_agent
 from src.tools.file_index import get_file_index_stats, refresh_file_index, search_file_index
 
@@ -60,6 +74,30 @@ class WorkspaceIndexRefreshRequest(BaseModel):
     root: str = ""
 
 
+class EvalDatasetImportRequest(BaseModel):
+    ws: str = "default.ws"
+    name: str = ""
+    format: str = ""
+    content: str = ""
+    path: str = ""
+
+
+class EvalDatasetDownloadRequest(BaseModel):
+    ws: str = "default.ws"
+    name: str = ""
+    format: str = ""
+    url: str = ""
+
+
+class EvalRunCreateRequest(BaseModel):
+    ws: str = "default.ws"
+    dataset_id: str = ""
+    agent: str = ""
+    case_limit: int = 0
+    config_path: str = ""
+    observability_config_path: str = ""
+
+
 class AgentProfileWriteRequest(BaseModel):
     ws: str = "default.ws"
     agent: str = ""
@@ -94,6 +132,8 @@ class UISession:
 # Global session storage
 _sessions: dict[str, UISession] = {}
 _session_lock = threading.Lock()
+_eval_cancel_events: dict[str, threading.Event] = {}
+_eval_lock = threading.Lock()
 
 _TURN_RE = re.compile(r"^\[Turn (\d+)\]$")
 _TOOL_RE = re.compile(r"^\s*tool:\s*(.+)$")
@@ -1183,6 +1223,240 @@ async def write_workspace_file(request: WorkspaceFileWriteRequest):
         }
     except (OSError, UnicodeError) as e:
         return {"success": False, "error": str(e)}
+
+
+# === Eval API ===
+
+
+def _eval_agent_factory(
+    *,
+    ws: str,
+    ws_root: str,
+    agent_name: str,
+    config_path: str,
+    observability_config_path: str,
+    runtime_config: dict[str, Any] | None,
+):
+    runtime_config = runtime_config or {}
+
+    def _factory():
+        agent = build_agent(
+            config_path=config_path or None,
+            observability_config_path=observability_config_path or None,
+            workspace_dir=ws_root,
+            agent_name=agent_name,
+            agent_prompt=str(runtime_config.get("agent_prompt", "")),
+            agent_soul=str(runtime_config.get("agent_soul", "")),
+            tools_allowlist=runtime_config.get("tools_allowlist"),
+            skill_allowlist=runtime_config.get("skill_allowlist"),
+            model_override=str(runtime_config.get("model_override", "")),
+            max_turns=runtime_config.get("max_turns"),
+            memory_mode=str(runtime_config.get("memory_mode", "project")),
+        )
+        if hasattr(agent, "handler") and hasattr(agent.handler, "ctx"):
+            agent.handler.ctx.verbose = True
+        return agent
+
+    del ws
+    return _factory
+
+
+def _run_eval_background(
+    *,
+    ws_root: str,
+    run_id: str,
+    cancel_event: threading.Event,
+    agent_factory,
+) -> None:
+    try:
+        execute_eval_run(
+            ws_root,
+            run_id,
+            agent_factory=agent_factory,
+            cancel_event=cancel_event,
+        )
+    finally:
+        with _eval_lock:
+            _eval_cancel_events.pop(run_id, None)
+
+
+@app.get("/api/eval/datasets")
+async def api_list_eval_datasets(ws: str = "default.ws"):
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    imported = [{**item, "imported": True} for item in list_datasets(ws_root)]
+    workspace_datasets = list_workspace_eval_datasets(ws_root)
+    workspace_by_path = {
+        str(item.get("source", {}).get("path") or ""): item
+        for item in workspace_datasets
+    }
+    fresh_imported_paths: set[str] = set()
+    visible_imported: list[dict[str, Any]] = []
+    for item in imported:
+        source = item.get("source", {})
+        source_path = str(source.get("path") or "") if isinstance(source, dict) else ""
+        workspace_item = workspace_by_path.get(source_path)
+        if source_path and workspace_item and float(item.get("created_at") or 0) < float(workspace_item.get("created_at") or 0):
+            continue
+        visible_imported.append(item)
+        if source_path:
+            fresh_imported_paths.add(source_path)
+
+    visible_workspace_datasets = [
+        item
+        for item in workspace_datasets
+        if str(item.get("source", {}).get("path") or "") not in fresh_imported_paths
+    ]
+    return {"success": True, "data": visible_imported + visible_workspace_datasets}
+
+
+@app.post("/api/eval/datasets/import")
+async def api_import_eval_dataset(request: EvalDatasetImportRequest):
+    ws_root, error = _workspace_root(request.ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    try:
+        if request.path.strip():
+            data = import_dataset_path(
+                ws_root,
+                rel_path=request.path,
+                name=request.name,
+                fmt=request.format,
+            )
+        else:
+            if not request.content:
+                return {"success": False, "error": "content or path is required"}
+            data = import_dataset_content(
+                ws_root,
+                name=request.name or "dataset",
+                content=request.content,
+                fmt=request.format,
+                source={"type": "content"},
+            )
+        return {"success": True, "data": data}
+    except (EvalError, OSError, UnicodeError) as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@app.post("/api/eval/datasets/download")
+async def api_download_eval_dataset(request: EvalDatasetDownloadRequest):
+    ws_root, error = _workspace_root(request.ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    try:
+        data = download_dataset(
+            ws_root,
+            url=request.url,
+            name=request.name,
+            fmt=request.format,
+        )
+        return {"success": True, "data": data}
+    except (EvalError, OSError, UnicodeError) as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@app.get("/api/eval/datasets/{dataset_id}")
+async def api_get_eval_dataset(dataset_id: str, ws: str = "default.ws"):
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    try:
+        return {"success": True, "data": get_dataset_detail(ws_root, dataset_id)}
+    except (EvalError, OSError, json.JSONDecodeError) as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@app.get("/api/eval/runs")
+async def api_list_eval_runs(ws: str = "default.ws"):
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    return {"success": True, "data": list_eval_runs(ws_root)}
+
+
+@app.post("/api/eval/runs")
+async def api_create_eval_run(request: EvalRunCreateRequest):
+    ws_root, error = _workspace_root(request.ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+
+    agent_name = _normalize_path_input(request.agent)
+    runtime_config, runtime_error = _agent_runtime_config(request.ws, agent_name)
+    if runtime_error:
+        return {"success": False, "error": runtime_error}
+
+    case_limit = request.case_limit if request.case_limit > 0 else None
+    if case_limit is not None and case_limit > 500:
+        return {"success": False, "error": "case_limit cannot exceed 500"}
+
+    try:
+        result = create_eval_run(
+            ws_root,
+            workspace=request.ws,
+            dataset_id=request.dataset_id,
+            agent=agent_name,
+            case_limit=case_limit,
+        )
+    except (EvalError, OSError, json.JSONDecodeError) as exc:
+        return {"success": False, "error": str(exc)}
+
+    cancel_event = threading.Event()
+    with _eval_lock:
+        _eval_cancel_events[result["id"]] = cancel_event
+
+    agent_factory = _eval_agent_factory(
+        ws=request.ws,
+        ws_root=ws_root,
+        agent_name=agent_name,
+        config_path=_normalize_path_input(request.config_path),
+        observability_config_path=_normalize_path_input(request.observability_config_path),
+        runtime_config=runtime_config,
+    )
+    thread = threading.Thread(
+        target=_run_eval_background,
+        kwargs={
+            "ws_root": ws_root,
+            "run_id": result["id"],
+            "cancel_event": cancel_event,
+            "agent_factory": agent_factory,
+        },
+        daemon=True,
+    )
+    thread.start()
+    return {"success": True, "data": result}
+
+
+@app.get("/api/eval/runs/{run_id}")
+async def api_get_eval_run(run_id: str, ws: str = "default.ws"):
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    try:
+        return {"success": True, "data": read_eval_run(ws_root, run_id)}
+    except (EvalError, OSError, json.JSONDecodeError) as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@app.post("/api/eval/runs/{run_id}/cancel")
+async def api_cancel_eval_run(run_id: str, ws: str = "default.ws"):
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    try:
+        result = read_eval_run(ws_root, run_id)
+    except (EvalError, OSError, json.JSONDecodeError) as exc:
+        return {"success": False, "error": str(exc)}
+
+    with _eval_lock:
+        cancel_event = _eval_cancel_events.get(run_id)
+        if cancel_event is not None:
+            cancel_event.set()
+
+    if result.get("status") in {"pending", "running"}:
+        result["status"] = "canceling"
+        write_eval_run(ws_root, result)
+    return {"success": True, "data": result}
 
 
 # Serve static files (frontend build)
