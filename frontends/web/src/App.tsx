@@ -6,11 +6,12 @@ import { ChatArea } from './components/ChatArea';
 import { MemoryPanel } from './components/MemoryPanel';
 import { SystemPanel } from './components/SystemPanel';
 import { EvalPanel } from './components/EvalPanel';
+import { UsagePanel } from './components/UsagePanel';
 import { SettingsModal, loadConfig, type AgentConfig } from './components/SettingsModal';
 import { useChat } from './hooks/useChat';
 import { ThemeProvider } from './hooks/useTheme.tsx';
 
-type MainView = 'chat' | 'agents' | 'skills' | 'memory' | 'system' | 'eval' | 'agent-detail';
+type MainView = 'chat' | 'agents' | 'skills' | 'memory' | 'system' | 'eval' | 'usage' | 'agent-detail';
 
 function App() {
   const {
@@ -18,6 +19,7 @@ function App() {
     agentStatus,
     isWaitingForUser,
     askPrompt,
+    liveTokenUsage,
     submitTask,
     sendReply,
     stopTask,
@@ -128,6 +130,18 @@ function App() {
             workspace={currentWorkspace}
             configPath={agentConfig.configPath}
             observabilityConfigPath={agentConfig.observabilityConfigPath}
+          />
+        </div>
+      );
+    }
+
+    if (mainView === 'usage') {
+      return (
+        <div className="flex-1 flex flex-col min-w-0 bg-bg-primary">
+          <UsagePanel
+            workspace={currentWorkspace}
+            observabilityConfigPath={agentConfig.observabilityConfigPath}
+            liveUsage={liveTokenUsage}
           />
         </div>
       );

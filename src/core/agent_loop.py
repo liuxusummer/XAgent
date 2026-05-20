@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from types import GeneratorType
 from typing import Any, Callable
 
-from src.core.llm import ChatResponse
+from src.core.llm import ChatResponse, TokenUsage
 from src.core.telemetry import Event, EventSink, NullSink
 
 
@@ -57,6 +57,7 @@ class AgentContext:
     # Phase 8 观测性：每次 run_task 刷新 session_id；sink 默认 NullSink 零开销
     session_id: str = ""
     sink: EventSink = field(default_factory=NullSink)
+    token_usage: TokenUsage = field(default_factory=TokenUsage)
 
 
 @dataclass
@@ -262,6 +263,7 @@ def run_agent_loop(
     sink = handler.ctx.sink
     session_id = handler.ctx.session_id
     run_started_at = time.time()
+    handler.ctx.token_usage = TokenUsage()
 
     def _skill_state_data() -> dict[str, Any]:
         active_skills = list(getattr(handler.ctx, "active_skills", []) or [])
@@ -278,6 +280,7 @@ def run_agent_loop(
     )
 
     def _emit_run_end() -> None:
+        token_data = handler.ctx.token_usage.to_event_data()
         sink.emit(
             Event(
                 session_id=session_id,
@@ -285,7 +288,11 @@ def run_agent_loop(
                 kind="run_end",
                 name=exit_reason,
                 duration_ms=(time.time() - run_started_at) * 1000,
-                data={"turns": handler.ctx.current_turn, **_skill_state_data()},
+                data={
+                    "turns": handler.ctx.current_turn,
+                    **token_data,
+                    **_skill_state_data(),
+                },
             )
         )
 
@@ -345,6 +352,10 @@ def run_agent_loop(
 
         llm_started_at = time.time()
         response = client.chat(messages=messages, tools=tools_schema)
+        token_data = {}
+        if response.usage is not None:
+            handler.ctx.token_usage.add(response.usage)
+            token_data = response.usage.to_event_data()
         sink.emit(
             Event(
                 session_id=session_id,
@@ -356,6 +367,7 @@ def run_agent_loop(
                     "has_tool_calls": bool(response.tool_calls),
                     "content_len": len(response.content or ""),
                     "tool_call_count": len(response.tool_calls or []),
+                    **token_data,
                     **_skill_state_data(),
                 },
             )

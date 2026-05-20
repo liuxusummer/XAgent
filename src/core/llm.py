@@ -58,12 +58,83 @@ class ToolCall:
 
 
 @dataclass
+class TokenUsage:
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
+
+    def is_empty(self) -> bool:
+        return all(value is None for value in self._values())
+
+    def add(self, other: TokenUsage | None) -> None:
+        if other is None:
+            return
+        for field_name in self.__dataclass_fields__:
+            value = getattr(other, field_name)
+            if value is None:
+                continue
+            current = getattr(self, field_name)
+            setattr(self, field_name, value if current is None else current + value)
+
+    def to_event_data(self) -> dict[str, int]:
+        return {
+            field_name: value
+            for field_name in self.__dataclass_fields__
+            if (value := getattr(self, field_name)) is not None
+        }
+
+    def _values(self) -> list[int | None]:
+        return [getattr(self, field_name) for field_name in self.__dataclass_fields__]
+
+
+def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _normalize_usage(raw: dict[str, Any] | None) -> TokenUsage | None:
+    if not raw:
+        return None
+
+    completion_details = raw.get("completion_tokens_details") or {}
+    if not isinstance(completion_details, dict):
+        completion_details = {}
+    prompt_details = raw.get("prompt_tokens_details") or {}
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+    usage = TokenUsage(
+        input_tokens=_int_or_none(raw.get("input_tokens", raw.get("prompt_tokens"))),
+        output_tokens=_int_or_none(raw.get("output_tokens", raw.get("completion_tokens"))),
+        total_tokens=_int_or_none(raw.get("total_tokens")),
+        cache_creation_input_tokens=_int_or_none(raw.get("cache_creation_input_tokens")),
+        cache_read_input_tokens=_int_or_none(
+            raw.get("cache_read_input_tokens", prompt_details.get("cached_tokens"))
+        ),
+        reasoning_tokens=_int_or_none(
+            raw.get("reasoning_tokens", completion_details.get("reasoning_tokens"))
+        ),
+    )
+    if usage.total_tokens is None and usage.input_tokens is not None and usage.output_tokens is not None:
+        usage.total_tokens = usage.input_tokens + usage.output_tokens
+    return None if usage.is_empty() else usage
+
+
+@dataclass
 class ChatResponse:
     thinking: str
     content: str
     tool_calls: list[ToolCall]
     raw: Any = None
     stop_reason: str = "end_turn"
+    usage: TokenUsage | None = None
 
 
 @dataclass
@@ -79,6 +150,7 @@ class BaseSession:
     context_window_chars: int = 24000
     stream_callback: StreamCallback | None = None
     history: list[dict[str, Any]] = field(default_factory=list)
+    last_usage: TokenUsage | None = None
     _ask_count: int = field(default=0, init=False)
 
     def ask(self, prompt: str) -> str:
@@ -183,6 +255,7 @@ class BaseSession:
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     body = json.loads(response.read().decode("utf-8"))
+                self.last_usage = _normalize_usage(body.get("usage"))
                 return self._extract_text(body)
             except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
                 last_error = exc
@@ -220,6 +293,7 @@ class OpenAITextSession(BaseSession):
         }
         if self.stream:
             payload_dict["stream"] = True
+            payload_dict["stream_options"] = {"include_usage": True}
         payload = json.dumps(payload_dict).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
@@ -239,8 +313,10 @@ class OpenAITextSession(BaseSession):
                     if self.stream:
                         line_iter = (line.decode("utf-8") for line in response)
                         result = _parse_openai_sse(line_iter, stream_callback=self.stream_callback)
+                        self.last_usage = _normalize_usage(result.get("usage"))
                         return self._stream_result_to_text(result)
                     body = json.loads(response.read().decode("utf-8"))
+                self.last_usage = _normalize_usage(body.get("usage"))
                 return self._extract_text(body)
             except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
                 last_error = exc
@@ -344,6 +420,7 @@ class ClaudeTextSession(BaseSession):
                 with urllib.request.urlopen(request, timeout=self.timeout) as resp:
                     line_iter = (line.decode("utf-8") for line in resp)
                     result = _parse_claude_sse(line_iter, stream_callback=self.stream_callback)
+                self.last_usage = _normalize_usage(result.get("usage"))
                 return self._extract_text_from_blocks(result["content_blocks"])
             except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
                 last_error = exc
@@ -362,6 +439,7 @@ class ClaudeTextSession(BaseSession):
                 with urllib.request.urlopen(request, timeout=self.timeout) as resp:
                     body = json.loads(resp.read().decode("utf-8"))
                 content_blocks = body.get("content", [])
+                self.last_usage = _normalize_usage(body.get("usage"))
                 return self._extract_text_from_blocks(content_blocks)
             except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
                 last_error = exc
@@ -476,6 +554,7 @@ class ToolClient:
             tool_calls=tool_calls,
             raw=raw_text,
             stop_reason=stop_reason,
+            usage=getattr(self.backend, "last_usage", None),
         )
 
 
@@ -627,6 +706,7 @@ def _parse_openai_sse(
     stop_reason = "end_turn"
     finish_reason_seen = False
     done_seen = False
+    usage: dict[str, Any] = {}
 
     for line in line_iter:
         line = line.strip()
@@ -644,6 +724,10 @@ def _parse_openai_sse(
             chunk = json.loads(data_str)
         except json.JSONDecodeError:
             continue
+
+        usage_update = chunk.get("usage")
+        if isinstance(usage_update, dict):
+            usage.update(usage_update)
 
         choices = chunk.get("choices") or []
         if not choices:
@@ -723,6 +807,7 @@ def _parse_openai_sse(
         "tool_calls": tool_calls,
         "stop_reason": stop_reason if finish_reason_seen or done_seen else "stream_interrupted",
         "error": "" if finish_reason_seen or done_seen else "stream_interrupted",
+        "usage": usage,
     }
 
 
@@ -760,6 +845,7 @@ class ClaudeNativeSession(ClaudeTextSession):
             self._trim_history()
             messages = self._build_messages()
             response = self._raw_ask_native(messages)
+            self.last_usage = response.usage
             self.history.append(self._assistant_history_message(response))
             self._trim_history()
             return response
@@ -859,6 +945,7 @@ class ClaudeNativeSession(ClaudeTextSession):
             tool_calls=tool_calls,
             raw=content_blocks,
             stop_reason=stop_reason,
+            usage=_normalize_usage(result.get("usage")),
         )
 
     def _body_to_chat_response(self, body: dict[str, Any]) -> ChatResponse:
@@ -895,6 +982,7 @@ class ClaudeNativeSession(ClaudeTextSession):
             tool_calls=tool_calls,
             raw=body,
             stop_reason=stop_reason,
+            usage=_normalize_usage(body.get("usage")),
         )
 
 
@@ -914,6 +1002,7 @@ class OpenAINativeSession(OpenAITextSession):
             self._trim_history()
             messages = self._build_messages()
             response = self._raw_ask_native(messages)
+            self.last_usage = response.usage
             self.history.append(self._assistant_history_message(response))
             self._trim_history()
             return response
@@ -950,6 +1039,7 @@ class OpenAINativeSession(OpenAITextSession):
         }
         if self.stream:
             payload_dict["stream"] = True
+            payload_dict["stream_options"] = {"include_usage": True}
         if self._pending_tools:
             payload_dict["tools"] = self._pending_tools
 
@@ -995,12 +1085,19 @@ class OpenAINativeSession(OpenAITextSession):
             tool_calls=tool_calls,
             raw=result,
             stop_reason=result.get("stop_reason", "end_turn"),
+            usage=_normalize_usage(result.get("usage")),
         )
 
     def _body_to_chat_response(self, body: dict[str, Any]) -> ChatResponse:
         choices = body.get("choices") or []
         if not choices:
-            return ChatResponse(thinking="", content="", tool_calls=[], raw=body)
+            return ChatResponse(
+                thinking="",
+                content="",
+                tool_calls=[],
+                raw=body,
+                usage=_normalize_usage(body.get("usage")),
+            )
         choice = choices[0]
         message = choice.get("message", {})
         content = message.get("content", "") or ""
@@ -1020,6 +1117,7 @@ class OpenAINativeSession(OpenAITextSession):
             tool_calls=tool_calls,
             raw=body,
             stop_reason=stop_reason,
+            usage=_normalize_usage(body.get("usage")),
         )
 
 
@@ -1122,6 +1220,7 @@ class MixinSession:
     spring_back_timeout: float = 300.0
     _current_index: int = 0
     _last_fail_time: float = 0.0
+    last_usage: TokenUsage | None = None
 
     def __post_init__(self) -> None:
         if not self.sessions:
@@ -1161,6 +1260,7 @@ class MixinSession:
             session = self.sessions[self._current_index]
             try:
                 result = session.ask(prompt)
+                self.last_usage = session.last_usage
                 self.history = copy.deepcopy(session.history)
                 return result
             except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, RuntimeError) as exc:

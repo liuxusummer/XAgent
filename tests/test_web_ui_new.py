@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from src.core.eval import create_eval_run, import_dataset_content
 from src.core.agent_loop import AgentContext, exhaust
+from src.core.telemetry import Event, JsonlSink, MultiSink
 from src.core.XAgent import XAgent
 from src.core.skills import SkillRegistry
 from src.handler import XAgentHandler
@@ -51,6 +52,12 @@ from src.web_ui_new import (
     write_workspace_file,
     AgentProfileWriteRequest,
     WorkspaceIndexRefreshRequest,
+    WebSessionUsageSink,
+    _resolve_trace_log_dir,
+    _usage_summary_from_events,
+    read_trace_session_detail,
+    read_trace_sessions,
+    read_usage_summary,
 )
 
 
@@ -215,6 +222,209 @@ class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
         payload = "".join(chunks)
         self.assertIn('"type": "assistant_delta"', payload)
         self.assertIn("hello", payload)
+
+    def test_web_usage_sink_emits_delta_and_done_events(self) -> None:
+        session = UISession(session_id="usage")
+        sink = WebSessionUsageSink(session)
+
+        sink.emit(
+            Event(
+                session_id="run-1",
+                turn=1,
+                kind="llm_end",
+                name="stop",
+                data={"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+            )
+        )
+        sink.emit(
+            Event(
+                session_id="run-1",
+                turn=1,
+                kind="run_end",
+                name="CURRENT_TASK_DONE",
+                data={"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+            )
+        )
+
+        self.assertEqual(session.events[0]["type"], "token_usage_delta")
+        self.assertEqual(session.events[0]["data"]["totals"]["total_tokens"], 5)
+        self.assertEqual(session.events[1]["type"], "token_usage_done")
+        self.assertFalse(session.event_queue.empty())
+
+
+class WebUINewUsageSummaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_trace_dir_resolves_to_workspace_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))),
+                patch.dict("os.environ", {"XAGENT_LOG_DIR": ""}, clear=False),
+            ):
+                log_dir = _resolve_trace_log_dir(ws="default.ws")
+
+        self.assertEqual(log_dir, str(Path(tmp_dir) / "default.ws" / "runtime" / "traces"))
+
+    async def test_env_log_dir_overrides_workspace_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir) / "workspace")),
+                patch.dict("os.environ", {"XAGENT_LOG_DIR": tmp_dir}, clear=False),
+            ):
+                log_dir = _resolve_trace_log_dir(ws="default.ws")
+
+        self.assertEqual(log_dir, tmp_dir)
+
+    async def test_config_log_dir_overrides_workspace_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_log_dir = Path(tmp_dir) / "configured"
+            config_path = Path(tmp_dir) / "observability.json"
+            config_path.write_text(f'{{"log_dir": "{config_log_dir}"}}', encoding="utf-8")
+
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir) / "workspace")),
+                patch.dict("os.environ", {"XAGENT_LOG_DIR": ""}, clear=False),
+            ):
+                log_dir = _resolve_trace_log_dir(
+                    observability_config_path=str(config_path),
+                    ws="default.ws",
+                )
+
+        self.assertEqual(log_dir, str(config_log_dir))
+
+    async def test_summary_api_uses_default_workspace_trace_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))),
+                patch.dict("os.environ", {"XAGENT_LOG_DIR": ""}, clear=False),
+            ):
+                result = await read_usage_summary(ws="default.ws")
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["data"]["configured"])
+        self.assertEqual(
+            result["data"]["log_dir"],
+            str(Path(tmp_dir) / "default.ws" / "runtime" / "traces"),
+        )
+        self.assertEqual(result["data"]["totals"]["total_tokens"], 0)
+
+    async def test_summary_api_aggregates_run_end_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            log_file = Path(tmp_dir) / "s1.jsonl"
+            log_file.write_text(
+                "\n".join(
+                    [
+                        '{"session_id":"s1","kind":"run_start","ts":1,"data":{}}',
+                        '{"session_id":"s1","kind":"run_end","name":"CURRENT_TASK_DONE","ts":2,"duration_ms":1200,"data":{"turns":2,"input_tokens":10,"output_tokens":4,"total_tokens":14}}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict("os.environ", {"XAGENT_LOG_DIR": tmp_dir}, clear=False):
+                result = await read_usage_summary(limit=10)
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["data"]["configured"])
+        self.assertEqual(result["data"]["totals"]["total_tokens"], 14)
+        self.assertEqual(result["data"]["sessions"][0]["turns"], 2)
+
+    async def test_trace_sessions_api_lists_default_workspace_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            log_dir = Path(tmp_dir) / "default.ws" / "runtime" / "traces"
+            log_dir.mkdir(parents=True)
+            (log_dir / "s1.jsonl").write_text(
+                "\n".join(
+                    [
+                        '{"session_id":"s1","kind":"run_start","ts":1,"data":{}}',
+                        '{"session_id":"s1","kind":"llm_end","ts":1.5,"duration_ms":50,"data":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}',
+                        '{"session_id":"s1","kind":"run_end","name":"CURRENT_TASK_DONE","ts":2,"duration_ms":1000,"data":{"turns":1,"input_tokens":2,"output_tokens":1,"total_tokens":3}}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))),
+                patch.dict("os.environ", {"XAGENT_LOG_DIR": ""}, clear=False),
+            ):
+                result = await read_trace_sessions(ws="default.ws", limit=10)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["data"]["sessions"][0]["session_id"], "s1")
+        self.assertEqual(result["data"]["sessions"][0]["event_count"], 3)
+        self.assertEqual(result["data"]["sessions"][0]["usage"]["total_tokens"], 3)
+
+    async def test_trace_session_detail_returns_events_and_rejects_unsafe_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            log_dir = Path(tmp_dir) / "default.ws" / "runtime" / "traces"
+            log_dir.mkdir(parents=True)
+            (log_dir / "s1.jsonl").write_text(
+                '{"session_id":"s1","kind":"run_end","name":"CURRENT_TASK_DONE","ts":2,"duration_ms":1000,"data":{"turns":1}}\n',
+                encoding="utf-8",
+            )
+
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))),
+                patch.dict("os.environ", {"XAGENT_LOG_DIR": ""}, clear=False),
+            ):
+                result = await read_trace_session_detail("s1", ws="default.ws")
+                unsafe = await read_trace_session_detail("../s1", ws="default.ws")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["data"]["summary"]["session_id"], "s1")
+        self.assertEqual(len(result["data"]["events"]), 1)
+        self.assertFalse(unsafe["success"])
+
+    async def test_submit_task_attaches_default_jsonl_trace_sink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            agent_dir = Path(tmp_dir) / "default.ws" / "system" / "agents" / "main"
+            agent_dir.mkdir(parents=True)
+            (agent_dir / "AGENT.md").write_text("# Main\n", encoding="utf-8")
+
+            fake_agent = _FakeAgent()
+            fake_agent.handler = type("H", (), {"ctx": type("C", (), {"verbose": False, "sink": None})()})()
+
+            def _fake_build_agent(**_kwargs):
+                return fake_agent
+
+            _sessions.clear()
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))),
+                patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
+                patch("src.web_ui_new.threading.Thread", _NoopThread),
+                patch.dict("os.environ", {"XAGENT_LOG_DIR": ""}, clear=False),
+            ):
+                result = await submit_task(SubmitTaskRequest(task="hello", workspace_dir="default.ws", agent="main"))
+
+            self.assertTrue(result["success"])
+            self.assertIsInstance(fake_agent.sink, MultiSink)
+            self.assertTrue(any(isinstance(sink, JsonlSink) for sink in fake_agent.sink.sinks))
+            self.assertTrue((Path(tmp_dir) / "default.ws" / "runtime" / "traces").is_dir())
+
+    def test_summary_falls_back_to_llm_end_tokens(self) -> None:
+        summary = _usage_summary_from_events(
+            [
+                {
+                    "session_id": "s1",
+                    "kind": "llm_end",
+                    "duration_ms": 10,
+                    "ts": 1,
+                    "data": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+                },
+                {
+                    "session_id": "s1",
+                    "kind": "run_end",
+                    "name": "CURRENT_TASK_DONE",
+                    "duration_ms": 10,
+                    "ts": 2,
+                    "data": {"turns": 1},
+                },
+            ]
+        )
+
+        self.assertEqual(summary["totals"]["total_tokens"], 5)
+        self.assertEqual(summary["sessions"][0]["usage"]["output_tokens"], 3)
 
 
 class WebUINewWorkspaceFileTests(unittest.IsolatedAsyncioTestCase):

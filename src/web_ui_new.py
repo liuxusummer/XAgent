@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from src.core.telemetry import Event, JsonlSink, MultiSink, NullSink
 from src.core.eval import (
     EvalError,
     create_eval_run,
@@ -34,8 +35,10 @@ from src.core.eval import (
     read_eval_run,
     write_eval_run,
 )
-from src.main import build_agent
+from src.main import build_agent, load_observability_config
 from src.tools.file_index import get_file_index_stats, refresh_file_index, search_file_index
+from src.tools.reflect.reader import group_by_session, load_dir, load_events
+from src.tools.reflect.stats import TOKEN_FIELDS
 
 app = FastAPI(title="XAgent Web UI")
 
@@ -146,6 +149,167 @@ _HIDDEN_BLOCK_RE = re.compile(
     re.IGNORECASE,
 )
 _TRAILING_PARTIAL_TAG_RE = re.compile(r"<[^>]*$")
+_TRACE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _empty_usage() -> dict[str, int]:
+    return {field: 0 for field in TOKEN_FIELDS}
+
+
+def _event_token_data(event: dict[str, Any]) -> dict[str, int]:
+    data = event.get("data") or {}
+    tokens: dict[str, int] = {}
+    for field in TOKEN_FIELDS:
+        value = data.get(field)
+        if isinstance(value, int) and not isinstance(value, bool):
+            tokens[field] = value
+    return tokens
+
+
+def _add_usage(target: dict[str, int], source: dict[str, int]) -> None:
+    for field, value in source.items():
+        target[field] = target.get(field, 0) + value
+
+
+def _config_log_dir(observability_config_path: str = "") -> str:
+    env_log_dir = os.environ.get("XAGENT_LOG_DIR", "").strip()
+    if env_log_dir:
+        return env_log_dir
+    config_path = _normalize_path_input(observability_config_path)
+    if not config_path:
+        return ""
+    try:
+        config = load_observability_config(config_path)
+    except Exception:  # noqa: BLE001
+        return ""
+    return str(config.get("log_dir", "")).strip()
+
+
+def _resolve_trace_log_dir(
+    observability_config_path: str = "",
+    workspace_dir: str = "",
+    ws: str = "default.ws",
+) -> str:
+    configured_log_dir = _config_log_dir(observability_config_path)
+    if configured_log_dir:
+        return configured_log_dir
+
+    normalized_workspace_dir = _normalize_path_input(workspace_dir)
+    if normalized_workspace_dir:
+        workspace_root = _resolve_workspace_dir_input(normalized_workspace_dir)
+        if workspace_root:
+            return os.path.join(workspace_root, "runtime", "traces")
+
+    if not _is_workspace_name(ws):
+        return ""
+    return os.path.join(_WORKSPACE_ROOT, ws, "runtime", "traces")
+
+
+def _trace_summary_from_events(events: list[dict[str, Any]], limit: int = 20) -> list[dict[str, Any]]:
+    groups = group_by_session(events)
+    rows: list[dict[str, Any]] = []
+    for session_id, session_events in groups.items():
+        started_at = 0.0
+        ended_at = 0.0
+        duration_ms = 0.0
+        turns = 0
+        exit_reason = ""
+        run_usage: dict[str, int] = {}
+        llm_usage = _empty_usage()
+
+        for event in session_events:
+            ts = float(event.get("ts", 0.0) or 0.0)
+            if started_at == 0.0 or (ts and ts < started_at):
+                started_at = ts
+            kind = str(event.get("kind", ""))
+            if kind == "llm_end":
+                _add_usage(llm_usage, _event_token_data(event))
+            elif kind == "run_end":
+                ended_at = ts
+                duration_ms = float(event.get("duration_ms", 0.0) or 0.0)
+                data = event.get("data") or {}
+                turns = int(data.get("turns", event.get("turn", 0)) or 0)
+                exit_reason = str(event.get("name", ""))
+                run_usage = _event_token_data(event)
+
+        usage = run_usage or {field: value for field, value in llm_usage.items() if value}
+        normalized_usage = _empty_usage()
+        normalized_usage.update(usage)
+        rows.append(
+            {
+                "session_id": str(session_id),
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "duration_ms": duration_ms,
+                "turns": turns,
+                "exit_reason": exit_reason,
+                "event_count": len(session_events),
+                "usage": normalized_usage,
+            }
+        )
+
+    rows.sort(key=lambda item: item.get("ended_at") or item.get("started_at") or 0, reverse=True)
+    return rows[: max(1, min(limit, 200))]
+
+
+def _usage_summary_from_events(events: list[dict[str, Any]], limit: int = 20) -> dict[str, Any]:
+    totals = _empty_usage()
+    rows = [row for row in _trace_summary_from_events(events, limit=limit) if any(row["usage"].values())]
+    for row in rows:
+        _add_usage(totals, row["usage"])
+    return {
+        "totals": totals,
+        "sessions": rows,
+    }
+
+
+def _trace_file_path(log_dir: str, session_id: str) -> tuple[str | None, str | None]:
+    if not _TRACE_SESSION_ID_RE.fullmatch(session_id):
+        return None, "Invalid session id"
+    root = os.path.realpath(log_dir)
+    file_path = os.path.realpath(os.path.join(root, f"{session_id}.jsonl"))
+    if os.path.commonpath([root, file_path]) != root:
+        return None, "Path traversal not allowed"
+    if not os.path.isfile(file_path):
+        return None, "Trace session not found"
+    return file_path, None
+
+
+class WebSessionUsageSink:
+    """Emit token usage events into the Web UI session stream."""
+
+    def __init__(self, session: UISession) -> None:
+        self.session = session
+        self.totals = _empty_usage()
+
+    def emit(self, event: Event) -> None:
+        if event.kind not in {"llm_end", "run_end"}:
+            return
+        usage = _event_token_data({"data": event.data})
+        if not usage:
+            return
+        if event.kind == "llm_end":
+            _add_usage(self.totals, usage)
+            event_type = "token_usage_delta"
+        else:
+            self.totals = _empty_usage()
+            self.totals.update(usage)
+            event_type = "token_usage_done"
+        _emit(
+            self.session,
+            event_type,
+            {
+                "session_id": event.session_id,
+                "turn": event.turn,
+                "usage": {**_empty_usage(), **usage},
+                "totals": dict(self.totals),
+                "updated_at": event.ts,
+            },
+        )
+        _queue_state(self.session, finished=False)
+
+    def close(self) -> None:
+        return None
 
 
 def _visible_llm_output(text: str) -> str:
@@ -326,6 +490,14 @@ def _ensure_agent(
             max_turns=runtime_config.get("max_turns"),
             memory_mode=str(runtime_config.get("memory_mode", "project")),
         )
+        web_usage_sink = WebSessionUsageSink(session)
+        trace_log_dir = ""
+        if not _config_log_dir(observability_config_path):
+            trace_log_dir = _resolve_trace_log_dir(workspace_dir=workspace_dir)
+        trace_sink = JsonlSink(trace_log_dir) if trace_log_dir else NullSink()
+        existing_sink = getattr(session.agent, "sink", NullSink())
+        session.agent.sink = MultiSink(existing_sink, trace_sink, web_usage_sink)
+        session.agent.handler.ctx.sink = session.agent.sink
         session.agent.handler.ctx.verbose = True
         session.config_path = config_path
         session.observability_config_path = observability_config_path
@@ -593,6 +765,126 @@ async def stream_chat(request: Request):
             "Connection": "keep-alive",
         },
     )
+
+
+@app.get("/api/usage/summary")
+async def read_usage_summary(
+    observability_config_path: str = "",
+    limit: int = 20,
+    ws: str = "default.ws",
+):
+    log_dir = _resolve_trace_log_dir(observability_config_path=observability_config_path, ws=ws)
+    if not log_dir:
+        return {"success": False, "error": "Invalid workspace name"}
+
+    if not os.path.isdir(log_dir):
+        return {
+            "success": True,
+            "data": {
+                "configured": True,
+                "log_dir": log_dir,
+                "message": "Trace log directory does not exist yet. Run a task to create it.",
+                "totals": _empty_usage(),
+                "sessions": [],
+                "updated_at": time.time(),
+            },
+        }
+
+    try:
+        summary = _usage_summary_from_events(load_dir(log_dir), limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": str(exc)}
+
+    sessions = summary["sessions"]
+    return {
+        "success": True,
+        "data": {
+            "configured": True,
+            "log_dir": log_dir,
+            "message": "" if sessions else "No token usage events found yet.",
+            "totals": summary["totals"],
+            "sessions": sessions,
+            "updated_at": time.time(),
+        },
+    }
+
+
+@app.get("/api/trace/sessions")
+async def read_trace_sessions(
+    observability_config_path: str = "",
+    limit: int = 20,
+    ws: str = "default.ws",
+):
+    log_dir = _resolve_trace_log_dir(observability_config_path=observability_config_path, ws=ws)
+    if not log_dir:
+        return {"success": False, "error": "Invalid workspace name"}
+    if not os.path.isdir(log_dir):
+        return {
+            "success": True,
+            "data": {
+                "configured": True,
+                "log_dir": log_dir,
+                "message": "Trace log directory does not exist yet. Run a task to create it.",
+                "sessions": [],
+                "updated_at": time.time(),
+            },
+        }
+
+    try:
+        sessions = _trace_summary_from_events(load_dir(log_dir), limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": str(exc)}
+
+    return {
+        "success": True,
+        "data": {
+            "configured": True,
+            "log_dir": log_dir,
+            "message": "" if sessions else "No trace sessions recorded yet.",
+            "sessions": sessions,
+            "updated_at": time.time(),
+        },
+    }
+
+
+@app.get("/api/trace/sessions/{session_id}")
+async def read_trace_session_detail(
+    session_id: str,
+    observability_config_path: str = "",
+    ws: str = "default.ws",
+):
+    log_dir = _resolve_trace_log_dir(observability_config_path=observability_config_path, ws=ws)
+    if not log_dir:
+        return {"success": False, "error": "Invalid workspace name"}
+
+    file_path, error = _trace_file_path(log_dir, session_id)
+    if error or file_path is None:
+        return {"success": False, "error": error}
+
+    try:
+        events = load_events(file_path)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": str(exc)}
+
+    summaries = _trace_summary_from_events(events, limit=1)
+    summary = summaries[0] if summaries else {
+        "session_id": session_id,
+        "started_at": 0.0,
+        "ended_at": 0.0,
+        "duration_ms": 0.0,
+        "turns": 0,
+        "exit_reason": "",
+        "event_count": len(events),
+        "usage": _empty_usage(),
+    }
+    return {
+        "success": True,
+        "data": {
+            "summary": summary,
+            "events": events,
+            "log_path": file_path,
+        },
+    }
 
 
 # === Workspace Management API ===

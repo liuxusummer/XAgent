@@ -13,10 +13,11 @@ import {
   Brain,
   Shield,
   BarChart3,
+  Activity,
 } from 'lucide-react';
 import { api } from '../api/client';
 
-export type PanelTab = 'agents' | 'skills' | 'memory' | 'system' | 'eval';
+export type PanelTab = 'agents' | 'skills' | 'memory' | 'system' | 'eval' | 'usage';
 
 interface SidebarProps {
   onNewChat: () => void;
@@ -125,6 +126,17 @@ export function Sidebar({
             title="Eval"
           >
             <BarChart3 className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => onOpenPanel('usage')}
+            className={`flex items-center justify-center w-9 h-9 rounded-button transition-colors ${
+              activeView === 'usage'
+                ? 'bg-accent/10 text-accent'
+                : 'text-text-muted hover:bg-bg-tertiary hover:text-text-secondary'
+            }`}
+            title="Usage"
+          >
+            <Activity className="w-4 h-4" />
           </button>
         </div>
         <div className="p-3 border-t border-border">
@@ -253,6 +265,19 @@ export function Sidebar({
             <BarChart3 className="w-3.5 h-3.5 text-accent" />
           </div>
           <span className="font-medium">Eval</span>
+        </button>
+        <button
+          onClick={() => onOpenPanel('usage')}
+          className={`flex items-center gap-2.5 w-full px-3 py-2 rounded-button text-sm transition-colors ${
+            activeView === 'usage'
+              ? 'bg-accent/10 text-accent'
+              : 'text-text-secondary hover:bg-bg-tertiary hover:text-text-primary'
+          }`}
+        >
+          <div className="w-7 h-7 rounded-lg bg-accent/10 flex items-center justify-center shrink-0">
+            <Activity className="w-3.5 h-3.5 text-accent" />
+          </div>
+          <span className="font-medium">Usage</span>
         </button>
       </div>
 

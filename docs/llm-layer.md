@@ -21,10 +21,13 @@ ChatResponse
 ├── thinking    # 思维链内容（可能为空）
 ├── content     # 文本回复
 ├── tool_calls  # 工具调用列表（可能为空）
-└── stop_reason # 停止原因
+├── stop_reason # 停止原因
+└── usage       # provider 返回的真实 token 用量（可能为空）
 ```
 
 无论底层是 Claude content-block 还是 OpenAI delta，上层拿到的都是同一个形状。新增模型支持时，只需要实现 Session 的协议转换逻辑，不触碰上层代码。
+
+`usage` 只保存归一化后的元数据：输入、输出、总量、缓存创建、缓存读取和 reasoning token。provider 未返回 usage 时保持为空，不用字符数估算。
 
 ### 两种工具协议，两种策略
 
