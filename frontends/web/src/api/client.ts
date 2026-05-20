@@ -20,6 +20,9 @@ import type {
   AgentProfile,
   AgentProfileData,
   MemoryEntry,
+  UsageSummary,
+  TraceSessionDetail,
+  TraceSessionList,
 } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_BASE || '';
@@ -231,6 +234,35 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({}),
     });
+  }
+
+  async getUsageSummary(options: { ws?: string; observabilityConfigPath?: string; limit?: number } = {}): Promise<ApiResponse<UsageSummary>> {
+    const params = new URLSearchParams({
+      ws: options.ws || 'default.ws',
+      observability_config_path: options.observabilityConfigPath || '',
+      limit: String(options.limit ?? 30),
+    });
+    return this.fetch(`/api/usage/summary?${params.toString()}`);
+  }
+
+  async listTraceSessions(options: { ws?: string; observabilityConfigPath?: string; limit?: number } = {}): Promise<ApiResponse<TraceSessionList>> {
+    const params = new URLSearchParams({
+      ws: options.ws || 'default.ws',
+      observability_config_path: options.observabilityConfigPath || '',
+      limit: String(options.limit ?? 30),
+    });
+    return this.fetch(`/api/trace/sessions?${params.toString()}`);
+  }
+
+  async getTraceSession(
+    sessionId: string,
+    options: { ws?: string; observabilityConfigPath?: string } = {}
+  ): Promise<ApiResponse<TraceSessionDetail>> {
+    const params = new URLSearchParams({
+      ws: options.ws || 'default.ws',
+      observability_config_path: options.observabilityConfigPath || '',
+    });
+    return this.fetch(`/api/trace/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`);
   }
 }
 

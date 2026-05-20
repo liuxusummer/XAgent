@@ -18,6 +18,13 @@ def _fmt_rel(ts: float, start_ts: float) -> str:
     return f"[{max(ts - start_ts, 0):06.3f}s]"
 
 
+def _fmt_tokens(data: dict[str, Any]) -> str:
+    total = data.get("total_tokens")
+    if total is None:
+        return ""
+    return f", tokens={total}"
+
+
 def format_event(event: dict[str, Any], start_ts: float) -> str:
     """把单条事件渲染为单行文本。"""
     kind = str(event.get("kind", ""))
@@ -36,7 +43,8 @@ def format_event(event: dict[str, Any], start_ts: float) -> str:
         label = name or "stop"
         return (
             f"{rel} llm_end {label}{dur} "
-            f"(content={data.get('content_len', 0)}, tools={data.get('tool_call_count', 0)})"
+            f"(content={data.get('content_len', 0)}, tools={data.get('tool_call_count', 0)}"
+            f"{_fmt_tokens(data)})"
         )
     if kind == "tool_start":
         return f"{rel} tool_start {name}"

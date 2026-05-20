@@ -298,7 +298,7 @@ BaseSession
 
 ### 3.10 ChatResponse / ToolCall
 
-统一 Claude / OpenAI 两种 API 的响应格式。`ChatResponse(thinking, content, tool_calls, raw, stop_reason)`，`tool_calls` 为空时 `stop_reason = end_turn`。`ToolCall(name, args, id)` 封装单个工具调用。
+统一 Claude / OpenAI 两种 API 的响应格式。`ChatResponse(thinking, content, tool_calls, raw, stop_reason, usage)`，`tool_calls` 为空时 `stop_reason = end_turn`。`ToolCall(name, args, id)` 封装单个工具调用。`usage` 为可选的归一化 `TokenUsage`，只记录 provider 返回的真实 token 元数据，不做估算。
 
 ---
 

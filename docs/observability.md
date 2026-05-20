@@ -1,6 +1,6 @@
 # 观测性（Phase 8 + Phase 9）
 
-XAgent 把内部运行过程抽象为**结构化事件流**，通过单一 `EventSink` 协议对外暴露。默认零开销（`NullSink`），按需切换到 JSONL 文件或 stderr。
+XAgent 把内部运行过程抽象为**结构化事件流**，通过单一 `EventSink` 协议对外暴露。库/测试默认零开销（`NullSink`），CLI 可按需切换到 JSONL 文件或 stderr；Web UI 会默认把结构化 trace 持久化到当前 workspace runtime 目录。
 
 ## 开关
 
@@ -8,7 +8,7 @@ XAgent 把内部运行过程抽象为**结构化事件流**，通过单一 `Even
 
 | 变量 | 作用 |
 |---|---|
-| `XAGENT_LOG_DIR` | 未设 → NullSink；设值 → `JsonlSink(path)`，按 `session_id` 切分为 `{path}/{session_id}.jsonl` |
+| `XAGENT_LOG_DIR` | CLI 未设 → NullSink；Web UI 未设 → 使用 workspace runtime trace 目录；设值 → `JsonlSink(path)`，按 `session_id` 切分为 `{path}/{session_id}.jsonl` |
 | `XAGENT_LOG_STDERR` | `=1` 时叠加 `StderrSink`，与 Jsonl 共存（`MultiSink`） |
 | `XAGENT_OBS_BACKEND` | `langfuse` 时启用 Langfuse 远端轨迹 Sink（可选依赖） |
 | `XAGENT_LANGFUSE_ENABLED` | `=1` 时启用 Langfuse 远端轨迹 Sink |
@@ -17,7 +17,7 @@ XAgent 把内部运行过程抽象为**结构化事件流**，通过单一 `Even
 | `XAGENT_LANGFUSE_HOST` / `LANGFUSE_HOST` | Langfuse host，自托管时配置 |
 | `XAGENT_OBS_SERVICE` | 观测平台里的服务名，默认 `xagent` |
 
-仅 `main.build_sink()` 读取这些变量；库/测试调用保持 NullSink 默认。Langfuse 作为可选依赖，未安装或初始化失败时自动降级，不阻断 Agent 启动。
+仅 `main.build_sink()` 读取这些变量；库/测试调用保持 NullSink 默认。Web UI 在 agent 构造后会补一个本地 `JsonlSink`，目录解析优先级为 `XAGENT_LOG_DIR`、`observability_config.log_dir`、`workspace/<name>.ws/runtime/traces/`。Langfuse 作为可选依赖，未安装或初始化失败时自动降级，不阻断 Agent 启动。
 
 ## 事件模型
 
@@ -38,10 +38,10 @@ class Event:
 | kind | 何时触发 | name | data |
 |---|---|---|---|
 | `run_start` | `run_agent_loop` 入口 | query 首 80 字 | `{query_len, max_turns}` |
-| `run_end` | `run_agent_loop` 退出 | `exit_reason` | `{turns}` |
+| `run_end` | `run_agent_loop` 退出 | `exit_reason` | `{turns, input_tokens?, output_tokens?, total_tokens?, ...}` |
 | `turn_start` | 每 turn 顶部 | "" | `{}` |
 | `turn_end` | 每 turn 末尾 | "" | `{tool_count}` |
-| `llm_end` | `client.chat` 后 | `stop_reason` | `{has_tool_calls, content_len, tool_call_count}` |
+| `llm_end` | `client.chat` 后 | `stop_reason` | `{has_tool_calls, content_len, tool_call_count, input_tokens?, output_tokens?, total_tokens?, ...}` |
 | `tool_start` | `BaseHandler.dispatch` 入口 | tool_name | `{args_len}` |
 | `tool_end` | `BaseHandler.dispatch` 出口 | tool_name | `{should_exit, next_prompt_len, flags, status}` |
 | `hook_inject` | TurnEndHook 返回非空 | hook name | `{prompt_len}` |
@@ -53,8 +53,9 @@ class Event:
 
 原则：
 - 不记录完整 prompt / response / tool args（体积 + 隐私）
-- 只记长度、布尔位、枚举标签
+- 只记长度、布尔位、枚举标签和 provider 返回的 token usage 元数据
 - `run_end` / `llm_end` / `tool_end` 必有 `duration_ms`；`turn_end` 表示轮次边界，仅记录 `tool_count`
+- token 字段只在 provider 返回真实 usage 时出现；不做字符数估算
 
 ## Sink 实现
 
@@ -99,6 +100,16 @@ Phase 9 在 `src/tools/reflect/` 下补了两个离线 CLI：
 
 都支持 `--session <session_id>` 过滤单个会话。
 
+## Web UI Trace API
+
+Web UI 会把结构化 trace 写入同一个 JSONL 事件格式，并提供只读接口给 Usage 看板：
+
+- `GET /api/usage/summary?ws=default.ws&limit=30`：聚合 token usage 和最近任务
+- `GET /api/trace/sessions?ws=default.ws&limit=30`：列出 trace session 摘要
+- `GET /api/trace/sessions/{session_id}?ws=default.ws`：返回单个 session 的事件时间线
+
+这些接口只读取本地 JSONL，不暴露完整 prompt、LLM response、tool args 或 tool result。`XAGENT_LOG_DIR` 和 `observability_config.log_dir` 仍优先于 workspace 默认目录。
+
 ### replay
 
 把原始 JSONL 渲染成按 turn 缩进的可读轨迹，适合回答"这次 run 到底做了什么、卡在哪一步"。
@@ -124,7 +135,7 @@ python -m src.tools.reflect.replay /tmp/xa --session abc123
 
 ### stats
 
-聚合全部 session 的延迟、退出原因和 hook 命中次数，适合回答"最近是不是变慢了、哪个工具最慢、为什么退出"。
+聚合全部 session 的延迟、退出原因、hook 命中次数和 token 用量，适合回答"最近是不是变慢了、哪个工具最慢、为什么退出、一次任务花了多少 token"。
 
 ```bash
 python -m src.tools.reflect.stats /tmp/xa
@@ -144,6 +155,8 @@ Exit reasons:
   MAX_TURNS_EXCEEDED  1
 Hook injections:
   plan_reminder  2
+Token usage:
+  input_tokens=1200  output_tokens=340  total_tokens=1540
 ```
 
 ## Langfuse 接入
@@ -207,7 +220,7 @@ XAGENT_LANGFUSE_HOST=https://cloud.langfuse.com \
 |---|---|
 | `run_start` / `run_end` | Langfuse event（同一 trace），记录输入长度 / 退出原因 |
 | `turn_start` / `turn_end` | Langfuse event（同一 trace），记录轮次边界 |
-| `llm_end` | Langfuse event，记录停止原因、响应长度、工具调用数 |
+| `llm_end` | Langfuse event，记录停止原因、响应长度、工具调用数、token usage 元数据 |
 | `tool_start` / `tool_end` | Langfuse event，记录工具名、耗时、状态 |
 | `hook_inject` | Langfuse event，记录 hook 名和注入长度 |
 
@@ -215,7 +228,7 @@ CLI 退出时会调用 `XAgent.close()`，从而触发 sink `close()` / Langfuse
 
 ## 不做的事
 
-- 不采集 token 用量（`ChatResponse` 无 usage 字段，不为观测倒逼契约变更）
-- 不做实时订阅 / 流式 tail / 可视化 UI
+- 不做 token 估算；provider 未返回 usage 时保持 unknown
+- 不做通用实时 tail；Web UI 只消费当前任务的 SSE token 事件和已落盘 JSONL
 - 不做事件采样/节流；离线聚合由 `stats.py` 提供最小可用能力
-- 不记录完整 prompt/response（需要现场时用 `verbose` 重放）
+- 不记录完整 prompt、LLM response、tool args 或 tool result（需要现场时用 `verbose` 重放）

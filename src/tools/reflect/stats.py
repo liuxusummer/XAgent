@@ -7,6 +7,15 @@ from typing import Any
 
 from src.tools.reflect.reader import group_by_session, load_dir
 
+TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "reasoning_tokens",
+)
+
 
 def compute_percentiles(values: list[float]) -> dict[str, float]:
     """百分位计算。空/单值走 fallback 常量路径；≥2 时线性插值。"""
@@ -34,6 +43,21 @@ def compute_percentiles(values: list[float]) -> dict[str, float]:
     }
 
 
+def _event_token_data(event: dict[str, Any]) -> dict[str, int]:
+    data = event.get("data") or {}
+    tokens: dict[str, int] = {}
+    for field in TOKEN_FIELDS:
+        value = data.get(field)
+        if isinstance(value, int) and not isinstance(value, bool):
+            tokens[field] = value
+    return tokens
+
+
+def _add_tokens(target: dict[str, int], source: dict[str, int]) -> None:
+    for field, value in source.items():
+        target[field] = target.get(field, 0) + value
+
+
 def aggregate(events: list[dict[str, Any]]) -> dict[str, Any]:
     """按 kind 聚合延迟、退出原因、hook 注入等统计。"""
     groups = group_by_session(events)
@@ -41,23 +65,38 @@ def aggregate(events: list[dict[str, Any]]) -> dict[str, Any]:
     tool_values_by_name: dict[str, list[float]] = {}
     exit_reasons: dict[str, int] = {}
     hook_counts: dict[str, int] = {}
+    llm_tokens_by_session: dict[str, dict[str, int]] = {}
+    run_tokens_by_session: dict[str, dict[str, int]] = {}
     turn_count = 0
     tool_call_count = 0
 
     for event in events:
         kind = str(event.get("kind", ""))
         name = str(event.get("name", ""))
+        session_id = str(event.get("session_id", ""))
         if kind == "turn_end":
             turn_count += 1
         elif kind == "llm_end" and event.get("duration_ms") is not None:
             llm_values.append(float(event["duration_ms"]))
+            _add_tokens(llm_tokens_by_session.setdefault(session_id, {}), _event_token_data(event))
         elif kind == "tool_end" and event.get("duration_ms") is not None:
             tool_call_count += 1
             tool_values_by_name.setdefault(name, []).append(float(event["duration_ms"]))
         elif kind == "run_end":
             exit_reasons[name] = exit_reasons.get(name, 0) + 1
+            tokens = _event_token_data(event)
+            if tokens:
+                run_tokens_by_session[session_id] = tokens
         elif kind == "hook_inject":
             hook_counts[name] = hook_counts.get(name, 0) + 1
+
+    token_usage_by_session = {
+        session_id: run_tokens_by_session.get(session_id, llm_tokens_by_session.get(session_id, {}))
+        for session_id in groups
+    }
+    token_usage: dict[str, int] = {}
+    for tokens in token_usage_by_session.values():
+        _add_tokens(token_usage, tokens)
 
     tool_latency = {
         name: compute_percentiles(values)
@@ -71,6 +110,12 @@ def aggregate(events: list[dict[str, Any]]) -> dict[str, Any]:
         "tool_latency": tool_latency,
         "exit_reasons": dict(sorted(exit_reasons.items())),
         "hook_injections": dict(sorted(hook_counts.items())),
+        "token_usage": token_usage,
+        "token_usage_by_session": {
+            session_id: tokens
+            for session_id, tokens in sorted(token_usage_by_session.items())
+            if tokens
+        },
     }
 
 
@@ -114,6 +159,24 @@ def render(report: dict[str, Any]) -> str:
             lines.append(f"  {name}  {count}")
     else:
         lines.append("  (none)")
+
+    lines.append("Token usage:")
+    if report.get("token_usage"):
+        token_text = "  " + "  ".join(
+            f"{field}={report['token_usage'].get(field, 0)}" for field in TOKEN_FIELDS
+            if field in report["token_usage"]
+        )
+        lines.append(token_text)
+    else:
+        lines.append("  (unknown)")
+
+    if len(report.get("token_usage_by_session", {})) == 1:
+        session_id, tokens = next(iter(report["token_usage_by_session"].items()))
+        token_text = "  " + "  ".join(
+            f"{field}={tokens.get(field, 0)}" for field in TOKEN_FIELDS if field in tokens
+        )
+        lines.append(f"Token usage for session {session_id}:")
+        lines.append(token_text)
     return "\n".join(lines)
 
 

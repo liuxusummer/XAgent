@@ -54,12 +54,78 @@ export interface SSEEvent {
     | 'ask_user'
     | 'user_reply'
     | 'run_done'
+    | 'token_usage_delta'
+    | 'token_usage_done'
     | 'done'
     | 'log'
     | 'stop'
     | 'error'
     | 'heartbeat';
   data: unknown;
+}
+
+export interface TokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  reasoning_tokens: number;
+}
+
+export interface LiveTokenUsage {
+  session_id: string;
+  turn: number;
+  usage: TokenUsage;
+  totals: TokenUsage;
+  updated_at: number;
+  running: boolean;
+}
+
+export interface UsageSession {
+  session_id: string;
+  started_at: number;
+  ended_at: number;
+  duration_ms: number;
+  turns: number;
+  exit_reason: string;
+  event_count: number;
+  usage: TokenUsage;
+}
+
+export interface UsageSummary {
+  configured: boolean;
+  log_dir: string;
+  message: string;
+  totals: TokenUsage;
+  sessions: UsageSession[];
+  updated_at: number;
+}
+
+export type TraceSessionSummary = UsageSession;
+
+export interface TraceEvent {
+  session_id: string;
+  turn: number;
+  kind: string;
+  name: string;
+  ts: number;
+  duration_ms?: number | null;
+  data?: Record<string, unknown>;
+}
+
+export interface TraceSessionList {
+  configured: boolean;
+  log_dir: string;
+  message: string;
+  sessions: TraceSessionSummary[];
+  updated_at: number;
+}
+
+export interface TraceSessionDetail {
+  summary: TraceSessionSummary;
+  events: TraceEvent[];
+  log_path: string;
 }
 
 export interface SubmitTaskRequest {

@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import type { Message, ChatSession, AgentStatus, ToolCall } from '../types';
+import type { LiveTokenUsage, Message, ChatSession, AgentStatus, ToolCall, TokenUsage } from '../types';
 import api from '../api/client';
 
 function generateId(): string {
@@ -52,6 +52,17 @@ function completeStreamingAgentMessages(messages: Message[]): Message[] {
   );
 }
 
+function emptyTokenUsage(): TokenUsage {
+  return {
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    reasoning_tokens: 0,
+  };
+}
+
 export function useChat() {
   const [session, setSession] = useState<ChatSession>(() => {
     const now = Date.now();
@@ -69,6 +80,7 @@ export function useChat() {
   const [agentStatus, setAgentStatus] = useState<AgentStatus>({
     state: 'idle',
   });
+  const [liveTokenUsage, setLiveTokenUsage] = useState<LiveTokenUsage | null>(null);
 
   const [isWaitingForUser, setIsWaitingForUser] = useState(false);
   const [askPrompt, setAskPrompt] = useState('');
@@ -205,6 +217,20 @@ export function useChat() {
           break;
         }
 
+        case 'token_usage_delta':
+        case 'token_usage_done': {
+          const payload = data.data as LiveTokenUsage;
+          setLiveTokenUsage({
+            session_id: payload.session_id || backendSessionIdRef.current,
+            turn: payload.turn || 0,
+            usage: { ...emptyTokenUsage(), ...(payload.usage || {}) },
+            totals: { ...emptyTokenUsage(), ...(payload.totals || {}) },
+            updated_at: payload.updated_at || Date.now() / 1000,
+            running: data.type === 'token_usage_delta',
+          });
+          break;
+        }
+
         case 'done': {
           const result = data.data as {
             response?: string;
@@ -299,6 +325,7 @@ export function useChat() {
     setAgentStatus({ state: 'thinking' });
     setIsWaitingForUser(false);
     setAskPrompt('');
+    setLiveTokenUsage(null);
 
     try {
       // Submit task to API
@@ -411,6 +438,7 @@ export function useChat() {
     setAgentStatus({ state: 'idle' });
     setIsWaitingForUser(false);
     setAskPrompt('');
+    setLiveTokenUsage(null);
   }, [closeEventSource]);
 
   // Cleanup on unmount
@@ -425,6 +453,7 @@ export function useChat() {
     agentStatus,
     isWaitingForUser,
     askPrompt,
+    liveTokenUsage,
     submitTask,
     sendReply,
     stopTask,
