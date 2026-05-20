@@ -8,6 +8,15 @@ interface MessageCardProps {
   message: Message;
 }
 
+function formatCompletedAt(value: number): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+  const pad = (part: number) => part.toString().padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
 function ToolCallCard({ toolCall }: { toolCall: ToolCall }) {
   const [expanded, setExpanded] = useState(false);
 
@@ -189,6 +198,7 @@ export function MessageCard({ message }: MessageCardProps) {
   const hasThinking = !!message.thinking && message.thinking.trim().length > 0;
   const hasTools = message.toolCalls && message.toolCalls.length > 0;
   const hasAnyContent = hasContent || hasThinking || hasTools || isStreaming;
+  const completedAt = message.metadata?.completedAt ? formatCompletedAt(message.metadata.completedAt) : '';
 
   if (isSystem) {
     return (
@@ -268,9 +278,9 @@ export function MessageCard({ message }: MessageCardProps) {
         )}
 
         {/* Metadata */}
-        {message.metadata?.exitReason && (
+        {completedAt && (
           <div className="mt-1 text-xs text-text-muted">
-            Exit: {message.metadata.exitReason}
+            Completed: {completedAt}
           </div>
         )}
       </div>

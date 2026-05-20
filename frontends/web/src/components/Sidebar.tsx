@@ -16,6 +16,7 @@ import {
   Activity,
 } from 'lucide-react';
 import { api } from '../api/client';
+import type { ChatMetadata } from '../types';
 
 export type PanelTab = 'agents' | 'skills' | 'memory' | 'system' | 'eval' | 'usage';
 
@@ -23,6 +24,12 @@ interface SidebarProps {
   onNewChat: () => void;
   onClearChat: () => void;
   currentSessionId: string;
+  currentAgent: string | null;
+  chats: ChatMetadata[];
+  activeChatId: string;
+  chatsLoading: boolean;
+  onSelectChat: (chatId: string) => void;
+  onDeleteChat: (chatId: string) => void;
   onOpenSettings: () => void;
   currentWorkspace: string;
   onWorkspaceChange: (ws: string) => void;
@@ -33,6 +40,12 @@ interface SidebarProps {
 export function Sidebar({
   onNewChat,
   onClearChat,
+  currentAgent,
+  chats,
+  activeChatId,
+  chatsLoading,
+  onSelectChat,
+  onDeleteChat,
   onOpenSettings,
   currentWorkspace,
   onWorkspaceChange,
@@ -282,15 +295,66 @@ export function Sidebar({
       </div>
 
       {/* Session */}
-      <div className="px-3 py-1">
-        <button
-          onClick={onClearChat}
-          className="flex items-center gap-2 w-full px-3 py-2 rounded-button hover:bg-bg-tertiary transition-colors group"
-        >
-          <MessageSquare className="w-4 h-4 text-text-muted group-hover:text-text-secondary" />
-          <span className="text-sm text-text-secondary truncate flex-1 text-left">Current Chat</span>
-          <Trash2 className="w-3.5 h-3.5 text-text-muted opacity-0 group-hover:opacity-100 transition-opacity" />
-        </button>
+      <div className="px-3 py-2 border-t border-border/70">
+        {currentAgent ? (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between px-1">
+              <div className="text-[11px] font-medium text-text-muted uppercase tracking-wider">
+                {currentAgent} Chats
+              </div>
+              {chatsLoading && <span className="text-[11px] text-text-muted">Loading</span>}
+            </div>
+            <div className="max-h-56 overflow-y-auto space-y-1">
+              {chats.length === 0 ? (
+                <div className="px-3 py-3 text-xs text-text-muted rounded-button bg-bg-tertiary/50">
+                  No saved chats yet.
+                </div>
+              ) : (
+                chats.map((chat) => (
+                  <div
+                    key={chat.chat_id}
+                    className={`group flex items-start gap-2 w-full px-3 py-2 rounded-button transition-colors text-left ${
+                      activeChatId === chat.chat_id
+                        ? 'bg-accent/10 text-accent'
+                        : 'hover:bg-bg-tertiary text-text-secondary'
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => onSelectChat(chat.chat_id)}
+                      className="flex min-w-0 flex-1 items-start gap-2 text-left"
+                    >
+                      <MessageSquare className="w-4 h-4 mt-0.5 shrink-0" />
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-sm font-medium truncate">{chat.title || 'New Chat'}</span>
+                        <span className="block text-[11px] text-text-muted truncate">
+                          {chat.last_message_preview || formatChatTime(chat.updated_at)}
+                        </span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onDeleteChat(chat.chat_id)}
+                      className="opacity-0 group-hover:opacity-100 text-text-muted hover:text-status-error transition-opacity"
+                      title="Delete chat"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        ) : (
+          <button
+            onClick={onClearChat}
+            className="flex items-center gap-2 w-full px-3 py-2 rounded-button hover:bg-bg-tertiary transition-colors group"
+          >
+            <MessageSquare className="w-4 h-4 text-text-muted group-hover:text-text-secondary" />
+            <span className="text-sm text-text-secondary truncate flex-1 text-left">Current Chat</span>
+            <Trash2 className="w-3.5 h-3.5 text-text-muted opacity-0 group-hover:opacity-100 transition-opacity" />
+          </button>
+        )}
       </div>
 
       {/* Footer */}
@@ -312,4 +376,9 @@ export function Sidebar({
       </div>
     </aside>
   );
+}
+
+function formatChatTime(seconds: number): string {
+  if (!seconds) return '';
+  return new Date(seconds * 1000).toLocaleDateString();
 }
