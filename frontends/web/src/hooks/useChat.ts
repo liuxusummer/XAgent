@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import type { LiveTokenUsage, Message, ChatSession, AgentStatus, ToolCall, TokenUsage } from '../types';
+import type { LiveTokenUsage, Message, ChatSession, AgentStatus, ToolCall, TokenUsage, PersistentChatDetail } from '../types';
 import api from '../api/client';
 
 function generateId(): string {
@@ -63,7 +63,7 @@ function emptyTokenUsage(): TokenUsage {
   };
 }
 
-export function useChat() {
+export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) {
   const [session, setSession] = useState<ChatSession>(() => {
     const now = Date.now();
 
@@ -86,7 +86,13 @@ export function useChat() {
   const [askPrompt, setAskPrompt] = useState('');
   const eventSourceRef = useRef<EventSource | null>(null);
   const backendSessionIdRef = useRef<string>('');
+  const persistentChatIdRef = useRef<string>('');
   const streamRunIdRef = useRef(0);
+  const onPersistentChatUpdatedRef = useRef(options.onPersistentChatUpdated);
+
+  useEffect(() => {
+    onPersistentChatUpdatedRef.current = options.onPersistentChatUpdated;
+  }, [options.onPersistentChatUpdated]);
 
   const closeEventSource = useCallback(() => {
     streamRunIdRef.current += 1;
@@ -241,6 +247,7 @@ export function useChat() {
               data?: unknown;
             }>;
           };
+          const completedAt = Date.now();
 
           setAgentStatus({ state: 'idle' });
           setSession(prev => ({ ...prev, status: 'idle' }));
@@ -274,10 +281,11 @@ export function useChat() {
               lastMsg.metadata = {
                 ...lastMsg.metadata,
                 exitReason: result.exit_reason || '',
+                completedAt,
               };
             } else if (result.response) {
               messages.push(createMessage('agent', result.response, {
-                metadata: { exitReason: result.exit_reason || '' },
+                metadata: { exitReason: result.exit_reason || '', completedAt },
               }));
             }
 
@@ -285,6 +293,9 @@ export function useChat() {
           });
 
           closeEventSource();
+          if (persistentChatIdRef.current) {
+            onPersistentChatUpdatedRef.current?.();
+          }
           break;
         }
 
@@ -307,6 +318,7 @@ export function useChat() {
     observabilityConfigPath?: string;
     workspaceDir?: string;
     agent?: string;
+    chatId?: string;
   }) => {
     if (!task.trim()) return;
 
@@ -319,6 +331,9 @@ export function useChat() {
     // Update session status
     setSession(prev => ({
       ...prev,
+      title: (config?.chatId || persistentChatIdRef.current) && prev.title === 'New Chat'
+        ? task.trim().slice(0, 40)
+        : prev.title,
       status: 'running',
       config: config || prev.config,
     }));
@@ -332,6 +347,7 @@ export function useChat() {
       const response = await api.submitTask({
         task: task.trim(),
         session_id: backendSessionIdRef.current || undefined,
+        chat_id: config?.chatId || persistentChatIdRef.current || undefined,
         config_path: config?.configPath,
         observability_config_path: config?.observabilityConfigPath,
         workspace_dir: config?.workspaceDir,
@@ -348,6 +364,9 @@ export function useChat() {
       }
 
       backendSessionIdRef.current = response.data?.session_id || '';
+      if (config?.chatId) {
+        persistentChatIdRef.current = config.chatId;
+      }
       const streamRunId = streamRunIdRef.current + 1;
       streamRunIdRef.current = streamRunId;
 
@@ -427,6 +446,7 @@ export function useChat() {
   const clearChat = useCallback(() => {
     closeEventSource();
     backendSessionIdRef.current = '';
+    persistentChatIdRef.current = '';
     setSession({
       id: generateId(),
       title: 'New Chat',
@@ -438,6 +458,30 @@ export function useChat() {
     setAgentStatus({ state: 'idle' });
     setIsWaitingForUser(false);
     setAskPrompt('');
+    setLiveTokenUsage(null);
+  }, [closeEventSource]);
+
+  const loadPersistentChat = useCallback((detail: PersistentChatDetail) => {
+    closeEventSource();
+    const metadata = detail.metadata;
+    const state = detail.state;
+    backendSessionIdRef.current = state.backend_session_id || '';
+    persistentChatIdRef.current = metadata.chat_id;
+    setSession({
+      id: metadata.chat_id,
+      title: metadata.title || 'New Chat',
+      messages: state.messages || [],
+      createdAt: Math.round((metadata.created_at || Date.now() / 1000) * 1000),
+      updatedAt: Math.round((metadata.updated_at || Date.now() / 1000) * 1000),
+      status: state.waiting_for_user ? 'waiting_for_user' : 'idle',
+      config: {
+        workspaceDir: metadata.workspace,
+        agent: metadata.agent,
+      },
+    });
+    setAgentStatus({ state: state.waiting_for_user ? 'waiting_for_user' : 'idle' });
+    setIsWaitingForUser(Boolean(state.waiting_for_user));
+    setAskPrompt(state.ask_prompt || '');
     setLiveTokenUsage(null);
   }, [closeEventSource]);
 
@@ -458,5 +502,6 @@ export function useChat() {
     sendReply,
     stopTask,
     clearChat,
+    loadPersistentChat,
   };
 }

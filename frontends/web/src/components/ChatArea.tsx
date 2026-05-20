@@ -16,6 +16,7 @@ interface ChatAreaProps {
   onStopTask: () => void;
   view: 'chat' | 'agents' | 'skills';
   activeAgent?: string | null;
+  chatTitle?: string;
 }
 
 function EmptyState({ onSuggestion }: { onSuggestion: (text: string) => void }) {
@@ -64,6 +65,7 @@ export function ChatArea({
   onStopTask,
   view,
   activeAgent,
+  chatTitle,
 }: ChatAreaProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -91,7 +93,7 @@ export function ChatArea({
   return (
     <div className="flex-1 flex flex-col min-w-0 bg-bg-primary">
       {/* Status Bar */}
-      <StatusBar status={agentStatus} activeAgent={activeAgent} />
+      <StatusBar status={agentStatus} activeAgent={activeAgent} chatTitle={chatTitle} />
 
       {/* Messages Area */}
       {showChat && messages.length === 0 && (

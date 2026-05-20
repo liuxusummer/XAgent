@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Sidebar, type PanelTab } from './components/Sidebar';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import { AgentDetail } from './components/AgentDetail';
@@ -10,10 +10,36 @@ import { UsagePanel } from './components/UsagePanel';
 import { SettingsModal, loadConfig, type AgentConfig } from './components/SettingsModal';
 import { useChat } from './hooks/useChat';
 import { ThemeProvider } from './hooks/useTheme.tsx';
+import { api } from './api/client';
+import type { ChatMetadata, PersistentChatDetail } from './types';
 
 type MainView = 'chat' | 'agents' | 'skills' | 'memory' | 'system' | 'eval' | 'usage' | 'agent-detail';
 
 function App() {
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [agentConfig, setAgentConfig] = useState<AgentConfig>(loadConfig());
+  const [currentWorkspace, setCurrentWorkspace] = useState('default.ws');
+  const [mainView, setMainView] = useState<MainView>('chat');
+  const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
+  const [agentChats, setAgentChats] = useState<ChatMetadata[]>([]);
+  const [activeChatId, setActiveChatId] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+
+  const refreshAgentChats = useCallback(() => {
+    if (!selectedAgent) {
+      setAgentChats([]);
+      return;
+    }
+    setChatLoading(true);
+    api.listChats(currentWorkspace, selectedAgent)
+      .then((res) => {
+        if (res.success && res.data) {
+          setAgentChats(res.data);
+        }
+      })
+      .finally(() => setChatLoading(false));
+  }, [currentWorkspace, selectedAgent]);
+
   const {
     session,
     agentStatus,
@@ -24,39 +50,63 @@ function App() {
     sendReply,
     stopTask,
     clearChat,
-  } = useChat();
+    loadPersistentChat,
+  } = useChat({ onPersistentChatUpdated: refreshAgentChats });
 
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [agentConfig, setAgentConfig] = useState<AgentConfig>(loadConfig());
-  const [currentWorkspace, setCurrentWorkspace] = useState('default.ws');
-  const [mainView, setMainView] = useState<MainView>('chat');
-  const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
+  useEffect(() => {
+    refreshAgentChats();
+  }, [refreshAgentChats]);
 
   const handleSaveConfig = (config: AgentConfig) => {
     setAgentConfig(config);
   };
 
-  const handleSubmitTask = (task: string) => {
+  const createAndLoadAgentChat = useCallback(async (agentName: string): Promise<PersistentChatDetail | null> => {
+    const res = await api.createChat(currentWorkspace, agentName);
+    if (!res.success || !res.data) return null;
+    setActiveChatId(res.data.metadata.chat_id);
+    loadPersistentChat(res.data);
+    refreshAgentChats();
+    return res.data;
+  }, [currentWorkspace, loadPersistentChat, refreshAgentChats]);
+
+  const handleSubmitTask = async (task: string) => {
+    let chatId = activeChatId;
+    if (selectedAgent && !chatId) {
+      const detail = await createAndLoadAgentChat(selectedAgent);
+      chatId = detail?.metadata.chat_id || '';
+    }
     submitTask(task, {
       ...agentConfig,
       workspaceDir: agentConfig.workspaceDir || currentWorkspace,
       agent: selectedAgent || undefined,
+      chatId: chatId || undefined,
     });
   };
 
   const handleOpenPanel = (tab: PanelTab) => {
     setMainView(tab);
     setSelectedAgent(null);
+    setActiveChatId('');
   };
 
-  const handleNewChat = () => {
+  const handleNewChat = async () => {
+    if (selectedAgent) {
+      const detail = await createAndLoadAgentChat(selectedAgent);
+      if (detail) {
+        setMainView('chat');
+      }
+      return;
+    }
     clearChat();
+    setActiveChatId('');
     setMainView('chat');
     setSelectedAgent(null);
   };
 
   const handleClearChat = () => {
     clearChat();
+    setActiveChatId('');
     setSelectedAgent(null);
   };
 
@@ -67,6 +117,8 @@ function App() {
 
   const handleChatWithAgent = (agentName: string) => {
     setSelectedAgent(agentName);
+    setActiveChatId('');
+    clearChat();
     setMainView('chat');
   };
 
@@ -78,6 +130,32 @@ function App() {
   const handleWorkspaceChange = (workspace: string) => {
     setCurrentWorkspace(workspace);
     setSelectedAgent(null);
+    setActiveChatId('');
+    clearChat();
+  };
+
+  const handleSelectChat = async (chatId: string) => {
+    if (!selectedAgent) return;
+    const res = await api.readChat(currentWorkspace, selectedAgent, chatId);
+    if (res.success && res.data) {
+      setActiveChatId(chatId);
+      loadPersistentChat(res.data);
+      setMainView('chat');
+    }
+  };
+
+  const handleDeleteChat = async (chatId: string) => {
+    if (!selectedAgent) return;
+    const ok = window.confirm('Delete this chat history?');
+    if (!ok) return;
+    const res = await api.deleteChat(currentWorkspace, selectedAgent, chatId);
+    if (res.success) {
+      if (activeChatId === chatId) {
+        setActiveChatId('');
+        clearChat();
+      }
+      refreshAgentChats();
+    }
   };
 
   const renderMainContent = () => {
@@ -93,6 +171,7 @@ function App() {
           onStopTask={stopTask}
           view={mainView}
           activeAgent={selectedAgent}
+          chatTitle={selectedAgent ? session.title : undefined}
         />
       );
     }
@@ -167,6 +246,12 @@ function App() {
           onNewChat={handleNewChat}
           onClearChat={handleClearChat}
           currentSessionId={session.id}
+          currentAgent={selectedAgent}
+          chats={agentChats}
+          activeChatId={activeChatId}
+          chatsLoading={chatLoading}
+          onSelectChat={handleSelectChat}
+          onDeleteChat={handleDeleteChat}
           onOpenSettings={() => setSettingsOpen(true)}
           currentWorkspace={currentWorkspace}
           onWorkspaceChange={handleWorkspaceChange}

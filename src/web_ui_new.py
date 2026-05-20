@@ -9,6 +9,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -55,6 +56,7 @@ app.add_middleware(
 class SubmitTaskRequest(BaseModel):
     task: str
     session_id: str = ""
+    chat_id: str = ""
     config_path: str = ""
     observability_config_path: str = ""
     workspace_dir: str = ""
@@ -108,6 +110,11 @@ class AgentProfileWriteRequest(BaseModel):
     body: str = ""
 
 
+class ChatCreateRequest(BaseModel):
+    ws: str = "default.ws"
+    agent: str = ""
+
+
 @dataclass
 class UISession:
     agent: object | None = None
@@ -121,6 +128,11 @@ class UISession:
     agent_name: str = ""
     runtime_config_key: str = ""
     session_id: str = ""
+    chat_id: str = ""
+    chat_ws: str = ""
+    chat_agent: str = ""
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    restored_llm_history: list[dict[str, Any]] = field(default_factory=list)
     event_queue: queue.Queue[dict[str, Any]] = field(default_factory=lambda: queue.Queue(maxsize=1))
     llm_stream_buffer: str = ""
     assistant_stream_emitted_len: int = 0
@@ -150,6 +162,33 @@ _HIDDEN_BLOCK_RE = re.compile(
 )
 _TRAILING_PARTIAL_TAG_RE = re.compile(r"<[^>]*$")
 _TRACE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_CHAT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _safe_json_value(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return json.loads(json.dumps(str(value), ensure_ascii=False))
+
+
+def _write_json_file(path: str, payload: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp_path, path)
+
+
+def _read_json_file(path: str) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        value = json.load(f)
+    return value if isinstance(value, dict) else {}
 
 
 def _empty_usage() -> dict[str, int]:
@@ -322,6 +361,104 @@ def _tool_key(name: str, arguments: dict[str, Any]) -> str:
     return f"{name}:{json.dumps(arguments, ensure_ascii=False, sort_keys=True)}"
 
 
+def _new_ui_message(role: str, content: str, status: str = "complete") -> dict[str, Any]:
+    return {
+        "id": uuid.uuid4().hex[:12],
+        "role": role,
+        "content": content,
+        "timestamp": _now_ms(),
+        "status": status,
+    }
+
+
+def _ensure_ui_agent_message(session: UISession) -> dict[str, Any]:
+    if session.messages and session.messages[-1].get("role") == "agent":
+        return session.messages[-1]
+    message = _new_ui_message("agent", "", status="streaming")
+    session.messages.append(message)
+    return message
+
+
+def _append_ui_delta(current: str, delta: str) -> str:
+    if not delta or current.endswith(delta):
+        return current
+    return current + delta
+
+
+def _update_session_messages(session: UISession, event_type: str, data: Any = None) -> None:
+    if event_type in {"user_task", "user_reply"}:
+        session.messages.append(_new_ui_message("user", str(data or "")))
+        return
+    if event_type == "assistant_delta":
+        message = _ensure_ui_agent_message(session)
+        message["content"] = _append_ui_delta(str(message.get("content", "")), str(data or ""))
+        message["status"] = "streaming"
+        return
+    if event_type == "thinking_delta":
+        message = _ensure_ui_agent_message(session)
+        message["thinking"] = _append_ui_delta(str(message.get("thinking", "")), str(data or ""))
+        message["status"] = "streaming"
+        return
+    if event_type == "turn_start":
+        message = _ensure_ui_agent_message(session)
+        payload = data if isinstance(data, dict) else {}
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        message["metadata"] = {**metadata, "turn": payload.get("turn", 0)}
+        return
+    if event_type == "tool_call":
+        message = _ensure_ui_agent_message(session)
+        tool_calls = message.get("toolCalls")
+        if not isinstance(tool_calls, list):
+            tool_calls = []
+        payload = data if isinstance(data, dict) else {}
+        tool_id = str(payload.get("id", uuid.uuid4().hex[:8]))
+        if not any(item.get("id") == tool_id for item in tool_calls if isinstance(item, dict)):
+            tool_calls.append(
+                {
+                    "id": tool_id,
+                    "name": str(payload.get("name", "")),
+                    "arguments": payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {},
+                    "status": str(payload.get("status", "success")),
+                }
+            )
+        message["toolCalls"] = tool_calls
+        return
+    if event_type == "done":
+        payload = data if isinstance(data, dict) else {}
+        message = _ensure_ui_agent_message(session)
+        if not message.get("content") and payload.get("response"):
+            message["content"] = str(payload.get("response", ""))
+        message["status"] = "complete"
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        message["metadata"] = {
+            **metadata,
+            "exitReason": str(payload.get("exit_reason", "")),
+            "completedAt": _now_ms(),
+        }
+        tool_results = payload.get("tool_results") if isinstance(payload.get("tool_results"), list) else []
+        fallback_tools = []
+        for item in tool_results:
+            if not isinstance(item, dict):
+                continue
+            tool_name = str(item.get("tool_name", ""))
+            if not tool_name or tool_name == "no_tool":
+                continue
+            fallback_tools.append(
+                {
+                    "id": str(item.get("tool_call_id") or tool_name),
+                    "name": tool_name,
+                    "arguments": {},
+                    "status": "success",
+                    "result": item.get("data"),
+                }
+            )
+        if fallback_tools and not message.get("toolCalls"):
+            message["toolCalls"] = fallback_tools
+        return
+    if event_type in {"error", "stop"}:
+        session.messages.append(_new_ui_message("system", str(data or ""), status="error" if event_type == "error" else "complete"))
+
+
 def _emit_tool_call(session: UISession, name: str, arguments: dict[str, Any], tool_id: str | None = None) -> None:
     key = _tool_key(name, arguments)
     if key in session.emitted_tool_keys:
@@ -385,6 +522,8 @@ def _emit(session: UISession, event_type: str, data: Any = None) -> None:
     elif event_type == "thinking_delta":
         session.last_thinking_delta = str(data)
     session.events.append({"type": event_type, "data": data})
+    _update_session_messages(session, event_type, data)
+    _persist_chat_state(session)
 
 
 def _append_progress(session: UISession, message: str) -> None:
@@ -458,6 +597,216 @@ def _resolve_workspace_dir_input(value: str) -> str:
     return normalized
 
 
+def _valid_chat_id(chat_id: str) -> bool:
+    return bool(chat_id) and _CHAT_ID_RE.fullmatch(chat_id) is not None and chat_id not in {".", ".."}
+
+
+def _chat_root(ws: str, agent: str) -> tuple[str | None, str | None]:
+    if not _is_workspace_name(ws):
+        return None, "Invalid workspace name"
+    if not _is_child_name(agent):
+        return None, "Invalid agent name"
+    ws_root = os.path.realpath(os.path.join(_WORKSPACE_ROOT, ws))
+    workspace_parent = os.path.realpath(_WORKSPACE_ROOT)
+    if os.path.commonpath([workspace_parent, ws_root]) != workspace_parent:
+        return None, "Path traversal not allowed"
+    return os.path.join(ws_root, "runtime", "chats", agent), None
+
+
+def _chat_dir(ws: str, agent: str, chat_id: str) -> tuple[str | None, str | None]:
+    if not _valid_chat_id(chat_id):
+        return None, "Invalid chat id"
+    root, error = _chat_root(ws, agent)
+    if error or root is None:
+        return None, error
+    real_root = os.path.realpath(root)
+    chat_path = os.path.realpath(os.path.join(real_root, chat_id))
+    if os.path.commonpath([real_root, chat_path]) != real_root:
+        return None, "Path traversal not allowed"
+    return chat_path, None
+
+
+def _chat_metadata_path(ws: str, agent: str, chat_id: str) -> tuple[str | None, str | None]:
+    chat_path, error = _chat_dir(ws, agent, chat_id)
+    if error or chat_path is None:
+        return None, error
+    return os.path.join(chat_path, "metadata.json"), None
+
+
+def _chat_state_path(ws: str, agent: str, chat_id: str) -> tuple[str | None, str | None]:
+    chat_path, error = _chat_dir(ws, agent, chat_id)
+    if error or chat_path is None:
+        return None, error
+    return os.path.join(chat_path, "state.json"), None
+
+
+def _default_chat_metadata(ws: str, agent: str, chat_id: str) -> dict[str, Any]:
+    now = time.time()
+    return {
+        "chat_id": chat_id,
+        "workspace": ws,
+        "agent": agent,
+        "title": "New Chat",
+        "created_at": now,
+        "updated_at": now,
+        "last_message_preview": "",
+        "message_count": 0,
+        "status": "idle",
+    }
+
+
+def _default_chat_state(ws: str, agent: str, chat_id: str, session_id: str = "") -> dict[str, Any]:
+    return {
+        "chat_id": chat_id,
+        "workspace": ws,
+        "agent": agent,
+        "backend_session_id": session_id,
+        "runtime_config_key": "",
+        "messages": [],
+        "llm_history": [],
+        "waiting_for_user": False,
+        "ask_prompt": "",
+        "status": "idle",
+        "updated_at": time.time(),
+    }
+
+
+def _read_chat_metadata(ws: str, agent: str, chat_id: str) -> dict[str, Any] | None:
+    path, error = _chat_metadata_path(ws, agent, chat_id)
+    if error or path is None or not os.path.isfile(path):
+        return None
+    try:
+        return _read_json_file(path)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _read_chat_state(ws: str, agent: str, chat_id: str) -> dict[str, Any] | None:
+    path, error = _chat_state_path(ws, agent, chat_id)
+    if error or path is None or not os.path.isfile(path):
+        return None
+    try:
+        return _read_json_file(path)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _extract_llm_history(agent: object | None) -> list[dict[str, Any]]:
+    if agent is None:
+        return []
+    client = getattr(agent, "client", None)
+    backend = getattr(client, "backend", None)
+    history = getattr(backend, "history", [])
+    return _safe_json_value(history) if isinstance(history, list) else []
+
+
+def _restore_llm_history(agent: object | None, history: list[dict[str, Any]]) -> None:
+    if agent is None or not isinstance(history, list):
+        return
+    client = getattr(agent, "client", None)
+    backend = getattr(client, "backend", None)
+    if backend is None or not hasattr(backend, "history"):
+        return
+    try:
+        backend.history = _safe_json_value(history)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _chat_preview(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        content = str(message.get("content", "")).strip()
+        if content:
+            return content[:80]
+    return ""
+
+
+def _chat_title(metadata: dict[str, Any], messages: list[dict[str, Any]]) -> str:
+    current = str(metadata.get("title", "New Chat") or "New Chat")
+    if current != "New Chat":
+        return current
+    for message in messages:
+        if message.get("role") == "user":
+            content = str(message.get("content", "")).strip()
+            if content:
+                return content[:40]
+    return current
+
+
+def _persist_chat_state(session: UISession) -> None:
+    if not session.chat_id or not session.chat_ws or not session.chat_agent:
+        return
+    metadata_path, error = _chat_metadata_path(session.chat_ws, session.chat_agent, session.chat_id)
+    state_path, state_error = _chat_state_path(session.chat_ws, session.chat_agent, session.chat_id)
+    if error or state_error or metadata_path is None or state_path is None:
+        return
+    metadata = _read_chat_metadata(session.chat_ws, session.chat_agent, session.chat_id)
+    if metadata is None:
+        metadata = _default_chat_metadata(session.chat_ws, session.chat_agent, session.chat_id)
+    status = "waiting_for_user" if session.waiting_for_user else ("running" if session.running else "idle")
+    messages = _safe_json_value(session.messages)
+    llm_history = _extract_llm_history(session.agent) or _safe_json_value(session.restored_llm_history)
+    now = time.time()
+    metadata.update(
+        {
+            "workspace": session.chat_ws,
+            "agent": session.chat_agent,
+            "title": _chat_title(metadata, messages),
+            "updated_at": now,
+            "last_message_preview": _chat_preview(messages),
+            "message_count": len(messages),
+            "status": status,
+        }
+    )
+    state = {
+        **_default_chat_state(session.chat_ws, session.chat_agent, session.chat_id, session.session_id),
+        "backend_session_id": session.session_id,
+        "runtime_config_key": session.runtime_config_key,
+        "messages": messages,
+        "llm_history": llm_history,
+        "waiting_for_user": session.waiting_for_user,
+        "ask_prompt": session.ask_prompt,
+        "status": status,
+        "updated_at": now,
+    }
+    try:
+        _write_json_file(metadata_path, metadata)
+        _write_json_file(state_path, state)
+    except OSError:
+        return
+
+
+def _load_chat_into_session(ws: str, agent: str, chat_id: str, session: UISession | None = None) -> tuple[UISession | None, str | None]:
+    chat_path, error = _chat_dir(ws, agent, chat_id)
+    if error or chat_path is None:
+        return None, error
+    metadata = _read_chat_metadata(ws, agent, chat_id)
+    state = _read_chat_state(ws, agent, chat_id)
+    if metadata is None or state is None:
+        return None, "Chat not found"
+    session = session or UISession(session_id=str(state.get("backend_session_id") or uuid.uuid4().hex[:16]))
+    session.chat_id = chat_id
+    session.chat_ws = ws
+    session.chat_agent = agent
+    session.session_id = session.session_id or uuid.uuid4().hex[:16]
+    messages = state.get("messages")
+    session.messages = _safe_json_value(messages) if isinstance(messages, list) else []
+    history = state.get("llm_history")
+    session.restored_llm_history = _safe_json_value(history) if isinstance(history, list) else []
+    session.waiting_for_user = False
+    session.running = False
+    session.ask_prompt = ""
+    _sessions[session.session_id] = session
+    return session, None
+
+
+def _find_session_by_chat(ws: str, agent: str, chat_id: str) -> UISession | None:
+    for session in _sessions.values():
+        if session.chat_ws == ws and session.chat_agent == agent and session.chat_id == chat_id:
+            return session
+    return None
+
+
 def _ensure_agent(
     session: UISession,
     config_path: str,
@@ -499,11 +848,17 @@ def _ensure_agent(
         session.agent.sink = MultiSink(existing_sink, trace_sink, web_usage_sink)
         session.agent.handler.ctx.sink = session.agent.sink
         session.agent.handler.ctx.verbose = True
+        if session.restored_llm_history:
+            _restore_llm_history(session.agent, session.restored_llm_history)
+            session.restored_llm_history = []
         session.config_path = config_path
         session.observability_config_path = observability_config_path
         session.workspace_dir = workspace_dir
         session.agent_name = agent_name
         session.runtime_config_key = runtime_config_key
+    elif session.restored_llm_history:
+        _restore_llm_history(session.agent, session.restored_llm_history)
+        session.restored_llm_history = []
     return session.agent
 
 
@@ -528,6 +883,7 @@ def _drain_sync(session: UISession, wait: bool) -> bool:
             session.running = False
             session.ask_prompt = msg["ask_user"]
             _emit(session, "ask_user", msg["ask_user"])
+            _persist_chat_state(session)
             break
         elif "done" in msg:
             result = msg["done"]
@@ -544,6 +900,7 @@ def _drain_sync(session: UISession, wait: bool) -> bool:
             session.running = False
             session.waiting_for_user = False
             session.ask_prompt = ""
+            _persist_chat_state(session)
             finished = True
             break
 
@@ -610,7 +967,19 @@ def _run_task_background(session: UISession, task: str) -> None:
 async def submit_task(request: SubmitTaskRequest):
     """Submit a new task"""
     requested_session_id = _normalize_path_input(request.session_id)
+    chat_id = _normalize_path_input(request.chat_id)
+    workspace_dir = _normalize_path_input(request.workspace_dir)
+    agent_name = _normalize_path_input(request.agent)
+    chat_ws = workspace_dir if _is_workspace_name(workspace_dir) else "default.ws"
+    if chat_id and not agent_name:
+        return {"success": False, "error": "Agent is required for persistent chat"}
     session = _sessions.get(requested_session_id) if requested_session_id else None
+    if session is None and chat_id:
+        session = _find_session_by_chat(chat_ws, agent_name, chat_id)
+    if session is None and chat_id:
+        session, load_error = _load_chat_into_session(chat_ws, agent_name, chat_id)
+        if load_error or session is None:
+            return {"success": False, "error": load_error}
     if session is None:
         session_id = uuid.uuid4().hex[:16]
         session = UISession(session_id=session_id)
@@ -620,8 +989,10 @@ async def submit_task(request: SubmitTaskRequest):
 
     config_path = _normalize_path_input(request.config_path)
     observability_config_path = _normalize_path_input(request.observability_config_path)
-    workspace_dir = _normalize_path_input(request.workspace_dir)
-    agent_name = _normalize_path_input(request.agent)
+    if chat_id:
+        session.chat_id = chat_id
+        session.chat_ws = chat_ws
+        session.chat_agent = agent_name
     runtime_config, runtime_error = _agent_runtime_config(workspace_dir, agent_name)
     if runtime_error:
         return {"success": False, "error": runtime_error}
@@ -635,6 +1006,7 @@ async def submit_task(request: SubmitTaskRequest):
         agent_name,
         runtime_config,
     )
+    _persist_chat_state(session)
 
     # Start background task
     thread = threading.Thread(
@@ -666,6 +1038,7 @@ async def send_reply(request: ReplyRequest):
         active_session.running = True
         _emit(active_session, "user_reply", request.reply.strip())
         active_session.agent.reply_queue.put(request.reply.strip())
+        _persist_chat_state(active_session)
 
     # Restart drain in background
     thread = threading.Thread(
@@ -702,6 +1075,7 @@ async def stop_task(request: Request):
                 session.agent.stop()
                 _emit(session, "stop", "interrupt signal sent")
                 _queue_state(session, finished=False)
+                _persist_chat_state(session)
                 return {"success": True}
 
     return {"success": False, "error": "No running task"}
@@ -765,6 +1139,103 @@ async def stream_chat(request: Request):
             "Connection": "keep-alive",
         },
     )
+
+
+@app.get("/api/chats")
+async def list_chats(ws: str = "default.ws", agent: str = ""):
+    root, error = _chat_root(ws, agent)
+    if error or root is None:
+        return {"success": False, "error": error}
+    if not os.path.isdir(root):
+        return {"success": True, "data": []}
+    rows: list[dict[str, Any]] = []
+    try:
+        for entry in os.scandir(root):
+            if not entry.is_dir(follow_symlinks=False) or not _valid_chat_id(entry.name):
+                continue
+            metadata = _read_chat_metadata(ws, agent, entry.name)
+            if metadata is not None:
+                rows.append(metadata)
+    except OSError as exc:
+        return {"success": False, "error": str(exc)}
+    rows.sort(key=lambda item: float(item.get("updated_at", 0.0) or 0.0), reverse=True)
+    return {"success": True, "data": rows}
+
+
+@app.post("/api/chats")
+async def create_chat(request: ChatCreateRequest):
+    ws = _normalize_path_input(request.ws) or "default.ws"
+    agent = _normalize_path_input(request.agent)
+    if not agent:
+        return {"success": False, "error": "Agent is required"}
+    root, error = _chat_root(ws, agent)
+    if error or root is None:
+        return {"success": False, "error": error}
+    chat_id = uuid.uuid4().hex[:16]
+    metadata = _default_chat_metadata(ws, agent, chat_id)
+    session_id = uuid.uuid4().hex[:16]
+    state = _default_chat_state(ws, agent, chat_id, session_id=session_id)
+    metadata_path, metadata_error = _chat_metadata_path(ws, agent, chat_id)
+    state_path, state_error = _chat_state_path(ws, agent, chat_id)
+    if metadata_error or state_error or metadata_path is None or state_path is None:
+        return {"success": False, "error": metadata_error or state_error}
+    try:
+        _write_json_file(metadata_path, metadata)
+        _write_json_file(state_path, state)
+    except OSError as exc:
+        return {"success": False, "error": str(exc)}
+    session = UISession(
+        session_id=session_id,
+        chat_id=chat_id,
+        chat_ws=ws,
+        chat_agent=agent,
+    )
+    _sessions[session_id] = session
+    return {"success": True, "data": {"metadata": metadata, "state": state}}
+
+
+@app.get("/api/chats/{chat_id}")
+async def read_chat(chat_id: str, ws: str = "default.ws", agent: str = ""):
+    ws = _normalize_path_input(ws) or "default.ws"
+    agent = _normalize_path_input(agent)
+    if not agent:
+        return {"success": False, "error": "Agent is required"}
+    session = _find_session_by_chat(ws, agent, chat_id)
+    if session is None:
+        session, error = _load_chat_into_session(ws, agent, chat_id)
+        if error or session is None:
+            return {"success": False, "error": error}
+    metadata = _read_chat_metadata(ws, agent, chat_id)
+    state = _read_chat_state(ws, agent, chat_id)
+    if metadata is None or state is None:
+        return {"success": False, "error": "Chat not found"}
+    state = {**state, "backend_session_id": session.session_id, "status": "idle"}
+    metadata = {**metadata, "status": "idle" if metadata.get("status") == "running" else metadata.get("status", "idle")}
+    return {"success": True, "data": {"metadata": metadata, "state": state}}
+
+
+@app.delete("/api/chats/{chat_id}")
+async def delete_chat(chat_id: str, ws: str = "default.ws", agent: str = ""):
+    ws = _normalize_path_input(ws) or "default.ws"
+    agent = _normalize_path_input(agent)
+    if not agent:
+        return {"success": False, "error": "Agent is required"}
+    session = _find_session_by_chat(ws, agent, chat_id)
+    if session is not None and session.running:
+        return {"success": False, "error": "Chat is running; stop the task before deleting it"}
+    chat_path, error = _chat_dir(ws, agent, chat_id)
+    if error or chat_path is None:
+        return {"success": False, "error": error}
+    if not os.path.isdir(chat_path):
+        return {"success": False, "error": "Chat not found"}
+    try:
+        shutil.rmtree(chat_path)
+    except OSError as exc:
+        return {"success": False, "error": str(exc)}
+    if session is not None:
+        _sessions.pop(session.session_id, None)
+        _close_agent(session)
+    return {"success": True}
 
 
 @app.get("/api/usage/summary")

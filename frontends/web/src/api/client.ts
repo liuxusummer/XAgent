@@ -20,6 +20,8 @@ import type {
   AgentProfile,
   AgentProfileData,
   MemoryEntry,
+  ChatMetadata,
+  PersistentChatDetail,
   UsageSummary,
   TraceSessionDetail,
   TraceSessionList,
@@ -80,6 +82,30 @@ class ApiClient {
     return this.fetch('/api/chat/stop', {
       method: 'POST',
       body: JSON.stringify({ session_id: sessionId || '' }),
+    });
+  }
+
+  async listChats(ws: string, agent: string): Promise<ApiResponse<ChatMetadata[]>> {
+    const params = new URLSearchParams({ ws, agent });
+    return this.fetch(`/api/chats?${params.toString()}`);
+  }
+
+  async createChat(ws: string, agent: string): Promise<ApiResponse<PersistentChatDetail>> {
+    return this.fetch('/api/chats', {
+      method: 'POST',
+      body: JSON.stringify({ ws, agent }),
+    });
+  }
+
+  async readChat(ws: string, agent: string, chatId: string): Promise<ApiResponse<PersistentChatDetail>> {
+    const params = new URLSearchParams({ ws, agent });
+    return this.fetch(`/api/chats/${encodeURIComponent(chatId)}?${params.toString()}`);
+  }
+
+  async deleteChat(ws: string, agent: string, chatId: string): Promise<ApiResponse<void>> {
+    const params = new URLSearchParams({ ws, agent });
+    return this.fetch(`/api/chats/${encodeURIComponent(chatId)}?${params.toString()}`, {
+      method: 'DELETE',
     });
   }
 

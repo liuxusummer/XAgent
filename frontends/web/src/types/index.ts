@@ -8,6 +8,7 @@ export interface Message {
   thinking?: string;
   metadata?: {
     exitReason?: string;
+    completedAt?: number;
     turn?: number;
   };
 }
@@ -34,6 +35,37 @@ export interface ChatSession {
     workspaceDir?: string;
     agent?: string;
   };
+}
+
+export interface ChatMetadata {
+  chat_id: string;
+  workspace: string;
+  agent: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+  last_message_preview: string;
+  message_count: number;
+  status: 'idle' | 'running' | 'waiting_for_user' | 'interrupted' | string;
+}
+
+export interface ChatState {
+  chat_id: string;
+  workspace: string;
+  agent: string;
+  backend_session_id: string;
+  runtime_config_key: string;
+  messages: Message[];
+  llm_history: unknown[];
+  waiting_for_user: boolean;
+  ask_prompt: string;
+  status: 'idle' | 'running' | 'waiting_for_user' | 'interrupted' | string;
+  updated_at: number;
+}
+
+export interface PersistentChatDetail {
+  metadata: ChatMetadata;
+  state: ChatState;
 }
 
 export interface AgentStatus {
@@ -131,6 +163,7 @@ export interface TraceSessionDetail {
 export interface SubmitTaskRequest {
   task: string;
   session_id?: string;
+  chat_id?: string;
   config_path?: string;
   observability_config_path?: string;
   workspace_dir?: string;

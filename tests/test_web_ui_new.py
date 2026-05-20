@@ -3,6 +3,8 @@ from __future__ import annotations
 import tempfile
 import threading
 import unittest
+import queue
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,11 +24,15 @@ from src.web_ui_new import (
     EvalDatasetImportRequest,
     EvalRunCreateRequest,
     WorkspaceFileWriteRequest,
+    ChatCreateRequest,
     _agent_runtime_config,
     _eval_cancel_events,
     _queue_state,
     _resolve_workspace_dir_input,
     _sessions,
+    create_chat,
+    delete_chat,
+    list_chats,
     api_cancel_eval_run,
     api_create_eval_run,
     api_download_eval_dataset,
@@ -57,6 +63,7 @@ from src.web_ui_new import (
     _usage_summary_from_events,
     read_trace_session_detail,
     read_trace_sessions,
+    read_chat,
     read_usage_summary,
 )
 
@@ -133,6 +140,34 @@ class _EvalFakeAgent:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _HistoryBackend:
+    def __init__(self, history: list[dict] | None = None) -> None:
+        self.history = history or []
+
+
+class _HistoryFakeAgent(_FakeAgent):
+    def __init__(self, history: list[dict] | None = None) -> None:
+        super().__init__()
+        self.client = type("Client", (), {"backend": _HistoryBackend(history)})()
+        self.handler = type("H", (), {"ctx": type("C", (), {"verbose": False, "sink": None})()})()
+        self.display_queue = queue.Queue()
+        self.ran_tasks: list[str] = []
+
+    def run_task_async(self, task: str) -> None:
+        self.ran_tasks.append(task)
+        self.client.backend.history.append({"role": "user", "content": task})
+        self.display_queue.put(
+            {
+                "done": {
+                    "response": "ok",
+                    "exit_reason": "CURRENT_TASK_DONE",
+                    "tool_results": [],
+                    "turns": 1,
+                }
+            }
+        )
 
 
 class _FakeDownloadResponse:
@@ -425,6 +460,146 @@ class WebUINewUsageSummaryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(summary["totals"]["total_tokens"], 5)
         self.assertEqual(summary["sessions"][0]["usage"]["output_tokens"], 3)
+
+
+class WebUINewPersistentChatTests(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self) -> None:
+        _sessions.clear()
+
+    async def test_create_list_restore_and_delete_agent_chat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir()
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))):
+                created = await create_chat(ChatCreateRequest(ws="default.ws", agent="coding"))
+                self.assertTrue(created["success"])
+                chat_id = created["data"]["metadata"]["chat_id"]
+
+                listed = await list_chats(ws="default.ws", agent="coding")
+                restored = await read_chat(chat_id, ws="default.ws", agent="coding")
+                deleted = await delete_chat(chat_id, ws="default.ws", agent="coding")
+
+            self.assertEqual(listed["data"][0]["chat_id"], chat_id)
+            self.assertEqual(restored["data"]["metadata"]["chat_id"], chat_id)
+            self.assertTrue(deleted["success"])
+            self.assertFalse((Path(tmp_dir) / "default.ws" / "runtime" / "chats" / "coding" / chat_id).exists())
+
+    async def test_list_chats_is_scoped_by_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir()
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))):
+                coding = await create_chat(ChatCreateRequest(ws="default.ws", agent="coding"))
+                main = await create_chat(ChatCreateRequest(ws="default.ws", agent="main"))
+                coding_list = await list_chats(ws="default.ws", agent="coding")
+                main_list = await list_chats(ws="default.ws", agent="main")
+
+            self.assertEqual([item["chat_id"] for item in coding_list["data"]], [coding["data"]["metadata"]["chat_id"]])
+            self.assertEqual([item["chat_id"] for item in main_list["data"]], [main["data"]["metadata"]["chat_id"]])
+
+    async def test_chat_restore_rejects_unsafe_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir()
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))):
+                result = await read_chat("../bad", ws="default.ws", agent="coding")
+
+        self.assertFalse(result["success"])
+
+    async def test_submit_task_with_chat_id_persists_messages_and_llm_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            agent_dir = Path(tmp_dir) / "default.ws" / "system" / "agents" / "coding"
+            agent_dir.mkdir(parents=True)
+            (agent_dir / "AGENT.md").write_text(
+                '---\nname: "coding"\ntools: []\nskills: []\nproject_agents: []\n---\n\n# Coding\n',
+                encoding="utf-8",
+            )
+            fake_agent = _HistoryFakeAgent(history=[{"role": "user", "content": "before"}])
+
+            def _fake_build_agent(**_kwargs):
+                return fake_agent
+
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))),
+                patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
+                patch("src.web_ui_new.threading.Thread", _ImmediateThread),
+                patch.dict("os.environ", {"XAGENT_LOG_DIR": ""}, clear=False),
+            ):
+                created = await create_chat(ChatCreateRequest(ws="default.ws", agent="coding"))
+                chat_id = created["data"]["metadata"]["chat_id"]
+                result = await submit_task(
+                    SubmitTaskRequest(
+                        task="continue this",
+                        chat_id=chat_id,
+                        workspace_dir="default.ws",
+                        agent="coding",
+                    )
+                )
+                restored = await read_chat(chat_id, ws="default.ws", agent="coding")
+
+        self.assertTrue(result["success"])
+        messages = restored["data"]["state"]["messages"]
+        history = restored["data"]["state"]["llm_history"]
+        self.assertEqual(messages[0]["content"], "continue this")
+        self.assertTrue(any(item.get("content") == "continue this" for item in history))
+        self.assertEqual(restored["data"]["metadata"]["title"], "continue this")
+
+    async def test_restored_chat_history_is_applied_after_memory_session_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            agent_dir = Path(tmp_dir) / "default.ws" / "system" / "agents" / "coding"
+            agent_dir.mkdir(parents=True)
+            (agent_dir / "AGENT.md").write_text(
+                '---\nname: "coding"\ntools: []\nskills: []\nproject_agents: []\n---\n\n# Coding\n',
+                encoding="utf-8",
+            )
+            applied_agents: list[_HistoryFakeAgent] = []
+
+            def _fake_build_agent(**_kwargs):
+                agent = _HistoryFakeAgent()
+                applied_agents.append(agent)
+                return agent
+
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))),
+                patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
+                patch("src.web_ui_new.threading.Thread", _NoopThread),
+                patch.dict("os.environ", {"XAGENT_LOG_DIR": ""}, clear=False),
+            ):
+                created = await create_chat(ChatCreateRequest(ws="default.ws", agent="coding"))
+                chat_id = created["data"]["metadata"]["chat_id"]
+                state_path = Path(tmp_dir) / "default.ws" / "runtime" / "chats" / "coding" / chat_id / "state.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state["llm_history"] = [{"role": "user", "content": "saved context"}]
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                _sessions.clear()
+                restored = await read_chat(chat_id, ws="default.ws", agent="coding")
+                result = await submit_task(
+                    SubmitTaskRequest(
+                        task="next",
+                        session_id=restored["data"]["state"]["backend_session_id"],
+                        chat_id=chat_id,
+                        workspace_dir="default.ws",
+                        agent="coding",
+                    )
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(applied_agents[0].client.backend.history, [{"role": "user", "content": "saved context"}])
+
+    async def test_global_chat_without_chat_id_does_not_create_chat_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            fake_agent = _HistoryFakeAgent()
+
+            def _fake_build_agent(**_kwargs):
+                return fake_agent
+
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))),
+                patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
+                patch("src.web_ui_new.threading.Thread", _NoopThread),
+                patch.dict("os.environ", {"XAGENT_LOG_DIR": ""}, clear=False),
+            ):
+                result = await submit_task(SubmitTaskRequest(task="global", workspace_dir="default.ws"))
+
+        self.assertTrue(result["success"])
+        self.assertFalse((Path(tmp_dir) / "default.ws" / "runtime" / "chats").exists())
 
 
 class WebUINewWorkspaceFileTests(unittest.IsolatedAsyncioTestCase):
