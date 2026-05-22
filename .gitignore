@@ -57,6 +57,7 @@ dist-ssr/
 temp/
 logs/
 *.log
+workspace/**/runtime/
 
 
 AGENTS.md

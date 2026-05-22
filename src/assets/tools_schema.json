@@ -57,7 +57,7 @@
     "type": "function",
     "function": {
       "name": "file_search",
-      "description": "Search the current workspace file index by path and keyword content. Use this to locate candidate files quickly, then call file_read before relying on exact content or modifying files.",
+      "description": "Search the current workspace file index by path, keyword content, and optional semantic chunks. Use this to locate candidate files quickly, then call file_read before relying on exact content or modifying files.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -80,6 +80,11 @@
           "path_only": {
             "type": "boolean",
             "description": "When true, search only file names and paths, not file contents."
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["keyword", "semantic", "hybrid"],
+            "description": "Search mode. Defaults to hybrid. path_only=true forces keyword mode."
           }
         },
         "required": ["query"]

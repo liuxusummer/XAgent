@@ -323,8 +323,9 @@ BaseSession
 - 文件不存在时模糊匹配建议
 
 #### 4.2.3 file_search
-- 基于当前 workspace 的 `runtime/file_index.sqlite3` 做路径 / 全文关键词检索
+- 基于当前 workspace 的 `runtime/file_index.sqlite3` 做路径 / 全文关键词检索，可选启用 chunk 级语义向量检索
 - 首次搜索或 `refresh=true` 时增量刷新索引，按 `relative_path + mtime_ns + size` 判断文件是否变化
+- `mode=keyword|semantic|hybrid` 控制检索模式；默认 `hybrid`，但未配置 embedding 或缺少 `sqlite-vec` 时保持 FTS5 兼容降级
 - 只返回候选路径、行号、短片段和基础元信息；修改或依赖精确内容前仍需 `file_read`
 - `root` 只能位于当前 workspace 内，索引跳过二进制、超大文件、依赖/构建目录和 `runtime/**`
 
@@ -387,8 +388,8 @@ Handler 具有双重身份：分发器（`exec_*` 命名约定分发工具调用
 - 输出：`ActionResult(result, next_prompt)`
 
 ### 5.4 exec_file_search
-- Handler 只传入 `self.ctx.cwd`、`root`、`query`、`limit`、`refresh`、`path_only`，不持有索引状态
-- 纯函数在 workspace `runtime/file_index.sqlite3` 中维护 SQLite FTS5 索引
+- Handler 只传入 `self.ctx.cwd`、`root`、`query`、`limit`、`refresh`、`path_only`、`mode` 和可选 embedding 配置，不持有索引状态
+- 纯函数在 workspace `runtime/file_index.sqlite3` 中维护 SQLite FTS5 索引和可选语义 chunk/embedding 索引
 - 输出：`ActionResult(result, next_prompt)`，next_prompt 提醒搜索结果只用于定位，精读候选文件仍用 `file_read`
 
 ### 5.5 exec_file_patch

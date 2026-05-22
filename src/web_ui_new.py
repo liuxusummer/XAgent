@@ -21,6 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from src.config import load_config
+from src.core.XAgent import XAgent
 from src.core.telemetry import Event, JsonlSink, MultiSink, NullSink
 from src.core.eval import (
     EvalError,
@@ -77,6 +79,8 @@ class WorkspaceFileWriteRequest(BaseModel):
 class WorkspaceIndexRefreshRequest(BaseModel):
     ws: str = "default.ws"
     root: str = ""
+    semantic: bool = False
+    config_path: str = ""
 
 
 class EvalDatasetImportRequest(BaseModel):
@@ -805,6 +809,19 @@ def _find_session_by_chat(ws: str, agent: str, chat_id: str) -> UISession | None
         if session.chat_ws == ws and session.chat_agent == agent and session.chat_id == chat_id:
             return session
     return None
+
+
+def _file_index_embedding_config_from_path(config_path: str) -> dict[str, Any] | None:
+    normalized = _normalize_path_input(config_path)
+    if not normalized:
+        return None
+    try:
+        configs = load_config(normalized)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not configs:
+        return None
+    return XAgent._file_index_embedding_config(next(iter(configs.values())))
 
 
 def _ensure_agent(
@@ -1845,7 +1862,12 @@ async def refresh_workspace_index(request: WorkspaceIndexRefreshRequest):
     ws_root, error = _workspace_root(request.ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
-    result = refresh_file_index(root=request.root, cwd=ws_root)
+    result = refresh_file_index(
+        root=request.root,
+        cwd=ws_root,
+        semantic=request.semantic,
+        embedding_config=_file_index_embedding_config_from_path(request.config_path),
+    )
     if result.get("status") != "OK":
         return {"success": False, "error": result.get("error", "failed to refresh index"), "data": result}
     return {"success": True, "data": result}
@@ -1859,6 +1881,8 @@ async def search_workspace_index(
     limit: int = 20,
     refresh: bool = False,
     path_only: bool = False,
+    mode: str = "hybrid",
+    config_path: str = "",
 ):
     """Search the workspace file index."""
     ws_root, error = _workspace_root(ws)
@@ -1871,6 +1895,8 @@ async def search_workspace_index(
         limit=limit,
         refresh=refresh,
         path_only=path_only,
+        mode=mode,
+        embedding_config=_file_index_embedding_config_from_path(config_path),
     )
     if result.get("status") != "OK":
         return {"success": False, "error": result.get("error", "failed to search index"), "data": result}

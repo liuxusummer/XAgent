@@ -177,7 +177,7 @@ patch 是最危险的操作——改错一行可能破坏整个文件。唯一�
 
 ### 4.3 文件索引检索
 
-`file_search` 用于在当前 workspace 内快速定位文件名、路径片段、符号或文本片段。首版使用 Python 标准库 `sqlite3` 的 FTS5 能力，不引入向量库或后台任务。
+`file_search` 用于在当前 workspace 内快速定位文件名、路径片段、符号或文本片段。基础层使用 Python 标准库 `sqlite3` 的 FTS5 能力；可选二层语义检索使用 chunk 级 embedding + SQLite 存储增强召回，不替代 FTS5。
 
 关键契约：
 
@@ -185,6 +185,9 @@ patch 是最危险的操作——改错一行可能破坏整个文件。唯一�
 - 首次搜索或 `refresh=true` 时扫描并增量更新索引；增量依据 `relative_path + mtime_ns + size`
 - 只索引 UTF-8 文本文件，跳过二进制、超大文件、常见依赖/构建目录和 `runtime/**`
 - `root` 必须位于当前 workspace 内，避免检索工作区外路径
+- `mode=keyword|semantic|hybrid` 控制检索模式；`path_only=true` 强制只走路径/关键词检索
+- 语义检索默认关闭，仅在 `file_index_embedding.enabled=true` 或 `XAGENT_FILE_INDEX_EMBEDDING=1` 且 embedding 配置完整时启用
+- 语义索引数据同库保存为 `file_index_chunks`、`file_index_chunk_embeddings`，可用 `sqlite-vec` 时额外维护 `file_index_vec`；缺少依赖或 embedding 失败时降级为 FTS5 并返回诊断状态
 - 返回结果只作为候选，修改前必须继续 `file_read` 精读目标文件
 
 ### 4.4 文件引用展开

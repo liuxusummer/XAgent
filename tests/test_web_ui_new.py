@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import unittest
@@ -1002,6 +1003,48 @@ project_agents:
             self.assertFalse(result["success"])
             self.assertEqual(result["error"], "Invalid workspace name")
 
+    async def test_workspace_index_search_passes_embedding_config_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "default.ws"
+            root.mkdir()
+            config_path = Path(tmp_dir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "openai_text": {
+                            "apikey": "chat-key",
+                            "apibase": "https://example.com/chat/completions",
+                            "model": "chat-model",
+                            "file_index_embedding": {
+                                "enabled": True,
+                                "apibase": "https://example.com/v1/embeddings",
+                                "model": "embed-model",
+                                "dimension": 3,
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
+                patch("src.web_ui_new.search_file_index") as search_mock,
+            ):
+                search_mock.return_value = {"status": "OK", "matches": []}
+                result = await search_workspace_index(
+                    ws="default.ws",
+                    q="needle",
+                    mode="semantic",
+                    config_path=str(config_path),
+                )
+
+            self.assertTrue(result["success"])
+            embedding_config = search_mock.call_args.kwargs["embedding_config"]
+            nested = embedding_config["file_index_embedding"]
+            self.assertEqual(nested["apikey"], "chat-key")
+            self.assertEqual(nested["model"], "embed-model")
+
     async def test_workspace_preview_reads_workspace_text_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "default.ws"
@@ -1298,6 +1341,43 @@ project_agents:
             )
             try:
                 self.assertEqual(agent.client.backend.model, "agent-model")
+            finally:
+                agent.close()
+
+    def test_file_index_embedding_config_reaches_handler_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "openai_text": {
+                            "apikey": "chat-key",
+                            "apibase": "https://example.com/chat/completions",
+                            "model": "config-model",
+                            "file_index_embedding": {
+                                "enabled": True,
+                                "apibase": "https://example.com/v1/embeddings",
+                                "model": "embed-model",
+                                "dimension": 3,
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            agent = XAgent(
+                system_prompt="",
+                tools_schema=[],
+                config_path=str(config_path),
+                model="",
+                workspace_dir=str(Path(tmp_dir) / "default.ws"),
+            )
+            try:
+                cfg = agent.handler.ctx.file_index_embedding or {}
+                nested = cfg.get("file_index_embedding", {})
+                self.assertEqual(nested["apikey"], "chat-key")
+                self.assertEqual(nested["model"], "embed-model")
+                self.assertEqual(nested["dimension"], 3)
             finally:
                 agent.close()
 

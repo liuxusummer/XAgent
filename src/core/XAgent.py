@@ -8,7 +8,7 @@ from pathlib import Path
 from queue import Queue
 from typing import Any
 
-from src.config import create_client, load_config
+from src.config import SessionConfig, create_client, load_config
 from src.core.agent_loop import AgentContext, run_agent_loop
 from src.core.llm import MixinSession, NativeToolClient, OpenAITextSession, ToolClient
 from src.core.skills import SkillRegistry, dedupe_skill_names, select_skills
@@ -80,6 +80,7 @@ class XAgent:
     max_turns: int = 40
     agent_name: str = ""
     memory_mode: str = "project"
+    file_index_embedding_config: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.workspace_dir = resolve_workspace_dir(self.workspace_dir or self.cwd)
@@ -99,6 +100,7 @@ class XAgent:
                 memory_root=self.cwd,
                 agent_name=self.agent_name,
                 memory_mode=self.memory_mode,
+                file_index_embedding=self.file_index_embedding_config,
             ),
             task_dir=self.workspace_dir,
         )
@@ -115,6 +117,7 @@ class XAgent:
             configs = load_config(self.config_path)
             if configs:
                 first_config = next(iter(configs.values()))
+                self.file_index_embedding_config = self._file_index_embedding_config(first_config)
                 if self.model:
                     first_config.model = self.model
                 client = create_client(first_config)
@@ -137,6 +140,15 @@ class XAgent:
         client = ToolClient(backend=session)
         self._attach_stream_callback(client)
         return client
+
+    @staticmethod
+    def _file_index_embedding_config(config: SessionConfig) -> dict[str, Any] | None:
+        raw = config.extra.get("file_index_embedding")
+        if not isinstance(raw, dict):
+            return None
+        merged = dict(raw)
+        merged.setdefault("apikey", config.apikey)
+        return {"file_index_embedding": merged}
 
     def _attach_stream_callback(self, client: ToolClient | NativeToolClient) -> None:
         backend = getattr(client, "backend", None)

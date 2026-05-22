@@ -307,6 +307,7 @@ class XAgentHandler(BaseHandler):
             limit = int(args.get("limit", 20))
         except (TypeError, ValueError):
             limit = 20
+        mode = str(args.get("mode", "hybrid"))
         result = search_file_index(
             query=query,
             cwd=self.ctx.cwd or None,
@@ -314,6 +315,8 @@ class XAgentHandler(BaseHandler):
             limit=limit,
             refresh=bool(args.get("refresh", False)),
             path_only=bool(args.get("path_only", False)),
+            mode=mode,
+            embedding_config=self.ctx.file_index_embedding,
         )
         return ActionResult(
             data=result,

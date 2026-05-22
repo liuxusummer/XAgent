@@ -1,10 +1,39 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from src.tools.file_index import refresh_file_index, search_file_index
+
+
+class FakeEmbeddingProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        vectors = []
+        for text in texts:
+            lowered = text.lower()
+            if any(term in lowered for term in ("login", "signin", "sign in", "auth", "authentication")):
+                vectors.append([1.0, 0.0, 0.0])
+            elif any(term in lowered for term in ("billing", "invoice", "payment")):
+                vectors.append([0.0, 1.0, 0.0])
+            else:
+                vectors.append([0.0, 0.0, 1.0])
+        return vectors
+
+
+EMBEDDING_CONFIG = {
+    "file_index_embedding": {
+        "enabled": True,
+        "apibase": "https://example.com/v1/embeddings",
+        "model": "fake-embedding",
+        "dimension": 3,
+    }
+}
 
 
 class FileIndexTests(unittest.TestCase):
@@ -114,6 +143,208 @@ class FileIndexTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "OK")
             self.assertEqual([match["path"] for match in result["matches"]], ["b/target.txt"])
+
+    def test_semantic_search_uses_fake_embedding_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "auth.md").write_text("Authentication module accepts login credentials.\n", encoding="utf-8")
+            (root / "billing.md").write_text("Invoices and payment collection live here.\n", encoding="utf-8")
+
+            result = search_file_index(
+                query="sign in flow",
+                cwd=str(root),
+                refresh=True,
+                mode="semantic",
+                embedding_config=EMBEDDING_CONFIG,
+                embedding_provider=FakeEmbeddingProvider(),
+            )
+
+            self.assertEqual(result["status"], "OK")
+            self.assertEqual(result["semantic_status"]["status"], "OK")
+            self.assertEqual(result["matches"][0]["path"], "auth.md")
+            self.assertEqual(result["matches"][0]["match_type"], "semantic")
+            self.assertIn("signals", result["matches"][0])
+
+    def test_semantic_search_can_return_multiple_chunks_from_same_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "auth.md").write_text(
+                "# Login\nAuthentication module accepts login credentials.\n"
+                "# Sign in\nSign in flow validates authentication tokens.\n",
+                encoding="utf-8",
+            )
+
+            result = search_file_index(
+                query="sign in flow",
+                cwd=str(root),
+                refresh=True,
+                mode="semantic",
+                limit=2,
+                embedding_config=EMBEDDING_CONFIG,
+                embedding_provider=FakeEmbeddingProvider(),
+            )
+
+            self.assertEqual(result["status"], "OK")
+            self.assertEqual([match["path"] for match in result["matches"]], ["auth.md", "auth.md"])
+            self.assertEqual([match["start_line"] for match in result["matches"]], [1, 3])
+
+    def test_hybrid_search_merges_keyword_and_semantic_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "auth.md").write_text("Authentication module accepts login credentials.\n", encoding="utf-8")
+            (root / "billing.md").write_text("Invoices and payment collection live here.\n", encoding="utf-8")
+
+            result = search_file_index(
+                query="billing sign in",
+                cwd=str(root),
+                refresh=True,
+                mode="hybrid",
+                embedding_config=EMBEDDING_CONFIG,
+                embedding_provider=FakeEmbeddingProvider(),
+            )
+
+            self.assertEqual(result["status"], "OK")
+            paths = [match["path"] for match in result["matches"]]
+            self.assertIn("auth.md", paths)
+            self.assertIn("billing.md", paths)
+            self.assertTrue(all(match["match_type"] == "hybrid" for match in result["matches"]))
+
+    def test_semantic_root_filters_results_before_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a").mkdir()
+            (root / "b").mkdir()
+            (root / "a" / "auth.md").write_text("Authentication module accepts login credentials.\n", encoding="utf-8")
+            (root / "b" / "auth.md").write_text("Authentication module accepts login credentials.\n", encoding="utf-8")
+
+            result = search_file_index(
+                query="sign in",
+                cwd=str(root),
+                root="b",
+                refresh=True,
+                mode="semantic",
+                limit=1,
+                embedding_config=EMBEDDING_CONFIG,
+                embedding_provider=FakeEmbeddingProvider(),
+            )
+
+            self.assertEqual(result["status"], "OK")
+            self.assertEqual([match["path"] for match in result["matches"]], ["b/auth.md"])
+
+    def test_semantic_refresh_removes_deleted_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "auth.md"
+            target.write_text("Authentication module accepts login credentials.\n", encoding="utf-8")
+            self.assertEqual(
+                search_file_index(
+                    query="sign in",
+                    cwd=str(root),
+                    refresh=True,
+                    mode="semantic",
+                    embedding_config=EMBEDDING_CONFIG,
+                    embedding_provider=FakeEmbeddingProvider(),
+                )["status"],
+                "OK",
+            )
+
+            target.unlink()
+            result = search_file_index(
+                query="sign in",
+                cwd=str(root),
+                refresh=True,
+                mode="semantic",
+                embedding_config=EMBEDDING_CONFIG,
+                embedding_provider=FakeEmbeddingProvider(),
+            )
+
+            self.assertEqual(result["status"], "OK")
+            self.assertEqual(result["matches"], [])
+
+    def test_hybrid_search_does_not_embed_query_when_semantic_index_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "target.txt").write_text("needle\n", encoding="utf-8")
+            self.assertEqual(search_file_index(query="needle", cwd=str(root), mode="keyword")["status"], "OK")
+            provider = FakeEmbeddingProvider()
+
+            result = search_file_index(
+                query="needle",
+                cwd=str(root),
+                mode="hybrid",
+                embedding_config=EMBEDDING_CONFIG,
+                embedding_provider=provider,
+            )
+
+            self.assertEqual(result["status"], "OK")
+            self.assertEqual(provider.calls, 0)
+            self.assertEqual(result["semantic_status"]["status"], "EMPTY")
+            self.assertEqual(result["matches"][0]["path"], "target.txt")
+
+    def test_long_single_line_text_is_split_into_multiple_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "long.txt").write_text("authentication " * 700, encoding="utf-8")
+
+            refresh = refresh_file_index(
+                cwd=str(root),
+                semantic=True,
+                embedding_config=EMBEDDING_CONFIG,
+                embedding_provider=FakeEmbeddingProvider(),
+            )
+
+            self.assertEqual(refresh["status"], "OK")
+            with sqlite3.connect(root / "runtime" / "file_index.sqlite3") as conn:
+                count, max_len = conn.execute(
+                    "SELECT COUNT(*), max(length(content)) FROM file_index_chunks WHERE path = 'long.txt'"
+                ).fetchone()
+            self.assertGreater(count, 1)
+            self.assertLessEqual(max_len, 3000)
+
+    def test_failed_embedding_refresh_removes_partial_chunks(self) -> None:
+        class FailingProvider:
+            def embed_texts(self, texts: list[str]) -> list[list[float]]:
+                raise RuntimeError("boom")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "target.txt").write_text("needle\n", encoding="utf-8")
+
+            refresh = refresh_file_index(
+                cwd=str(root),
+                semantic=True,
+                embedding_config=EMBEDDING_CONFIG,
+                embedding_provider=FailingProvider(),
+            )
+
+            self.assertEqual(refresh["status"], "OK")
+            self.assertEqual(refresh["semantic_status"]["status"], "ERROR")
+            with sqlite3.connect(root / "runtime" / "file_index.sqlite3") as conn:
+                count = conn.execute("SELECT COUNT(*) FROM file_index_chunks WHERE path = 'target.txt'").fetchone()[0]
+            self.assertEqual(count, 0)
+
+    def test_semantic_failure_degrades_to_keyword_results(self) -> None:
+        class FailingProvider:
+            def embed_texts(self, texts: list[str]) -> list[list[float]]:
+                raise RuntimeError("boom")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "target.txt").write_text("needle\n", encoding="utf-8")
+
+            result = search_file_index(
+                query="needle",
+                cwd=str(root),
+                refresh=True,
+                mode="hybrid",
+                embedding_config=EMBEDDING_CONFIG,
+                embedding_provider=FailingProvider(),
+            )
+
+            self.assertEqual(result["status"], "OK")
+            self.assertEqual(result["matches"][0]["path"], "target.txt")
+            self.assertEqual(result["refresh_stats"]["semantic_status"]["status"], "ERROR")
+            self.assertEqual(result["semantic_status"]["status"], "EMPTY")
 
 
 if __name__ == "__main__":

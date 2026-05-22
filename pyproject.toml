@@ -14,6 +14,9 @@ web = [
     "gradio>=5.0.0",
     "selenium>=4.0.0",
 ]
+semantic-search = [
+    "sqlite-vec>=0.1.9,<0.2",
+]
 
 [dependency-groups]
 dev = []
