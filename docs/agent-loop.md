@@ -164,10 +164,11 @@ class TurnEndHook:
 |---|---|---|
 | `external_intervene` | 30 | 检查文件信号（`_keyinfo`、`_intervene`），允许运行时从外部注入指令 |
 | `plan_reminder` | 25 | 每 15 轮注入 `plan.md` 预览（前 400 字），提醒对齐计划；本轮已调 `plan_update` 则跳过 |
+| `self_evolution` | 23 | 从本轮失败/空转工具结果沉淀经验，并注入换策略提示 |
 | `periodic_inject` | 20 | 按轮次间隔注入防重试警告、全局记忆、强制 ask_user |
 | `summary_extract` | 10 | 从 LLM 回复中提取 `<summary>`，写入对话摘要历史 |
 
-优先级规则：外部干预 > Plan 对齐 > 周期性注入 > 摘要提取。外部干预可以覆盖其他注入内容。
+优先级规则：外部干预 > Plan 对齐 > 自我进化 > 周期性注入 > 摘要提取。外部干预可以覆盖其他注入内容。
 
 `turn_end_callback` 的实现变为分发器：
 

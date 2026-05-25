@@ -378,14 +378,13 @@ def run_agent_loop(
 
         if not response.tool_calls:
             result = handle_no_tool_call(handler, response)
-            all_tool_results.append(
-                {
-                    "tool_name": "no_tool",
-                    "tool_call_id": "",
-                    "data": result.data,
-                }
-            )
-            turn_end_prompt = handler.turn_end_callback(response, [])
+            no_tool_result = {
+                "tool_name": "no_tool",
+                "tool_call_id": "",
+                "data": result.data,
+            }
+            all_tool_results.append(no_tool_result)
+            turn_end_prompt = handler.turn_end_callback(response, [no_tool_result])
             _emit_turn_end(0)
             if result.should_exit or result.next_prompt == "":
                 exit_reason = "EXITED"

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from src.core.agent_loop import ActionResult, AgentContext, BaseHandler, TurnEndHook
-from src.core.memory import load_effective_memory, load_global_memory
+from src.core.memory import load_effective_memory, load_global_memory, record_self_evolution_lesson
 from src.core.skills import SkillRegistry, dedupe_skill_names, render_active_skills
 from src.core.telemetry import Event
 from src.tools import ask_user, delete_file, patch_file, plan_update, read_file, search_file_index, start_long_term_update, update_working_checkpoint, web_execute_js, web_scan, write_file
@@ -21,6 +21,14 @@ CODE_BLOCK_PATTERN = re.compile(r"```(?:[\w+-]+)?\n?([\s\S]*?)```", re.DOTALL)
 MAX_HISTORY_INFO_ENTRIES = 60
 PLAN_REMIND_INTERVAL = 15
 PLAN_PREVIEW_CHARS = 400
+PROBLEM_STATUSES = {
+    "ERROR",
+    "SKIP",
+    "TIMEOUT",
+    "EMPTY_RESPONSE",
+    "RETRYABLE_RESPONSE_ERROR",
+    "CODE_BLOCK_WITHOUT_TOOL",
+}
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
@@ -46,6 +54,7 @@ class XAgentHandler(BaseHandler):
         self._turn_end_hooks.extend([
             TurnEndHook(name="external_intervene", fn=self._external_intervene_hook, priority=30),
             TurnEndHook(name="plan_reminder", fn=self._plan_reminder_hook, priority=25),
+            TurnEndHook(name="self_evolution", fn=self._self_evolution_hook, priority=23),
             TurnEndHook(name="periodic_inject", fn=self._periodic_inject_hook, priority=20),
             TurnEndHook(name="summary_extract", fn=self._summary_extract_hook, priority=10),
         ])
@@ -124,6 +133,79 @@ class XAgentHandler(BaseHandler):
                 f"[DANGER] 已连续执行第 {turn} 轮。必须总结当前情况并调用 ask_user 请求用户确认。"
             )
         return "\n".join(parts) if parts else None
+
+    def _self_evolution_hook(
+        self,
+        response,
+        tool_results,
+        ctx: AgentContext,
+    ) -> str | None:
+        del response
+        issue = self._select_self_evolution_issue(tool_results)
+        if issue is None:
+            return None
+
+        memory_root_value = ctx.memory_root or ctx.cwd
+        if memory_root_value:
+            record = record_self_evolution_lesson(
+                Path(memory_root_value),
+                issue["lesson"],
+                agent_name=getattr(ctx, "agent_name", ""),
+            )
+            record_status = str(record.get("status", "UNKNOWN"))
+        else:
+            record_status = "SKIP"
+        if record_status == "OK":
+            memory_note = "经验已写入或已存在于自我进化记忆。"
+        elif record_status == "SKIP":
+            memory_note = "当前未配置记忆根目录，本轮仅注入策略修正。"
+        else:
+            memory_note = "经验写入失败，本轮仍必须按该经验调整策略。"
+
+        return (
+            "[Self Evolution]\n"
+            f"检测到本轮问题：{issue['problem']}。\n"
+            f"已沉淀经验：{issue['lesson']}\n"
+            f"{memory_note}\n"
+            "下一轮必须先判断根因并选择最优路径：优先补充探测信息、换更小验证步骤或切换方案；"
+            "不要重复同一失败动作。只有缺少外部决策时才调用 ask_user。"
+        )
+
+    def _select_self_evolution_issue(self, tool_results: list[dict[str, Any]]) -> dict[str, str] | None:
+        for result in tool_results:
+            data = result.get("data")
+            if not isinstance(data, dict):
+                continue
+            status = str(data.get("status", "")).strip().upper()
+            has_error = "error" in data and bool(data.get("error"))
+            if status not in PROBLEM_STATUSES and not (has_error and not status):
+                continue
+            tool_name = str(result.get("tool_name", "tool"))
+            return self._build_self_evolution_issue(tool_name, status or "ERROR")
+        return None
+
+    @staticmethod
+    def _build_self_evolution_issue(tool_name: str, status: str) -> dict[str, str]:
+        problem = f"{tool_name} 返回 {status}"
+        if tool_name == "file_patch":
+            lesson = "file_patch 失败后先用 file_read 精读目标片段，再用唯一 old_content 重试。"
+        elif tool_name == "file_read":
+            lesson = "file_read 失败后先用 file_search 或检查 workspace 路径候选，再重试。"
+        elif tool_name == "code_run":
+            lesson = "code_run 失败后先阅读 stdout/stderr 和环境状态，用更小脚本验证根因再继续。"
+        elif tool_name in {"web_scan", "web_execute_js"}:
+            lesson = "浏览器工具失败后先确认当前 session 和页面状态，必要时缩小 JS 查询范围。"
+        elif tool_name == "no_tool" and status == "CODE_BLOCK_WITHOUT_TOOL":
+            lesson = "需要执行或验证代码时必须调用 code_run；仅汇报结果时不要输出代码块。"
+        elif tool_name == "no_tool" and status == "EMPTY_RESPONSE":
+            lesson = "空响应后必须直接给最终答案或调用合适工具继续，禁止继续空转。"
+        elif tool_name == "no_tool" and status == "RETRYABLE_RESPONSE_ERROR":
+            lesson = "响应截断或流异常后应缩短输出，重试必要工具调用并避免大段一次性输出。"
+        elif status == "SKIP":
+            lesson = "工具返回 SKIP 时先识别授权或能力边界，换可行路径；必要时再请求用户确认。"
+        else:
+            lesson = "工具失败后不要原样重试；先判断根因，补充探测信息或切换更小的验证步骤。"
+        return {"problem": problem, "lesson": lesson}
 
     def _plan_reminder_hook(
         self,

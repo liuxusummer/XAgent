@@ -136,6 +136,8 @@ XAgent/
   - 通过 `TurnEndHook(name, fn, priority)` 注册，按优先级降序执行
   - 默认注册的钩子：
     - `external_intervene`（priority=30）：`_keyinfo` / `_intervene` 文件注入
+    - `plan_reminder`（priority=25）：每 15 轮注入 plan.md 预览，提醒对齐计划
+    - `self_evolution`（priority=23）：从失败/空转工具结果沉淀经验并注入换策略提示
     - `periodic_inject`（priority=20）：每7轮防重试警告、每10轮全局记忆、每65轮强制 ask_user
     - `summary_extract`（priority=10）：提取 `<summary>` 写入 `ctx.history_info`，无 summary 时强制提醒
   - 准入条件：只允许注册轮次级横切关注点（需感知 `current_turn` 或 `response` 全文）

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.core.agent_loop import AgentContext
+from src.core.agent_loop import AgentContext, BaseHandler, TurnEndHook, run_agent_loop
 from src.core.llm import ChatResponse
 from src.core.memory import (
     load_agent_memory,
@@ -14,6 +14,7 @@ from src.core.memory import (
     load_global_memory,
     load_memory_sop,
     load_workspace_memory,
+    record_self_evolution_lesson,
 )
 from src.handler import XAgentHandler
 from src.main import build_system_prompt
@@ -158,6 +159,51 @@ class MemoryProviderTests(unittest.TestCase):
             self.assertEqual(result.content, "")
             self.assertEqual(result.files[0].error, "invalid_name")
 
+    def test_record_self_evolution_lesson_uses_workspace_memory_without_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+
+            result = record_self_evolution_lesson(root, "  避免重复失败  ")
+
+            target = root / "system" / "memory" / "self_evolution.md"
+            self.assertEqual(result["status"], "OK")
+            self.assertTrue(result["written"])
+            self.assertIn("## 自我进化经验", target.read_text(encoding="utf-8"))
+            self.assertIn("- 避免重复失败", target.read_text(encoding="utf-8"))
+
+    def test_record_self_evolution_lesson_uses_agent_private_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            target = root / "system" / "agents" / "main" / "MEMORY.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("# Main Memory\n\n## 稳定事实\n- keep\n", encoding="utf-8")
+
+            result = record_self_evolution_lesson(root, "先探测再重试", agent_name="main")
+
+            content = target.read_text(encoding="utf-8")
+            self.assertEqual(result["status"], "OK")
+            self.assertIn("# Main Memory", content)
+            self.assertIn("## 稳定事实\n- keep", content)
+            self.assertIn("## 自我进化经验\n\n- 先探测再重试", content)
+
+    def test_record_self_evolution_lesson_dedupes_and_caps_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+
+            first = record_self_evolution_lesson(root, "lesson-1", max_lessons=2)
+            duplicate = record_self_evolution_lesson(root, "lesson-1", max_lessons=2)
+            second = record_self_evolution_lesson(root, "lesson-2", max_lessons=2)
+            third = record_self_evolution_lesson(root, "lesson-3", max_lessons=2)
+
+            content = (root / "system" / "memory" / "self_evolution.md").read_text(encoding="utf-8")
+            self.assertTrue(first["written"])
+            self.assertFalse(duplicate["written"])
+            self.assertTrue(second["written"])
+            self.assertTrue(third["written"])
+            self.assertNotIn("lesson-1", content)
+            self.assertIn("- lesson-2", content)
+            self.assertIn("- lesson-3", content)
+
 
 class MemoryProviderIntegrationTests(unittest.TestCase):
     def test_build_system_prompt_keeps_memory_block_content(self) -> None:
@@ -292,6 +338,88 @@ class MemoryProviderIntegrationTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "OK")
             self.assertEqual(result["sop_content"], "")
+
+    def test_self_evolution_hook_persists_lesson_and_injects_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            handler = XAgentHandler(ctx=AgentContext(memory_root=str(root), agent_name="main"))
+
+            prompt = handler._self_evolution_hook(  # noqa: SLF001
+                response=ChatResponse(thinking="", content="", tool_calls=[]),
+                tool_results=[
+                    {
+                        "tool_name": "file_patch",
+                        "tool_call_id": "1",
+                        "data": {"status": "ERROR", "error": "no match"},
+                    }
+                ],
+                ctx=handler.ctx,
+            )
+
+            memory = root / "system" / "agents" / "main" / "MEMORY.md"
+            self.assertIsNotNone(prompt)
+            assert prompt is not None
+            self.assertIn("[Self Evolution]", prompt)
+            self.assertIn("file_patch 返回 ERROR", prompt)
+            self.assertIn("file_read 精读目标片段", memory.read_text(encoding="utf-8"))
+
+    def test_self_evolution_hook_skips_ok_tool_results(self) -> None:
+        handler = XAgentHandler(ctx=AgentContext())
+
+        prompt = handler._self_evolution_hook(  # noqa: SLF001
+            response=ChatResponse(thinking="", content="", tool_calls=[]),
+            tool_results=[
+                {
+                    "tool_name": "file_read",
+                    "tool_call_id": "1",
+                    "data": {"status": "OK", "content": "done"},
+                }
+            ],
+            ctx=handler.ctx,
+        )
+
+        self.assertIsNone(prompt)
+
+    def test_run_agent_loop_passes_no_tool_result_to_turn_end_hooks(self) -> None:
+        class DummyClient:
+            def __init__(self) -> None:
+                self.responses = [
+                    ChatResponse(thinking="", content="", tool_calls=[]),
+                    ChatResponse(thinking="", content="任务完成", tool_calls=[]),
+                ]
+                self.calls = 0
+                self.backend = type("Backend", (), {"history": []})()
+
+            def chat(self, messages, tools):  # noqa: ANN001
+                del messages, tools
+                response = self.responses[self.calls]
+                self.calls += 1
+                return response
+
+        class CaptureTurnEndHandler(BaseHandler):
+            def __init__(self) -> None:
+                super().__init__(ctx=AgentContext())
+                self.seen_tool_results: list[list[dict]] = []
+                self._turn_end_hooks.append(TurnEndHook(name="capture", fn=self._capture, priority=1))
+
+            def _capture(self, response, tool_results, ctx):  # noqa: ANN001
+                del response, ctx
+                self.seen_tool_results.append(tool_results)
+                return None
+
+        handler = CaptureTurnEndHandler()
+
+        run_agent_loop(
+            client=DummyClient(),
+            system_prompt="sys",
+            user_input="go",
+            handler=handler,
+            tools_schema=[],
+            max_turns=5,
+        )
+
+        self.assertEqual(handler.seen_tool_results[0][0]["tool_name"], "no_tool")
+        self.assertEqual(handler.seen_tool_results[0][0]["data"]["status"], "EMPTY_RESPONSE")
 
 
 if __name__ == "__main__":

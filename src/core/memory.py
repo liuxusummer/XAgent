@@ -8,6 +8,9 @@ BOOT_MEMORY_FILES = ("global_mem_insight.txt", "insight_fixed_structure.txt")
 GLOBAL_MEMORY_FILE = "global_mem.txt"
 DEFAULT_MEMORY_SOP = "memory_management_sop.md"
 AGENT_MEMORY_FILE = "MEMORY.md"
+SELF_EVOLUTION_MEMORY_FILE = "self_evolution.md"
+SELF_EVOLUTION_HEADER = "## 自我进化经验"
+MAX_SELF_EVOLUTION_LESSONS = 20
 WORKSPACE_MEMORY_DIR = Path("system") / "memory"
 WORKSPACE_AGENT_DIR = Path("system") / "agents"
 WORKSPACE_MEMORY_SUFFIXES = {".md", ".txt"}
@@ -195,3 +198,134 @@ def load_memory_sop(
         status = _empty_status(name, root / name, exists=False, error="invalid_name")
         return MemoryReadResult(content="", files=(status,))
     return _read_files(root, (name,))
+
+
+def _normalize_lesson(lesson: str) -> str:
+    return " ".join(str(lesson or "").split())
+
+
+def _self_evolution_target(workspace_root: Path, agent_name: str) -> Path:
+    if _safe_child_name(agent_name):
+        return workspace_root / WORKSPACE_AGENT_DIR / agent_name / AGENT_MEMORY_FILE
+    return workspace_root / WORKSPACE_MEMORY_DIR / SELF_EVOLUTION_MEMORY_FILE
+
+
+def _replace_self_evolution_section(content: str, lessons: list[str]) -> str:
+    section_lines = [SELF_EVOLUTION_HEADER, ""]
+    section_lines.extend(f"- {item}" for item in lessons)
+
+    lines = content.splitlines()
+    header_idx = next(
+        (index for index, line in enumerate(lines) if line.strip() == SELF_EVOLUTION_HEADER),
+        None,
+    )
+    if header_idx is None:
+        prefix = content.rstrip()
+        section = "\n".join(section_lines)
+        return f"{prefix}\n\n{section}\n" if prefix else f"{section}\n"
+
+    end_idx = header_idx + 1
+    while end_idx < len(lines):
+        stripped = lines[end_idx].strip()
+        if stripped.startswith("## ") and stripped != SELF_EVOLUTION_HEADER:
+            break
+        end_idx += 1
+
+    new_lines = lines[:header_idx]
+    while new_lines and not new_lines[-1].strip():
+        new_lines.pop()
+    if new_lines:
+        new_lines.append("")
+    new_lines.extend(section_lines)
+    suffix = lines[end_idx:]
+    if suffix:
+        new_lines.append("")
+        new_lines.extend(suffix)
+    return "\n".join(new_lines).rstrip() + "\n"
+
+
+def record_self_evolution_lesson(
+    workspace_root: str | Path,
+    lesson: str,
+    agent_name: str = "",
+    max_lessons: int = MAX_SELF_EVOLUTION_LESSONS,
+) -> dict[str, object]:
+    normalized = _normalize_lesson(lesson)
+    root = _memory_root_path(workspace_root)
+    target = _self_evolution_target(root, agent_name)
+    if not normalized:
+        return {
+            "status": "SKIP",
+            "error": "empty lesson",
+            "path": str(target),
+            "lesson": "",
+            "written": False,
+        }
+
+    try:
+        content = target.read_text(encoding="utf-8") if target.is_file() else ""
+    except OSError as exc:
+        return {
+            "status": "ERROR",
+            "error": type(exc).__name__,
+            "path": str(target),
+            "lesson": normalized,
+            "written": False,
+        }
+    except UnicodeError as exc:
+        return {
+            "status": "ERROR",
+            "error": type(exc).__name__,
+            "path": str(target),
+            "lesson": normalized,
+            "written": False,
+        }
+
+    lines = content.splitlines()
+    header_idx = next(
+        (index for index, line in enumerate(lines) if line.strip() == SELF_EVOLUTION_HEADER),
+        None,
+    )
+    existing: list[str] = []
+    if header_idx is not None:
+        end_idx = header_idx + 1
+        while end_idx < len(lines):
+            stripped = lines[end_idx].strip()
+            if stripped.startswith("## ") and stripped != SELF_EVOLUTION_HEADER:
+                break
+            if stripped.startswith("- "):
+                existing.append(_normalize_lesson(stripped[2:]))
+            end_idx += 1
+
+    if normalized in existing:
+        return {
+            "status": "OK",
+            "path": str(target),
+            "lesson": normalized,
+            "written": False,
+        }
+
+    limit = max(1, int(max_lessons))
+    lessons = [item for item in existing if item]
+    lessons.append(normalized)
+    lessons = lessons[-limit:]
+    updated = _replace_self_evolution_section(content, lessons)
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        return {
+            "status": "ERROR",
+            "error": type(exc).__name__,
+            "path": str(target),
+            "lesson": normalized,
+            "written": False,
+        }
+
+    return {
+        "status": "OK",
+        "path": str(target),
+        "lesson": normalized,
+        "written": True,
+    }
