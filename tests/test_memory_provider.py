@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from src.core.XAgent import XAgent
 from src.core.agent_loop import AgentContext, BaseHandler, TurnEndHook, run_agent_loop
 from src.core.llm import ChatResponse
 from src.core.memory import (
@@ -15,6 +17,12 @@ from src.core.memory import (
     load_memory_sop,
     load_workspace_memory,
     record_self_evolution_lesson,
+)
+from src.core.runbook import (
+    RUNBOOK_SKILL_NAME,
+    RUNBOOK_TASK_ID,
+    distill_runbook_from_task,
+    ensure_runbook_template,
 )
 from src.handler import XAgentHandler
 from src.main import build_system_prompt
@@ -420,6 +428,204 @@ class MemoryProviderIntegrationTests(unittest.TestCase):
 
         self.assertEqual(handler.seen_tool_results[0][0]["tool_name"], "no_tool")
         self.assertEqual(handler.seen_tool_results[0][0]["data"]["status"], "EMPTY_RESPONSE")
+
+
+class RunbookDistillationTests(unittest.TestCase):
+    def test_short_task_below_interaction_threshold_skips_without_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "demo.ws"
+            workspace.mkdir()
+
+            record = distill_runbook_from_task(
+                workspace,
+                "Quick answer",
+                {"exit_reason": "CURRENT_TASK_DONE", "turns": 1, "tool_results": []},
+            )
+
+            self.assertEqual(record["status"], "SKIP")
+            self.assertEqual(record["error"], "insufficient_interaction_records")
+            self.assertEqual(record["interaction_records"], 1)
+            self.assertEqual(record["min_interaction_records"], 10)
+            self.assertFalse((workspace / "system" / "skills" / RUNBOOK_SKILL_NAME / "SKILL.md").exists())
+            self.assertFalse((workspace / "runtime" / "tasks" / "tasks.json").exists())
+
+    def test_successful_task_creates_skill_template_and_review_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "demo.ws"
+            workspace.mkdir()
+            result = {
+                "exit_reason": "CURRENT_TASK_DONE",
+                "turns": 8,
+                "tool_results": [
+                    {
+                        "tool_name": "file_read",
+                        "tool_call_id": "1",
+                        "data": {"status": "OK", "content": "secret full file content"},
+                    },
+                    {"tool_name": "file_patch", "tool_call_id": "2", "data": {"status": "OK"}},
+                ],
+            }
+
+            record = distill_runbook_from_task(workspace, "Update config safely", result, agent_name="coding")
+
+            self.assertEqual(record["status"], "OK")
+            self.assertEqual(record["outcome"], "success")
+            skill = workspace / "system" / "skills" / RUNBOOK_SKILL_NAME / "SKILL.md"
+            meta = workspace / "system" / "skills" / RUNBOOK_SKILL_NAME / "_meta.json"
+            template = workspace / "system" / "templates" / "runbook-sop.md"
+            task_store = workspace / "runtime" / "tasks" / "tasks.json"
+            skill_text = skill.read_text(encoding="utf-8")
+            self.assertIn("Outcome: `success`", skill_text)
+            self.assertIn("file_read:OK -> file_patch:OK", skill_text)
+            self.assertNotIn("secret full file content", skill_text)
+            self.assertTrue(template.exists())
+            self.assertEqual(json.loads(meta.read_text(encoding="utf-8"))["name"], RUNBOOK_SKILL_NAME)
+            tasks = json.loads(task_store.read_text(encoding="utf-8"))["tasks"]
+            review = next(item for item in tasks if item["id"] == RUNBOOK_TASK_ID)
+            self.assertEqual(review["name"], "Runbook Auto Distillation Review")
+            self.assertEqual(review["agent"], "coding")
+            self.assertEqual(review["workspace"], "demo.ws")
+
+    def test_failed_task_creates_failure_caution_without_raw_error_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "demo.ws"
+            workspace.mkdir()
+            result = {
+                "exit_reason": "CURRENT_TASK_DONE",
+                "turns": 9,
+                "tool_results": [
+                    {
+                        "tool_name": "code_run",
+                        "tool_call_id": "1",
+                        "data": {
+                            "status": "ERROR",
+                            "error": "secret stack trace",
+                            "stdout": "secret stdout",
+                        },
+                    }
+                ],
+            }
+
+            record = distill_runbook_from_task(workspace, "Run migration", result, agent_name="main")
+
+            self.assertEqual(record["outcome"], "failure")
+            skill_text = (workspace / "system" / "skills" / RUNBOOK_SKILL_NAME / "SKILL.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("Outcome: `failure`", skill_text)
+            self.assertIn("code_run:ERROR", skill_text)
+            self.assertIn("Failure trace distilled", skill_text)
+            self.assertNotIn("secret stack trace", skill_text)
+            self.assertNotIn("secret stdout", skill_text)
+
+    def test_entries_are_deduped_and_capped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "demo.ws"
+            workspace.mkdir()
+            ok_result = {"exit_reason": "CURRENT_TASK_DONE", "turns": 10, "tool_results": []}
+
+            distill_runbook_from_task(workspace, "Task A", ok_result, max_entries=2)
+            distill_runbook_from_task(workspace, "Task A", ok_result, max_entries=2)
+            distill_runbook_from_task(workspace, "Task B", ok_result, max_entries=2)
+            distill_runbook_from_task(workspace, "Task C", ok_result, max_entries=2)
+
+            skill_text = (workspace / "system" / "skills" / RUNBOOK_SKILL_NAME / "SKILL.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertEqual(skill_text.count("- Key: `"), 2)
+            self.assertNotIn("### Task A", skill_text)
+            self.assertIn("### Task B", skill_text)
+            self.assertIn("### Task C", skill_text)
+
+    def test_template_creation_preserves_existing_user_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            template = workspace / "system" / "templates" / "runbook-sop.md"
+            template.parent.mkdir(parents=True)
+            template.write_text("custom template", encoding="utf-8")
+
+            ensure_runbook_template(workspace)
+
+            self.assertEqual(template.read_text(encoding="utf-8"), "custom template")
+
+    def test_review_task_upsert_preserves_unrelated_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "demo.ws"
+            task_store = workspace / "runtime" / "tasks" / "tasks.json"
+            task_store.parent.mkdir(parents=True)
+            task_store.write_text(
+                json.dumps({"tasks": [{"id": "keep", "name": "Keep me"}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            distill_runbook_from_task(
+                workspace,
+                "Task",
+                {"exit_reason": "CURRENT_TASK_DONE", "turns": 10, "tool_results": []},
+            )
+            distill_runbook_from_task(
+                workspace,
+                "Task again",
+                {"exit_reason": "CURRENT_TASK_DONE", "turns": 10, "tool_results": []},
+            )
+
+            tasks = json.loads(task_store.read_text(encoding="utf-8"))["tasks"]
+            self.assertEqual(len([item for item in tasks if item["id"] == RUNBOOK_TASK_ID]), 1)
+            self.assertTrue(any(item["id"] == "keep" for item in tasks))
+
+
+class XAgentRunbookIntegrationTests(unittest.TestCase):
+    def test_run_task_skips_distillation_when_interaction_records_are_low(self) -> None:
+        class DummyClient:
+            backend = type("Backend", (), {"history": []})()
+
+            def chat(self, messages, tools):  # noqa: ANN001
+                del messages, tools
+                return ChatResponse(thinking="", content="done", tool_calls=[])
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "demo.ws"
+            agent = XAgent(
+                system_prompt="sys",
+                tools_schema=[],
+                workspace_dir=str(workspace),
+                skills_dir=str(workspace / "system" / "skills"),
+            )
+            agent.client = DummyClient()
+
+            result = agent.run_task("Summarize workspace")
+
+            self.assertEqual(result["exit_reason"], "CURRENT_TASK_DONE")
+            self.assertFalse((workspace / "system" / "skills" / RUNBOOK_SKILL_NAME / "SKILL.md").exists())
+
+    def test_run_task_distills_after_enough_interactions_and_reloads_workspace_skill(self) -> None:
+        class DummyClient:
+            backend = type("Backend", (), {"history": []})()
+
+            def chat(self, messages, tools):  # noqa: ANN001
+                del messages, tools
+                return ChatResponse(thinking="", content="done", tool_calls=[])
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "demo.ws"
+            agent = XAgent(
+                system_prompt="sys",
+                tools_schema=[],
+                workspace_dir=str(workspace),
+                skills_dir=str(workspace / "system" / "skills"),
+                runbook_min_interaction_records=2,
+            )
+            agent.client = DummyClient()
+
+            result = agent.run_task("Summarize workspace")
+
+            self.assertEqual(result["exit_reason"], "CURRENT_TASK_DONE")
+            skill_text = (workspace / "system" / "skills" / RUNBOOK_SKILL_NAME / "SKILL.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("llm_end:1", skill_text)
+            self.assertIn("run_end:1", skill_text)
+            self.assertIn(RUNBOOK_SKILL_NAME, agent.skill_registry.skills)
 
 
 if __name__ == "__main__":

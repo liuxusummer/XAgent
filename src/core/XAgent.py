@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from queue import Queue
 from typing import Any
@@ -11,8 +11,9 @@ from typing import Any
 from src.config import SessionConfig, create_client, load_config
 from src.core.agent_loop import AgentContext, run_agent_loop
 from src.core.llm import MixinSession, NativeToolClient, OpenAITextSession, ToolClient
+from src.core.runbook import distill_runbook_from_task
 from src.core.skills import SkillRegistry, dedupe_skill_names, select_skills
-from src.core.telemetry import Event, EventSink, NullSink
+from src.core.telemetry import Event, EventSink, MultiSink, NullSink
 from src.handler import XAgentHandler
 from src.tools.interaction import make_progress_emitter, make_user_input_bridge
 
@@ -36,6 +37,17 @@ WORKSPACE_LAYOUT_FILES = (
     "system/agents/coding/SOUL.md",
     "system/agents/coding/MEMORY.md",
 )
+
+
+class _RunbookEventCollector:
+    def __init__(self) -> None:
+        self.events: list[Event] = []
+
+    def emit(self, event: Event) -> None:
+        self.events.append(event)
+
+    def close(self) -> None:
+        return None
 
 
 def ensure_workspace_layout(workspace_dir: str | Path) -> None:
@@ -81,6 +93,7 @@ class XAgent:
     agent_name: str = ""
     memory_mode: str = "project"
     file_index_embedding_config: dict[str, Any] | None = None
+    runbook_min_interaction_records: int = 10
 
     def __post_init__(self) -> None:
         self.workspace_dir = resolve_workspace_dir(self.workspace_dir or self.cwd)
@@ -109,7 +122,7 @@ class XAgent:
         if self.skills_dir:
             paths = [Path(self.skills_dir)]
         else:
-            paths = [PROJECT_ROOT / "skills"]
+            paths = [PROJECT_ROOT / "skills", Path(self.cwd) / "system" / "skills"]
         return SkillRegistry.load(paths)
 
     def _create_client(self) -> ToolClient | NativeToolClient:
@@ -188,6 +201,9 @@ class XAgent:
     def run_task(self, query: str) -> dict[str, Any]:
         self._running.set()
         self.stop_event.clear()
+        base_sink = self.handler.ctx.sink
+        runbook_collector = _RunbookEventCollector()
+        self.handler.ctx.sink = MultiSink(base_sink, runbook_collector)
         # Phase 8：每次任务刷新 session_id，便于事件流按会话归集
         self.handler.ctx.session_id = uuid.uuid4().hex[:16]
         skill_registry = getattr(self, "skill_registry", SkillRegistry())
@@ -236,10 +252,60 @@ class XAgent:
                     "turns": self.handler.ctx.current_turn,
                 }
                 self.handler.ctx.display_fn(f"[error] {exc}")
+            self._distill_runbook(query, result, runbook_collector.events)
             self.display_queue.put({"done": result})
             return result
         finally:
+            self.handler.ctx.sink = base_sink
             self._running.clear()
+
+    def _distill_runbook(self, query: str, result: dict[str, Any], events: list[Event]) -> None:
+        try:
+            workspace_root = getattr(self, "cwd", "") or getattr(self, "workspace_dir", "")
+            if not workspace_root:
+                self.handler.ctx.sink.emit(
+                    Event(
+                        session_id=self.handler.ctx.session_id,
+                        turn=self.handler.ctx.current_turn,
+                        kind="runbook_distilled",
+                        name="SKIP",
+                        data={"error": "missing_workspace"},
+                    )
+                )
+                return
+            record = distill_runbook_from_task(
+                workspace_root,
+                query,
+                result,
+                agent_name=self.agent_name,
+                trace_events=[asdict(event) for event in events],
+                min_interaction_records=self.runbook_min_interaction_records,
+            )
+            self.handler.ctx.sink.emit(
+                Event(
+                    session_id=self.handler.ctx.session_id,
+                    turn=self.handler.ctx.current_turn,
+                    kind="runbook_distilled",
+                    name=str(record.get("status", "UNKNOWN")),
+                    data={
+                        "outcome": record.get("outcome", ""),
+                        "entry_key": record.get("entry_key", ""),
+                    },
+                )
+            )
+            if record.get("status") == "OK":
+                self.skill_registry = self._load_skill_registry()
+                self.handler.ctx.skills = self.skill_registry
+        except Exception as exc:  # noqa: BLE001
+            self.handler.ctx.sink.emit(
+                Event(
+                    session_id=self.handler.ctx.session_id,
+                    turn=self.handler.ctx.current_turn,
+                    kind="runbook_distilled",
+                    name="ERROR",
+                    data={"error": type(exc).__name__},
+                )
+            )
 
     def run_task_async(self, query: str) -> None:
         thread = threading.Thread(target=self.run_task, args=(query,), daemon=True)
