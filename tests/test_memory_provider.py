@@ -8,7 +8,13 @@ from unittest.mock import patch
 
 from src.core.XAgent import XAgent
 from src.core.agent_loop import AgentContext, BaseHandler, TurnEndHook, run_agent_loop
-from src.core.llm import ChatResponse
+from src.core.checkpoint import (
+    build_task_checkpoint,
+    load_task_checkpoint,
+    render_resume_prompt,
+    write_task_checkpoint,
+)
+from src.core.llm import ChatResponse, ToolCall
 from src.core.memory import (
     load_agent_memory,
     load_boot_memory,
@@ -626,6 +632,202 @@ class XAgentRunbookIntegrationTests(unittest.TestCase):
             self.assertIn("llm_end:1", skill_text)
             self.assertIn("run_end:1", skill_text)
             self.assertIn(RUNBOOK_SKILL_NAME, agent.skill_registry.skills)
+
+
+class TaskCheckpointTests(unittest.TestCase):
+    def test_checkpoint_writes_latest_with_plan_tools_files_and_pending_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "demo.ws"
+            workspace.mkdir()
+            target = workspace / "business" / "config.txt"
+            target.parent.mkdir()
+            target.write_text("value=1", encoding="utf-8")
+            (workspace / "plan.md").write_text("- [x] inspect\n- [ ] patch config\n", encoding="utf-8")
+            checkpoint = build_task_checkpoint(
+                workspace,
+                checkpoint_id="abc",
+                session_id="abc",
+                task="Update config",
+                turn=3,
+                status="running",
+                tool_results=[
+                    {
+                        "tool_name": "file_read",
+                        "tool_call_id": "1",
+                        "data": {
+                            "status": "OK",
+                            "path": str(target),
+                            "content": "secret full content",
+                        },
+                    }
+                ],
+                pending_prompts=["继续验证 patch"],
+            )
+
+            record = write_task_checkpoint(workspace, checkpoint)
+            loaded = load_task_checkpoint(workspace, "latest")
+
+            self.assertEqual(record["status"], "OK")
+            self.assertEqual(loaded["status"], "OK")
+            payload = loaded["checkpoint"]
+            self.assertEqual(payload["checkpoint_id"], "abc")
+            self.assertIn("- [ ] patch config", payload["plan"])
+            self.assertIn("patch config", payload["pending_steps"][0])
+            self.assertIn("Loop prompt", payload["pending_steps"][1])
+            self.assertEqual(payload["tool_results"][0]["tool_name"], "file_read")
+            self.assertNotIn("content", payload["tool_results"][0])
+            self.assertEqual(payload["file_states"][0]["path"], "business/config.txt")
+            self.assertEqual(payload["file_states"][0]["sha256"], "a777d5a2d0a4836c7b44b4514048e97ef61b5b127fb8b6479f0337d0b160fe0b")
+
+    def test_resume_prompt_renders_checkpoint_context(self) -> None:
+        checkpoint = {
+            "checkpoint_id": "abc",
+            "status": "interrupted",
+            "turn": 5,
+            "exit_reason": "INTERRUPTED",
+            "task": "Original long task",
+            "plan": "- [ ] finish",
+            "pending_steps": ["finish"],
+            "tool_results": [{"tool_name": "file_read", "status": "OK", "path": "business/a.txt"}],
+            "file_states": [{"path": "business/a.txt", "exists": True, "size": 3, "mtime_ns": 1, "sha256": "hash"}],
+        }
+
+        prompt = render_resume_prompt(checkpoint, "用户补充")
+
+        self.assertIn("[Resume Checkpoint]", prompt)
+        self.assertIn("Original long task", prompt)
+        self.assertIn("不要重放已完成工具动作", prompt)
+        self.assertIn("用户补充", prompt)
+
+    def test_agent_loop_invokes_checkpoint_callback_during_run(self) -> None:
+        class DummyClient:
+            backend = type("Backend", (), {"history": []})()
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def chat(self, messages, tools):  # noqa: ANN001
+                del messages, tools
+                self.calls += 1
+                if self.calls == 1:
+                    return ChatResponse(
+                        thinking="",
+                        content="",
+                        tool_calls=[ToolCall(name="echo", args={}, id="1")],
+                    )
+                return ChatResponse(thinking="", content="done", tool_calls=[])
+
+        class Handler(BaseHandler):
+            def exec_echo(self, args):  # noqa: ANN001
+                del args
+                return ActionResult(data={"status": "OK", "path": "business/a.txt"}, next_prompt="continue")
+
+        from src.core.agent_loop import ActionResult
+
+        snapshots: list[dict[str, object]] = []
+        handler = Handler(ctx=AgentContext(checkpoint_callback=snapshots.append))
+
+        result = run_agent_loop(
+            client=DummyClient(),
+            system_prompt="sys",
+            user_input="go",
+            handler=handler,
+            tools_schema=[],
+            max_turns=3,
+        )
+
+        self.assertEqual(result["exit_reason"], "CURRENT_TASK_DONE")
+        self.assertGreaterEqual(len(snapshots), 3)
+        self.assertEqual(snapshots[0]["status"], "running")
+        self.assertEqual(snapshots[-1]["status"], "completed")
+        self.assertEqual(snapshots[-1]["exit_reason"], "CURRENT_TASK_DONE")
+        self.assertEqual(snapshots[-1]["tool_results"][0]["tool_name"], "echo")
+
+    def test_agent_loop_marks_interrupted_checkpoint(self) -> None:
+        class DummyClient:
+            backend = type("Backend", (), {"history": []})()
+
+            def chat(self, messages, tools):  # noqa: ANN001
+                del messages, tools
+                return ChatResponse(thinking="", content="done", tool_calls=[])
+
+        snapshots: list[dict[str, object]] = []
+        handler = BaseHandler(ctx=AgentContext(checkpoint_callback=snapshots.append, code_stop_signal=True))
+
+        result = run_agent_loop(
+            client=DummyClient(),
+            system_prompt="sys",
+            user_input="go",
+            handler=handler,
+            tools_schema=[],
+            max_turns=3,
+        )
+
+        self.assertEqual(result["exit_reason"], "INTERRUPTED")
+        self.assertEqual(snapshots[-1]["status"], "interrupted")
+        self.assertEqual(snapshots[-1]["exit_reason"], "INTERRUPTED")
+
+    def test_xagent_resume_task_injects_latest_checkpoint(self) -> None:
+        class DummyClient:
+            backend = type("Backend", (), {"history": []})()
+
+            def __init__(self) -> None:
+                self.messages = None
+
+            def chat(self, messages, tools):  # noqa: ANN001
+                del tools
+                self.messages = messages
+                return ChatResponse(thinking="", content="done", tool_calls=[])
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "demo.ws"
+            workspace.mkdir()
+            checkpoint = build_task_checkpoint(
+                workspace,
+                checkpoint_id="abc",
+                session_id="abc",
+                task="Original task",
+                turn=2,
+                status="interrupted",
+                exit_reason="INTERRUPTED",
+            )
+            write_task_checkpoint(workspace, checkpoint)
+            agent = XAgent(
+                system_prompt="sys",
+                tools_schema=[],
+                workspace_dir=str(workspace),
+                runbook_min_interaction_records=99,
+            )
+            dummy = DummyClient()
+            agent.client = dummy
+
+            result = agent.resume_task("latest", "继续")
+
+            self.assertEqual(result["exit_reason"], "CURRENT_TASK_DONE")
+            assert dummy.messages is not None
+            self.assertIn("[Resume Checkpoint]", dummy.messages[1]["content"])
+            self.assertIn("Original task", dummy.messages[1]["content"])
+
+    def test_xagent_writes_failed_checkpoint_when_loop_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "demo.ws"
+            agent = XAgent(
+                system_prompt="sys",
+                tools_schema=[],
+                workspace_dir=str(workspace),
+                runbook_min_interaction_records=99,
+            )
+
+            with patch("src.core.XAgent.run_agent_loop", side_effect=RuntimeError("boom")):
+                result = agent.run_task("Long task")
+
+            loaded = load_task_checkpoint(workspace, "latest")
+            self.assertEqual(result["exit_reason"], "ERROR")
+            self.assertEqual(loaded["status"], "OK")
+            checkpoint = loaded["checkpoint"]
+            self.assertEqual(checkpoint["status"], "failed")
+            self.assertEqual(checkpoint["exit_reason"], "ERROR")
+            self.assertEqual(checkpoint["tool_results"][0]["tool_name"], "run_task")
 
 
 if __name__ == "__main__":

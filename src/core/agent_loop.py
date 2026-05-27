@@ -59,6 +59,7 @@ class AgentContext:
     session_id: str = ""
     sink: EventSink = field(default_factory=NullSink)
     token_usage: TokenUsage = field(default_factory=TokenUsage)
+    checkpoint_callback: Callable[[dict[str, Any]], None] | None = None
 
 
 @dataclass
@@ -280,6 +281,40 @@ def run_agent_loop(
         )
     )
 
+    def _emit_checkpoint(
+        status: str,
+        reason: str = "",
+        pending_prompts: list[str] | None = None,
+    ) -> None:
+        callback = getattr(handler.ctx, "checkpoint_callback", None)
+        if not callable(callback):
+            return
+        try:
+            callback(
+                {
+                    "session_id": session_id,
+                    "turn": handler.ctx.current_turn,
+                    "status": status,
+                    "exit_reason": reason,
+                    "tool_results": list(all_tool_results),
+                    "working": dict(getattr(handler.ctx, "working", {}) or {}),
+                    "history_info": list(getattr(handler.ctx, "history_info", []) or []),
+                    "pending_prompts": list(pending_prompts or []),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            sink.emit(
+                Event(
+                    session_id=session_id,
+                    turn=handler.ctx.current_turn,
+                    kind="checkpoint_error",
+                    name=type(exc).__name__,
+                    data={},
+                )
+            )
+
+    _emit_checkpoint("running")
+
     def _emit_run_end() -> None:
         token_data = handler.ctx.token_usage.to_event_data()
         sink.emit(
@@ -345,6 +380,7 @@ def run_agent_loop(
             # 复位 code_stop_signal，防止一次性的代码级中断残留到下一次 run_task。
             # stop_event 由调用方（XAgent.run_task）在每次任务开始前 clear。
             handler.ctx.code_stop_signal = False
+            _emit_checkpoint("interrupted", exit_reason)
             break
 
         sink.emit(Event(session_id=session_id, turn=turn, kind="turn_start", name="", data=_skill_state_data()))
@@ -388,13 +424,16 @@ def run_agent_loop(
             _emit_turn_end(0)
             if result.should_exit or result.next_prompt == "":
                 exit_reason = "EXITED"
+                _emit_checkpoint("failed", exit_reason)
                 break
             if result.next_prompt is None:
                 exit_reason = "CURRENT_TASK_DONE"
+                _emit_checkpoint("completed", exit_reason)
                 break
             next_prompts = [result.next_prompt]
             if turn_end_prompt:
                 next_prompts.append(turn_end_prompt)
+            _emit_checkpoint("running", pending_prompts=next_prompts)
             messages = build_next_user_message(next_prompts, [])
             continue
 
@@ -431,6 +470,11 @@ def run_agent_loop(
 
         if exit_reason in {"EXITED", "CURRENT_TASK_DONE"}:
             _emit_turn_end(len(turn_tool_results))
+            _emit_checkpoint(
+                "completed" if exit_reason == "CURRENT_TASK_DONE" else "failed",
+                exit_reason,
+                pending_prompts=next_prompts,
+            )
             break
 
         turn_end_prompt = handler.turn_end_callback(response, turn_tool_results)
@@ -443,13 +487,17 @@ def run_agent_loop(
             else:
                 exit_reason = "CURRENT_TASK_DONE"
                 _emit_turn_end(len(turn_tool_results))
+                _emit_checkpoint("completed", exit_reason)
                 break
 
         messages = build_next_user_message(next_prompts, turn_tool_results)
         _emit_turn_end(len(turn_tool_results))
+        _emit_checkpoint("running", pending_prompts=next_prompts)
 
     handler.ctx.display_fn(f"[Done] exit_reason={exit_reason}, turns={handler.ctx.current_turn}")
 
+    if exit_reason == "MAX_TURNS_EXCEEDED":
+        _emit_checkpoint("failed", exit_reason)
     _emit_run_end()
     return {
         "response": final_response,

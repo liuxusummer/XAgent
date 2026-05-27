@@ -10,6 +10,7 @@ from typing import Any
 
 from src.config import SessionConfig, create_client, load_config
 from src.core.agent_loop import AgentContext, run_agent_loop
+from src.core.checkpoint import build_task_checkpoint, load_task_checkpoint, render_resume_prompt, write_task_checkpoint
 from src.core.llm import MixinSession, NativeToolClient, OpenAITextSession, ToolClient
 from src.core.runbook import distill_runbook_from_task
 from src.core.skills import SkillRegistry, dedupe_skill_names, select_skills
@@ -198,14 +199,18 @@ class XAgent:
     def put_task(self, query: str) -> None:
         self.task_queue.put(query)
 
-    def run_task(self, query: str) -> dict[str, Any]:
+    def run_task(self, query: str, resume_checkpoint: str | None = None) -> dict[str, Any]:
         self._running.set()
         self.stop_event.clear()
         base_sink = self.handler.ctx.sink
+        base_checkpoint_callback = self.handler.ctx.checkpoint_callback
         runbook_collector = _RunbookEventCollector()
         self.handler.ctx.sink = MultiSink(base_sink, runbook_collector)
         # Phase 8：每次任务刷新 session_id，便于事件流按会话归集
         self.handler.ctx.session_id = uuid.uuid4().hex[:16]
+        if resume_checkpoint:
+            query = self._query_with_resume_checkpoint(query, resume_checkpoint)
+        self.handler.ctx.checkpoint_callback = self._build_checkpoint_callback(query)
         skill_registry = getattr(self, "skill_registry", SkillRegistry())
         skill_allowlist = getattr(self.handler.ctx, "skill_allowlist", None)
         if skill_allowlist is None:
@@ -252,12 +257,81 @@ class XAgent:
                     "turns": self.handler.ctx.current_turn,
                 }
                 self.handler.ctx.display_fn(f"[error] {exc}")
+                self._write_terminal_checkpoint(query, result, "failed")
             self._distill_runbook(query, result, runbook_collector.events)
             self.display_queue.put({"done": result})
             return result
         finally:
+            self.handler.ctx.checkpoint_callback = base_checkpoint_callback
             self.handler.ctx.sink = base_sink
             self._running.clear()
+
+    def resume_task(self, checkpoint_id: str = "latest", query: str = "") -> dict[str, Any]:
+        return self.run_task(query or "继续执行 checkpoint 中未完成的任务。", resume_checkpoint=checkpoint_id)
+
+    def _query_with_resume_checkpoint(self, query: str, checkpoint_id: str) -> str:
+        loaded = load_task_checkpoint(self.cwd, checkpoint_id)
+        if loaded.get("status") != "OK":
+            self.handler.ctx.display_fn(
+                f"[checkpoint] resume skipped: {loaded.get('error', 'unknown error')}"
+            )
+            return query
+        checkpoint = loaded.get("checkpoint")
+        if not isinstance(checkpoint, dict):
+            self.handler.ctx.display_fn("[checkpoint] resume skipped: invalid checkpoint")
+            return query
+        self.handler.ctx.display_fn(f"[checkpoint] resume from {checkpoint.get('checkpoint_id', checkpoint_id)}")
+        return render_resume_prompt(checkpoint, query)
+
+    def _build_checkpoint_callback(self, query: str):
+        workspace_root = getattr(self, "cwd", "") or getattr(self, "workspace_dir", "")
+        if not workspace_root:
+            return lambda _snapshot: None
+
+        def _checkpoint(snapshot: dict[str, Any]) -> None:
+            checkpoint = build_task_checkpoint(
+                workspace_root,
+                checkpoint_id=str(snapshot.get("session_id") or self.handler.ctx.session_id),
+                session_id=str(snapshot.get("session_id") or self.handler.ctx.session_id),
+                task=query,
+                agent_name=self.agent_name,
+                turn=int(snapshot.get("turn") or 0),
+                status=str(snapshot.get("status") or "running"),
+                exit_reason=str(snapshot.get("exit_reason") or ""),
+                tool_results=snapshot.get("tool_results") if isinstance(snapshot.get("tool_results"), list) else [],
+                working=snapshot.get("working") if isinstance(snapshot.get("working"), dict) else {},
+                history_info=snapshot.get("history_info") if isinstance(snapshot.get("history_info"), list) else [],
+                pending_prompts=snapshot.get("pending_prompts") if isinstance(snapshot.get("pending_prompts"), list) else [],
+            )
+            record = write_task_checkpoint(workspace_root, checkpoint)
+            self.handler.ctx.sink.emit(
+                Event(
+                    session_id=self.handler.ctx.session_id,
+                    turn=int(snapshot.get("turn") or 0),
+                    kind="checkpoint_written",
+                    name=str(record.get("status", "UNKNOWN")),
+                    data={"checkpoint_id": record.get("checkpoint_id", ""), "path": record.get("path", "")},
+                )
+            )
+
+        return _checkpoint
+
+    def _write_terminal_checkpoint(self, query: str, result: dict[str, Any], status: str) -> None:
+        callback = getattr(self.handler.ctx, "checkpoint_callback", None)
+        if not callable(callback):
+            return
+        callback(
+            {
+                "session_id": self.handler.ctx.session_id,
+                "turn": self.handler.ctx.current_turn,
+                "status": status,
+                "exit_reason": str(result.get("exit_reason", "")),
+                "tool_results": result.get("tool_results", []),
+                "working": dict(getattr(self.handler.ctx, "working", {}) or {}),
+                "history_info": list(getattr(self.handler.ctx, "history_info", []) or []),
+                "pending_prompts": [query],
+            }
+        )
 
     def _distill_runbook(self, query: str, result: dict[str, Any], events: list[Event]) -> None:
         try:
