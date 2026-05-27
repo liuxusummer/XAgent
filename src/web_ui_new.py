@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -119,6 +120,31 @@ class ChatCreateRequest(BaseModel):
     agent: str = ""
 
 
+class ScheduledTaskWriteRequest(BaseModel):
+    ws: str = "default.ws"
+    name: str = ""
+    prompt: str = ""
+    agent: str = ""
+    repeat: str = "none"
+    date: str = ""
+    time: str = ""
+    end_date: str = ""
+    interval_minutes: int = 0
+    keep_one_chat: bool = False
+    status: str = ""
+    config_path: str = ""
+    observability_config_path: str = ""
+
+
+class ScheduledTaskStatusRequest(BaseModel):
+    ws: str = "default.ws"
+    status: str = ""
+
+
+class ScheduledTaskRunRequest(BaseModel):
+    ws: str = "default.ws"
+
+
 @dataclass
 class UISession:
     agent: object | None = None
@@ -167,6 +193,14 @@ _HIDDEN_BLOCK_RE = re.compile(
 _TRAILING_PARTIAL_TAG_RE = re.compile(r"<[^>]*$")
 _TRACE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _CHAT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_TASK_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_TASK_TIME_RE = re.compile(r"^\d{2}:\d{2}$")
+_TASK_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TASK_REPEATS = {"none", "daily", "weekly", "custom"}
+_TASK_STATUSES = {"running", "paused"}
+_task_lock = threading.Lock()
+_task_scheduler_started = False
+_task_scheduler_stop = threading.Event()
 
 
 def _now_ms() -> int:
@@ -1379,6 +1413,7 @@ async def read_trace_session_detail(
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _WORKSPACE_ROOT = os.path.join(_PROJECT_ROOT, "workspace")
+_DEFAULT_WORKSPACE_ROOT = _WORKSPACE_ROOT
 _AGENT_PROFILE_FIELDS = (
     "name",
     "description",
@@ -1733,6 +1768,556 @@ def _agent_runtime_config(workspace_dir: str, agent_name: str) -> tuple[dict[str
         }, None
     except (OSError, UnicodeDecodeError) as exc:
         return None, str(exc)
+
+
+def _valid_task_id(task_id: str) -> bool:
+    return bool(task_id) and _TASK_ID_RE.fullmatch(task_id) is not None and task_id not in {".", ".."}
+
+
+def _task_store_path(ws: str) -> tuple[str | None, str | None]:
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return None, error
+    return os.path.join(ws_root, "runtime", "tasks", "tasks.json"), None
+
+
+def _read_scheduled_tasks(ws: str) -> tuple[list[dict[str, Any]], str | None]:
+    path, error = _task_store_path(ws)
+    if error or path is None:
+        return [], error
+    if not os.path.isfile(path):
+        if _should_seed_default_tasks(ws):
+            tasks = _default_scheduled_tasks()
+            write_error = _write_scheduled_tasks(ws, tasks)
+            return tasks, write_error
+        return [], None
+    try:
+        payload = _read_json_file(path)
+    except (OSError, json.JSONDecodeError) as exc:
+        return [], str(exc)
+    raw_tasks = payload.get("tasks", [])
+    if not isinstance(raw_tasks, list):
+        return [], "Invalid task store"
+    return [item for item in raw_tasks if isinstance(item, dict)], None
+
+
+def _write_scheduled_tasks(ws: str, tasks: list[dict[str, Any]]) -> str | None:
+    path, error = _task_store_path(ws)
+    if error or path is None:
+        return error
+    try:
+        _write_json_file(path, {"tasks": tasks, "updated_at": time.time()})
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def _should_seed_default_tasks(ws: str) -> bool:
+    return ws == "default.ws" and os.path.realpath(_WORKSPACE_ROOT) == os.path.realpath(_DEFAULT_WORKSPACE_ROOT)
+
+
+def _parse_task_datetime(date_value: str, time_value: str) -> float | None:
+    date_value = _normalize_path_input(date_value)
+    time_value = _normalize_path_input(time_value)
+    if not date_value or not time_value:
+        return None
+    if not _TASK_DATE_RE.fullmatch(date_value) or not _TASK_TIME_RE.fullmatch(time_value):
+        raise ValueError("Invalid date or time")
+    parsed = datetime.strptime(f"{date_value} {time_value}", "%Y-%m-%d %H:%M")
+    return parsed.timestamp()
+
+
+def _format_task_datetime(timestamp: float | None) -> str | None:
+    if timestamp is None:
+        return None
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(timestamp))
+
+
+def _task_end_timestamp(task: dict[str, Any]) -> float | None:
+    end_date = str(task.get("end_date") or "").strip()
+    if not end_date:
+        return None
+    if not _TASK_DATE_RE.fullmatch(end_date):
+        raise ValueError("Invalid end date")
+    return datetime.strptime(f"{end_date} 23:59", "%Y-%m-%d %H:%M").timestamp()
+
+
+def _next_task_run(task: dict[str, Any], after_ts: float | None = None, first: bool = False) -> str | None:
+    after_ts = time.time() if after_ts is None else after_ts
+    repeat = str(task.get("repeat") or "none")
+    base_ts = _parse_task_datetime(str(task.get("date") or ""), str(task.get("time") or ""))
+    next_ts: float | None = None
+
+    if repeat == "none":
+        next_ts = base_ts if first else None
+    elif repeat == "daily":
+        if base_ts is not None:
+            candidate = datetime.fromtimestamp(base_ts)
+            current = datetime.fromtimestamp(after_ts)
+            candidate = candidate.replace(year=current.year, month=current.month, day=current.day)
+            while candidate.timestamp() <= after_ts:
+                candidate += timedelta(days=1)
+            next_ts = candidate.timestamp()
+    elif repeat == "weekly":
+        if base_ts is not None:
+            candidate = datetime.fromtimestamp(base_ts)
+            current = datetime.fromtimestamp(after_ts)
+            days = (candidate.weekday() - current.weekday()) % 7
+            candidate = current.replace(
+                hour=candidate.hour,
+                minute=candidate.minute,
+                second=0,
+                microsecond=0,
+            ) + timedelta(days=days)
+            if candidate.timestamp() <= after_ts:
+                candidate += timedelta(days=7)
+            next_ts = candidate.timestamp()
+    elif repeat == "custom":
+        interval = int(task.get("interval_minutes") or 0)
+        if interval <= 0:
+            interval = 60
+        if base_ts is None:
+            next_ts = after_ts + interval * 60
+        else:
+            next_ts = base_ts
+            while next_ts <= after_ts:
+                next_ts += interval * 60
+
+    end_ts = _task_end_timestamp(task)
+    if next_ts is not None and end_ts is not None and next_ts > end_ts:
+        return None
+    return _format_task_datetime(next_ts)
+
+
+def _normalize_scheduled_task(
+    request: ScheduledTaskWriteRequest,
+    *,
+    task_id: str | None = None,
+    existing: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    ws = _normalize_path_input(request.ws) or "default.ws"
+    if not _is_workspace_name(ws):
+        return None, "Invalid workspace name"
+    name = str(request.name or "").strip()
+    prompt = str(request.prompt or "").strip()
+    if not name:
+        return None, "Name is required"
+    if not prompt:
+        return None, "Prompt is required"
+
+    repeat = str(request.repeat or "none").strip() or "none"
+    if repeat not in _TASK_REPEATS:
+        return None, "Invalid repeat"
+    status = str(request.status or (existing or {}).get("status") or "").strip()
+    if not status:
+        status = "running"
+    if status not in _TASK_STATUSES:
+        return None, "Invalid status"
+
+    agent = _normalize_path_input(request.agent)
+    if agent and not _is_child_name(agent):
+        return None, "Invalid agent name"
+    if request.keep_one_chat and not agent:
+        return None, "Agent is required when keeping task runs in one chat"
+    if repeat in {"none", "daily", "weekly"} and (
+        not _normalize_path_input(request.date) or not _normalize_path_input(request.time)
+    ):
+        return None, "Date and time are required"
+    interval_minutes = int(request.interval_minutes or 0)
+    if repeat == "custom" and interval_minutes <= 0:
+        interval_minutes = 60
+
+    now = time.time()
+    task = {
+        **(existing or {}),
+        "id": task_id or uuid.uuid4().hex[:16],
+        "workspace": ws,
+        "name": name,
+        "prompt": prompt,
+        "agent": agent,
+        "repeat": repeat,
+        "date": _normalize_path_input(request.date),
+        "time": _normalize_path_input(request.time),
+        "end_date": _normalize_path_input(request.end_date),
+        "interval_minutes": interval_minutes,
+        "keep_one_chat": bool(request.keep_one_chat),
+        "status": status,
+        "config_path": _normalize_path_input(request.config_path),
+        "observability_config_path": _normalize_path_input(request.observability_config_path),
+        "updated_at": now,
+    }
+    task.setdefault("created_at", now)
+    task.setdefault("chat_id", "")
+    task.setdefault("last_run", None)
+    task.setdefault("last_session_id", "")
+    task.setdefault("last_error", "")
+    task.setdefault("last_debug_run", None)
+    task.setdefault("last_debug_session_id", "")
+    task.setdefault("last_debug_error", "")
+
+    try:
+        next_run = _next_task_run(task, after_ts=now, first=True)
+    except ValueError as exc:
+        return None, str(exc)
+    task["next_run"] = next_run
+    if not next_run:
+        task["status"] = "paused"
+    return task, None
+
+
+def _seed_date_for_weekday(target_weekday: int, now_ts: float) -> str:
+    current = datetime.fromtimestamp(now_ts)
+    days = (target_weekday - current.weekday()) % 7
+    return (current + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def _default_scheduled_tasks(now_ts: float | None = None) -> list[dict[str, Any]]:
+    now_ts = time.time() if now_ts is None else now_ts
+    today = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d")
+    seeds = [
+        {
+            "id": "preset-daily-check",
+            "name": "Daily Workspace Check",
+            "prompt": "检查当前 workspace 的状态，汇总需要用户关注的问题，并给出简短建议。",
+            "agent": "main",
+            "repeat": "daily",
+            "date": today,
+            "time": "09:00",
+        },
+        {
+            "id": "preset-weekly-code-quality-audit",
+            "name": "Weekly Code Quality Audit",
+            "prompt": (
+                "对当前仓库做一次代码质量审计：检查未提交改动、关键后端/前端文件的职责是否清晰、"
+                "是否存在明显类型/测试/启动风险；输出按严重程度排序的问题列表，并给出最小修复建议。"
+                "不要直接修改代码。"
+            ),
+            "agent": "coding",
+            "repeat": "weekly",
+            "date": _seed_date_for_weekday(4, now_ts),
+            "time": "18:00",
+        },
+        {
+            "id": "preset-runtime-observability-review",
+            "name": "Runtime Observability Review",
+            "prompt": (
+                "检查 workspace/runtime 下最近的 traces、chats、tasks 等运行时产物：总结最近任务是否正常结束、"
+                "是否有重复错误或异常增长，并提出需要清理或进一步排查的项目。只读检查，不要删除文件。"
+            ),
+            "agent": "main",
+            "repeat": "custom",
+            "date": today,
+            "time": "10:30",
+            "interval_minutes": 240,
+        },
+        {
+            "id": "preset-docs-implementation-consistency",
+            "name": "Docs Implementation Consistency",
+            "prompt": (
+                "对 docs/ 中的关键设计文档与当前实现做一致性检查，重点比较 scheduled task、workspace、"
+                "agent profile、chat persistence 相关契约是否和代码一致；列出文档过期、实现偏离、测试缺口，"
+                "并标注建议修复优先级。不要直接修改文件。"
+            ),
+            "agent": "coding",
+            "repeat": "weekly",
+            "date": _seed_date_for_weekday(0, now_ts),
+            "time": "10:00",
+        },
+    ]
+    tasks: list[dict[str, Any]] = []
+    for seed in seeds:
+        task, error = _normalize_scheduled_task(
+            ScheduledTaskWriteRequest(
+                ws="default.ws",
+                name=seed["name"],
+                prompt=seed["prompt"],
+                agent=seed["agent"],
+                repeat=seed["repeat"],
+                date=seed["date"],
+                time=seed["time"],
+                interval_minutes=seed.get("interval_minutes", 0),
+                keep_one_chat=True,
+                status="running",
+                config_path="config.json",
+            ),
+            task_id=seed["id"],
+        )
+        if task is not None and error is None:
+            tasks.append(task)
+    return tasks
+
+
+def _create_or_load_task_chat(task: dict[str, Any]) -> tuple[UISession | None, str | None]:
+    ws = str(task.get("workspace") or "default.ws")
+    agent = str(task.get("agent") or "")
+    if not agent:
+        return None, "Agent is required when keeping task runs in one chat"
+
+    chat_id = str(task.get("chat_id") or "")
+    if chat_id:
+        session = _find_session_by_chat(ws, agent, chat_id)
+        if session is None:
+            session, error = _load_chat_into_session(ws, agent, chat_id)
+            if error or session is None:
+                return None, error
+        return session, None
+
+    chat_id = uuid.uuid4().hex[:16]
+    metadata = _default_chat_metadata(ws, agent, chat_id)
+    metadata["title"] = str(task.get("name") or "Scheduled Task")[:40]
+    session_id = uuid.uuid4().hex[:16]
+    state = _default_chat_state(ws, agent, chat_id, session_id=session_id)
+    metadata_path, metadata_error = _chat_metadata_path(ws, agent, chat_id)
+    state_path, state_error = _chat_state_path(ws, agent, chat_id)
+    if metadata_error or state_error or metadata_path is None or state_path is None:
+        return None, metadata_error or state_error
+    try:
+        _write_json_file(metadata_path, metadata)
+        _write_json_file(state_path, state)
+    except OSError as exc:
+        return None, str(exc)
+    session = UISession(session_id=session_id, chat_id=chat_id, chat_ws=ws, chat_agent=agent)
+    _sessions[session_id] = session
+    task["chat_id"] = chat_id
+    return session, None
+
+
+def _dispatch_scheduled_task(task: dict[str, Any]) -> tuple[str | None, str | None]:
+    ws = str(task.get("workspace") or "default.ws")
+    agent_name = str(task.get("agent") or "")
+    runtime_config, runtime_error = _agent_runtime_config(ws, agent_name)
+    if runtime_error:
+        return None, runtime_error
+
+    if task.get("keep_one_chat"):
+        session, chat_error = _create_or_load_task_chat(task)
+        if chat_error or session is None:
+            return None, chat_error
+        if session.running:
+            return None, "Task chat is already running"
+    else:
+        session = UISession(session_id=uuid.uuid4().hex[:16])
+        _sessions[session.session_id] = session
+
+    _ensure_agent(
+        session,
+        str(task.get("config_path") or ""),
+        str(task.get("observability_config_path") or ""),
+        ws,
+        agent_name,
+        runtime_config,
+    )
+    _persist_chat_state(session)
+    thread = threading.Thread(
+        target=_run_task_background,
+        args=(session, str(task.get("prompt") or "")),
+        daemon=True,
+    )
+    thread.start()
+    return session.session_id, None
+
+
+def _run_scheduled_task_record(task: dict[str, Any], now_ts: float | None = None) -> dict[str, Any]:
+    now_ts = time.time() if now_ts is None else now_ts
+    session_id, error = _dispatch_scheduled_task(task)
+    task["updated_at"] = time.time()
+    if error:
+        task["last_error"] = error
+        return task
+    task["last_run"] = _format_task_datetime(now_ts)
+    task["last_session_id"] = session_id or ""
+    task["last_error"] = ""
+    if task.get("repeat") == "none":
+        task["next_run"] = None
+        task["status"] = "paused"
+    else:
+        try:
+            task["next_run"] = _next_task_run(task, after_ts=now_ts, first=False)
+        except ValueError as exc:
+            task["next_run"] = None
+            task["last_error"] = str(exc)
+        if not task.get("next_run"):
+            task["status"] = "paused"
+    return task
+
+
+def _debug_scheduled_task_record(task: dict[str, Any], now_ts: float | None = None) -> dict[str, Any]:
+    now_ts = time.time() if now_ts is None else now_ts
+    session_id, error = _dispatch_scheduled_task(task)
+    task["updated_at"] = time.time()
+    task["last_debug_run"] = _format_task_datetime(now_ts)
+    if error:
+        task["last_debug_error"] = error
+        return task
+    task["last_debug_session_id"] = session_id or ""
+    task["last_debug_error"] = ""
+    return task
+
+
+def _run_due_scheduled_tasks(now_ts: float | None = None) -> None:
+    now_ts = time.time() if now_ts is None else now_ts
+    if not os.path.isdir(_WORKSPACE_ROOT):
+        return
+    for ws in sorted(os.listdir(_WORKSPACE_ROOT)):
+        if not _is_workspace_name(ws):
+            continue
+        with _task_lock:
+            tasks, error = _read_scheduled_tasks(ws)
+            if error:
+                continue
+            changed = False
+            for task in tasks:
+                next_run = str(task.get("next_run") or "")
+                if task.get("status") != "running" or not next_run:
+                    continue
+                try:
+                    due_ts = datetime.strptime(next_run, "%Y-%m-%d %H:%M").timestamp()
+                except ValueError:
+                    task["last_error"] = "Invalid next_run"
+                    task["status"] = "paused"
+                    changed = True
+                    continue
+                if due_ts <= now_ts:
+                    _run_scheduled_task_record(task, now_ts=now_ts)
+                    changed = True
+            if changed:
+                _write_scheduled_tasks(ws, tasks)
+
+
+def _task_scheduler_loop() -> None:
+    while not _task_scheduler_stop.wait(30):
+        try:
+            _run_due_scheduled_tasks()
+        except Exception:
+            continue
+
+
+@app.on_event("startup")
+def _start_task_scheduler() -> None:
+    global _task_scheduler_started
+    if _task_scheduler_started:
+        return
+    _task_scheduler_started = True
+    threading.Thread(target=_task_scheduler_loop, daemon=True).start()
+
+
+@app.get("/api/tasks")
+async def list_scheduled_tasks(ws: str = "default.ws"):
+    ws = _normalize_path_input(ws) or "default.ws"
+    with _task_lock:
+        tasks, error = _read_scheduled_tasks(ws)
+    if error:
+        return {"success": False, "error": error}
+    return {"success": True, "data": tasks}
+
+
+@app.post("/api/tasks")
+async def create_scheduled_task(request: ScheduledTaskWriteRequest):
+    task, error = _normalize_scheduled_task(request)
+    if error or task is None:
+        return {"success": False, "error": error}
+    ws = task["workspace"]
+    with _task_lock:
+        tasks, read_error = _read_scheduled_tasks(ws)
+        if read_error:
+            return {"success": False, "error": read_error}
+        tasks.append(task)
+        write_error = _write_scheduled_tasks(ws, tasks)
+    if write_error:
+        return {"success": False, "error": write_error}
+    return {"success": True, "data": task}
+
+
+@app.put("/api/tasks/{task_id}")
+async def update_scheduled_task(task_id: str, request: ScheduledTaskWriteRequest):
+    if not _valid_task_id(task_id):
+        return {"success": False, "error": "Invalid task id"}
+    ws = _normalize_path_input(request.ws) or "default.ws"
+    with _task_lock:
+        tasks, read_error = _read_scheduled_tasks(ws)
+        if read_error:
+            return {"success": False, "error": read_error}
+        for index, existing in enumerate(tasks):
+            if existing.get("id") != task_id:
+                continue
+            task, error = _normalize_scheduled_task(request, task_id=task_id, existing=existing)
+            if error or task is None:
+                return {"success": False, "error": error}
+            tasks[index] = task
+            write_error = _write_scheduled_tasks(ws, tasks)
+            if write_error:
+                return {"success": False, "error": write_error}
+            return {"success": True, "data": task}
+    return {"success": False, "error": "Task not found"}
+
+
+@app.post("/api/tasks/{task_id}/status")
+async def set_scheduled_task_status(task_id: str, request: ScheduledTaskStatusRequest):
+    if not _valid_task_id(task_id):
+        return {"success": False, "error": "Invalid task id"}
+    ws = _normalize_path_input(request.ws) or "default.ws"
+    status = _normalize_path_input(request.status)
+    if status not in _TASK_STATUSES:
+        return {"success": False, "error": "Invalid status"}
+    with _task_lock:
+        tasks, read_error = _read_scheduled_tasks(ws)
+        if read_error:
+            return {"success": False, "error": read_error}
+        for task in tasks:
+            if task.get("id") != task_id:
+                continue
+            task["status"] = status
+            task["updated_at"] = time.time()
+            if status == "running" and not task.get("next_run"):
+                try:
+                    task["next_run"] = _next_task_run(task, after_ts=time.time(), first=True)
+                except ValueError as exc:
+                    return {"success": False, "error": str(exc)}
+            write_error = _write_scheduled_tasks(ws, tasks)
+            if write_error:
+                return {"success": False, "error": write_error}
+            return {"success": True, "data": task}
+    return {"success": False, "error": "Task not found"}
+
+
+@app.delete("/api/tasks/{task_id}")
+async def delete_scheduled_task(task_id: str, ws: str = "default.ws"):
+    if not _valid_task_id(task_id):
+        return {"success": False, "error": "Invalid task id"}
+    ws = _normalize_path_input(ws) or "default.ws"
+    with _task_lock:
+        tasks, read_error = _read_scheduled_tasks(ws)
+        if read_error:
+            return {"success": False, "error": read_error}
+        remaining = [task for task in tasks if task.get("id") != task_id]
+        if len(remaining) == len(tasks):
+            return {"success": False, "error": "Task not found"}
+        write_error = _write_scheduled_tasks(ws, remaining)
+    if write_error:
+        return {"success": False, "error": write_error}
+    return {"success": True}
+
+
+@app.post("/api/tasks/{task_id}/run")
+async def run_scheduled_task_now(task_id: str, request: ScheduledTaskRunRequest):
+    if not _valid_task_id(task_id):
+        return {"success": False, "error": "Invalid task id"}
+    ws = _normalize_path_input(request.ws) or "default.ws"
+    with _task_lock:
+        tasks, read_error = _read_scheduled_tasks(ws)
+        if read_error:
+            return {"success": False, "error": read_error}
+        for task in tasks:
+            if task.get("id") != task_id:
+                continue
+            _debug_scheduled_task_record(task, now_ts=time.time())
+            write_error = _write_scheduled_tasks(ws, tasks)
+            if write_error:
+                return {"success": False, "error": write_error}
+            if task.get("last_debug_error"):
+                return {"success": False, "error": task["last_debug_error"], "data": task}
+            return {"success": True, "data": task}
+    return {"success": False, "error": "Task not found"}
 
 
 @app.get("/api/workspace/list")

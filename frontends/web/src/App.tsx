@@ -7,13 +7,14 @@ import { MemoryPanel } from './components/MemoryPanel';
 import { SystemPanel } from './components/SystemPanel';
 import { EvalPanel } from './components/EvalPanel';
 import { UsagePanel } from './components/UsagePanel';
+import { CronPanel } from './components/CronPanel';
 import { SettingsModal, loadConfig, type AgentConfig } from './components/SettingsModal';
 import { useChat } from './hooks/useChat';
 import { ThemeProvider } from './hooks/useTheme.tsx';
 import { api } from './api/client';
-import type { ChatMetadata, PersistentChatDetail } from './types';
+import type { ChatMetadata, PersistentChatDetail, ScheduledTask } from './types';
 
-type MainView = 'chat' | 'agents' | 'skills' | 'memory' | 'system' | 'eval' | 'usage' | 'agent-detail';
+type MainView = 'chat' | 'agents' | 'skills' | 'memory' | 'system' | 'eval' | 'usage' | 'cron' | 'agent-detail';
 
 function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -51,6 +52,7 @@ function App() {
     stopTask,
     clearChat,
     loadPersistentChat,
+    attachRunningSession,
   } = useChat({ onPersistentChatUpdated: refreshAgentChats });
 
   useEffect(() => {
@@ -158,6 +160,22 @@ function App() {
     }
   };
 
+  const handleDebugRunStarted = (task: ScheduledTask, sessionId: string) => {
+    setSelectedAgent(task.agent || null);
+    setActiveChatId(task.keep_one_chat && task.chat_id ? task.chat_id : '');
+    attachRunningSession(sessionId, {
+      title: `Debug: ${task.name}`,
+      task: task.prompt,
+      config: {
+        configPath: task.config_path || agentConfig.configPath,
+        observabilityConfigPath: task.observability_config_path || agentConfig.observabilityConfigPath,
+        workspaceDir: task.workspace || currentWorkspace,
+        agent: task.agent || undefined,
+      },
+    });
+    setMainView('chat');
+  };
+
   const renderMainContent = () => {
     if (mainView === 'chat') {
       return (
@@ -221,6 +239,19 @@ function App() {
             workspace={currentWorkspace}
             observabilityConfigPath={agentConfig.observabilityConfigPath}
             liveUsage={liveTokenUsage}
+          />
+        </div>
+      );
+    }
+
+    if (mainView === 'cron') {
+      return (
+        <div className="flex-1 flex flex-col min-w-0 bg-bg-primary">
+          <CronPanel
+            workspace={currentWorkspace}
+            configPath={agentConfig.configPath}
+            observabilityConfigPath={agentConfig.observabilityConfigPath}
+            onDebugRunStarted={handleDebugRunStarted}
           />
         </div>
       );

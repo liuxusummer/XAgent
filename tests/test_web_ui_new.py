@@ -6,6 +6,7 @@ import threading
 import unittest
 import queue
 import json
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,13 +27,20 @@ from src.web_ui_new import (
     EvalRunCreateRequest,
     WorkspaceFileWriteRequest,
     ChatCreateRequest,
+    ScheduledTaskRunRequest,
+    ScheduledTaskStatusRequest,
+    ScheduledTaskWriteRequest,
     _agent_runtime_config,
     _eval_cancel_events,
     _queue_state,
+    _run_due_scheduled_tasks,
     _resolve_workspace_dir_input,
     _sessions,
+    create_scheduled_task,
     create_chat,
+    delete_scheduled_task,
     delete_chat,
+    list_scheduled_tasks,
     list_chats,
     api_cancel_eval_run,
     api_create_eval_run,
@@ -66,6 +74,9 @@ from src.web_ui_new import (
     read_trace_sessions,
     read_chat,
     read_usage_summary,
+    run_scheduled_task_now,
+    set_scheduled_task_status,
+    update_scheduled_task,
 )
 
 
@@ -927,6 +938,220 @@ project_agents:
 
             self.assertFalse(result["success"])
             build_agent_mock.assert_not_called()
+
+
+class WebUINewScheduledTaskTests(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self) -> None:
+        _sessions.clear()
+
+    async def test_scheduled_task_crud_persists_under_workspace_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ws_root = Path(tmp_dir) / "default.ws"
+            ws_root.mkdir(parents=True)
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                created = await create_scheduled_task(
+                    ScheduledTaskWriteRequest(
+                        ws="default.ws",
+                        name="Daily Report",
+                        prompt="write report",
+                        agent="",
+                        repeat="daily",
+                        date="2099-01-01",
+                        time="09:00",
+                    )
+                )
+                self.assertTrue(created["success"])
+                task_id = created["data"]["id"]
+
+                listed = await list_scheduled_tasks("default.ws")
+                self.assertTrue(listed["success"])
+                self.assertEqual(len(listed["data"]), 1)
+                self.assertEqual(listed["data"][0]["name"], "Daily Report")
+
+                paused = await set_scheduled_task_status(
+                    task_id,
+                    ScheduledTaskStatusRequest(ws="default.ws", status="paused"),
+                )
+                self.assertTrue(paused["success"])
+                self.assertEqual(paused["data"]["status"], "paused")
+
+                updated = await update_scheduled_task(
+                    task_id,
+                    ScheduledTaskWriteRequest(
+                        ws="default.ws",
+                        name="Daily Report v2",
+                        prompt="write updated report",
+                        repeat="weekly",
+                        date="2099-01-01",
+                        time="10:30",
+                        status="running",
+                    ),
+                )
+                self.assertTrue(updated["success"])
+                self.assertEqual(updated["data"]["repeat"], "weekly")
+
+                deleted = await delete_scheduled_task(task_id, ws="default.ws")
+                self.assertTrue(deleted["success"])
+                listed_after = await list_scheduled_tasks("default.ws")
+                self.assertEqual(listed_after["data"], [])
+
+                store_path = ws_root / "runtime" / "tasks" / "tasks.json"
+                self.assertTrue(store_path.is_file())
+
+    async def test_due_scheduled_task_dispatches_existing_task_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir(parents=True)
+            built: list[dict[str, object]] = []
+
+            def _fake_build_agent(**kwargs):
+                built.append(kwargs)
+                agent = _HistoryFakeAgent()
+                agent.handler.ctx.verbose = False
+                return agent
+
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
+                patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
+                patch("src.web_ui_new.threading.Thread", _NoopThread),
+            ):
+                created = await create_scheduled_task(
+                    ScheduledTaskWriteRequest(
+                        ws="default.ws",
+                        name="Once",
+                        prompt="run once",
+                        repeat="none",
+                        date="2000-01-01",
+                        time="00:00",
+                    )
+                )
+                self.assertTrue(created["success"])
+                _run_due_scheduled_tasks(now_ts=946684801)
+                listed = await list_scheduled_tasks("default.ws")
+
+            self.assertEqual(len(built), 1)
+            self.assertEqual(built[0]["workspace_dir"], str(Path(tmp_dir) / "default.ws"))
+            task = listed["data"][0]
+            self.assertEqual(task["status"], "paused")
+            self.assertEqual(task["last_run"], time.strftime("%Y-%m-%d %H:%M", time.localtime(946684801)))
+            self.assertTrue(task["last_session_id"])
+
+    async def test_debug_run_scheduled_task_reports_dispatch_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir(parents=True)
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
+                patch("src.web_ui_new._dispatch_scheduled_task", return_value=(None, "boom")),
+            ):
+                created = await create_scheduled_task(
+                    ScheduledTaskWriteRequest(
+                        ws="default.ws",
+                        name="Manual",
+                        prompt="run now",
+                        repeat="none",
+                        date="2099-01-01",
+                        time="00:00",
+                    )
+                )
+                result = await run_scheduled_task_now(
+                    created["data"]["id"],
+                    ScheduledTaskRunRequest(ws="default.ws"),
+                )
+
+            self.assertFalse(result["success"])
+            self.assertEqual(result["error"], "boom")
+            self.assertEqual(result["data"]["last_debug_error"], "boom")
+
+    async def test_debug_run_does_not_advance_schedule_or_pause_one_off_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir(parents=True)
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
+                patch("src.web_ui_new._dispatch_scheduled_task", return_value=("debug-session", None)),
+            ):
+                created = await create_scheduled_task(
+                    ScheduledTaskWriteRequest(
+                        ws="default.ws",
+                        name="Manual",
+                        prompt="debug now",
+                        repeat="none",
+                        date="2099-01-01",
+                        time="00:00",
+                        status="running",
+                    )
+                )
+                before = created["data"]
+                result = await run_scheduled_task_now(
+                    before["id"],
+                    ScheduledTaskRunRequest(ws="default.ws"),
+                )
+
+            self.assertTrue(result["success"])
+            task = result["data"]
+            self.assertEqual(task["next_run"], before["next_run"])
+            self.assertEqual(task["status"], "running")
+            self.assertIsNone(task["last_run"])
+            self.assertEqual(task["last_session_id"], "")
+            self.assertTrue(task["last_debug_run"])
+            self.assertEqual(task["last_debug_session_id"], "debug-session")
+
+    async def test_scheduled_task_rejects_missing_datetime_for_fixed_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir(parents=True)
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                result = await create_scheduled_task(
+                    ScheduledTaskWriteRequest(
+                        ws="default.ws",
+                        name="Bad schedule",
+                        prompt="run later",
+                        repeat="daily",
+                    )
+                )
+
+            self.assertFalse(result["success"])
+            self.assertEqual(result["error"], "Date and time are required")
+
+    async def test_scheduled_task_rejects_keep_one_chat_without_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir(parents=True)
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                result = await create_scheduled_task(
+                    ScheduledTaskWriteRequest(
+                        ws="default.ws",
+                        name="Shared chat",
+                        prompt="run together",
+                        repeat="custom",
+                        keep_one_chat=True,
+                    )
+                )
+
+            self.assertFalse(result["success"])
+            self.assertEqual(result["error"], "Agent is required when keeping task runs in one chat")
+
+    async def test_default_workspace_seeds_preset_tasks_for_project_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ws_root = Path(tmp_dir) / "default.ws"
+            ws_root.mkdir(parents=True)
+
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
+                patch("src.web_ui_new._DEFAULT_WORKSPACE_ROOT", str(tmp_dir)),
+            ):
+                listed = await list_scheduled_tasks("default.ws")
+
+            self.assertTrue(listed["success"])
+            self.assertEqual(
+                {task["id"] for task in listed["data"]},
+                {
+                    "preset-daily-check",
+                    "preset-weekly-code-quality-audit",
+                    "preset-runtime-observability-review",
+                    "preset-docs-implementation-consistency",
+                },
+            )
+            self.assertTrue((ws_root / "runtime" / "tasks" / "tasks.json").is_file())
 
     async def test_workspace_tree_returns_system_directory_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

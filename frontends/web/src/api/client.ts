@@ -25,6 +25,8 @@ import type {
   UsageSummary,
   TraceSessionDetail,
   TraceSessionList,
+  ScheduledTask,
+  ScheduledTaskWriteRequest,
 } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_BASE || '';
@@ -82,6 +84,48 @@ class ApiClient {
     return this.fetch('/api/chat/stop', {
       method: 'POST',
       body: JSON.stringify({ session_id: sessionId || '' }),
+    });
+  }
+
+  async listScheduledTasks(ws: string): Promise<ApiResponse<ScheduledTask[]>> {
+    return this.fetch(`/api/tasks?ws=${encodeURIComponent(ws)}`);
+  }
+
+  async createScheduledTask(request: ScheduledTaskWriteRequest): Promise<ApiResponse<ScheduledTask>> {
+    return this.fetch('/api/tasks', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async updateScheduledTask(id: string, request: ScheduledTaskWriteRequest): Promise<ApiResponse<ScheduledTask>> {
+    return this.fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async setScheduledTaskStatus(
+    ws: string,
+    id: string,
+    status: ScheduledTask['status']
+  ): Promise<ApiResponse<ScheduledTask>> {
+    return this.fetch(`/api/tasks/${encodeURIComponent(id)}/status`, {
+      method: 'POST',
+      body: JSON.stringify({ ws, status }),
+    });
+  }
+
+  async debugRunScheduledTask(ws: string, id: string): Promise<ApiResponse<ScheduledTask>> {
+    return this.fetch(`/api/tasks/${encodeURIComponent(id)}/run`, {
+      method: 'POST',
+      body: JSON.stringify({ ws }),
+    });
+  }
+
+  async deleteScheduledTask(ws: string, id: string): Promise<ApiResponse<void>> {
+    return this.fetch(`/api/tasks/${encodeURIComponent(id)}?ws=${encodeURIComponent(ws)}`, {
+      method: 'DELETE',
     });
   }
 

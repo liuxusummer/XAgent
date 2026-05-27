@@ -399,6 +399,54 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
     }
   }, [addMessage, closeEventSource, handleSSEMessage]);
 
+  const attachRunningSession = useCallback((sessionId: string, options: {
+    title?: string;
+    task?: string;
+    config?: {
+      configPath?: string;
+      observabilityConfigPath?: string;
+      workspaceDir?: string;
+      agent?: string;
+    };
+  } = {}) => {
+    if (!sessionId) return;
+
+    closeEventSource();
+    backendSessionIdRef.current = sessionId;
+    persistentChatIdRef.current = '';
+    setIsWaitingForUser(false);
+    setAskPrompt('');
+    setLiveTokenUsage(null);
+    setAgentStatus({ state: 'thinking' });
+    setSession({
+      id: sessionId,
+      title: options.title || 'Debug Run',
+      messages: options.task ? [createMessage('user', options.task)] : [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      status: 'running',
+      config: options.config,
+    });
+
+    const streamRunId = streamRunIdRef.current + 1;
+    streamRunIdRef.current = streamRunId;
+    const es = api.createEventSource(sessionId);
+    eventSourceRef.current = es;
+
+    es.onmessage = event => {
+      if (streamRunId !== streamRunIdRef.current) return;
+      handleSSEMessage(event);
+    };
+
+    es.onerror = () => {
+      if (streamRunId !== streamRunIdRef.current) return;
+      console.error('SSE connection error');
+      setAgentStatus({ state: 'error' });
+      setSession(prev => ({ ...prev, status: 'error' }));
+      closeEventSource();
+    };
+  }, [closeEventSource, handleSSEMessage]);
+
   const sendReply = useCallback(async (reply: string) => {
     if (!reply.trim() || !isWaitingForUser) return;
 
@@ -503,5 +551,6 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
     stopTask,
     clearChat,
     loadPersistentChat,
+    attachRunningSession,
   };
 }

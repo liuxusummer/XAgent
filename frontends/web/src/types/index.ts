@@ -170,6 +170,49 @@ export interface SubmitTaskRequest {
   agent?: string;
 }
 
+export interface ScheduledTask {
+  id: string;
+  workspace: string;
+  name: string;
+  prompt: string;
+  agent: string;
+  repeat: 'none' | 'daily' | 'weekly' | 'custom';
+  date: string;
+  time: string;
+  end_date?: string;
+  interval_minutes?: number;
+  keep_one_chat: boolean;
+  chat_id?: string;
+  status: 'running' | 'paused';
+  next_run: string | null;
+  last_run?: string | null;
+  last_session_id?: string;
+  last_error?: string;
+  last_debug_run?: string | null;
+  last_debug_session_id?: string;
+  last_debug_error?: string;
+  config_path?: string;
+  observability_config_path?: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ScheduledTaskWriteRequest {
+  ws: string;
+  name: string;
+  prompt: string;
+  agent?: string;
+  repeat: 'none' | 'daily' | 'weekly' | 'custom';
+  date?: string;
+  time?: string;
+  end_date?: string;
+  interval_minutes?: number;
+  keep_one_chat?: boolean;
+  status?: 'running' | 'paused';
+  config_path?: string;
+  observability_config_path?: string;
+}
+
 export interface ReplyRequest {
   reply: string;
   session_id?: string;
