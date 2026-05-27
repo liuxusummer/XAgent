@@ -239,6 +239,23 @@ export interface WorkspaceTool {
   name: string;
 }
 
+export interface WorkspaceTemplate {
+  id: string;
+  name: string;
+  description: string;
+}
+
+export interface WorkspaceCreateRequest {
+  name: string;
+  template_id: string;
+}
+
+export interface WorkspaceCreateResponse {
+  name: string;
+  template_id: string;
+  path: string;
+}
+
 export interface WorkspaceFile {
   path: string;
   content: string;

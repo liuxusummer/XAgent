@@ -25,6 +25,7 @@ from src.web_ui_new import (
     EvalDatasetDownloadRequest,
     EvalDatasetImportRequest,
     EvalRunCreateRequest,
+    WorkspaceCreateRequest,
     WorkspaceFileWriteRequest,
     ChatCreateRequest,
     ScheduledTaskRunRequest,
@@ -37,10 +38,12 @@ from src.web_ui_new import (
     _resolve_workspace_dir_input,
     _sessions,
     create_scheduled_task,
+    create_workspace,
     create_chat,
     delete_scheduled_task,
     delete_chat,
     list_scheduled_tasks,
+    list_workspace_template_options,
     list_chats,
     api_cancel_eval_run,
     api_create_eval_run,
@@ -717,6 +720,81 @@ class WebUINewWorkspaceFileTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(resolved, str(Path(tmp_dir) / "default.ws"))
 
+    async def test_workspace_template_list_includes_requested_templates(self) -> None:
+        result = await list_workspace_template_options()
+
+        self.assertTrue(result["success"])
+        template_ids = {item["id"] for item in result["data"]}
+        self.assertTrue(
+            {
+                "blank",
+                "code_project",
+                "research_project",
+                "operations",
+                "data_analysis",
+                "personal_assistant",
+            }.issubset(template_ids)
+        )
+
+    async def test_create_workspace_from_code_project_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                result = await create_workspace(
+                    WorkspaceCreateRequest(name="demo", template_id="code_project")
+                )
+
+            ws_root = Path(tmp_dir) / "demo.ws"
+            self.assertTrue(result["success"])
+            self.assertEqual(result["data"]["name"], "demo.ws")
+            self.assertTrue((ws_root / "business" / "src").is_dir())
+            self.assertTrue((ws_root / "runtime" / "tasks" / "tasks.json").is_file())
+            self.assertTrue((ws_root / "system" / "agents" / "review" / "AGENT.md").is_file())
+            self.assertTrue((ws_root / "system" / "skills" / "code-review" / "SKILL.md").is_file())
+            self.assertIn(
+                "Project Memory",
+                (ws_root / "system" / "memory" / "project.md").read_text(encoding="utf-8"),
+            )
+            tasks = json.loads((ws_root / "runtime" / "tasks" / "tasks.json").read_text(encoding="utf-8"))
+            self.assertEqual(tasks["tasks"][0]["workspace"], "demo.ws")
+            self.assertEqual(tasks["tasks"][0]["agent"], "review")
+
+    async def test_create_workspace_rejects_invalid_duplicate_and_unknown_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                invalid = await create_workspace(WorkspaceCreateRequest(name="../bad", template_id="blank"))
+                unknown = await create_workspace(WorkspaceCreateRequest(name="unknown", template_id="missing"))
+                first = await create_workspace(WorkspaceCreateRequest(name="dupe.ws", template_id="blank"))
+                duplicate = await create_workspace(WorkspaceCreateRequest(name="dupe", template_id="blank"))
+
+        self.assertFalse(invalid["success"])
+        self.assertIn("Invalid workspace name", invalid["error"])
+        self.assertFalse(unknown["success"])
+        self.assertIn("Unknown workspace template", unknown["error"])
+        self.assertTrue(first["success"])
+        self.assertFalse(duplicate["success"])
+        self.assertIn("Workspace already exists", duplicate["error"])
+
+    async def test_non_blank_workspace_templates_seed_expected_resources(self) -> None:
+        expected = {
+            "research_project": ("research", "research-notes", "research.md"),
+            "operations": ("ops", "ops-runbook", "operations.md"),
+            "data_analysis": ("data", "analysis-report", "data.md"),
+            "personal_assistant": ("assistant", "personal-planning", "personal.md"),
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for template_id, (agent, skill, memory_file) in expected.items():
+                with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                    result = await create_workspace(
+                        WorkspaceCreateRequest(name=template_id, template_id=template_id)
+                    )
+                ws_root = Path(tmp_dir) / f"{template_id}.ws"
+                self.assertTrue(result["success"], template_id)
+                self.assertTrue((ws_root / "system" / "agents" / agent / "AGENT.md").is_file())
+                self.assertTrue((ws_root / "system" / "skills" / skill / "SKILL.md").is_file())
+                self.assertTrue((ws_root / "system" / "memory" / memory_file).is_file())
+                tasks = json.loads((ws_root / "runtime" / "tasks" / "tasks.json").read_text(encoding="utf-8"))
+                self.assertGreaterEqual(len(tasks["tasks"]), 1)
+
     def test_parse_agent_markdown_with_frontmatter(self) -> None:
         content = """---
 name: "main"
@@ -844,6 +922,8 @@ project_agents:
         with tempfile.TemporaryDirectory() as tmp_dir:
             agent_dir = Path(tmp_dir) / "default.ws" / "system" / "agents" / "coding"
             agent_dir.mkdir(parents=True)
+            skills_dir = Path(tmp_dir) / "default.ws" / "system" / "skills"
+            skills_dir.mkdir(parents=True)
             (agent_dir / "AGENT.md").write_text(
                 '---\nname: "coding"\ndescription: ""\ntools:\n  - "file_read"\nmodel: "dev-model"\nmaxTurns: 12\nmemory: ""\nskills: []\nproject_agents: []\n---\n\n# Coding Agent\n',
                 encoding="utf-8",
@@ -876,6 +956,7 @@ project_agents:
             self.assertEqual(captured["model_override"], "dev-model")
             self.assertEqual(captured["max_turns"], 12)
             self.assertEqual(captured["memory_mode"], "project")
+            self.assertEqual(captured["skills_dir"], str(skills_dir))
 
     async def test_submit_task_rebuilds_agent_when_runtime_config_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

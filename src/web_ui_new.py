@@ -25,6 +25,10 @@ from pydantic import BaseModel
 from src.config import load_config
 from src.core.XAgent import XAgent
 from src.core.telemetry import Event, JsonlSink, MultiSink, NullSink
+from src.core.workspace_templates import (
+    create_workspace_from_template,
+    list_workspace_templates,
+)
 from src.core.eval import (
     EvalError,
     create_eval_run,
@@ -75,6 +79,11 @@ class WorkspaceFileWriteRequest(BaseModel):
     ws: str = "default.ws"
     path: str = ""
     content: str = ""
+
+
+class WorkspaceCreateRequest(BaseModel):
+    name: str = ""
+    template_id: str = "blank"
 
 
 class WorkspaceIndexRefreshRequest(BaseModel):
@@ -635,6 +644,14 @@ def _resolve_workspace_dir_input(value: str) -> str:
     return normalized
 
 
+def _workspace_skills_dir_input(value: str) -> str | None:
+    workspace_root = _resolve_workspace_dir_input(value)
+    if not workspace_root:
+        return None
+    skills_dir = os.path.join(workspace_root, "system", "skills")
+    return skills_dir if os.path.isdir(skills_dir) else None
+
+
 def _valid_chat_id(chat_id: str) -> bool:
     return bool(chat_id) and _CHAT_ID_RE.fullmatch(chat_id) is not None and chat_id not in {".", ".."}
 
@@ -880,6 +897,7 @@ def _ensure_agent(
         session.agent = build_agent(
             config_path=config_path or None,
             observability_config_path=observability_config_path or None,
+            skills_dir=_workspace_skills_dir_input(workspace_dir),
             workspace_dir=_resolve_workspace_dir_input(workspace_dir) or None,
             agent_name=agent_name,
             agent_prompt=str(runtime_config.get("agent_prompt", "")),
@@ -2329,6 +2347,30 @@ async def list_workspaces():
             if name.endswith(".ws") and os.path.isdir(os.path.join(_WORKSPACE_ROOT, name)):
                 workspaces.append(name)
     return {"success": True, "data": workspaces}
+
+
+@app.get("/api/workspace/templates")
+async def list_workspace_template_options():
+    """List available workspace templates."""
+    return {"success": True, "data": list_workspace_templates()}
+
+
+@app.post("/api/workspace")
+async def create_workspace(request: WorkspaceCreateRequest):
+    """Create a new workspace from a template."""
+    try:
+        data = create_workspace_from_template(
+            _WORKSPACE_ROOT,
+            request.name,
+            request.template_id or "blank",
+        )
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+    except FileExistsError as exc:
+        return {"success": False, "error": str(exc)}
+    except OSError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": data}
 
 
 @app.get("/api/workspace/agents")

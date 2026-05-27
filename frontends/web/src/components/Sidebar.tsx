@@ -17,7 +17,7 @@ import {
   Clock,
 } from 'lucide-react';
 import { api } from '../api/client';
-import type { ChatMetadata } from '../types';
+import type { ChatMetadata, WorkspaceTemplate } from '../types';
 
 export type PanelTab = 'agents' | 'skills' | 'memory' | 'system' | 'eval' | 'usage' | 'cron';
 
@@ -55,12 +55,32 @@ export function Sidebar({
 }: SidebarProps) {
   const [collapsed, setCollapsed] = useState(false);
   const [workspaces, setWorkspaces] = useState<string[]>([]);
+  const [templates, setTemplates] = useState<WorkspaceTemplate[]>([]);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [workspaceName, setWorkspaceName] = useState('');
+  const [selectedTemplate, setSelectedTemplate] = useState('code_project');
+  const [createError, setCreateError] = useState('');
+  const [creating, setCreating] = useState(false);
 
-  useEffect(() => {
-    api.listWorkspaces().then(res => {
+  const refreshWorkspaces = useCallback(() => {
+    return api.listWorkspaces().then(res => {
       if (res.success && res.data) setWorkspaces(res.data);
     });
   }, []);
+
+  useEffect(() => {
+    refreshWorkspaces();
+    api.listWorkspaceTemplates().then(res => {
+      if (res.success && res.data) {
+        setTemplates(res.data);
+        setSelectedTemplate(current =>
+          res.data && res.data.length > 0 && !res.data.some(template => template.id === current)
+            ? res.data[0].id
+            : current
+        );
+      }
+    });
+  }, [refreshWorkspaces]);
 
   const handleWorkspaceChange = useCallback(
     (ws: string) => {
@@ -68,6 +88,26 @@ export function Sidebar({
     },
     [onWorkspaceChange]
   );
+
+  const handleCreateWorkspace = useCallback(async () => {
+    const name = workspaceName.trim();
+    if (!name) {
+      setCreateError('Workspace name is required');
+      return;
+    }
+    setCreating(true);
+    setCreateError('');
+    const res = await api.createWorkspace({ name, template_id: selectedTemplate || 'blank' });
+    setCreating(false);
+    if (!res.success || !res.data) {
+      setCreateError(res.error || 'Failed to create workspace');
+      return;
+    }
+    await refreshWorkspaces();
+    onWorkspaceChange(res.data.name);
+    setWorkspaceName('');
+    setCreateOpen(false);
+  }, [onWorkspaceChange, refreshWorkspaces, selectedTemplate, workspaceName]);
 
   if (collapsed) {
     return (
@@ -194,20 +234,33 @@ export function Sidebar({
           <FolderOpen className="w-3 h-3" />
           Workspace
         </label>
-        <select
-          value={currentWorkspace}
-          onChange={e => handleWorkspaceChange(e.target.value)}
-          className="w-full px-2.5 py-1.5 bg-bg-tertiary border border-border rounded-button text-sm text-text-primary outline-none focus:border-accent/50 transition-colors appearance-none cursor-pointer"
-        >
-          {workspaces.map(ws => (
-            <option key={ws} value={ws}>
-              {ws.replace(/\.ws$/, '')}
-            </option>
-          ))}
-          {workspaces.length === 0 && (
-            <option value="default.ws">default</option>
-          )}
-        </select>
+        <div className="flex items-center gap-1.5">
+          <select
+            value={currentWorkspace}
+            onChange={e => handleWorkspaceChange(e.target.value)}
+            className="min-w-0 flex-1 px-2.5 py-1.5 bg-bg-tertiary border border-border rounded-button text-sm text-text-primary outline-none focus:border-accent/50 transition-colors appearance-none cursor-pointer"
+          >
+            {workspaces.map(ws => (
+              <option key={ws} value={ws}>
+                {ws.replace(/\.ws$/, '')}
+              </option>
+            ))}
+            {workspaces.length === 0 && (
+              <option value="default.ws">default</option>
+            )}
+          </select>
+          <button
+            type="button"
+            onClick={() => {
+              setCreateError('');
+              setCreateOpen(true);
+            }}
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-button border border-border text-text-muted hover:bg-bg-tertiary hover:text-text-primary transition-colors"
+            title="New workspace"
+          >
+            <Plus className="w-3.5 h-3.5" />
+          </button>
+        </div>
       </div>
 
       {/* New Chat */}
@@ -399,6 +452,73 @@ export function Sidebar({
           <span className="text-sm">Settings</span>
         </button>
       </div>
+      {createOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="w-full max-w-md rounded-card border border-border bg-bg-secondary shadow-xl">
+            <div className="flex items-center justify-between border-b border-border px-5 py-4">
+              <h2 className="text-base font-semibold text-text-primary">New Workspace</h2>
+              <button
+                type="button"
+                onClick={() => setCreateOpen(false)}
+                className="rounded-button px-2 py-1 text-sm text-text-muted hover:bg-bg-tertiary"
+              >
+                Close
+              </button>
+            </div>
+            <div className="space-y-4 px-5 py-4">
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-text-muted">Name</span>
+                <input
+                  value={workspaceName}
+                  onChange={event => setWorkspaceName(event.target.value)}
+                  placeholder="my-project"
+                  className="w-full rounded-input border border-border bg-bg-primary px-3 py-2 text-sm text-text-primary outline-none transition-colors placeholder-text-muted focus:border-accent/50"
+                  autoFocus
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-text-muted">Template</span>
+                <select
+                  value={selectedTemplate}
+                  onChange={event => setSelectedTemplate(event.target.value)}
+                  className="w-full rounded-input border border-border bg-bg-primary px-3 py-2 text-sm text-text-primary outline-none transition-colors focus:border-accent/50"
+                >
+                  {templates.map(template => (
+                    <option key={template.id} value={template.id}>
+                      {template.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="min-h-10 rounded-input border border-border bg-bg-primary px-3 py-2 text-xs text-text-muted">
+                {templates.find(template => template.id === selectedTemplate)?.description || 'Standard workspace layout.'}
+              </div>
+              {createError && (
+                <div className="rounded-input border border-status-error/30 bg-status-error/10 px-3 py-2 text-sm text-status-error">
+                  {createError}
+                </div>
+              )}
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-border px-5 py-4">
+              <button
+                type="button"
+                onClick={() => setCreateOpen(false)}
+                className="rounded-button border border-border px-3 py-2 text-sm text-text-secondary hover:bg-bg-tertiary transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleCreateWorkspace}
+                disabled={creating}
+                className="rounded-button bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-60 transition-colors"
+              >
+                {creating ? 'Creating' : 'Create'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </aside>
   );
 }

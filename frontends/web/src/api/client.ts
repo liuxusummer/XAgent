@@ -3,7 +3,10 @@ import type {
   ReplyRequest,
   ApiResponse,
   WorkspaceAgent,
+  WorkspaceCreateRequest,
+  WorkspaceCreateResponse,
   WorkspaceSkill,
+  WorkspaceTemplate,
   WorkspaceTool,
   WorkspaceFile,
   WorkspaceFileWriteResponse,
@@ -163,6 +166,17 @@ class ApiClient {
 
   async listWorkspaces(): Promise<ApiResponse<string[]>> {
     return this.fetch('/api/workspace/list');
+  }
+
+  async listWorkspaceTemplates(): Promise<ApiResponse<WorkspaceTemplate[]>> {
+    return this.fetch('/api/workspace/templates');
+  }
+
+  async createWorkspace(request: WorkspaceCreateRequest): Promise<ApiResponse<WorkspaceCreateResponse>> {
+    return this.fetch('/api/workspace', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
   }
 
   async listAgents(ws: string = 'default.ws'): Promise<ApiResponse<WorkspaceAgent[]>> {
