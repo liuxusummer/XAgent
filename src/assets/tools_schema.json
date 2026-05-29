@@ -260,6 +260,35 @@
   {
     "type": "function",
     "function": {
+      "name": "agent_delegate",
+      "description": "Delegate a bounded sub-task to an enabled member of the active Agent team. Use only when the member's role fits the sub-task; execution is serial and returns the member's final result.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent": {
+            "type": "string",
+            "description": "Target team member agent name."
+          },
+          "task": {
+            "type": "string",
+            "description": "Specific sub-task for the member agent to complete."
+          },
+          "context": {
+            "type": "string",
+            "description": "Optional concise leader context needed by the member."
+          },
+          "expected_output": {
+            "type": "string",
+            "description": "Optional expected result format or acceptance criteria."
+          }
+        },
+        "required": ["agent", "task"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "update_working_checkpoint",
       "description": "Update short-term working memory (key_info and related_sop). Updated content is injected into every subsequent turn.",
       "parameters": {

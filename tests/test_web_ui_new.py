@@ -31,6 +31,7 @@ from src.web_ui_new import (
     ScheduledTaskRunRequest,
     ScheduledTaskStatusRequest,
     ScheduledTaskWriteRequest,
+    TeamWriteRequest,
     _agent_runtime_config,
     _eval_cancel_events,
     _queue_state,
@@ -68,11 +69,16 @@ from src.web_ui_new import (
     preview_workspace_file,
     write_agent_profile,
     write_workspace_file,
+    list_teams,
+    read_team,
+    write_team,
+    delete_team,
     AgentProfileWriteRequest,
     WorkspaceIndexRefreshRequest,
     WebSessionUsageSink,
     _resolve_trace_log_dir,
     _usage_summary_from_events,
+    _update_session_messages,
     read_trace_session_detail,
     read_trace_sessions,
     read_chat,
@@ -256,6 +262,57 @@ class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state["finished"])
         self.assertTrue(session.event_queue.empty())
 
+    def test_done_merges_tool_result_error_status(self) -> None:
+        session = UISession(session_id="tools")
+        _update_session_messages(
+            session,
+            "tool_call",
+            {"id": "t1", "name": "web_download", "arguments": {}, "status": "running"},
+        )
+
+        _update_session_messages(
+            session,
+            "done",
+            {
+                "response": "done",
+                "exit_reason": "CURRENT_TASK_DONE",
+                "tool_results": [
+                    {
+                        "tool_name": "web_download",
+                        "tool_call_id": "t1",
+                        "data": {"status": "ERROR", "error": "unknown tool"},
+                    }
+                ],
+            },
+        )
+
+        tool_call = session.messages[-1]["toolCalls"][0]
+        self.assertEqual(tool_call["status"], "error")
+        self.assertEqual(tool_call["result"]["error"], "unknown tool")
+
+    def test_done_merges_duplicate_tool_names_in_order(self) -> None:
+        session = UISession(session_id="tools")
+        for tool_id in ("a", "b"):
+            _update_session_messages(
+                session,
+                "tool_call",
+                {"id": tool_id, "name": "web_scan", "arguments": {}, "status": "running"},
+            )
+
+        _update_session_messages(
+            session,
+            "done",
+            {
+                "tool_results": [
+                    {"tool_name": "web_scan", "tool_call_id": "tool_1", "status": "OK"},
+                    {"tool_name": "web_scan", "tool_call_id": "tool_1", "status": "OK"},
+                ],
+            },
+        )
+
+        tool_calls = session.messages[-1]["toolCalls"]
+        self.assertEqual([item["status"] for item in tool_calls], ["success", "success"])
+
     async def test_stream_reads_events_from_session_log_not_queue_payload(self) -> None:
         session = UISession(session_id="stream")
         session.events.append({"type": "assistant_delta", "data": "hello"})
@@ -425,6 +482,95 @@ class WebUINewUsageSummaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["data"]["summary"]["session_id"], "s1")
         self.assertEqual(len(result["data"]["events"]), 1)
         self.assertFalse(unsafe["success"])
+
+
+class WebUINewAgentTeamTests(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self) -> None:
+        _sessions.clear()
+
+    def _write_agent(self, root: Path, name: str, tools: list[str] | None = None) -> None:
+        agent_dir = root / "default.ws" / "system" / "agents" / name
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        tool_lines = "\n".join(f'  - "{tool}"' for tool in (tools or ["file_read"]))
+        agent_dir.joinpath("AGENT.md").write_text(
+            (
+                f'---\nname: "{name}"\ndescription: ""\ntools:\n{tool_lines}\n'
+                'model: "dev-model"\nmaxTurns: 12\nmemory: "project"\nskills: []\nproject_agents: []\n---\n\n'
+                f"# {name}\n"
+            ),
+            encoding="utf-8",
+        )
+
+    async def test_team_api_crud_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            self._write_agent(root, "main")
+            self._write_agent(root, "coding")
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(root)):
+                written = await write_team(
+                    TeamWriteRequest(
+                        ws="default.ws",
+                        team={
+                            "name": "dev-team",
+                            "description": "Dev team",
+                            "leader": "main",
+                            "mode": "leader_delegates",
+                            "members": [{"agent": "coding", "role": "implementation", "autoDelegate": True}],
+                        },
+                    )
+                )
+                listed = await list_teams(ws="default.ws")
+                read = await read_team(ws="default.ws", team="dev-team")
+                deleted = await delete_team(ws="default.ws", team="dev-team")
+
+        self.assertTrue(written["success"])
+        self.assertEqual(written["data"]["members"][0]["agent"], "coding")
+        self.assertTrue(listed["success"])
+        self.assertEqual(listed["data"][0]["name"], "dev-team")
+        self.assertTrue(read["success"])
+        self.assertEqual(read["data"]["leader"], "main")
+        self.assertTrue(deleted["success"])
+
+    async def test_submit_task_with_team_uses_team_leader_and_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            self._write_agent(root, "main")
+            self._write_agent(root, "coding")
+            team_dir = root / "default.ws" / "system" / "teams"
+            team_dir.mkdir(parents=True)
+            team_dir.joinpath("dev-team.json").write_text(
+                json.dumps(
+                    {
+                        "name": "dev-team",
+                        "description": "Dev team",
+                        "leader": "main",
+                        "mode": "leader_delegates",
+                        "members": [{"agent": "coding", "role": "implementation", "autoDelegate": True}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_agent = _FakeAgent()
+            fake_agent.handler = type("H", (), {"ctx": type("C", (), {"verbose": False, "sink": None})()})()
+            captured: dict[str, object] = {}
+
+            def _fake_build_agent(**kwargs):
+                captured.update(kwargs)
+                return fake_agent
+
+            _sessions.clear()
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(root)),
+                patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
+                patch("src.web_ui_new.threading.Thread", _NoopThread),
+            ):
+                result = await submit_task(
+                    SubmitTaskRequest(task="hello", workspace_dir="default.ws", team="dev-team")
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(captured["agent_name"], "main")
+        self.assertEqual(captured["team_config"]["name"], "dev-team")
 
     async def test_submit_task_attaches_default_jsonl_trace_sink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -792,6 +938,20 @@ class WebUINewWorkspaceFileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue((ws_root / "system" / "agents" / agent / "AGENT.md").is_file())
                 self.assertTrue((ws_root / "system" / "skills" / skill / "SKILL.md").is_file())
                 self.assertTrue((ws_root / "system" / "memory" / memory_file).is_file())
+                if template_id == "research_project":
+                    team_path = ws_root / "system" / "teams" / "deepresearch.json"
+                    self.assertTrue(team_path.is_file())
+                    team = json.loads(team_path.read_text(encoding="utf-8"))
+                    self.assertEqual(team["leader"], "main")
+                    self.assertEqual(team["mode"], "leader_delegates")
+                    self.assertEqual(
+                        [member["agent"] for member in team["members"]],
+                        ["source_scout", "evidence_analyst", "synthesis_writer", "research_critic"],
+                    )
+                    for research_agent in team["members"]:
+                        self.assertTrue(
+                            (ws_root / "system" / "agents" / research_agent["agent"] / "AGENT.md").is_file()
+                        )
                 tasks = json.loads((ws_root / "runtime" / "tasks" / "tasks.json").read_text(encoding="utf-8"))
                 self.assertGreaterEqual(len(tasks["tasks"]), 1)
 

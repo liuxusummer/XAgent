@@ -38,12 +38,29 @@ class TemplateSkill:
 
 
 @dataclass(frozen=True)
+class TemplateTeamMember:
+    agent: str
+    role: str
+    auto_delegate: bool = True
+
+
+@dataclass(frozen=True)
+class TemplateTeam:
+    name: str
+    description: str
+    leader: str
+    mode: str
+    members: tuple[TemplateTeamMember, ...] = ()
+
+
+@dataclass(frozen=True)
 class WorkspaceTemplate:
     id: str
     name: str
     description: str
     directories: tuple[str, ...] = ()
     agents: tuple[TemplateAgent, ...] = ()
+    teams: tuple[TemplateTeam, ...] = ()
     skills: tuple[TemplateSkill, ...] = ()
     memory_files: dict[str, str] = field(default_factory=dict)
     template_files: dict[str, str] = field(default_factory=dict)
@@ -103,6 +120,26 @@ def _skill(name: str, description: str, content: str, *triggers: str) -> Templat
         description=description,
         content=content.strip() + "\n",
         triggers=tuple(item for item in triggers if item),
+    )
+
+
+def _team_member(agent: str, role: str, *, auto_delegate: bool = True) -> TemplateTeamMember:
+    return TemplateTeamMember(agent=agent, role=role, auto_delegate=auto_delegate)
+
+
+def _team(
+    name: str,
+    description: str,
+    leader: str,
+    *members: TemplateTeamMember,
+    mode: str = "leader_delegates",
+) -> TemplateTeam:
+    return TemplateTeam(
+        name=name,
+        description=description,
+        leader=leader,
+        mode=mode,
+        members=members,
     )
 
 
@@ -235,11 +272,61 @@ name remaining test gaps.
     research_project = WorkspaceTemplate(
         id="research_project",
         name="Research Project",
-        description="Agents and tasks for literature review, notes, and synthesis.",
+        description="Agents, teams, and tasks for deep research, notes, and synthesis.",
         directories=("business/sources", "business/notes", "business/drafts", "runtime/citations"),
         agents=(
-            _agent("main", "Coordinates research work.", "你是研究项目主 Agent。维护研究问题、资料范围和产出结构。", project_agents=("research",)),
-            _agent("research", "Collects, organizes, and synthesizes research notes.", "你是研究 Agent。区分事实、推断和待验证信息，输出结构化研究笔记。", skills=("research-notes",)),
+            _agent(
+                "main",
+                "Coordinates research work and delegates deep-research sub-tasks.",
+                "你是研究项目主 Agent。先明确研究问题、范围和交付形式，再协调 deepresearch 团队完成检索、证据分析、综合写作和批判审查。",
+                project_agents=("source_scout", "evidence_analyst", "synthesis_writer", "research_critic"),
+            ),
+            _agent(
+                "source_scout",
+                "Finds and triages relevant sources for a research question.",
+                "你是资料侦察 Agent。围绕研究问题寻找候选资料、判断来源可信度、提取可追溯引用线索，并输出 source map。不要写最终结论。",
+                tools=("file_read", "file_search", "web_scan", "web_execute_js", "update_working_checkpoint", "plan_update"),
+                skills=("research-notes",),
+            ),
+            _agent(
+                "evidence_analyst",
+                "Extracts claims, evidence, assumptions, and contradictions.",
+                "你是证据分析 Agent。对给定资料做事实抽取、证据分级、冲突识别和假设标注。必须区分事实、推断、观点和待验证信息。",
+                tools=("file_read", "file_search", "code_run", "update_working_checkpoint", "plan_update"),
+                skills=("research-notes",),
+            ),
+            _agent(
+                "synthesis_writer",
+                "Turns evidence into structured research briefs and drafts.",
+                "你是综合写作 Agent。把已验证证据组织成结构化研究简报、提纲或草稿。输出必须保留证据链和不确定性，不编造引用。",
+                tools=("file_read", "file_search", "file_write", "file_patch", "update_working_checkpoint", "plan_update"),
+                skills=("research-notes",),
+            ),
+            _agent(
+                "research_critic",
+                "Reviews research for gaps, weak evidence, and overclaims.",
+                "你是研究审查 Agent。专门寻找证据缺口、逻辑跳跃、过度结论、遗漏反例和引用不充分处。优先输出可执行的修正建议。",
+                tools=("file_read", "file_search", "update_working_checkpoint", "plan_update"),
+                skills=("research-notes",),
+            ),
+            _agent(
+                "research",
+                "Collects, organizes, and synthesizes research notes.",
+                "你是通用研究 Agent。区分事实、推断和待验证信息，输出结构化研究笔记。",
+                skills=("research-notes",),
+            ),
+        ),
+        teams=(
+            _team(
+                "deepresearch",
+                "深度研究团队：由主控 Agent 串行委派资料检索、证据分析、综合写作和批判审查。",
+                "main",
+                _team_member("source_scout", "source discovery and credibility triage"),
+                _team_member("evidence_analyst", "claim extraction and evidence analysis"),
+                _team_member("synthesis_writer", "structured synthesis and draft writing"),
+                _team_member("research_critic", "gap analysis and overclaim review"),
+                mode="leader_delegates",
+            ),
         ),
         skills=(
             _skill(
@@ -420,6 +507,29 @@ def _write_template(root: Path, workspace_name: str, template: WorkspaceTemplate
         (agent_dir / "AGENT.md").write_text(_frontmatter(agent), encoding="utf-8")
         (agent_dir / "SOUL.md").write_text(agent.soul, encoding="utf-8")
         (agent_dir / "MEMORY.md").write_text(agent.memory, encoding="utf-8")
+    for team in template.teams:
+        team_path = _safe_path(root, f"system/teams/{team.name}.json")
+        team_path.parent.mkdir(parents=True, exist_ok=True)
+        team_config = {
+            "name": team.name,
+            "description": team.description,
+            "leader": team.leader,
+            "mode": team.mode,
+            "members": [
+                {
+                    "agent": member.agent,
+                    "role": member.role,
+                    "autoDelegate": member.auto_delegate,
+                }
+                for member in team.members
+            ],
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+        team_path.write_text(
+            json.dumps(team_config, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     for skill in template.skills:
         skill_dir = _safe_path(root, f"system/skills/{skill.name}")
         skill_dir.mkdir(parents=True, exist_ok=True)

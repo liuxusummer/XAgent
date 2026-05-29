@@ -518,6 +518,49 @@ class XAgentHandler(BaseHandler):
             next_prompt=f"用户回复：{user_reply}" if user_reply else "用户未提供回复，请基于已有信息继续执行。",
         )
 
+    def exec_agent_delegate(self, args: dict[str, Any]) -> ActionResult:
+        agent = str(args.get("agent") or "").strip()
+        task = str(args.get("task") or "").strip()
+        context = str(args.get("context") or "").strip()
+        expected_output = str(args.get("expected_output") or "").strip()
+        if not agent:
+            return ActionResult(
+                data={"status": "ERROR", "error": "agent is required"},
+                next_prompt="委派失败：缺少目标 agent。请指定团队成员 agent，或停止并说明无法委派。",
+            )
+        if not task:
+            return ActionResult(
+                data={"status": "ERROR", "error": "task is required"},
+                next_prompt="委派失败：缺少子任务描述。请补充明确 task 后重试，或自行继续执行。",
+            )
+        runner = getattr(self.ctx, "delegate_runner", None)
+        if runner is None:
+            return ActionResult(
+                data={"status": "ERROR", "error": "no active team"},
+                next_prompt="当前没有启用 Agent 团队，不能调用 agent_delegate。请改用当前 Agent 的工具继续。",
+            )
+
+        self.ctx.display_fn(f"  agent_delegate: start ({agent})")
+        result = runner(
+            agent=agent,
+            task=task,
+            context=context,
+            expected_output=expected_output,
+            parent_ctx=self.ctx,
+        )
+        status = str(result.get("status", "UNKNOWN")) if isinstance(result, dict) else "ERROR"
+        self.ctx.display_fn(f"  agent_delegate: done ({agent}, {status})")
+        if not isinstance(result, dict):
+            result = {"status": "ERROR", "error": f"delegate runner returned {type(result)!r}"}
+        if result.get("status") == "OK":
+            next_prompt = (
+                f"团队成员 {agent} 已完成委派任务。请基于 tool_results 中的 response 和元数据整合结果；"
+                "若总任务未完成，可以继续调用工具或委派其他成员。"
+            )
+        else:
+            next_prompt = "Agent 委派失败。请基于错误信息改用其他成员、当前 Agent 工具，或向用户说明限制。"
+        return ActionResult(data=result, next_prompt=next_prompt)
+
     def exec_update_working_checkpoint(self, args: dict[str, Any]) -> ActionResult:
         key_info = args.get("key_info")
         related_sop = args.get("related_sop")

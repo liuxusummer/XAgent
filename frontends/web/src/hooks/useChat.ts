@@ -44,6 +44,35 @@ function appendToolCall(toolCalls: ToolCall[] | undefined, toolCall: ToolCall): 
   return [...current, toolCall];
 }
 
+function statusFromToolData(data: unknown): ToolCall['status'] {
+  if (data && typeof data === 'object') {
+    const payload = data as { status?: unknown; error?: unknown };
+    if (String(payload.status || '').toUpperCase() === 'ERROR' || payload.error) {
+      return 'error';
+    }
+  }
+  return 'success';
+}
+
+function mergeToolCallResults(toolCalls: ToolCall[] | undefined, results: ToolCall[]): ToolCall[] {
+  const merged = [...(toolCalls || [])];
+  results.forEach(result => {
+    const exactMatch = merged.find(tool => tool.id === result.id);
+    const pendingNameMatch = merged.find(
+      tool => tool.name === result.name && ['pending', 'running'].includes(tool.status) && tool.result === undefined
+    );
+    const anyNameMatch = merged.find(tool => tool.name === result.name);
+    const target = exactMatch || pendingNameMatch || anyNameMatch;
+    if (target) {
+      target.status = result.status;
+      target.result = result.result;
+      return;
+    }
+    merged.push(result);
+  });
+  return merged;
+}
+
 function completeStreamingAgentMessages(messages: Message[]): Message[] {
   return messages.map(message =>
     message.role === 'agent' && message.status === 'streaming'
@@ -245,6 +274,8 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
               tool_name?: string;
               tool_call_id?: string;
               data?: unknown;
+              status?: string;
+              error?: unknown;
             }>;
           };
           const completedAt = Date.now();
@@ -267,14 +298,11 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
                     id: tool.tool_call_id || tool.tool_name!,
                     name: tool.tool_name!,
                     arguments: {},
-                    status: 'success' as const,
-                    result: tool.data,
+                    status: statusFromToolData(Object.prototype.hasOwnProperty.call(tool, 'data') ? tool.data : tool),
+                    result: Object.prototype.hasOwnProperty.call(tool, 'data') ? tool.data : tool,
                   }));
                 if (fallbackTools.length) {
-                  lastMsg.toolCalls = fallbackTools.reduce(
-                    (toolCalls, toolCall) => appendToolCall(toolCalls, toolCall),
-                    lastMsg.toolCalls || []
-                  );
+                  lastMsg.toolCalls = mergeToolCallResults(lastMsg.toolCalls, fallbackTools);
                 }
               }
               lastMsg.status = 'complete';
@@ -319,6 +347,7 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
     workspaceDir?: string;
     agent?: string;
     chatId?: string;
+    team?: string;
   }) => {
     if (!task.trim()) return;
 
@@ -352,6 +381,7 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
         observability_config_path: config?.observabilityConfigPath,
         workspace_dir: config?.workspaceDir,
         agent: config?.agent,
+        team: config?.team,
       });
 
       if (!response.success) {
@@ -407,6 +437,7 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
       observabilityConfigPath?: string;
       workspaceDir?: string;
       agent?: string;
+      team?: string;
     };
   } = {}) => {
     if (!sessionId) return;

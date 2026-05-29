@@ -17,6 +17,10 @@ memory: "project"
 skills: []
 project_agents:
   - "coding"
+  - "source_scout"
+  - "evidence_analyst"
+  - "synthesis_writer"
+  - "research_critic"
 ---
 
 # Main Agent

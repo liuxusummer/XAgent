@@ -5,10 +5,11 @@ import { useTheme } from '../hooks/useTheme.tsx';
 interface StatusBarProps {
   status: AgentStatus;
   activeAgent?: string | null;
+  activeTeam?: string | null;
   chatTitle?: string;
 }
 
-export function StatusBar({ status, activeAgent, chatTitle }: StatusBarProps) {
+export function StatusBar({ status, activeAgent, activeTeam, chatTitle }: StatusBarProps) {
   const { theme, toggleTheme } = useTheme();
   const getStatusConfig = () => {
     switch (status.state) {
@@ -73,6 +74,12 @@ export function StatusBar({ status, activeAgent, chatTitle }: StatusBarProps) {
           <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-accent/10 border border-accent/20">
             <Sparkles className="w-3 h-3 text-accent" />
             <span className="text-xs font-medium text-accent">{activeAgent}</span>
+          </div>
+        )}
+
+        {activeTeam && (
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-bg-tertiary border border-border">
+            <span className="text-xs font-medium text-text-secondary">Team {activeTeam}</span>
           </div>
         )}
 

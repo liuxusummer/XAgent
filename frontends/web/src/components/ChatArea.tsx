@@ -14,8 +14,9 @@ interface ChatAreaProps {
   onSubmitTask: (task: string) => void;
   onSendReply: (reply: string) => void;
   onStopTask: () => void;
-  view: 'chat' | 'agents' | 'skills';
+  view: 'chat' | 'agents' | 'teams' | 'skills';
   activeAgent?: string | null;
+  activeTeam?: string | null;
   chatTitle?: string;
 }
 
@@ -65,6 +66,7 @@ export function ChatArea({
   onStopTask,
   view,
   activeAgent,
+  activeTeam,
   chatTitle,
 }: ChatAreaProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -93,7 +95,7 @@ export function ChatArea({
   return (
     <div className="flex-1 flex flex-col min-w-0 bg-bg-primary">
       {/* Status Bar */}
-      <StatusBar status={agentStatus} activeAgent={activeAgent} chatTitle={chatTitle} />
+      <StatusBar status={agentStatus} activeAgent={activeAgent} activeTeam={activeTeam} chatTitle={chatTitle} />
 
       {/* Messages Area */}
       {showChat && messages.length === 0 && (

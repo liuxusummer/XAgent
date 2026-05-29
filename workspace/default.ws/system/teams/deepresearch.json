@@ -1,0 +1,30 @@
+{
+  "created_at": 0,
+  "description": "深度研究团队：主控 Agent 串行委派资料检索、证据分析、综合写作和批判审查。",
+  "leader": "main",
+  "members": [
+    {
+      "agent": "source_scout",
+      "autoDelegate": true,
+      "role": "source discovery and credibility triage"
+    },
+    {
+      "agent": "evidence_analyst",
+      "autoDelegate": true,
+      "role": "claim extraction and evidence analysis"
+    },
+    {
+      "agent": "synthesis_writer",
+      "autoDelegate": true,
+      "role": "structured synthesis and draft writing"
+    },
+    {
+      "agent": "research_critic",
+      "autoDelegate": true,
+      "role": "gap analysis and overclaim review"
+    }
+  ],
+  "mode": "leader_delegates",
+  "name": "deepresearch",
+  "updated_at": 0
+}

@@ -13,6 +13,11 @@ from src.core.telemetry import Event, EventSink, NullSink
 
 
 CODE_BLOCK_PATTERN = re.compile(r"```[\s\S]+?```")
+TOOL_USE_OPEN_PATTERN = re.compile(r"<tool_use\b", re.IGNORECASE)
+TOOL_INTENT_VERB_PATTERN = re.compile(
+    r"(?:将|准备|尝试|接下来|继续|需要|改用|调用|执行|运行|通过|\b(?:call|use|run|execute)\b)",
+    re.IGNORECASE,
+)
 EMPTY_RESPONSE_LIMIT = 3
 
 
@@ -37,6 +42,8 @@ class AgentContext:
     memory_root: str = ""
     agent_name: str = ""
     memory_mode: str = "project"
+    team_config: dict[str, Any] | None = None
+    delegate_runner: Callable[..., dict[str, Any]] | None = None
     current_turn: int = 0
     history_info: list[str] = field(default_factory=list)
     # 代码执行级中断信号。语义：由代码执行子模块（例如未来的 web_execute_js 长任务
@@ -75,6 +82,45 @@ def exhaust(generator: GeneratorType) -> Any:
             next(generator)
     except StopIteration as stop:
         return stop.value
+
+
+def _tool_names_from_schema(tools_schema: list[dict[str, Any]] | None) -> set[str]:
+    names: set[str] = set()
+    for tool in tools_schema or []:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if not name and isinstance(tool.get("function"), dict):
+            name = tool["function"].get("name")
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
+
+
+def _looks_like_tool_intent_without_call(
+    content: str,
+    raw_text: str,
+    tools_schema: list[dict[str, Any]] | None,
+) -> str:
+    if TOOL_USE_OPEN_PATTERN.search(raw_text) and not response_tool_blocks_complete(raw_text):
+        return "malformed_tool_use"
+
+    tool_names = _tool_names_from_schema(tools_schema)
+    if not tool_names:
+        return ""
+    for tool_name in sorted(tool_names, key=len, reverse=True):
+        match = re.search(rf"`?{re.escape(tool_name)}`?", content, re.IGNORECASE)
+        if not match:
+            continue
+        window_start = max(0, match.start() - 24)
+        window_end = min(len(content), match.end() + 24)
+        if TOOL_INTENT_VERB_PATTERN.search(content[window_start:window_end]):
+            return tool_name
+    return ""
+
+
+def response_tool_blocks_complete(raw_text: str) -> bool:
+    return raw_text.count("<tool_use") <= raw_text.count("</tool_use>")
 
 
 class BaseHandler:
@@ -202,9 +248,10 @@ class BaseHandler:
 def handle_no_tool_call(
     handler: BaseHandler,
     response: ChatResponse,
+    tools_schema: list[dict[str, Any]] | None = None,
 ) -> ActionResult:
     content = (response.content or "").strip()
-    raw_text = str(response.raw or "")
+    raw_text = str(response.raw if response.raw is not None else response.content or "")
     if response.stop_reason in {"max_tokens", "length"} or raw_text.rstrip().endswith("!!!Error"):
         handler.ctx.empty_count = 0
         return ActionResult(
@@ -235,6 +282,19 @@ def handle_no_tool_call(
         return ActionResult(
             data={"status": "CODE_BLOCK_WITHOUT_TOOL", "content": content},
             next_prompt="你输出了代码块但没有调用工具。若需要执行代码，请调用 code_run；若只是汇报结果，请不要输出代码块。",
+            flags=frozenset({"retry"}),
+        )
+
+    tool_intent = _looks_like_tool_intent_without_call(content, raw_text, tools_schema)
+    if tool_intent:
+        handler.ctx.empty_count = 0
+        return ActionResult(
+            data={"status": "TOOL_INTENT_WITHOUT_CALL", "tool": tool_intent, "content": content},
+            next_prompt=(
+                "你刚才描述了要继续使用工具，但没有发起合法工具调用。"
+                "如果任务还没完成，请立即输出一个合法的 <tool_use>{\"name\": ..., \"arguments\": {...}}</tool_use>；"
+                "如果任务已经完成，请直接给出完整最终结论，不要只输出执行计划。"
+            ),
             flags=frozenset({"retry"}),
         )
 
@@ -413,7 +473,7 @@ def run_agent_loop(
             final_response = response.content.strip()
 
         if not response.tool_calls:
-            result = handle_no_tool_call(handler, response)
+            result = handle_no_tool_call(handler, response, tools_schema=tools_schema)
             no_tool_result = {
                 "tool_name": "no_tool",
                 "tool_call_id": "",

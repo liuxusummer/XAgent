@@ -29,6 +29,7 @@ WORKSPACE_LAYOUT_DIRS = (
     "system/memory",
     "system/skills",
     "system/templates",
+    "system/teams",
 )
 WORKSPACE_LAYOUT_FILES = (
     "system/agents/main/AGENT.md",
@@ -93,6 +94,8 @@ class XAgent:
     max_turns: int = 40
     agent_name: str = ""
     memory_mode: str = "project"
+    team_config: dict[str, Any] | None = None
+    delegate_runner: Any | None = None
     file_index_embedding_config: dict[str, Any] | None = None
     runbook_min_interaction_records: int = 10
 
@@ -114,6 +117,8 @@ class XAgent:
                 memory_root=self.cwd,
                 agent_name=self.agent_name,
                 memory_mode=self.memory_mode,
+                team_config=self.team_config,
+                delegate_runner=self.delegate_runner,
                 file_index_embedding=self.file_index_embedding_config,
             ),
             task_dir=self.workspace_dir,

@@ -24,6 +24,13 @@ from pydantic import BaseModel
 
 from src.config import load_config
 from src.core.XAgent import XAgent
+from src.core.agent_profiles import load_agent_runtime_config
+from src.core.agent_teams import (
+    delete_team_config,
+    list_team_configs,
+    read_team_config,
+    write_team_config,
+)
 from src.core.telemetry import Event, JsonlSink, MultiSink, NullSink
 from src.core.workspace_templates import (
     create_workspace_from_template,
@@ -68,6 +75,7 @@ class SubmitTaskRequest(BaseModel):
     observability_config_path: str = ""
     workspace_dir: str = ""
     agent: str = ""
+    team: str = ""
 
 
 class ReplyRequest(BaseModel):
@@ -124,6 +132,16 @@ class AgentProfileWriteRequest(BaseModel):
     body: str = ""
 
 
+class TeamWriteRequest(BaseModel):
+    ws: str = "default.ws"
+    team: dict[str, Any] = {}
+
+
+class TeamDeleteRequest(BaseModel):
+    ws: str = "default.ws"
+    team: str = ""
+
+
 class ChatCreateRequest(BaseModel):
     ws: str = "default.ws"
     agent: str = ""
@@ -165,6 +183,7 @@ class UISession:
     observability_config_path: str = ""
     workspace_dir: str = ""
     agent_name: str = ""
+    team_name: str = ""
     runtime_config_key: str = ""
     session_id: str = ""
     chat_id: str = ""
@@ -432,6 +451,43 @@ def _append_ui_delta(current: str, delta: str) -> str:
     return current + delta
 
 
+def _tool_status_from_data(data: Any) -> str:
+    if not isinstance(data, dict):
+        return "success"
+    status = str(data.get("status", "")).upper()
+    if status == "ERROR" or data.get("error"):
+        return "error"
+    return "success"
+
+
+def _merge_tool_call_results(tool_calls: list[Any], fallback_tools: list[dict[str, Any]]) -> list[Any]:
+    for fallback in fallback_tools:
+        exact_match = None
+        pending_name_match = None
+        any_name_match = None
+        for existing in tool_calls:
+            if not isinstance(existing, dict):
+                continue
+            if existing.get("id") == fallback["id"]:
+                exact_match = existing
+                break
+            if existing.get("name") == fallback["name"]:
+                if existing.get("status") in {"pending", "running"} and existing.get("result") is None:
+                    pending_name_match = pending_name_match or existing
+                any_name_match = any_name_match or existing
+        target = exact_match or pending_name_match or any_name_match
+        if target is not None:
+            target.update(
+                {
+                    "status": fallback["status"],
+                    "result": fallback["result"],
+                }
+            )
+        else:
+            tool_calls.append(fallback)
+    return tool_calls
+
+
 def _update_session_messages(session: UISession, event_type: str, data: Any = None) -> None:
     if event_type in {"user_task", "user_reply"}:
         session.messages.append(_new_ui_message("user", str(data or "")))
@@ -495,12 +551,15 @@ def _update_session_messages(session: UISession, event_type: str, data: Any = No
                     "id": str(item.get("tool_call_id") or tool_name),
                     "name": tool_name,
                     "arguments": {},
-                    "status": "success",
-                    "result": item.get("data"),
+                    "status": _tool_status_from_data(item.get("data") if "data" in item else item),
+                    "result": item.get("data") if "data" in item else item,
                 }
             )
-        if fallback_tools and not message.get("toolCalls"):
-            message["toolCalls"] = fallback_tools
+        if fallback_tools:
+            tool_calls = message.get("toolCalls")
+            if not isinstance(tool_calls, list):
+                tool_calls = []
+            message["toolCalls"] = _merge_tool_call_results(tool_calls, fallback_tools)
         return
     if event_type in {"error", "stop"}:
         session.messages.append(_new_ui_message("system", str(data or ""), status="error" if event_type == "error" else "complete"))
@@ -518,7 +577,7 @@ def _emit_tool_call(session: UISession, name: str, arguments: dict[str, Any], to
             "id": tool_id or uuid.uuid4().hex[:8],
             "name": name,
             "arguments": arguments,
-            "status": "success",
+            "status": "running",
         },
     )
 
@@ -882,15 +941,19 @@ def _ensure_agent(
     workspace_dir: str,
     agent_name: str,
     runtime_config: dict[str, Any] | None = None,
+    team_name: str = "",
+    team_config: dict[str, Any] | None = None,
 ):
     runtime_config = runtime_config or {}
-    runtime_config_key = json.dumps(runtime_config, ensure_ascii=False, sort_keys=True, default=str)
+    runtime_key_data = {"agent": runtime_config, "team": team_config or {}}
+    runtime_config_key = json.dumps(runtime_key_data, ensure_ascii=False, sort_keys=True, default=str)
     if (
         session.agent is None
         or session.config_path != config_path
         or session.observability_config_path != observability_config_path
         or session.workspace_dir != workspace_dir
         or session.agent_name != agent_name
+        or session.team_name != team_name
         or session.runtime_config_key != runtime_config_key
     ):
         _close_agent(session)
@@ -907,6 +970,7 @@ def _ensure_agent(
             model_override=str(runtime_config.get("model_override", "")),
             max_turns=runtime_config.get("max_turns"),
             memory_mode=str(runtime_config.get("memory_mode", "project")),
+            team_config=team_config,
         )
         web_usage_sink = WebSessionUsageSink(session)
         trace_log_dir = ""
@@ -924,6 +988,7 @@ def _ensure_agent(
         session.observability_config_path = observability_config_path
         session.workspace_dir = workspace_dir
         session.agent_name = agent_name
+        session.team_name = team_name
         session.runtime_config_key = runtime_config_key
     elif session.restored_llm_history:
         _restore_llm_history(session.agent, session.restored_llm_history)
@@ -1039,7 +1104,18 @@ async def submit_task(request: SubmitTaskRequest):
     chat_id = _normalize_path_input(request.chat_id)
     workspace_dir = _normalize_path_input(request.workspace_dir)
     agent_name = _normalize_path_input(request.agent)
+    team_name = _normalize_path_input(request.team)
     chat_ws = workspace_dir if _is_workspace_name(workspace_dir) else "default.ws"
+    team_config = None
+    if team_name:
+        ws_root, ws_error = _workspace_root(chat_ws)
+        if ws_error or ws_root is None:
+            return {"success": False, "error": ws_error}
+        team_config, team_error = read_team_config(ws_root, team_name)
+        if team_error or team_config is None:
+            return {"success": False, "error": team_error}
+        if not agent_name:
+            agent_name = str(team_config.get("leader") or "").strip()
     if chat_id and not agent_name:
         return {"success": False, "error": "Agent is required for persistent chat"}
     session = _sessions.get(requested_session_id) if requested_session_id else None
@@ -1074,6 +1150,8 @@ async def submit_task(request: SubmitTaskRequest):
         workspace_dir,
         agent_name,
         runtime_config,
+        team_name,
+        team_config,
     )
     _persist_chat_state(session)
 
@@ -1768,24 +1846,16 @@ def _string_list(value: Any) -> list[str]:
 def _agent_runtime_config(workspace_dir: str, agent_name: str) -> tuple[dict[str, Any] | None, str | None]:
     if not agent_name:
         return None, None
-    agent_dir, error = _agent_dir_from_workspace_input(workspace_dir, agent_name)
-    if error or agent_dir is None:
-        return None, error
-    try:
-        profile_data = _read_agent_profile(agent_dir, agent_name)
-        profile = profile_data["profile"]
-        model_override = str(profile.get("model") or "").strip()
-        return {
-            "agent_prompt": profile_data["body"],
-            "agent_soul": _read_optional_text(os.path.join(agent_dir, "SOUL.md")),
-            "tools_allowlist": _string_list(profile.get("tools")),
-            "skill_allowlist": _string_list(profile.get("skills")),
-            "model_override": model_override,
-            "max_turns": _positive_int(profile.get("maxTurns")),
-            "memory_mode": str(profile.get("memory") or "project").strip() or "project",
-        }, None
-    except (OSError, UnicodeDecodeError) as exc:
-        return None, str(exc)
+    workspace_path = _resolve_workspace_dir_input(workspace_dir)
+    if not workspace_path:
+        workspace_input = _normalize_path_input(workspace_dir) or "default.ws"
+        if _is_workspace_name(workspace_input):
+            workspace_path, error = _workspace_root(workspace_input)
+            if error or workspace_path is None:
+                return None, error
+        else:
+            workspace_path = workspace_input
+    return load_agent_runtime_config(workspace_path, agent_name)
 
 
 def _valid_task_id(task_id: str) -> bool:
@@ -2439,6 +2509,47 @@ async def write_agent_profile(request: AgentProfileWriteRequest):
         }
     except OSError as exc:
         return {"success": False, "error": str(exc)}
+
+
+@app.get("/api/workspace/teams")
+async def list_teams(ws: str = "default.ws"):
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    return {"success": True, "data": list_team_configs(ws_root)}
+
+
+@app.get("/api/workspace/team")
+async def read_team(ws: str = "default.ws", team: str = ""):
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    config, error = read_team_config(ws_root, team)
+    if error or config is None:
+        return {"success": False, "error": error}
+    return {"success": True, "data": config}
+
+
+@app.put("/api/workspace/team")
+async def write_team(request: TeamWriteRequest):
+    ws_root, error = _workspace_root(request.ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    config, error = write_team_config(ws_root, request.team)
+    if error or config is None:
+        return {"success": False, "error": error}
+    return {"success": True, "data": config}
+
+
+@app.delete("/api/workspace/team")
+async def delete_team(ws: str = "default.ws", team: str = ""):
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    error = delete_team_config(ws_root, team)
+    if error:
+        return {"success": False, "error": error}
+    return {"success": True, "data": None}
 
 
 @app.get("/api/workspace/skills")

@@ -168,6 +168,7 @@ export interface SubmitTaskRequest {
   observability_config_path?: string;
   workspace_dir?: string;
   agent?: string;
+  team?: string;
 }
 
 export interface ScheduledTask {
@@ -229,6 +230,22 @@ export interface WorkspaceAgent {
   description?: string;
   files: string[];
   profile?: AgentProfile;
+}
+
+export interface AgentTeamMember {
+  agent: string;
+  role: string;
+  autoDelegate: boolean;
+}
+
+export interface AgentTeam {
+  name: string;
+  description: string;
+  leader: string;
+  mode: 'manual' | 'leader_delegates' | 'roundtable_review' | string;
+  members: AgentTeamMember[];
+  created_at?: number;
+  updated_at?: number;
 }
 
 export interface WorkspaceSkill {

@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from src.core.XAgent import XAgent, resolve_workspace_dir
+from src.core.agent_profiles import load_agent_runtime_config
+from src.core.agent_teams import render_team_prompt
 from src.core.memory import load_boot_memory, load_effective_memory
 from src.core.observability import build_langfuse_sink
 from src.core.skills import SkillRegistry
@@ -57,6 +59,7 @@ def build_system_prompt(
     agent_prompt: str = "",
     agent_soul: str = "",
     memory_mode: str = "project",
+    team_config: dict[str, Any] | None = None,
 ) -> str:
     base_parts: list[str] = []
     if agent_prompt.strip() or agent_soul.strip():
@@ -88,7 +91,103 @@ def build_system_prompt(
             "Skills are prompt instruction packs only. Activate relevant skills with skill_activate if needed.\n"
             f"{skill_registry.list_index()}"
         )
+    team_prompt = render_team_prompt(team_config)
+    if team_prompt:
+        dynamic += f"\n\n{team_prompt}"
     return "\n\n".join(base_parts) + dynamic
+
+
+def _append_unique_tool(allowed_tools: list[str] | None, tool_name: str) -> list[str] | None:
+    if allowed_tools is None:
+        return None
+    normalized = [str(item).strip() for item in allowed_tools if str(item).strip()]
+    if tool_name not in normalized:
+        normalized.append(tool_name)
+    return normalized
+
+
+def _build_delegate_runner(
+    *,
+    config_path: str | None,
+    observability_config_path: str | None,
+    skills_dir: str | None,
+    workspace: str,
+    current_agent: str,
+    team_config: dict[str, Any] | None,
+):
+    def _run_delegate(
+        *,
+        agent: str,
+        task: str,
+        context: str = "",
+        expected_output: str = "",
+        parent_ctx: Any | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(team_config, dict) or not team_config.get("name"):
+            return {"status": "ERROR", "error": "no active team"}
+        target = str(agent or "").strip()
+        if not target:
+            return {"status": "ERROR", "error": "agent is required"}
+        if target == current_agent:
+            return {"status": "ERROR", "error": "agent_delegate cannot delegate to the current leader"}
+        members = team_config.get("members") if isinstance(team_config.get("members"), list) else []
+        member = next((item for item in members if isinstance(item, dict) and item.get("agent") == target), None)
+        if member is None:
+            return {"status": "ERROR", "error": f"agent is not a member of active team: {target}"}
+        if not bool(member.get("autoDelegate", True)):
+            return {"status": "ERROR", "error": f"agent is manual-only in active team: {target}"}
+
+        runtime_config, runtime_error = load_agent_runtime_config(workspace, target)
+        if runtime_error:
+            return {"status": "ERROR", "error": runtime_error, "agent": target}
+        runtime_config = runtime_config or {}
+        child_prompt = (
+            "你正在作为团队成员 Agent 执行 leader 委派的子任务。"
+            "你需要完成子任务并把结果汇报给 leader，不要假设你正在直接回复最终用户。\n\n"
+            f"[Subtask]\n{task.strip()}"
+        )
+        if context.strip():
+            child_prompt += f"\n\n[Leader Context]\n{context.strip()}"
+        if expected_output.strip():
+            child_prompt += f"\n\n[Expected Output]\n{expected_output.strip()}"
+
+        child = build_agent(
+            config_path=config_path,
+            observability_config_path=observability_config_path,
+            skills_dir=skills_dir,
+            workspace_dir=workspace,
+            agent_name=target,
+            agent_prompt=str(runtime_config.get("agent_prompt", "")),
+            agent_soul=str(runtime_config.get("agent_soul", "")),
+            tools_allowlist=runtime_config.get("tools_allowlist"),
+            skill_allowlist=runtime_config.get("skill_allowlist"),
+            model_override=str(runtime_config.get("model_override", "")),
+            max_turns=runtime_config.get("max_turns"),
+            memory_mode=str(runtime_config.get("memory_mode", "project")),
+            team_config=None,
+        )
+        if parent_ctx is not None:
+            child.handler.ctx.sink = parent_ctx.sink
+            child.sink = parent_ctx.sink
+            child.handler.ctx.verbose = getattr(parent_ctx, "verbose", False)
+            child.handler.ctx.display_fn = parent_ctx.display_fn
+        try:
+            result = child.run_task(child_prompt)
+            return {
+                "status": "OK",
+                "agent": target,
+                "team": team_config.get("name", ""),
+                "exit_reason": result.get("exit_reason", ""),
+                "turns": result.get("turns", 0),
+                "response": result.get("response", ""),
+                "tool_result_count": len(result.get("tool_results", []) or []),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "ERROR", "agent": target, "error": str(exc)}
+        finally:
+            child.close()
+
+    return _run_delegate
 
 
 def load_observability_config(path: str | None) -> dict[str, Any]:
@@ -140,6 +239,7 @@ def build_agent(
     model_override: str = "",
     max_turns: int | None = None,
     memory_mode: str = "project",
+    team_config: dict[str, Any] | None = None,
 ) -> XAgent:
     project_root = Path(__file__).resolve().parent.parent
     assets_dir = Path(__file__).resolve().parent / "assets"
@@ -162,7 +262,10 @@ def build_agent(
         agent_prompt=agent_prompt,
         agent_soul=agent_soul,
         memory_mode=memory_mode,
+        team_config=team_config,
     )
+    if team_config is not None:
+        tools_allowlist = _append_unique_tool(tools_allowlist, "agent_delegate")
     tools_schema = filter_tools_schema(load_tools_schema(assets_dir / "tools_schema.json"), tools_allowlist)
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
@@ -182,6 +285,15 @@ def build_agent(
         max_turns=max_turns or 40,
         agent_name=agent_name,
         memory_mode=memory_mode,
+        team_config=team_config,
+        delegate_runner=_build_delegate_runner(
+            config_path=config_path,
+            observability_config_path=observability_config_path,
+            skills_dir=skills_dir,
+            workspace=workspace,
+            current_agent=agent_name,
+            team_config=team_config,
+        ),
     )
     allowed_tools = {item["function"]["name"] for item in tools_schema if item.get("type") == "function"}
     agent.handler.ctx.allowed_tools = allowed_tools if tools_allowlist is not None else None

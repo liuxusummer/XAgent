@@ -9,6 +9,7 @@ import {
   Settings,
   FolderOpen,
   User,
+  Users,
   Zap,
   Brain,
   Shield,
@@ -19,7 +20,7 @@ import {
 import { api } from '../api/client';
 import type { ChatMetadata, WorkspaceTemplate } from '../types';
 
-export type PanelTab = 'agents' | 'skills' | 'memory' | 'system' | 'eval' | 'usage' | 'cron';
+export type PanelTab = 'agents' | 'teams' | 'skills' | 'memory' | 'system' | 'eval' | 'usage' | 'cron';
 
 interface SidebarProps {
   onNewChat: () => void;
@@ -136,6 +137,17 @@ export function Sidebar({
             title="Agents"
           >
             <User className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => onOpenPanel('teams')}
+            className={`flex items-center justify-center w-9 h-9 rounded-button transition-colors ${
+              activeView === 'teams'
+                ? 'bg-accent/10 text-accent'
+                : 'text-text-muted hover:bg-bg-tertiary hover:text-text-secondary'
+            }`}
+            title="Teams"
+          >
+            <Users className="w-4 h-4" />
           </button>
           <button
             onClick={() => onOpenPanel('skills')}
@@ -291,6 +303,19 @@ export function Sidebar({
             <User className="w-3.5 h-3.5 text-accent" />
           </div>
           <span className="font-medium">Agents</span>
+        </button>
+        <button
+          onClick={() => onOpenPanel('teams')}
+          className={`flex items-center gap-2.5 w-full px-3 py-2 rounded-button text-sm transition-colors ${
+            activeView === 'teams'
+              ? 'bg-accent/10 text-accent'
+              : 'text-text-secondary hover:bg-bg-tertiary hover:text-text-primary'
+          }`}
+        >
+          <div className="w-7 h-7 rounded-lg bg-accent/10 flex items-center justify-center shrink-0">
+            <Users className="w-3.5 h-3.5 text-accent" />
+          </div>
+          <span className="font-medium">Teams</span>
         </button>
         <button
           onClick={() => onOpenPanel('skills')}
