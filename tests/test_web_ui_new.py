@@ -12,11 +12,12 @@ from unittest.mock import patch
 
 from src.core.eval import create_eval_run, import_dataset_content
 from src.core.agent_loop import AgentContext, exhaust
-from src.core.telemetry import Event, JsonlSink, MultiSink
+from src.core.team_workflows import normalize_team_workflow, run_team_workflow
+from src.core.telemetry import Event, JsonlSink, MultiSink, NullSink
 from src.core.XAgent import XAgent
 from src.core.skills import SkillRegistry
 from src.handler import XAgentHandler
-from src.main import build_system_prompt, filter_tools_schema
+from src.main import build_system_prompt, build_team_step_runner, filter_tools_schema
 from src.tools.file_ops import write_file
 from src.web_ui_new import (
     SubmitTaskRequest,
@@ -31,6 +32,7 @@ from src.web_ui_new import (
     ScheduledTaskRunRequest,
     ScheduledTaskStatusRequest,
     ScheduledTaskWriteRequest,
+    TeamWorkflowWriteRequest,
     TeamWriteRequest,
     _agent_runtime_config,
     _eval_cancel_events,
@@ -73,6 +75,8 @@ from src.web_ui_new import (
     read_team,
     write_team,
     delete_team,
+    read_team_workflow_api,
+    write_team_workflow_api,
     AgentProfileWriteRequest,
     WorkspaceIndexRefreshRequest,
     WebSessionUsageSink,
@@ -531,6 +535,185 @@ class WebUINewAgentTeamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(read["data"]["leader"], "main")
         self.assertTrue(deleted["success"])
 
+    async def test_list_teams_ignores_workflow_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            self._write_agent(root, "main")
+            self._write_agent(root, "coding")
+            team_dir = root / "default.ws" / "system" / "teams"
+            team_dir.mkdir(parents=True)
+            team_dir.joinpath("dev-team.json").write_text(
+                json.dumps(
+                    {
+                        "name": "dev-team",
+                        "leader": "main",
+                        "mode": "leader_delegates",
+                        "members": [{"agent": "coding", "role": "implementation", "autoDelegate": True}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            team_dir.joinpath("dev-team.workflow.json").write_text(
+                json.dumps(
+                    {
+                        "name": "dev-workflow",
+                        "steps": [{"id": "code", "agent": "coding", "task": "Code"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(root)):
+                listed = await list_teams(ws="default.ws")
+
+        self.assertTrue(listed["success"])
+        self.assertEqual([team["name"] for team in listed["data"]], ["dev-team"])
+
+    async def test_delete_team_removes_workflow_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            self._write_agent(root, "main")
+            self._write_agent(root, "coding")
+            team_dir = root / "default.ws" / "system" / "teams"
+            team_dir.mkdir(parents=True)
+            team_dir.joinpath("dev-team.json").write_text(
+                json.dumps(
+                    {
+                        "name": "dev-team",
+                        "leader": "main",
+                        "mode": "leader_delegates",
+                        "members": [{"agent": "coding", "role": "implementation", "autoDelegate": True}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            workflow_path = team_dir / "dev-team.workflow.json"
+            workflow_path.write_text(
+                json.dumps(
+                    {
+                        "name": "dev-workflow",
+                        "steps": [{"id": "code", "agent": "coding", "task": "Code"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(root)):
+                deleted = await delete_team(ws="default.ws", team="dev-team")
+                workflow_exists_after_delete = workflow_path.exists()
+
+        self.assertTrue(deleted["success"])
+        self.assertFalse(workflow_exists_after_delete)
+
+    async def test_team_workflow_api_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            self._write_agent(root, "main")
+            self._write_agent(root, "coding")
+            team_dir = root / "default.ws" / "system" / "teams"
+            team_dir.mkdir(parents=True)
+            team_dir.joinpath("dev-team.json").write_text(
+                json.dumps(
+                    {
+                        "name": "dev-team",
+                        "leader": "main",
+                        "mode": "leader_delegates",
+                        "members": [{"agent": "coding", "role": "implementation", "autoDelegate": True}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(root)):
+                written = await write_team_workflow_api(
+                    TeamWorkflowWriteRequest(
+                        ws="default.ws",
+                        team="dev-team",
+                        workflow={
+                            "name": "dev-workflow",
+                            "version": "invalid",
+                            "steps": [
+                                {"id": "plan", "agent": "main", "task": "Plan {{input}}"},
+                                {"id": "code", "agent": "coding", "depends_on": ["plan"], "task": "Code"},
+                            ],
+                        },
+                    )
+                )
+                read = await read_team_workflow_api(ws="default.ws", team="dev-team")
+
+        self.assertTrue(written["success"])
+        self.assertEqual(written["data"]["version"], 1)
+        self.assertEqual(written["data"]["steps"][1]["depends_on"], ["plan"])
+        self.assertTrue(read["success"])
+        self.assertEqual(read["data"]["name"], "dev-workflow")
+
+    async def test_team_workflow_validation_rejects_bad_steps(self) -> None:
+        team = {
+            "name": "dev-team",
+            "leader": "main",
+            "members": [{"agent": "coding", "autoDelegate": True}],
+        }
+        cases = [
+            (
+                {"steps": [{"id": "final", "agent": "main", "depends_on": ["missing"], "task": "finish"}]},
+                "unknown or forward dependency",
+            ),
+            (
+                {
+                    "steps": [
+                        {"id": "same", "agent": "main", "task": "one"},
+                        {"id": "same", "agent": "coding", "task": "two"},
+                    ]
+                },
+                "Duplicate workflow step id",
+            ),
+            (
+                {"steps": [{"id": "hack", "agent": "outsider", "task": "run"}]},
+                "not enabled in team",
+            ),
+        ]
+
+        for workflow, expected_error in cases:
+            with self.subTest(expected_error=expected_error):
+                normalized, error = normalize_team_workflow(workflow, team_name="dev-team", team_config=team)
+
+            self.assertIsNone(normalized)
+            self.assertIn(expected_error, error)
+
+    async def test_run_team_workflow_executes_steps_in_order(self) -> None:
+        calls: list[dict] = []
+        workflow, error = normalize_team_workflow(
+            {
+                "name": "dev-workflow",
+                "steps": [
+                    {"id": "first", "agent": "main", "task": "Find {{input}}"},
+                    {
+                        "id": "second",
+                        "agent": "coding",
+                        "depends_on": ["first"],
+                        "task": "Write from {{steps.first.response}}",
+                    },
+                ],
+            },
+            team_name="dev-team",
+        )
+        self.assertIsNone(error)
+
+        def _run_step(**kwargs):
+            calls.append(kwargs)
+            return {
+                "status": "OK",
+                "agent": kwargs["agent"],
+                "response": f"{kwargs['step_id']} response",
+                "exit_reason": "CURRENT_TASK_DONE",
+                "turns": 1,
+            }
+
+        result = run_team_workflow(workflow, "semiconductors", _run_step)
+
+        self.assertEqual([call["step_id"] for call in calls], ["first", "second"])
+        self.assertIn("first response", calls[1]["task"])
+        self.assertEqual(result["exit_reason"], "CURRENT_TASK_DONE")
+        self.assertEqual(result["response"], "second response")
+        self.assertEqual(result["tool_results"][0]["tool_name"], "team_step")
+
     async def test_submit_task_with_team_uses_team_leader_and_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -546,6 +729,18 @@ class WebUINewAgentTeamTests(unittest.IsolatedAsyncioTestCase):
                         "leader": "main",
                         "mode": "leader_delegates",
                         "members": [{"agent": "coding", "role": "implementation", "autoDelegate": True}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            team_dir.joinpath("dev-team.workflow.json").write_text(
+                json.dumps(
+                    {
+                        "name": "dev-workflow",
+                        "steps": [
+                            {"id": "plan", "agent": "main", "task": "Plan {{input}}"},
+                            {"id": "code", "agent": "coding", "depends_on": ["plan"], "task": "Code it"},
+                        ],
                     }
                 ),
                 encoding="utf-8",
@@ -571,6 +766,145 @@ class WebUINewAgentTeamTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["success"])
         self.assertEqual(captured["agent_name"], "main")
         self.assertEqual(captured["team_config"]["name"], "dev-team")
+        session = _sessions[result["data"]["session_id"]]
+        self.assertEqual(session.team_workflow["name"], "dev-workflow")
+        self.assertTrue(callable(session.team_step_runner))
+
+    async def test_submit_task_with_team_workflow_runs_workflow_instead_of_leader_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            self._write_agent(root, "main")
+            self._write_agent(root, "coding")
+            team_dir = root / "default.ws" / "system" / "teams"
+            team_dir.mkdir(parents=True)
+            team_dir.joinpath("dev-team.json").write_text(
+                json.dumps(
+                    {
+                        "name": "dev-team",
+                        "leader": "main",
+                        "mode": "leader_delegates",
+                        "members": [{"agent": "coding", "role": "implementation", "autoDelegate": True}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            team_dir.joinpath("dev-team.workflow.json").write_text(
+                json.dumps({"name": "dev-workflow", "steps": [{"id": "code", "agent": "coding", "task": "Do {{input}}"}]}),
+                encoding="utf-8",
+            )
+            fake_agent = _HistoryFakeAgent()
+            calls: list[dict] = []
+
+            def _fake_runner(**kwargs):
+                calls.append(kwargs)
+                kwargs["parent_ctx"].display_fn("[error] child internal error")
+                kwargs["parent_ctx"].display_fn('  llm | <tool_use>{"name": "bad_json"')
+                return {"status": "OK", "agent": kwargs["agent"], "response": "workflow response", "turns": 1}
+
+            _sessions.clear()
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(root)),
+                patch("src.web_ui_new.build_agent", return_value=fake_agent),
+                patch("src.web_ui_new.build_team_step_runner", return_value=_fake_runner),
+                patch("src.web_ui_new.threading.Thread", _ImmediateThread),
+            ):
+                result = await submit_task(
+                    SubmitTaskRequest(task="hello", workspace_dir="default.ws", team="dev-team")
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(fake_agent.ran_tasks, [])
+        self.assertEqual(calls[0]["agent"], "coding")
+        session = _sessions[result["data"]["session_id"]]
+        self.assertEqual(session.messages[-1]["content"], "workflow response")
+        self.assertIn("[Team Workflow] start dev-workflow", session.messages[-1].get("thinking", ""))
+        self.assertNotIn("child internal error", json.dumps(session.messages, ensure_ascii=False))
+        self.assertNotIn("bad_json", json.dumps(session.messages, ensure_ascii=False))
+        self.assertEqual(session.messages[-1]["metadata"]["exitReason"], "CURRENT_TASK_DONE")
+        self.assertEqual(session.messages[-1]["metadata"]["teamWorkflow"]["name"], "dev-workflow")
+
+    async def test_team_step_runner_marks_child_exit_error_as_error(self) -> None:
+        class _ChildAgent:
+            def __init__(self) -> None:
+                self.handler = type("H", (), {"ctx": type("C", (), {})()})()
+                self.sink = NullSink()
+                self.closed = False
+
+            def run_task(self, _task: str) -> dict:
+                return {
+                    "response": "[error] child failed",
+                    "exit_reason": "ERROR",
+                    "tool_results": [{"tool_name": "run_task"}],
+                    "turns": 2,
+                }
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            self._write_agent(root, "coding")
+            child = _ChildAgent()
+            runner = build_team_step_runner(
+                config_path=None,
+                observability_config_path=None,
+                skills_dir=None,
+                workspace=str(root / "default.ws"),
+                team_config={
+                    "name": "dev-team",
+                    "leader": "main",
+                    "members": [{"agent": "coding", "autoDelegate": True}],
+                },
+            )
+            with patch("src.main.build_agent", return_value=child):
+                result = runner(agent="coding", task="do it", step_id="code")
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["exit_reason"], "ERROR")
+        self.assertTrue(child.closed)
+
+    async def test_submit_task_with_team_workflow_exception_finishes_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            self._write_agent(root, "main")
+            self._write_agent(root, "coding")
+            team_dir = root / "default.ws" / "system" / "teams"
+            team_dir.mkdir(parents=True)
+            team_dir.joinpath("dev-team.json").write_text(
+                json.dumps(
+                    {
+                        "name": "dev-team",
+                        "leader": "main",
+                        "mode": "leader_delegates",
+                        "members": [{"agent": "coding", "role": "implementation", "autoDelegate": True}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            team_dir.joinpath("dev-team.workflow.json").write_text(
+                json.dumps({"name": "dev-workflow", "steps": [{"id": "code", "agent": "coding", "task": "Do {{input}}"}]}),
+                encoding="utf-8",
+            )
+            fake_agent = _HistoryFakeAgent()
+
+            _sessions.clear()
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(root)),
+                patch("src.web_ui_new.build_agent", return_value=fake_agent),
+                patch("src.web_ui_new.build_team_step_runner", return_value=lambda **_kwargs: {}),
+                patch("src.web_ui_new.run_team_workflow", side_effect=RuntimeError("workflow exploded")),
+                patch("src.web_ui_new.threading.Thread", _ImmediateThread),
+            ):
+                result = await submit_task(
+                    SubmitTaskRequest(task="hello", workspace_dir="default.ws", team="dev-team")
+                )
+
+        self.assertTrue(result["success"])
+        session = _sessions[result["data"]["session_id"]]
+        self.assertFalse(session.running)
+        self.assertEqual(session.messages[-1]["metadata"]["exitReason"], "ERROR")
+        self.assertIn("workflow exploded", session.messages[-1]["content"])
+        self.assertEqual(session.messages[-1]["metadata"]["teamWorkflow"]["name"], "dev-workflow")
 
     async def test_submit_task_attaches_default_jsonl_trace_sink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -940,10 +1274,17 @@ class WebUINewWorkspaceFileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue((ws_root / "system" / "memory" / memory_file).is_file())
                 if template_id == "research_project":
                     team_path = ws_root / "system" / "teams" / "deepresearch.json"
+                    workflow_path = ws_root / "system" / "teams" / "deepresearch.workflow.json"
                     self.assertTrue(team_path.is_file())
+                    self.assertTrue(workflow_path.is_file())
                     team = json.loads(team_path.read_text(encoding="utf-8"))
+                    workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
                     self.assertEqual(team["leader"], "main")
                     self.assertEqual(team["mode"], "leader_delegates")
+                    self.assertEqual(
+                        [step["agent"] for step in workflow["steps"]],
+                        ["source_scout", "evidence_analyst", "synthesis_writer", "research_critic", "main"],
+                    )
                     self.assertEqual(
                         [member["agent"] for member in team["members"]],
                         ["source_scout", "evidence_analyst", "synthesis_writer", "research_critic"],

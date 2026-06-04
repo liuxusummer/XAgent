@@ -6,6 +6,7 @@ import {
   Trash2,
   ChevronLeft,
   ChevronRight,
+  Check,
   Settings,
   FolderOpen,
   User,
@@ -16,6 +17,7 @@ import {
   BarChart3,
   Activity,
   Clock,
+  X,
 } from 'lucide-react';
 import { api } from '../api/client';
 import type { ChatMetadata, WorkspaceTemplate } from '../types';
@@ -30,8 +32,10 @@ interface SidebarProps {
   chats: ChatMetadata[];
   activeChatId: string;
   chatsLoading: boolean;
+  deletingChatId: string;
+  chatDeleteError: string;
   onSelectChat: (chatId: string) => void;
-  onDeleteChat: (chatId: string) => void;
+  onDeleteChat: (chatId: string) => void | Promise<void>;
   onOpenSettings: () => void;
   currentWorkspace: string;
   onWorkspaceChange: (ws: string) => void;
@@ -46,6 +50,8 @@ export function Sidebar({
   chats,
   activeChatId,
   chatsLoading,
+  deletingChatId,
+  chatDeleteError,
   onSelectChat,
   onDeleteChat,
   onOpenSettings,
@@ -62,6 +68,7 @@ export function Sidebar({
   const [selectedTemplate, setSelectedTemplate] = useState('code_project');
   const [createError, setCreateError] = useState('');
   const [creating, setCreating] = useState(false);
+  const [confirmingDeleteChatId, setConfirmingDeleteChatId] = useState('');
 
   const refreshWorkspaces = useCallback(() => {
     return api.listWorkspaces().then(res => {
@@ -407,6 +414,11 @@ export function Sidebar({
               </div>
               {chatsLoading && <span className="text-[11px] text-text-muted">Loading</span>}
             </div>
+            {chatDeleteError && (
+              <div className="px-3 py-2 text-xs text-status-error rounded-button bg-status-error/10">
+                {chatDeleteError}
+              </div>
+            )}
             <div className="max-h-56 overflow-y-auto space-y-1">
               {chats.length === 0 ? (
                 <div className="px-3 py-3 text-xs text-text-muted rounded-button bg-bg-tertiary/50">
@@ -435,14 +447,54 @@ export function Sidebar({
                         </span>
                       </span>
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => onDeleteChat(chat.chat_id)}
-                      className="opacity-0 group-hover:opacity-100 text-text-muted hover:text-status-error transition-opacity"
-                      title="Delete chat"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
+                    {confirmingDeleteChatId === chat.chat_id ? (
+                      <div className="flex shrink-0 items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            Promise.resolve(onDeleteChat(chat.chat_id)).finally(() => {
+                              setConfirmingDeleteChatId('');
+                            });
+                          }}
+                          disabled={deletingChatId === chat.chat_id}
+                          className="rounded-md p-1 text-status-error hover:bg-status-error/10 disabled:opacity-60 disabled:cursor-not-allowed"
+                          title="Confirm delete"
+                          aria-label={`Confirm delete chat ${chat.title || 'New Chat'}`}
+                          data-chat-id={chat.chat_id}
+                          data-delete-confirm="true"
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setConfirmingDeleteChatId('');
+                          }}
+                          className="rounded-md p-1 text-text-muted hover:bg-bg-tertiary hover:text-text-primary"
+                          title="Cancel delete"
+                          aria-label={`Cancel delete chat ${chat.title || 'New Chat'}`}
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setConfirmingDeleteChatId(chat.chat_id);
+                        }}
+                        disabled={deletingChatId === chat.chat_id}
+                        className="opacity-0 group-hover:opacity-100 text-text-muted hover:text-status-error disabled:opacity-60 disabled:cursor-not-allowed transition-opacity"
+                        title="Delete chat"
+                        aria-label={`Delete chat ${chat.title || 'New Chat'}`}
+                        data-chat-id={chat.chat_id}
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
                   </div>
                 ))
               )}

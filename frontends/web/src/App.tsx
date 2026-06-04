@@ -15,7 +15,18 @@ import { ThemeProvider } from './hooks/useTheme.tsx';
 import { api } from './api/client';
 import type { AgentTeam, ChatMetadata, PersistentChatDetail, ScheduledTask } from './types';
 
-type MainView = 'chat' | 'agents' | 'teams' | 'skills' | 'memory' | 'system' | 'eval' | 'usage' | 'cron' | 'agent-detail' | 'team-detail';
+type MainView =
+  | 'chat'
+  | 'agents'
+  | 'teams'
+  | 'skills'
+  | 'memory'
+  | 'system'
+  | 'eval'
+  | 'usage'
+  | 'cron'
+  | 'agent-detail'
+  | 'team-detail';
 
 function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -28,6 +39,8 @@ function App() {
   const [agentChats, setAgentChats] = useState<ChatMetadata[]>([]);
   const [activeChatId, setActiveChatId] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
+  const [deletingChatId, setDeletingChatId] = useState('');
+  const [chatDeleteError, setChatDeleteError] = useState('');
 
   const refreshAgentChats = useCallback(() => {
     if (!selectedAgent) {
@@ -96,6 +109,7 @@ function App() {
     setSelectedTeam(null);
     setSelectedTeamName(null);
     setActiveChatId('');
+    setChatDeleteError('');
   };
 
   const handleNewChat = async () => {
@@ -112,6 +126,7 @@ function App() {
     setSelectedTeamName(null);
     setMainView('chat');
     setSelectedAgent(null);
+    setChatDeleteError('');
   };
 
   const handleClearChat = () => {
@@ -120,12 +135,14 @@ function App() {
     setSelectedAgent(null);
     setSelectedTeam(null);
     setSelectedTeamName(null);
+    setChatDeleteError('');
   };
 
   const handleSelectAgent = (agentName: string) => {
     setSelectedAgent(agentName);
     setSelectedTeam(null);
     setSelectedTeamName(null);
+    setChatDeleteError('');
     setMainView('agent-detail');
   };
 
@@ -134,6 +151,7 @@ function App() {
     setSelectedTeam(null);
     setSelectedTeamName(null);
     setActiveChatId('');
+    setChatDeleteError('');
     clearChat();
     setMainView('chat');
   };
@@ -143,6 +161,7 @@ function App() {
     setSelectedTeamName(team.name);
     setSelectedAgent(team.leader || null);
     setActiveChatId('');
+    setChatDeleteError('');
     clearChat();
     setMainView('chat');
   };
@@ -151,6 +170,8 @@ function App() {
     setSelectedTeamName(teamName);
     setSelectedTeam(null);
     setSelectedAgent(null);
+    setActiveChatId('');
+    setChatDeleteError('');
     setMainView('team-detail');
   };
 
@@ -158,6 +179,8 @@ function App() {
     setSelectedTeamName(null);
     setSelectedTeam(null);
     setSelectedAgent(null);
+    setActiveChatId('');
+    setChatDeleteError('');
     setMainView('team-detail');
   };
 
@@ -177,6 +200,7 @@ function App() {
     setSelectedTeam(null);
     setSelectedTeamName(null);
     setActiveChatId('');
+    setChatDeleteError('');
     clearChat();
   };
 
@@ -185,28 +209,35 @@ function App() {
     const res = await api.readChat(currentWorkspace, selectedAgent, chatId);
     if (res.success && res.data) {
       setActiveChatId(chatId);
+      setChatDeleteError('');
       loadPersistentChat(res.data);
       setMainView('chat');
     }
   };
 
   const handleDeleteChat = async (chatId: string) => {
-    if (!selectedAgent) return;
-    const ok = window.confirm('Delete this chat history?');
-    if (!ok) return;
+    if (!selectedAgent || deletingChatId) return;
+    setDeletingChatId(chatId);
+    setChatDeleteError('');
     const res = await api.deleteChat(currentWorkspace, selectedAgent, chatId);
-    if (res.success) {
-      if (activeChatId === chatId) {
-        setActiveChatId('');
-        clearChat();
-      }
-      refreshAgentChats();
+    setDeletingChatId('');
+    if (!res.success) {
+      setChatDeleteError(res.error || 'Failed to delete chat');
+      return;
     }
+    if (activeChatId === chatId) {
+      setActiveChatId('');
+      clearChat();
+    }
+    refreshAgentChats();
   };
 
   const handleDebugRunStarted = (task: ScheduledTask, sessionId: string) => {
     setSelectedAgent(task.agent || null);
+    setSelectedTeam(null);
+    setSelectedTeamName(null);
     setActiveChatId(task.keep_one_chat && task.chat_id ? task.chat_id : '');
+    setChatDeleteError('');
     attachRunningSession(sessionId, {
       title: `Debug: ${task.name}`,
       task: task.prompt,
@@ -350,6 +381,8 @@ function App() {
           chats={agentChats}
           activeChatId={activeChatId}
           chatsLoading={chatLoading}
+          deletingChatId={deletingChatId}
+          chatDeleteError={chatDeleteError}
           onSelectChat={handleSelectChat}
           onDeleteChat={handleDeleteChat}
           onOpenSettings={() => setSettingsOpen(true)}

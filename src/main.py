@@ -173,11 +173,13 @@ def _build_delegate_runner(
             child.handler.ctx.display_fn = parent_ctx.display_fn
         try:
             result = child.run_task(child_prompt)
+            exit_reason = str(result.get("exit_reason", ""))
+            status = "ERROR" if exit_reason == "ERROR" else "OK"
             return {
-                "status": "OK",
+                "status": status,
                 "agent": target,
                 "team": team_config.get("name", ""),
-                "exit_reason": result.get("exit_reason", ""),
+                "exit_reason": exit_reason,
                 "turns": result.get("turns", 0),
                 "response": result.get("response", ""),
                 "tool_result_count": len(result.get("tool_results", []) or []),
@@ -188,6 +190,99 @@ def _build_delegate_runner(
             child.close()
 
     return _run_delegate
+
+
+def build_team_step_runner(
+    *,
+    config_path: str | None,
+    observability_config_path: str | None,
+    skills_dir: str | None,
+    workspace: str,
+    team_config: dict[str, Any] | None,
+):
+    allowed_agents: set[str] = set()
+    if isinstance(team_config, dict):
+        leader = str(team_config.get("leader") or "").strip()
+        if leader:
+            allowed_agents.add(leader)
+        members = team_config.get("members") if isinstance(team_config.get("members"), list) else []
+        for member in members:
+            if isinstance(member, dict) and member.get("autoDelegate", True):
+                agent = str(member.get("agent") or "").strip()
+                if agent:
+                    allowed_agents.add(agent)
+
+    def _run_step(
+        *,
+        agent: str,
+        task: str,
+        context: str = "",
+        expected_output: str = "",
+        step_id: str = "",
+        max_turns: int | None = None,
+        parent_ctx: Any | None = None,
+    ) -> dict[str, Any]:
+        target = str(agent or "").strip()
+        if not target:
+            return {"status": "ERROR", "error": "agent is required", "step_id": step_id}
+        if allowed_agents and target not in allowed_agents:
+            return {"status": "ERROR", "agent": target, "step_id": step_id, "error": f"agent is not enabled in team: {target}"}
+
+        runtime_config, runtime_error = load_agent_runtime_config(workspace, target)
+        if runtime_error:
+            return {"status": "ERROR", "agent": target, "step_id": step_id, "error": runtime_error}
+        runtime_config = runtime_config or {}
+        step_prompt = (
+            "你正在作为团队 workflow 的一个步骤执行任务。"
+            "完成本步骤并输出可被后续步骤复用的结果，不要假设你正在直接回复最终用户。\n\n"
+            f"[Workflow Step]\n{step_id}\n\n"
+            f"[Step Task]\n{task.strip()}"
+        )
+        if context.strip():
+            step_prompt += f"\n\n[Workflow Context]\n{context.strip()}"
+        if expected_output.strip():
+            step_prompt += f"\n\n[Expected Output]\n{expected_output.strip()}"
+
+        child = build_agent(
+            config_path=config_path,
+            observability_config_path=observability_config_path,
+            skills_dir=skills_dir,
+            workspace_dir=workspace,
+            agent_name=target,
+            agent_prompt=str(runtime_config.get("agent_prompt", "")),
+            agent_soul=str(runtime_config.get("agent_soul", "")),
+            tools_allowlist=runtime_config.get("tools_allowlist"),
+            skill_allowlist=runtime_config.get("skill_allowlist"),
+            model_override=str(runtime_config.get("model_override", "")),
+            max_turns=max_turns or runtime_config.get("max_turns"),
+            memory_mode=str(runtime_config.get("memory_mode", "project")),
+            team_config=None,
+        )
+        if parent_ctx is not None:
+            child.handler.ctx.sink = parent_ctx.sink
+            child.sink = parent_ctx.sink
+            child.handler.ctx.verbose = getattr(parent_ctx, "verbose", False)
+            child.handler.ctx.display_fn = parent_ctx.display_fn
+        try:
+            result = child.run_task(step_prompt)
+            exit_reason = str(result.get("exit_reason", ""))
+            status = "ERROR" if exit_reason == "ERROR" else "OK"
+            return {
+                "status": status,
+                "agent": target,
+                "step_id": step_id,
+                "team": team_config.get("name", "") if isinstance(team_config, dict) else "",
+                "exit_reason": exit_reason,
+                "turns": result.get("turns", 0),
+                "response": result.get("response", ""),
+                "tool_result_count": len(result.get("tool_results", []) or []),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "ERROR", "agent": target, "step_id": step_id, "error": str(exc)}
+        finally:
+            child.close()
+
+    return _run_step
 
 
 def load_observability_config(path: str | None) -> dict[str, Any]:

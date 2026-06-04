@@ -1,0 +1,55 @@
+{
+  "description": "Serial deep research workflow owned by the deepresearch team.",
+  "name": "deepresearch-workflow",
+  "steps": [
+    {
+      "agent": "source_scout",
+      "expected_output": "source map with credible sources, dates, data points, and open gaps",
+      "id": "source_scout",
+      "output": "sources",
+      "task": "围绕 {{input}} 检索权威资料，输出来源列表、可信度评级、关键数据和引用线索。"
+    },
+    {
+      "agent": "evidence_analyst",
+      "depends_on": [
+        "source_scout"
+      ],
+      "expected_output": "evidence table with claims, support level, contradictions, and caveats",
+      "id": "evidence_analyst",
+      "output": "evidence",
+      "task": "基于资料侦察结果，抽取核心事实、证据强弱、冲突数据、假设和待验证问题。"
+    },
+    {
+      "agent": "synthesis_writer",
+      "depends_on": [
+        "evidence_analyst"
+      ],
+      "expected_output": "structured research draft with cited evidence and uncertainty notes",
+      "id": "synthesis_writer",
+      "output": "draft",
+      "task": "基于证据分析结果，为 {{input}} 写一版结构化研究报告草稿。"
+    },
+    {
+      "agent": "research_critic",
+      "depends_on": [
+        "synthesis_writer"
+      ],
+      "expected_output": "critique with concrete corrections and missing evidence",
+      "id": "research_critic",
+      "output": "critique",
+      "task": "审查研究草稿，指出证据缺口、过度推断、遗漏反例和需要修正的表述。"
+    },
+    {
+      "agent": "main",
+      "depends_on": [
+        "synthesis_writer",
+        "research_critic"
+      ],
+      "expected_output": "final user-facing research report",
+      "id": "final",
+      "output": "final",
+      "task": "结合草稿和审查意见，输出面向用户的最终深度研究结果：{{input}}"
+    }
+  ],
+  "version": 1
+}

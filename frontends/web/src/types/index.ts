@@ -248,6 +248,25 @@ export interface AgentTeam {
   updated_at?: number;
 }
 
+export interface AgentTeamWorkflowStep {
+  id: string;
+  agent: string;
+  task: string;
+  depends_on?: string[];
+  context?: string;
+  expected_output?: string;
+  output?: string;
+  on_error?: 'stop' | 'continue' | string;
+  max_turns?: number;
+}
+
+export interface AgentTeamWorkflow {
+  name: string;
+  version?: number;
+  description?: string;
+  steps: AgentTeamWorkflowStep[];
+}
+
 export interface WorkspaceSkill {
   name: string;
 }

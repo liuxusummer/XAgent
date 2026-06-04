@@ -51,6 +51,7 @@ class TemplateTeam:
     leader: str
     mode: str
     members: tuple[TemplateTeamMember, ...] = ()
+    workflow: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +134,7 @@ def _team(
     leader: str,
     *members: TemplateTeamMember,
     mode: str = "leader_delegates",
+    workflow: dict[str, Any] | None = None,
 ) -> TemplateTeam:
     return TemplateTeam(
         name=name,
@@ -140,7 +142,57 @@ def _team(
         leader=leader,
         mode=mode,
         members=members,
+        workflow=workflow,
     )
+
+
+def _deepresearch_workflow() -> dict[str, Any]:
+    return {
+        "name": "deepresearch-workflow",
+        "version": 1,
+        "description": "Serial deep research workflow owned by the deepresearch team.",
+        "steps": [
+            {
+                "id": "source_scout",
+                "agent": "source_scout",
+                "task": "围绕 {{input}} 检索权威资料，输出来源列表、可信度评级、关键数据和引用线索。",
+                "expected_output": "source map with credible sources, dates, data points, and open gaps",
+                "output": "sources",
+            },
+            {
+                "id": "evidence_analyst",
+                "agent": "evidence_analyst",
+                "depends_on": ["source_scout"],
+                "task": "基于资料侦察结果，抽取核心事实、证据强弱、冲突数据、假设和待验证问题。",
+                "expected_output": "evidence table with claims, support level, contradictions, and caveats",
+                "output": "evidence",
+            },
+            {
+                "id": "synthesis_writer",
+                "agent": "synthesis_writer",
+                "depends_on": ["evidence_analyst"],
+                "task": "基于证据分析结果，为 {{input}} 写一版结构化研究报告草稿。",
+                "expected_output": "structured research draft with cited evidence and uncertainty notes",
+                "output": "draft",
+            },
+            {
+                "id": "research_critic",
+                "agent": "research_critic",
+                "depends_on": ["synthesis_writer"],
+                "task": "审查研究草稿，指出证据缺口、过度推断、遗漏反例和需要修正的表述。",
+                "expected_output": "critique with concrete corrections and missing evidence",
+                "output": "critique",
+            },
+            {
+                "id": "final",
+                "agent": "main",
+                "depends_on": ["synthesis_writer", "research_critic"],
+                "task": "结合草稿和审查意见，输出面向用户的最终深度研究结果：{{input}}",
+                "expected_output": "final user-facing research report",
+                "output": "final",
+            },
+        ],
+    }
 
 
 def _task(task_id: str, name: str, prompt: str, agent: str, *, repeat: str = "none") -> dict[str, Any]:
@@ -326,6 +378,7 @@ name remaining test gaps.
                 _team_member("synthesis_writer", "structured synthesis and draft writing"),
                 _team_member("research_critic", "gap analysis and overclaim review"),
                 mode="leader_delegates",
+                workflow=_deepresearch_workflow(),
             ),
         ),
         skills=(
@@ -530,6 +583,12 @@ def _write_template(root: Path, workspace_name: str, template: WorkspaceTemplate
             json.dumps(team_config, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        if team.workflow:
+            workflow_path = _safe_path(root, f"system/teams/{team.name}.workflow.json")
+            workflow_path.write_text(
+                json.dumps(team.workflow, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
     for skill in template.skills:
         skill_dir = _safe_path(root, f"system/skills/{skill.name}")
         skill_dir.mkdir(parents=True, exist_ok=True)

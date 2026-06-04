@@ -114,6 +114,8 @@ def list_team_configs(workspace_dir: str | Path) -> list[dict[str, Any]]:
     for path in sorted(root.glob("*.json")):
         if not path.is_file():
             continue
+        if path.name.endswith(".workflow.json"):
+            continue
         config, error = read_team_config(workspace_dir, path.stem)
         if error is None and config is not None:
             teams.append(config)
@@ -148,6 +150,9 @@ def delete_team_config(workspace_dir: str | Path, team_name: str) -> str | None:
         return "Team not found"
     try:
         path.unlink()
+        workflow = path.with_name(f"{team_name}.workflow.json")
+        if workflow.is_file():
+            workflow.unlink()
     except OSError as exc:
         return str(exc)
     return None

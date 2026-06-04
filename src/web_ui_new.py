@@ -15,6 +15,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -31,6 +32,7 @@ from src.core.agent_teams import (
     read_team_config,
     write_team_config,
 )
+from src.core.team_workflows import read_team_workflow, run_team_workflow, write_team_workflow
 from src.core.telemetry import Event, JsonlSink, MultiSink, NullSink
 from src.core.workspace_templates import (
     create_workspace_from_template,
@@ -50,7 +52,7 @@ from src.core.eval import (
     read_eval_run,
     write_eval_run,
 )
-from src.main import build_agent, load_observability_config
+from src.main import build_agent, build_team_step_runner, load_observability_config
 from src.tools.file_index import get_file_index_stats, refresh_file_index, search_file_index
 from src.tools.reflect.reader import group_by_session, load_dir, load_events
 from src.tools.reflect.stats import TOKEN_FIELDS
@@ -142,6 +144,12 @@ class TeamDeleteRequest(BaseModel):
     team: str = ""
 
 
+class TeamWorkflowWriteRequest(BaseModel):
+    ws: str = "default.ws"
+    team: str = ""
+    workflow: dict[str, Any] = {}
+
+
 class ChatCreateRequest(BaseModel):
     ws: str = "default.ws"
     agent: str = ""
@@ -184,6 +192,9 @@ class UISession:
     workspace_dir: str = ""
     agent_name: str = ""
     team_name: str = ""
+    team_config: dict[str, Any] | None = None
+    team_workflow: dict[str, Any] | None = None
+    team_step_runner: Any | None = None
     runtime_config_key: str = ""
     session_id: str = ""
     chat_id: str = ""
@@ -538,6 +549,8 @@ def _update_session_messages(session: UISession, event_type: str, data: Any = No
             "exitReason": str(payload.get("exit_reason", "")),
             "completedAt": _now_ms(),
         }
+        if isinstance(payload.get("team_workflow"), dict):
+            message["metadata"]["teamWorkflow"] = payload["team_workflow"]
         tool_results = payload.get("tool_results") if isinstance(payload.get("tool_results"), list) else []
         fallback_tools = []
         for item in tool_results:
@@ -633,6 +646,9 @@ def _emit(session: UISession, event_type: str, data: Any = None) -> None:
 
 
 def _append_progress(session: UISession, message: str) -> None:
+    if message.startswith("[Team Workflow]"):
+        _emit(session, "thinking_delta", f"{message}\n")
+        return
     if message.startswith("  llm | "):
         _append_llm_delta(session, message[len("  llm | "):])
         return
@@ -876,6 +892,8 @@ def _persist_chat_state(session: UISession) -> None:
         **_default_chat_state(session.chat_ws, session.chat_agent, session.chat_id, session.session_id),
         "backend_session_id": session.session_id,
         "runtime_config_key": session.runtime_config_key,
+        "team": session.team_name or None,
+        "team_workflow": session.team_workflow.get("name") if isinstance(session.team_workflow, dict) else None,
         "messages": messages,
         "llm_history": llm_history,
         "waiting_for_user": session.waiting_for_user,
@@ -943,9 +961,10 @@ def _ensure_agent(
     runtime_config: dict[str, Any] | None = None,
     team_name: str = "",
     team_config: dict[str, Any] | None = None,
+    team_workflow: dict[str, Any] | None = None,
 ):
     runtime_config = runtime_config or {}
-    runtime_key_data = {"agent": runtime_config, "team": team_config or {}}
+    runtime_key_data = {"agent": runtime_config, "team": team_config or {}, "workflow": team_workflow or {}}
     runtime_config_key = json.dumps(runtime_key_data, ensure_ascii=False, sort_keys=True, default=str)
     if (
         session.agent is None
@@ -989,10 +1008,22 @@ def _ensure_agent(
         session.workspace_dir = workspace_dir
         session.agent_name = agent_name
         session.team_name = team_name
+        session.team_config = team_config
+        session.team_workflow = team_workflow
+        session.team_step_runner = build_team_step_runner(
+            config_path=config_path or None,
+            observability_config_path=observability_config_path or None,
+            skills_dir=_workspace_skills_dir_input(workspace_dir),
+            workspace=_resolve_workspace_dir_input(workspace_dir) or workspace_dir,
+            team_config=team_config,
+        )
         session.runtime_config_key = runtime_config_key
     elif session.restored_llm_history:
         _restore_llm_history(session.agent, session.restored_llm_history)
         session.restored_llm_history = []
+    else:
+        session.team_config = team_config
+        session.team_workflow = team_workflow
     return session.agent
 
 
@@ -1029,6 +1060,7 @@ def _drain_sync(session: UISession, wait: bool) -> bool:
                     "exit_reason": result.get("exit_reason", ""),
                     "tool_results": result.get("tool_results", []),
                     "turns": result.get("turns", 0),
+                    "team_workflow": result.get("team_workflow"),
                 },
             )
             session.running = False
@@ -1073,8 +1105,33 @@ def _drain_background(session: UISession) -> None:
         time.sleep(0.05)
 
 
+def _workflow_error_result(message: str, error: str, workflow: dict[str, Any] | None = None) -> dict[str, Any]:
+    workflow_name = workflow.get("name", "") if isinstance(workflow, dict) else ""
+    return {
+        "response": message,
+        "exit_reason": "ERROR",
+        "tool_results": [
+            {
+                "tool_name": "team_workflow",
+                "tool_call_id": "",
+                "data": {"status": "ERROR", "error": error},
+            }
+        ],
+        "turns": 0,
+        "team_workflow": {
+            "name": workflow_name,
+            "step_count": 0,
+            "duration_ms": 0,
+            "steps": [],
+        },
+    }
+
+
 def _run_task_background(session: UISession, task: str) -> None:
     """Run task in background and put events into async queue"""
+    workflow: dict[str, Any] | None = None
+    parent_ctx: Any | None = None
+    step_runner: Any | None = None
     with _session_lock:
         if session.running:
             return
@@ -1092,9 +1149,103 @@ def _run_task_background(session: UISession, task: str) -> None:
         session.running = True
         if task.strip():
             _emit(session, "user_task", task.strip())
-        session.agent.run_task_async(task.strip())
+        workflow = session.team_workflow
+        step_runner = session.team_step_runner
+        parent_ctx = getattr(getattr(session.agent, "handler", None), "ctx", None)
+        if not workflow:
+            session.agent.run_task_async(task.strip())
 
-    _drain_background(session)
+    if workflow:
+        agent = session.agent
+        try:
+            if agent is None:
+                result = _workflow_error_result(
+                    "[error] active team workflow has no agent",
+                    "missing parent agent",
+                    workflow,
+                )
+            else:
+                def _emit_workflow_progress(message: str) -> None:
+                    agent.display_queue.put({"progress": message})
+                    with _session_lock:
+                        _drain_sync(session, wait=False)
+                        _queue_state(session, finished=False)
+
+                def _suppress_child_progress(_message: str) -> None:
+                    return None
+
+                workflow_parent_ctx = parent_ctx
+                if parent_ctx is not None:
+                    workflow_parent_ctx = SimpleNamespace(
+                        sink=getattr(parent_ctx, "sink", None) or NullSink(),
+                        verbose=getattr(parent_ctx, "verbose", False),
+                        display_fn=_suppress_child_progress,
+                    )
+
+                if not callable(step_runner):
+                    result = _workflow_error_result(
+                        "[error] active team workflow has no step runner",
+                        "missing team step runner",
+                        workflow,
+                    )
+                else:
+                    result = run_team_workflow(
+                        workflow,
+                        task.strip(),
+                        step_runner,
+                        parent_ctx=workflow_parent_ctx,
+                        emit=_emit_workflow_progress,
+                    )
+                if not isinstance(result, dict):
+                    result = _workflow_error_result(
+                        "[error] team workflow returned an invalid result",
+                        f"invalid workflow result type: {type(result)!r}",
+                        workflow,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            result = _workflow_error_result(f"[error] team workflow failed: {exc}", str(exc), workflow)
+
+        if agent is not None:
+            agent.display_queue.put({"done": result})
+        else:
+            with _session_lock:
+                _emit(
+                    session,
+                    "done",
+                    {
+                        "response": result.get("response", ""),
+                        "exit_reason": result.get("exit_reason", ""),
+                        "tool_results": result.get("tool_results", []),
+                        "turns": result.get("turns", 0),
+                        "team_workflow": result.get("team_workflow"),
+                    },
+                )
+                session.running = False
+                session.waiting_for_user = False
+                session.ask_prompt = ""
+                _queue_state(session, finished=True)
+
+    try:
+        _drain_background(session)
+    except Exception as exc:  # noqa: BLE001
+        result = _workflow_error_result(f"[error] failed to drain task result: {exc}", str(exc), workflow)
+        with _session_lock:
+            _emit(
+                session,
+                "done",
+                {
+                    "response": result.get("response", ""),
+                    "exit_reason": result.get("exit_reason", ""),
+                    "tool_results": result.get("tool_results", []),
+                    "turns": result.get("turns", 0),
+                    "team_workflow": result.get("team_workflow"),
+                },
+            )
+            session.running = False
+            session.waiting_for_user = False
+            session.ask_prompt = ""
+            _persist_chat_state(session)
+            _queue_state(session, finished=True)
 
 
 @app.post("/api/chat")
@@ -1107,6 +1258,7 @@ async def submit_task(request: SubmitTaskRequest):
     team_name = _normalize_path_input(request.team)
     chat_ws = workspace_dir if _is_workspace_name(workspace_dir) else "default.ws"
     team_config = None
+    team_workflow = None
     if team_name:
         ws_root, ws_error = _workspace_root(chat_ws)
         if ws_error or ws_root is None:
@@ -1114,6 +1266,9 @@ async def submit_task(request: SubmitTaskRequest):
         team_config, team_error = read_team_config(ws_root, team_name)
         if team_error or team_config is None:
             return {"success": False, "error": team_error}
+        team_workflow, workflow_error = read_team_workflow(ws_root, team_name, team_config)
+        if workflow_error:
+            return {"success": False, "error": workflow_error}
         if not agent_name:
             agent_name = str(team_config.get("leader") or "").strip()
     if chat_id and not agent_name:
@@ -1152,6 +1307,7 @@ async def submit_task(request: SubmitTaskRequest):
         runtime_config,
         team_name,
         team_config,
+        team_workflow,
     )
     _persist_chat_state(session)
 
@@ -2550,6 +2706,34 @@ async def delete_team(ws: str = "default.ws", team: str = ""):
     if error:
         return {"success": False, "error": error}
     return {"success": True, "data": None}
+
+
+@app.get("/api/workspace/team/workflow")
+async def read_team_workflow_api(ws: str = "default.ws", team: str = ""):
+    ws_root, error = _workspace_root(ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    config, error = read_team_config(ws_root, team)
+    if error or config is None:
+        return {"success": False, "error": error}
+    workflow, error = read_team_workflow(ws_root, team, config)
+    if error:
+        return {"success": False, "error": error}
+    return {"success": True, "data": workflow}
+
+
+@app.put("/api/workspace/team/workflow")
+async def write_team_workflow_api(request: TeamWorkflowWriteRequest):
+    ws_root, error = _workspace_root(request.ws)
+    if error or ws_root is None:
+        return {"success": False, "error": error}
+    config, error = read_team_config(ws_root, request.team)
+    if error or config is None:
+        return {"success": False, "error": error}
+    workflow, error = write_team_workflow(ws_root, request.team, request.workflow, config)
+    if error or workflow is None:
+        return {"success": False, "error": error}
+    return {"success": True, "data": workflow}
 
 
 @app.get("/api/workspace/skills")

@@ -31,6 +31,7 @@ import type {
   ScheduledTask,
   ScheduledTaskWriteRequest,
   AgentTeam,
+  AgentTeamWorkflow,
 } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_BASE || '';
@@ -237,6 +238,21 @@ class ApiClient {
   async deleteTeam(ws: string, team: string): Promise<ApiResponse<void>> {
     return this.fetch(`/api/workspace/team?ws=${encodeURIComponent(ws)}&team=${encodeURIComponent(team)}`, {
       method: 'DELETE',
+    });
+  }
+
+  async readTeamWorkflow(ws: string, team: string): Promise<ApiResponse<AgentTeamWorkflow | null>> {
+    return this.fetch(`/api/workspace/team/workflow?ws=${encodeURIComponent(ws)}&team=${encodeURIComponent(team)}`);
+  }
+
+  async writeTeamWorkflow(
+    ws: string,
+    team: string,
+    workflow: AgentTeamWorkflow
+  ): Promise<ApiResponse<AgentTeamWorkflow>> {
+    return this.fetch('/api/workspace/team/workflow', {
+      method: 'PUT',
+      body: JSON.stringify({ ws, team, workflow }),
     });
   }
 
