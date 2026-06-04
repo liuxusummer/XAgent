@@ -166,6 +166,7 @@ def _build_delegate_runner(
             memory_mode=str(runtime_config.get("memory_mode", "project")),
             team_config=None,
         )
+        original_child_sink = child.sink
         if parent_ctx is not None:
             child.handler.ctx.sink = parent_ctx.sink
             child.sink = parent_ctx.sink
@@ -187,6 +188,7 @@ def _build_delegate_runner(
         except Exception as exc:  # noqa: BLE001
             return {"status": "ERROR", "agent": target, "error": str(exc)}
         finally:
+            child.sink = original_child_sink
             child.close()
 
     return _run_delegate
@@ -258,6 +260,7 @@ def build_team_step_runner(
             memory_mode=str(runtime_config.get("memory_mode", "project")),
             team_config=None,
         )
+        original_child_sink = child.sink
         if parent_ctx is not None:
             child.handler.ctx.sink = parent_ctx.sink
             child.sink = parent_ctx.sink
@@ -280,6 +283,7 @@ def build_team_step_runner(
         except Exception as exc:  # noqa: BLE001
             return {"status": "ERROR", "agent": target, "step_id": step_id, "error": str(exc)}
         finally:
+            child.sink = original_child_sink
             child.close()
 
     return _run_step
