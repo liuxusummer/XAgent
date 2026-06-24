@@ -1,77 +1,150 @@
-# XAgent
+# XAgent 🤖
 
-XAgent is a physical-execution agent runtime built around a closed-loop tool-calling cycle. It is designed for tasks that must touch the real environment: reading and editing files, running code, inspecting browser state, asking the user for clarification, and maintaining task memory.
+> A physical-execution agent runtime built around a closed-loop tool-calling cycle.
+>
+> **Observe first → act with minimal side effects → surface failures clearly → loop until a concrete terminal state.**
 
-The project is intentionally not a generic chat wrapper. Its core design goal is: observe first, act with minimal side effects, surface failures clearly, and keep looping until the task reaches a concrete terminal state.
+[![Python](https://img.shields.io/badge/Python-3.12%2B-blue)](#-requirements)
+[![Node](https://img.shields.io/badge/Node.js-18%2B-green)](#-fastapi--react-ui)
+[![Status](https://img.shields.io/badge/Status-Experimental-orange)](#-project-status)
+[![License](https://img.shields.io/badge/License-MIT-green)](#-license)
 
-## Highlights
+---
 
-- **Tool-call loop with explicit control flow**: every tool returns an `ActionResult` with data, next prompt, exit intent, and loop flags.
-- **Multiple model protocols**: text-based tool protocol plus native OpenAI/Claude tool-calling clients.
-- **Session-managed history**: model history, trimming, stream parsing, and failover stay inside the LLM layer.
-- **Physical tools**: file read/write/patch, Python and shell execution, browser scan/JavaScript execution, user interruption, short-term checkpoints, long-term memory settlement, local skill activation, and plan tracking.
-- **Streaming frontends**: CLI, Gradio UI, and a modern FastAPI + React UI with SSE updates.
-- **Observability hooks**: structured event sinks, JSONL logging, and optional Langfuse integration.
-- **Local-first workspace model**: relative paths resolve under an agent workspace, while project assets and memory stay under the repository.
+## ✨ Why XAgent
 
-## Project Status
+XAgent is designed for tasks that must **touch the real environment**:
 
-XAgent is an early-stage research and engineering project. It has a real architecture, tests, and runnable frontends, but the public API and configuration format may still evolve. Treat it as experimental software, especially because it can execute code and modify files.
+- 🗂️ read / write / patch files
+- 🧪 run Python or shell commands
+- 🌐 inspect and control a browser
+- 🙋 ask the user for clarification
+- 🧠 maintain short-term checkpoints and long-term memory
 
-## Architecture
+It is intentionally **not** a generic chat wrapper. The core is a **tool-call loop** that keeps going until the task reaches a real terminal outcome.
 
-```text
-┌──────────────────────────────────┐
-│ Frontends                        │
-│ CLI / Gradio / FastAPI + React   │
-├──────────────────────────────────┤
-│ Agent Core                       │
-│ XAgent → agent_loop → handler    │
-├──────────────────────────────────┤
-│ LLM Layer                        │
-│ Session / ToolClient / SSE       │
-├──────────────────────────────────┤
-│ Tool Layer                       │
-│ code_run / file_* / web_* / ...  │
-├──────────────────────────────────┤
-│ Infrastructure                   │
-│ BrowserDriver / memory / SOP     │
-└──────────────────────────────────┘
+---
+
+## ✅ Highlights
+
+- 🔁 **Explicit control flow**: each tool returns an `ActionResult` (data, next prompt, exit intent, loop flags).
+- 🧩 **Multiple model protocols**: text-based tool protocol + native OpenAI/Claude tool-calling clients.
+- 🧵 **Session-managed history**: trimming, streaming parsing, failover handled in the LLM layer.
+- 🛠️ **Physical toolset**: file ops, code execution, browser scan/JS execution, user interruption, checkpoints, long-term memory settlement, skill activation, plan tracking.
+- 🖥️ **Streaming frontends**: CLI, Gradio UI, and FastAPI + React UI with SSE updates.
+- 📈 **Observability hooks**: structured event sinks, JSONL logging, optional Langfuse.
+- 🧯 **Local-first workspace model**: relative paths resolve under an agent workspace to reduce accidental side effects.
+
+---
+
+## 🧪 Project Status
+
+XAgent is an **early-stage research + engineering project**. The architecture is real and the frontends are runnable, but the public API and configuration may evolve.
+
+⚠️ Treat it as **experimental software**, especially because it can execute code and modify files.
+
+---
+
+## 🧭 Architecture (at a glance)
+
+```mermaid
+flowchart TB
+  subgraph F[Frontends]
+    CLI[CLI]
+    Gradio[Gradio UI]
+    Web[FastAPI + React UI\n(SSE)]
+  end
+
+  subgraph C[Agent Core]
+    X[XAgent.run_task()]
+    Loop[run_agent_loop()]
+    Handler[XAgentHandler\n(dispatch tool calls)]
+  end
+
+  subgraph L[LLM Layer]
+    Session[Session\n(history / trimming / failover)]
+    ToolClient[ToolClient\n(OpenAI/Claude adapters)]
+    Stream[Streaming (SSE)]
+  end
+
+  subgraph T[Tool Layer]
+    File[file_read / file_write / file_patch]
+    Code[code_run]
+    WebTool[web_scan / web_execute_js]
+    Memory[checkpoint / long_term_memory]
+    Plan[plan_update]
+    Skill[skill_activate]
+    Ask[ask_user]
+  end
+
+  F --> C
+  C --> L
+  L --> C
+  C --> T
+  T --> C
 ```
 
-The main runtime path is:
+### 🔄 The tool-call loop (state view)
 
-```text
-user task
-  → XAgent.run_task()
-  → run_agent_loop()
-  → client.chat(messages, tools)
-  → handler.dispatch(tool_call)
-  → tool returns ActionResult
-  → next prompt or terminal exit
+```mermaid
+stateDiagram-v2
+  [*] --> Observe
+  Observe --> Think
+  Think --> CallTool: tool_call
+  CallTool --> Evaluate: ActionResult
+  Evaluate --> Observe: continue
+  Evaluate --> Terminal: exit intent
+  Terminal --> [*]
 ```
 
-Design details live in [`docs/`](docs/):
+### 🧵 Main runtime path (sequence view)
 
-- [`docs/architecture.md`](docs/architecture.md): system layers, module boundaries, workspace model
-- [`docs/agent-loop.md`](docs/agent-loop.md): `ActionResult`, `AgentContext`, handler dispatch, turn-end hooks
-- [`docs/llm-layer.md`](docs/llm-layer.md): sessions, protocol adapters, history trimming, failover
-- [`docs/tool-layer.md`](docs/tool-layer.md): tool isolation, truncation, browser contract, dual history alignment
-- [`docs/observability.md`](docs/observability.md): event model and telemetry sinks
-- [`docs/outlines.md`](docs/outlines.md): high-level technical outline
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant A as XAgent
+  participant L as LLM Client
+  participant H as Handler
+  participant T as Tools
 
-## Repository Layout
+  U->>A: task
+  A->>A: run_agent_loop()
+  A->>L: chat(messages, tools)
+  L-->>A: tool_call
+  A->>H: dispatch(tool_call)
+  H->>T: execute
+  T-->>H: ActionResult
+  H-->>A: ActionResult
+  alt terminal
+    A-->>U: final answer
+  else continue
+    A->>A: next turn
+  end
+```
+
+Design docs live in [`docs/`](docs/):
+
+- [`docs/architecture.md`](docs/architecture.md)
+- [`docs/agent-loop.md`](docs/agent-loop.md)
+- [`docs/llm-layer.md`](docs/llm-layer.md)
+- [`docs/tool-layer.md`](docs/tool-layer.md)
+- [`docs/observability.md`](docs/observability.md)
+- [`docs/outlines.md`](docs/outlines.md)
+
+---
+
+## 🗺️ Repository Layout
 
 ```text
 XAgent/
 ├── src/
 │   ├── core/                 # agent loop, LLM clients, telemetry, skills
-│   ├── handler/              # XAgentHandler tool dispatch methods
+│   ├── handler/              # XAgentHandler tool dispatch
 │   ├── tools/                # stateless tool implementations
 │   ├── assets/               # system prompt, tool schema, code-run header
-│   ├── main.py               # CLI entrypoint
-│   ├── web_ui.py             # Gradio frontend
-│   └── web_ui_new.py         # FastAPI backend for React frontend
+│   ├── main.py               # CLI entry
+│   ├── web_ui.py             # Gradio UI
+│   └── web_ui_new.py         # FastAPI backend for React UI
 ├── frontends/web/            # React + Vite UI
 ├── docs/                     # design documents
 ├── memory/                   # persistent memory and SOP files
@@ -82,17 +155,23 @@ XAgent/
 └── uv.lock
 ```
 
-Runtime output is expected under `workspace/`, `temp/`, and logs. These are ignored by Git.
+Runtime output is expected under `workspace/`, `temp/`, and logs (ignored by Git).
 
-## Requirements
+---
+
+## 📦 Requirements
 
 - Python `>=3.12,<3.13`
-- [`uv`](https://docs.astral.sh/uv/) for Python environment management
-- Node.js and npm for the React frontend
-- Chrome or Chromium if you use Selenium-backed browser tools
+- [`uv`](https://docs.astral.sh/uv/) (recommended) for Python env management
+- Node.js + npm (for React frontend)
+- Chrome/Chromium if you use Selenium-backed browser tools
 - An OpenAI-compatible or Claude-compatible model endpoint
 
-## Installation
+---
+
+## 🚀 Quick Start
+
+### 1) Install
 
 Create the Python environment:
 
@@ -106,16 +185,9 @@ Install optional web/browser dependencies:
 uv sync --extra web
 ```
 
-Install the React frontend dependencies:
+### 2) Configure
 
-```bash
-cd frontends/web
-npm install
-```
-
-## Configuration
-
-The simplest setup uses environment variables:
+The simplest setup uses env vars:
 
 ```bash
 export OPENAI_API_KEY="..."
@@ -123,29 +195,11 @@ export OPENAI_BASE_URL="https://api.openai.com/v1/chat/completions"
 export OPENAI_MODEL="gpt-4o"
 ```
 
-`OPENAI_BASE_URL` defaults to `https://api.openai.com/v1/chat/completions`, and `OPENAI_MODEL` defaults to `gpt-4o`.
+You can also provide a JSON config file with one or more named sessions (OpenAI text, Claude text, OpenAI native tools, Claude native tools, failover mixins).
 
-You can also provide a JSON config file with one or more named sessions. The loader supports OpenAI text, Claude text, OpenAI native tools, Claude native tools, and mixin failover sessions. A minimal shape looks like:
+**Tip:** do not commit secrets. Prefer `config.example.json` for shareable defaults.
 
-```json
-{
-  "openai_main": {
-    "apikey": "sk-...",
-    "apibase": "https://api.openai.com/v1/chat/completions",
-    "model": "gpt-4o",
-    "temperature": 0.2,
-    "max_tokens": 4096,
-    "timeout": 120,
-    "max_retries": 2
-  }
-}
-```
-
-Local configuration and secret files are ignored by default, including `config.json`, `mykey*`, `observability*.json`, `.env*`, and `*.secret.json`. Keep shareable examples under names such as `config.example.json` or `observability.example.json`.
-
-## Running
-
-### CLI
+### 3) Run (CLI)
 
 ```bash
 .venv/bin/python -m src.main
@@ -162,12 +216,15 @@ Useful CLI commands:
 /exit
 ```
 
-### FastAPI + React UI
+---
 
-For a single backend-served UI:
+## 🧩 FastAPI + React UI
+
+### Build once, serve from backend
 
 ```bash
 cd frontends/web
+npm install
 npm run build
 cd ../..
 .venv/bin/python -m src.web_ui_new --host 127.0.0.1 --port 7861
@@ -179,7 +236,7 @@ Open:
 http://127.0.0.1:7861/
 ```
 
-For frontend development with Vite:
+### Dev mode (Vite)
 
 ```bash
 .venv/bin/python -m src.web_ui_new --host 127.0.0.1 --port 7861
@@ -187,15 +244,19 @@ cd frontends/web
 VITE_API_BASE=http://127.0.0.1:7861 npm run dev -- --host 127.0.0.1 --port 5173
 ```
 
-### Gradio UI
+---
+
+## 🎛️ Gradio UI
 
 ```bash
 .venv/bin/python -m src.web_ui --host 127.0.0.1 --port 7860
 ```
 
-## Tools
+---
 
-XAgent exposes these tool domains to the model:
+## 🧰 Tools
+
+Tool behavior is declared in [`src/assets/tools_schema.json`](src/assets/tools_schema.json).
 
 | Domain | Tools |
 | --- | --- |
@@ -206,61 +267,62 @@ XAgent exposes these tool domains to the model:
 | Memory and planning | `update_working_checkpoint`, `start_long_term_update`, `plan_update` |
 | Prompt skills | `skill_activate` |
 
-Tool behavior is declared in [`src/assets/tools_schema.json`](src/assets/tools_schema.json). Tool implementations should remain stateless where possible; handler state belongs in `AgentContext`.
+---
 
-## Workspace and Safety Model
+## 🧯 Workspace & Safety Model
 
-By default, XAgent creates and uses `<project_root>/workspace` as the physical workspace. Relative file paths resolve under that workspace. This limits accidental repository or system-wide edits.
+By default, XAgent uses `<project_root>/workspace` as the physical workspace. Relative file paths resolve under that workspace.
 
-Important safety constraints:
+Safety constraints (high level):
 
-- File operations validate workspace boundaries.
-- `file_patch` requires exactly one match for `old_content`.
-- Code execution runs in a subprocess with timeout handling.
-- Browser execution uses an isolated driver abstraction.
-- Tool outputs are truncated before they re-enter the model context.
-- Long-running tasks can be interrupted by `/stop`, UI stop buttons, or runtime stop signals.
+- file ops validate workspace boundaries
+- `file_patch` requires **exactly one** match for `old_content`
+- code execution runs in a subprocess with timeout handling
+- tool outputs are truncated before re-entering the model context
+- long-running tasks can be interrupted
 
-XAgent can still execute shell code and write files. Review configuration, prompts, and workspace contents before running it against sensitive systems.
+---
 
-## Observability
+## 📈 Observability
 
-Event sinks can be enabled through environment variables or an observability config file.
+Enable JSONL logging:
 
 ```bash
 export XAGENT_LOG_DIR=logs
 export XAGENT_LOG_STDERR=1
 ```
 
-Optional Langfuse integration is available through the `observability` extra and `observability.example.json`.
+Optional Langfuse integration:
 
 ```bash
 uv sync --extra observability
 .venv/bin/python -m src.main --observability-config observability.example.json
 ```
 
-## Skills
+---
 
-Local skills are prompt instruction packs. They do not register new executable tools and do not run code by themselves.
+## 🧠 Skills
 
-The default skill root is [`skills/`](skills/). Each skill should include:
+Local skills are prompt instruction packs (they do **not** register new executable tools).
+
+Default skill root is [`skills/`](skills/). Each skill contains:
 
 ```text
 SKILL.md
 _meta.json
 ```
 
-You can pass a custom skill directory:
+Use a custom skill directory:
 
 ```bash
 .venv/bin/python -m src.main --skills-dir skills
 ```
 
-The agent can auto-select relevant skills based on the task, or activate them explicitly with the `skill_activate` tool.
+---
 
-## Testing
+## 🧪 Testing
 
-Run the Python test suite:
+Run Python tests:
 
 ```bash
 .venv/bin/python -m unittest discover -s tests
@@ -274,28 +336,42 @@ npm run build
 npm run lint
 ```
 
-The project currently uses `unittest` for Python tests. If you add pytest-only tests, add pytest to the development dependencies first.
+---
 
-## Development Guidelines
+## 🗓️ Roadmap
 
-- Read the relevant document in [`docs/`](docs/) before changing architecture, loop behavior, LLM protocol code, or tool behavior.
+- 🔐 stronger permission model for high-risk tools
+- 🧪 more complete frontend testing
+- 🧰 CI for Python + frontend checks
+- 📦 packaged release workflows
+- 🧾 more complete configuration examples
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome.
+
 - Keep diffs small and focused.
-- Preserve module boundaries:
-  - `core/agent_loop.py` should not depend on concrete tools.
-  - `core/llm.py` owns protocol translation and history management.
-  - `tools/` functions should stay stateless.
-  - `handler/` owns stateful orchestration through `AgentContext`.
-- Add tests for changes that affect loop exits, history, tool contracts, path safety, streaming, or frontend event delivery.
+- Read `docs/` before changing loop behavior, tool contracts, or protocol adapters.
+- Add tests for changes affecting loop exits, history, tool contracts, path safety, streaming, or event delivery.
 
-## Roadmap Ideas
+If you plan a larger change, open an issue first.
 
-- First-class config examples for OpenAI, Claude, and failover setups
-- A stricter permission model for high-risk tools
-- More complete frontend testing
-- CI for Python and frontend checks
-- Packaged release workflows
-- A formal plugin extension story
+---
 
-## License
+## 📄 License
 
-No license file is currently included. Until a license is added, all rights are reserved by default. Add a `LICENSE` file before encouraging external reuse or contributions.
+This project is licensed under the **MIT License**. See [`LICENSE`](LICENSE).
+
+---
+
+## 🙏 Acknowledgements
+
+Inspired by modern agent runtimes and tool-calling systems (e.g. LangChain, AutoGen, and the broader open-source LLM tooling ecosystem).
+
+<!-- 📸 Optional: add screenshots/GIFs here once available -->
+<!-- Example:
+![CLI Demo](docs/assets/cli-demo.gif)
+![Web UI](docs/assets/web-ui.png)
+-->
