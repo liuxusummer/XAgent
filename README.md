@@ -52,18 +52,18 @@ flowchart TB
   subgraph F[Frontends]
     CLI[CLI]
     Gradio[Gradio UI]
-    Web[FastAPI + React UI\n(SSE)]
+    Web[FastAPI + React UI<br/>SSE]
   end
 
   subgraph C[Agent Core]
     X[XAgent.run_task()]
     Loop[run_agent_loop()]
-    Handler[XAgentHandler\n(dispatch tool calls)]
+    Handler[XAgentHandler<br/>dispatch tool calls]
   end
 
   subgraph L[LLM Layer]
-    Session[Session\n(history / trimming / failover)]
-    ToolClient[ToolClient\n(OpenAI/Claude adapters)]
+    Session[Session<br/>history / trimming / failover]
+    ToolClient[ToolClient<br/>OpenAI/Claude adapters]
     Stream[Streaming (SSE)]
   end
 

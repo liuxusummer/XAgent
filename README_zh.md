@@ -52,18 +52,18 @@ flowchart TB
   subgraph F[前端入口]
     CLI[CLI]
     Gradio[Gradio UI]
-    Web[FastAPI + React UI\n(SSE)]
+    Web[FastAPI + React UI<br/>SSE]
   end
 
   subgraph C[Agent Core]
     X[XAgent.run_task()]
     Loop[run_agent_loop()]
-    Handler[XAgentHandler\n(分发工具调用)]
+    Handler[XAgentHandler<br/>分发工具调用]
   end
 
   subgraph L[LLM Layer]
-    Session[Session\n(历史 / 裁剪 / 故障转移)]
-    ToolClient[ToolClient\n(OpenAI/Claude 适配器)]
+    Session[Session<br/>历史 / 裁剪 / 故障转移]
+    ToolClient[ToolClient<br/>OpenAI/Claude 适配器]
     Stream[Streaming (SSE)]
   end
 
