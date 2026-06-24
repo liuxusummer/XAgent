@@ -9,6 +9,8 @@
 [![状态](https://img.shields.io/badge/状态-实验性-orange)](#-项目状态)
 [![许可证](https://img.shields.io/badge/许可证-MIT-green)](#-许可证)
 
+语言：[English](README.md) | 简体中文
+
 ---
 
 ## ✨ XAgent 是什么

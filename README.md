@@ -9,6 +9,8 @@
 [![Status](https://img.shields.io/badge/Status-Experimental-orange)](#-project-status)
 [![License](https://img.shields.io/badge/License-MIT-green)](#-license)
 
+Language: English | [简体中文](README_zh.md)
+
 ---
 
 ## ✨ Why XAgent
