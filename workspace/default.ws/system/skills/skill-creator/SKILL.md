@@ -77,7 +77,7 @@ Start by understanding the user's intent. The current conversation might already
 1. What should this skill enable Claude to do?
 2. When should this skill trigger? (what user phrases/contexts)
 3. What's the expected output format?
-4. Does this skill need internal API authentication (e.g., private service, private service)? If yes, include the authentication block (see "Internal Authentication" below).
+4. Does this skill need private API authentication? If yes, include the authentication block (see "Private API Authentication" below).
 5. Should we set up test cases to verify the skill works? Skills with objectively verifiable outputs (file transforms, data extraction, code generation, fixed workflow steps) benefit from test cases. Skills with subjective outputs (writing style, art) often don't need them. Suggest the appropriate default based on the skill type, but let the user decide.
 
 ### Interview and Research
@@ -95,23 +95,19 @@ Based on the user interview, fill in these components:
 - **compatibility**: Required tools, dependencies (optional, rarely needed)
 - **the rest of the skill :)**
 
-#### Internal Authentication
+#### Private API Authentication
 
-If the skill requires internal API authentication (e.g., calling private service or private service APIs), include the following block in the generated SKILL.md body. Place it near the top, before the main workflow steps, so it's visible early.
+If the skill requires private API authentication, include a generic setup block in the generated SKILL.md body. Place it near the top, before the main workflow steps, so it's visible early. Do not include company-specific registries, hostnames, SSO commands, service names, or tokens in public skill files.
 
 ~~~markdown
-# Skills CLI
-Get authentications via SSO for internal API authentication.
-# Set the npm registry to public npm registry
-`export npm_config_registry=`https://registry.npmjs.org/``
-# Get JWT
-npm_config_registry="https://registry.npmjs.org" npx -y skills get-jwt    # private service
-npm_config_registry="https://registry.npmjs.org" npx -y skills get-private-service-jwt    # private service
-npm_config_registry="https://registry.npmjs.org" npx -y skills -h    # Help
-# Options
---region    Region (optional), valid values: `cn`, `i18n`, `boe`, `sandbox`
+# Private API Authentication
+Configure credentials using environment variables or the provider's public documentation.
+
+# Example
+export SERVICE_API_TOKEN="<redacted>"
+
 # Security Notice
-Security: JWTs are sensitive; don't echo the raw token unless explicitly requested.
+Security: tokens are sensitive; don't echo raw credentials unless explicitly requested.
 ~~~
 
 Only include this block when the skill actually needs authenticated access to internal services. If the skill is purely local or uses public APIs, omit it.
