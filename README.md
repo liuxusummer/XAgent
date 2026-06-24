@@ -52,26 +52,26 @@ flowchart TB
   subgraph F[Frontends]
     CLI[CLI]
     Gradio[Gradio UI]
-    Web[FastAPI + React UI<br/>SSE]
+    Web["FastAPI + React UI<br/>SSE"]
   end
 
   subgraph C[Agent Core]
-    X[XAgent.run_task()]
-    Loop[run_agent_loop()]
-    Handler[XAgentHandler<br/>dispatch tool calls]
+    X["XAgent.run_task()"]
+    Loop["run_agent_loop()"]
+    Handler["XAgentHandler<br/>dispatch tool calls"]
   end
 
   subgraph L[LLM Layer]
-    Session[Session<br/>history / trimming / failover]
-    ToolClient[ToolClient<br/>OpenAI/Claude adapters]
-    Stream[Streaming (SSE)]
+    Session["Session<br/>history / trimming / failover"]
+    ToolClient["ToolClient<br/>OpenAI/Claude adapters"]
+    Stream["Streaming (SSE)"]
   end
 
   subgraph T[Tool Layer]
-    File[file_read / file_write / file_patch]
+    File["file_read / file_write / file_patch"]
     Code[code_run]
-    WebTool[web_scan / web_execute_js]
-    Memory[checkpoint / long_term_memory]
+    WebTool["web_scan / web_execute_js"]
+    Memory["checkpoint / long_term_memory"]
     Plan[plan_update]
     Skill[skill_activate]
     Ask[ask_user]
