@@ -1,0 +1,29 @@
+README.md
+  s_72af05a5dabd4c::t_7fe58770db4405 241-253
+README_zh.md
+  s_72af05a5dabd4c::t_e5b2a716edf0f1 241-252
+docs/agent-bound-persistent-chat-sessions-spec.md
+  s_72af05a5dabd4c::t_689de713f585f9 27,29-32,40,42-45
+src/web_ui_new.py
+  s_72af05a5dabd4c::t_21c1b504b71ac0 8,16,25,62-97,103-106,110-153,299-302,347-348,351-352,354,749-750,820-830,996-1007,1009-1010,1012,1018-1026,1034-1050,1052-1058,1060,1064-1065,1147-1197,1202-1203,1207-1240,1242-1253,1256-1276,1282-1283,1303,1305-1306,1311-1321,1323,1417-1418,1435-1436,1440,1458,1531,1542-1543,1619,1640,1681-1682,1746,1782-1783,1785-1795,1797-1806,1916-1923,2753-2755,2760,2781-2782,2883-2884,2886-2887,2889-2903,3635-3647,3661-3664
+tests/test_web_ui_new.py
+  s_72af05a5dabd4c::t_5e65c61ba6bf07 3,14-15,40,46-47,50,55-58,117,124,138-168,203-216,282-359,362,390-449,599-668,729-818
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7ff9c1acbd216d54583e941f8151e2443aed2fc3",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
