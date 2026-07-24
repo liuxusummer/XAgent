@@ -35,10 +35,15 @@ from src.web_ui_new import (
     TeamWorkflowWriteRequest,
     TeamWriteRequest,
     _agent_runtime_config,
+    _cleanup_sessions,
+    _drain_background,
+    _emit,
     _eval_cancel_events,
+    _persist_chat_state,
     _queue_state,
     _run_due_scheduled_tasks,
     _resolve_workspace_dir_input,
+    _session_lock,
     _sessions,
     create_scheduled_task,
     create_workspace,
@@ -361,6 +366,98 @@ class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.events[0]["data"]["totals"]["total_tokens"], 5)
         self.assertEqual(session.events[1]["type"], "token_usage_done")
         self.assertFalse(session.event_queue.empty())
+        self.assertEqual(session.persist_revision, 0)
+
+    def test_drain_wait_does_not_hold_global_session_registry_lock(self) -> None:
+        session = UISession(session_id="left", running=True)
+        entered = threading.Event()
+        release = threading.Event()
+
+        class _BlockingDisplayQueue:
+            def get(self, timeout: float):
+                del timeout
+                entered.set()
+                release.wait(1)
+                with session.lock:
+                    session.running = False
+                raise queue.Empty
+
+        agent = _FakeAgent(running=False)
+        agent.display_queue = _BlockingDisplayQueue()
+        session.agent = agent
+        worker = threading.Thread(target=_drain_background, args=(session,), daemon=True)
+        worker.start()
+        self.assertTrue(entered.wait(1))
+
+        acquired = _session_lock.acquire(timeout=0.05)
+        try:
+            self.assertTrue(acquired)
+        finally:
+            if acquired:
+                _session_lock.release()
+            release.set()
+            worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+
+    def test_chat_persistence_is_debounced_and_force_flushes(self) -> None:
+        session = UISession(
+            session_id="persist",
+            chat_id="chat",
+            chat_ws="default.ws",
+            chat_agent="coding",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))),
+                patch("src.web_ui_new._write_json_file") as write_json,
+            ):
+                _emit(session, "user_task", "hello")
+                self.assertEqual(write_json.call_count, 0)
+                self.assertTrue(_persist_chat_state(session, force=True))
+                self.assertEqual(write_json.call_count, 2)
+
+                _emit(session, "assistant_delta", "partial")
+                self.assertFalse(_persist_chat_state(session))
+                self.assertEqual(write_json.call_count, 2)
+
+                self.assertTrue(_persist_chat_state(session, force=True))
+                self.assertEqual(write_json.call_count, 4)
+
+    def test_cleanup_removes_only_idle_sessions_and_enforces_capacity(self) -> None:
+        expired_agent = _FakeAgent()
+        expired = UISession(
+            agent=expired_agent,
+            session_id="expired",
+            last_activity_at=10,
+            persist_revision=1,
+        )
+        active = UISession(
+            agent=_FakeAgent(),
+            session_id="active",
+            running=True,
+            last_activity_at=10,
+        )
+        fresh = UISession(session_id="fresh", last_activity_at=95)
+        _sessions.update({"expired": expired, "active": active, "fresh": fresh})
+
+        with patch("src.web_ui_new._persist_chat_state", return_value=True) as persist:
+            removed = _cleanup_sessions(now=100, idle_ttl_seconds=20, max_sessions=10)
+
+        self.assertEqual(removed, ["expired"])
+        persist.assert_called_once_with(expired, force=True)
+        self.assertNotIn("expired", _sessions)
+        self.assertIn("active", _sessions)
+        self.assertIn("fresh", _sessions)
+        self.assertTrue(expired_agent.stopped)
+
+        active.running = False
+        active.last_activity_at = 90
+        fresh.last_activity_at = 95
+        removed = _cleanup_sessions(now=100, idle_ttl_seconds=1000, max_sessions=1)
+
+        self.assertEqual(removed, ["active"])
+        self.assertEqual(list(_sessions), ["fresh"])
 
 
 class WebUINewUsageSummaryTests(unittest.IsolatedAsyncioTestCase):

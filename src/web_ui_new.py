@@ -211,6 +211,12 @@ class UISession:
     parsed_tool_use_count: int = 0
     pending_tool_names: list[str] = field(default_factory=list)
     emitted_tool_keys: set[str] = field(default_factory=set)
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    persist_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    last_activity_at: float = field(default_factory=time.time)
+    persist_revision: int = 0
+    persisted_revision: int = 0
+    last_persist_at: float = 0.0
 
 
 # Global session storage
@@ -237,9 +243,24 @@ _TASK_TIME_RE = re.compile(r"^\d{2}:\d{2}$")
 _TASK_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TASK_REPEATS = {"none", "daily", "weekly", "custom"}
 _TASK_STATUSES = {"running", "paused"}
+_PERSISTED_SESSION_EVENT_TYPES = {
+    "user_task",
+    "user_reply",
+    "assistant_delta",
+    "thinking_delta",
+    "turn_start",
+    "tool_call",
+    "ask_user",
+    "done",
+    "error",
+    "stop",
+}
 _task_lock = threading.Lock()
 _task_scheduler_started = False
 _task_scheduler_stop = threading.Event()
+_CHAT_PERSIST_INTERVAL_SECONDS = 1.0
+_SESSION_IDLE_TTL_SECONDS = 60 * 60
+_SESSION_MAX_COUNT = 256
 
 
 def _now_ms() -> int:
@@ -580,19 +601,20 @@ def _update_session_messages(session: UISession, event_type: str, data: Any = No
 
 def _emit_tool_call(session: UISession, name: str, arguments: dict[str, Any], tool_id: str | None = None) -> None:
     key = _tool_key(name, arguments)
-    if key in session.emitted_tool_keys:
-        return
-    session.emitted_tool_keys.add(key)
-    _emit(
-        session,
-        "tool_call",
-        {
-            "id": tool_id or uuid.uuid4().hex[:8],
-            "name": name,
-            "arguments": arguments,
-            "status": "running",
-        },
-    )
+    with session.lock:
+        if key in session.emitted_tool_keys:
+            return
+        session.emitted_tool_keys.add(key)
+        _emit(
+            session,
+            "tool_call",
+            {
+                "id": tool_id or uuid.uuid4().hex[:8],
+                "name": name,
+                "arguments": arguments,
+                "status": "running",
+            },
+        )
 
 
 def _emit_tool_uses(session: UISession) -> None:
@@ -632,17 +654,20 @@ def _append_llm_delta(session: UISession, delta: str) -> None:
 
 
 def _emit(session: UISession, event_type: str, data: Any = None) -> None:
-    if event_type == "assistant_delta" and data == session.last_assistant_delta:
-        return
-    if event_type == "thinking_delta" and data == session.last_thinking_delta:
-        return
-    if event_type == "assistant_delta":
-        session.last_assistant_delta = str(data)
-    elif event_type == "thinking_delta":
-        session.last_thinking_delta = str(data)
-    session.events.append({"type": event_type, "data": data})
-    _update_session_messages(session, event_type, data)
-    _persist_chat_state(session)
+    with session.lock:
+        if event_type == "assistant_delta" and data == session.last_assistant_delta:
+            return
+        if event_type == "thinking_delta" and data == session.last_thinking_delta:
+            return
+        if event_type == "assistant_delta":
+            session.last_assistant_delta = str(data)
+        elif event_type == "thinking_delta":
+            session.last_thinking_delta = str(data)
+        session.events.append({"type": event_type, "data": data})
+        _update_session_messages(session, event_type, data)
+        if event_type in _PERSISTED_SESSION_EVENT_TYPES:
+            session.persist_revision += 1
+        session.last_activity_at = time.time()
 
 
 def _append_progress(session: UISession, message: str) -> None:
@@ -700,10 +725,11 @@ def _append_progress(session: UISession, message: str) -> None:
 
 
 def _close_agent(session: UISession) -> None:
-    agent = session.agent
+    with session.lock:
+        agent = session.agent
+        session.agent = None
     if agent is not None:
         agent.close()
-    session.agent = None
 
 
 def _normalize_path_input(value: str | None) -> str:
@@ -863,49 +889,149 @@ def _chat_title(metadata: dict[str, Any], messages: list[dict[str, Any]]) -> str
     return current
 
 
-def _persist_chat_state(session: UISession) -> None:
-    if not session.chat_id or not session.chat_ws or not session.chat_agent:
-        return
-    metadata_path, error = _chat_metadata_path(session.chat_ws, session.chat_agent, session.chat_id)
-    state_path, state_error = _chat_state_path(session.chat_ws, session.chat_agent, session.chat_id)
-    if error or state_error or metadata_path is None or state_path is None:
-        return
-    metadata = _read_chat_metadata(session.chat_ws, session.chat_agent, session.chat_id)
-    if metadata is None:
-        metadata = _default_chat_metadata(session.chat_ws, session.chat_agent, session.chat_id)
-    status = "waiting_for_user" if session.waiting_for_user else ("running" if session.running else "idle")
-    messages = _safe_json_value(session.messages)
-    llm_history = _extract_llm_history(session.agent) or _safe_json_value(session.restored_llm_history)
-    now = time.time()
-    metadata.update(
-        {
-            "workspace": session.chat_ws,
-            "agent": session.chat_agent,
-            "title": _chat_title(metadata, messages),
-            "updated_at": now,
-            "last_message_preview": _chat_preview(messages),
-            "message_count": len(messages),
+def _touch_session(session: UISession) -> None:
+    with session.lock:
+        session.last_activity_at = time.time()
+
+
+def _get_session(session_id: str, *, touch: bool = True) -> UISession | None:
+    with _session_lock:
+        session = _sessions.get(session_id)
+        if session is not None and touch:
+            with session.lock:
+                session.last_activity_at = time.time()
+        return session
+
+
+def _session_snapshot() -> list[UISession]:
+    with _session_lock:
+        return list(_sessions.values())
+
+
+def _register_session(session: UISession) -> None:
+    _touch_session(session)
+    with _session_lock:
+        _sessions[session.session_id] = session
+    _cleanup_sessions()
+
+
+def _remove_session(session: UISession) -> None:
+    with _session_lock:
+        if _sessions.get(session.session_id) is session:
+            _sessions.pop(session.session_id, None)
+
+
+def _persist_chat_state(session: UISession, *, force: bool = False) -> bool:
+    with session.persist_lock:
+        monotonic_now = time.monotonic()
+        with session.lock:
+            if not session.chat_id or not session.chat_ws or not session.chat_agent:
+                return False
+            revision = session.persist_revision
+            if not force:
+                if revision <= session.persisted_revision:
+                    return False
+                if monotonic_now - session.last_persist_at < _CHAT_PERSIST_INTERVAL_SECONDS:
+                    return False
+            chat_id = session.chat_id
+            chat_ws = session.chat_ws
+            chat_agent = session.chat_agent
+            session_id = session.session_id
+            runtime_config_key = session.runtime_config_key
+            team_name = session.team_name
+            team_workflow_name = (
+                session.team_workflow.get("name")
+                if isinstance(session.team_workflow, dict)
+                else None
+            )
+            messages = _safe_json_value(session.messages)
+            restored_llm_history = _safe_json_value(session.restored_llm_history)
+            waiting_for_user = session.waiting_for_user
+            running = session.running
+            ask_prompt = session.ask_prompt
+            agent = session.agent
+
+        metadata_path, error = _chat_metadata_path(chat_ws, chat_agent, chat_id)
+        state_path, state_error = _chat_state_path(chat_ws, chat_agent, chat_id)
+        if error or state_error or metadata_path is None or state_path is None:
+            return False
+        metadata = _read_chat_metadata(chat_ws, chat_agent, chat_id)
+        if metadata is None:
+            metadata = _default_chat_metadata(chat_ws, chat_agent, chat_id)
+        status = "waiting_for_user" if waiting_for_user else ("running" if running else "idle")
+        llm_history = _extract_llm_history(agent) or restored_llm_history
+        now = time.time()
+        metadata.update(
+            {
+                "workspace": chat_ws,
+                "agent": chat_agent,
+                "title": _chat_title(metadata, messages),
+                "updated_at": now,
+                "last_message_preview": _chat_preview(messages),
+                "message_count": len(messages),
+                "status": status,
+            }
+        )
+        state = {
+            **_default_chat_state(chat_ws, chat_agent, chat_id, session_id),
+            "backend_session_id": session_id,
+            "runtime_config_key": runtime_config_key,
+            "team": team_name or None,
+            "team_workflow": team_workflow_name,
+            "messages": messages,
+            "llm_history": llm_history,
+            "waiting_for_user": waiting_for_user,
+            "ask_prompt": ask_prompt,
             "status": status,
+            "updated_at": now,
         }
-    )
-    state = {
-        **_default_chat_state(session.chat_ws, session.chat_agent, session.chat_id, session.session_id),
-        "backend_session_id": session.session_id,
-        "runtime_config_key": session.runtime_config_key,
-        "team": session.team_name or None,
-        "team_workflow": session.team_workflow.get("name") if isinstance(session.team_workflow, dict) else None,
-        "messages": messages,
-        "llm_history": llm_history,
-        "waiting_for_user": session.waiting_for_user,
-        "ask_prompt": session.ask_prompt,
-        "status": status,
-        "updated_at": now,
-    }
-    try:
-        _write_json_file(metadata_path, metadata)
-        _write_json_file(state_path, state)
-    except OSError:
-        return
+        try:
+            _write_json_file(metadata_path, metadata)
+            _write_json_file(state_path, state)
+        except OSError:
+            return False
+
+        with session.lock:
+            session.last_persist_at = monotonic_now
+            session.persisted_revision = max(session.persisted_revision, revision)
+        return True
+
+
+def _cleanup_sessions(
+    *,
+    now: float | None = None,
+    idle_ttl_seconds: float = _SESSION_IDLE_TTL_SECONDS,
+    max_sessions: int = _SESSION_MAX_COUNT,
+) -> list[str]:
+    current_time = time.time() if now is None else now
+    removed: list[tuple[str, UISession]] = []
+    with _session_lock:
+        for session_id, session in list(_sessions.items()):
+            with session.lock:
+                active = session.running or session.waiting_for_user
+                expired = current_time - session.last_activity_at >= idle_ttl_seconds
+            if not active and expired:
+                removed.append((session_id, session))
+                _sessions.pop(session_id, None)
+
+        overflow = max(0, len(_sessions) - max(1, max_sessions))
+        if overflow:
+            inactive: list[tuple[float, str, UISession]] = []
+            for session_id, session in _sessions.items():
+                with session.lock:
+                    if not session.running and not session.waiting_for_user:
+                        inactive.append((session.last_activity_at, session_id, session))
+            for _, session_id, session in sorted(inactive)[:overflow]:
+                removed.append((session_id, session))
+                _sessions.pop(session_id, None)
+
+    for _, session in removed:
+        with session.lock:
+            persist_dirty = session.persist_revision > session.persisted_revision
+        if persist_dirty:
+            _persist_chat_state(session, force=True)
+        _close_agent(session)
+    return [session_id for session_id, _ in removed]
 
 
 def _load_chat_into_session(ws: str, agent: str, chat_id: str, session: UISession | None = None) -> tuple[UISession | None, str | None]:
@@ -928,14 +1054,17 @@ def _load_chat_into_session(ws: str, agent: str, chat_id: str, session: UISessio
     session.waiting_for_user = False
     session.running = False
     session.ask_prompt = ""
-    _sessions[session.session_id] = session
+    _register_session(session)
     return session, None
 
 
 def _find_session_by_chat(ws: str, agent: str, chat_id: str) -> UISession | None:
-    for session in _sessions.values():
-        if session.chat_ws == ws and session.chat_agent == agent and session.chat_id == chat_id:
-            return session
+    with _session_lock:
+        for session in _sessions.values():
+            with session.lock:
+                if session.chat_ws == ws and session.chat_agent == agent and session.chat_id == chat_id:
+                    session.last_activity_at = time.time()
+                    return session
     return None
 
 
@@ -1029,45 +1158,54 @@ def _ensure_agent(
 
 def _drain_sync(session: UISession, wait: bool) -> bool:
     """Synchronous drain for background thread"""
-    agent = session.agent
+    with session.lock:
+        agent = session.agent
     if agent is None:
         return True
 
     finished = False
     while True:
-        timeout = 0.1 if wait and session.running else 0.0
+        with session.lock:
+            timeout = 0.1 if wait and session.running else 0.0
         try:
             msg = agent.display_queue.get(timeout=timeout)
         except queue.Empty:
             break
 
-        if "progress" in msg:
-            _append_progress(session, msg["progress"])
-        elif "ask_user" in msg:
-            session.waiting_for_user = True
-            session.running = False
-            session.ask_prompt = msg["ask_user"]
-            _emit(session, "ask_user", msg["ask_user"])
-            _persist_chat_state(session)
-            break
-        elif "done" in msg:
-            result = msg["done"]
-            _emit(
-                session,
-                "done",
-                {
-                    "response": result.get("response", ""),
-                    "exit_reason": result.get("exit_reason", ""),
-                    "tool_results": result.get("tool_results", []),
-                    "turns": result.get("turns", 0),
-                    "team_workflow": result.get("team_workflow"),
-                },
-            )
-            session.running = False
-            session.waiting_for_user = False
-            session.ask_prompt = ""
-            _persist_chat_state(session)
-            finished = True
+        force_persist = False
+        stop_draining = False
+        with session.lock:
+            if "progress" in msg:
+                _append_progress(session, msg["progress"])
+            elif "ask_user" in msg:
+                session.waiting_for_user = True
+                session.running = False
+                session.ask_prompt = msg["ask_user"]
+                _emit(session, "ask_user", msg["ask_user"])
+                force_persist = True
+                stop_draining = True
+            elif "done" in msg:
+                result = msg["done"]
+                _emit(
+                    session,
+                    "done",
+                    {
+                        "response": result.get("response", ""),
+                        "exit_reason": result.get("exit_reason", ""),
+                        "tool_results": result.get("tool_results", []),
+                        "turns": result.get("turns", 0),
+                        "team_workflow": result.get("team_workflow"),
+                    },
+                )
+                session.running = False
+                session.waiting_for_user = False
+                session.ask_prompt = ""
+                force_persist = True
+                finished = True
+                stop_draining = True
+
+        _persist_chat_state(session, force=force_persist)
+        if stop_draining:
             break
 
         if not wait:
@@ -1096,10 +1234,9 @@ def _queue_state(session: UISession, finished: bool) -> None:
 
 def _drain_background(session: UISession) -> None:
     while True:
-        with _session_lock:
-            finished = _drain_sync(session, wait=True)
-            _queue_state(session, finished)
-
+        finished = _drain_sync(session, wait=True)
+        _queue_state(session, finished)
+        with session.lock:
             if finished or session.waiting_for_user or not session.running:
                 break
         time.sleep(0.05)
@@ -1132,7 +1269,8 @@ def _run_task_background(session: UISession, task: str) -> None:
     workflow: dict[str, Any] | None = None
     parent_ctx: Any | None = None
     step_runner: Any | None = None
-    with _session_lock:
+    agent: Any | None = None
+    with session.lock:
         if session.running:
             return
         session.events = []
@@ -1152,11 +1290,13 @@ def _run_task_background(session: UISession, task: str) -> None:
         workflow = session.team_workflow
         step_runner = session.team_step_runner
         parent_ctx = getattr(getattr(session.agent, "handler", None), "ctx", None)
-        if not workflow:
-            session.agent.run_task_async(task.strip())
+        agent = session.agent
+    _persist_chat_state(session, force=True)
+
+    if not workflow and agent is not None:
+        agent.run_task_async(task.strip())
 
     if workflow:
-        agent = session.agent
         try:
             if agent is None:
                 result = _workflow_error_result(
@@ -1167,9 +1307,8 @@ def _run_task_background(session: UISession, task: str) -> None:
             else:
                 def _emit_workflow_progress(message: str) -> None:
                     agent.display_queue.put({"progress": message})
-                    with _session_lock:
-                        _drain_sync(session, wait=False)
-                        _queue_state(session, finished=False)
+                    _drain_sync(session, wait=False)
+                    _queue_state(session, finished=False)
 
                 def _suppress_child_progress(_message: str) -> None:
                     return None
@@ -1208,7 +1347,7 @@ def _run_task_background(session: UISession, task: str) -> None:
         if agent is not None:
             agent.display_queue.put({"done": result})
         else:
-            with _session_lock:
+            with session.lock:
                 _emit(
                     session,
                     "done",
@@ -1224,12 +1363,13 @@ def _run_task_background(session: UISession, task: str) -> None:
                 session.waiting_for_user = False
                 session.ask_prompt = ""
                 _queue_state(session, finished=True)
+            _persist_chat_state(session, force=True)
 
     try:
         _drain_background(session)
     except Exception as exc:  # noqa: BLE001
         result = _workflow_error_result(f"[error] failed to drain task result: {exc}", str(exc), workflow)
-        with _session_lock:
+        with session.lock:
             _emit(
                 session,
                 "done",
@@ -1244,8 +1384,8 @@ def _run_task_background(session: UISession, task: str) -> None:
             session.running = False
             session.waiting_for_user = False
             session.ask_prompt = ""
-            _persist_chat_state(session)
             _queue_state(session, finished=True)
+        _persist_chat_state(session, force=True)
 
 
 @app.post("/api/chat")
@@ -1273,7 +1413,7 @@ async def submit_task(request: SubmitTaskRequest):
             agent_name = str(team_config.get("leader") or "").strip()
     if chat_id and not agent_name:
         return {"success": False, "error": "Agent is required for persistent chat"}
-    session = _sessions.get(requested_session_id) if requested_session_id else None
+    session = _get_session(requested_session_id) if requested_session_id else None
     if session is None and chat_id:
         session = _find_session_by_chat(chat_ws, agent_name, chat_id)
     if session is None and chat_id:
@@ -1283,33 +1423,34 @@ async def submit_task(request: SubmitTaskRequest):
     if session is None:
         session_id = uuid.uuid4().hex[:16]
         session = UISession(session_id=session_id)
-        _sessions[session_id] = session
+        _register_session(session)
     else:
         session_id = session.session_id
 
     config_path = _normalize_path_input(request.config_path)
     observability_config_path = _normalize_path_input(request.observability_config_path)
     if chat_id:
-        session.chat_id = chat_id
-        session.chat_ws = chat_ws
-        session.chat_agent = agent_name
+        with session.lock:
+            session.chat_id = chat_id
+            session.chat_ws = chat_ws
+            session.chat_agent = agent_name
     runtime_config, runtime_error = _agent_runtime_config(workspace_dir, agent_name)
     if runtime_error:
         return {"success": False, "error": runtime_error}
 
     # Build agent
-    _ensure_agent(
-        session,
-        config_path,
-        observability_config_path,
-        workspace_dir,
-        agent_name,
-        runtime_config,
-        team_name,
-        team_config,
-        team_workflow,
-    )
-    _persist_chat_state(session)
+    with session.lock:
+        _ensure_agent(
+            session,
+            config_path,
+            observability_config_path,
+            workspace_dir,
+            agent_name,
+            runtime_config,
+            team_name,
+            team_config,
+            team_workflow,
+        )
 
     # Start background task
     thread = threading.Thread(
@@ -1326,22 +1467,31 @@ async def submit_task(request: SubmitTaskRequest):
 async def send_reply(request: ReplyRequest):
     """Send reply to agent's ask_user"""
     requested_session_id = _normalize_path_input(request.session_id)
-    with _session_lock:
-        if requested_session_id:
-            active_session = _sessions.get(requested_session_id)
-            if active_session is None or not active_session.waiting_for_user:
-                return {"success": False, "error": "Session is not waiting for reply"}
-        else:
-            active_session = next((s for s in _sessions.values() if s.waiting_for_user), None)
+    if requested_session_id:
+        active_session = _get_session(requested_session_id)
+    else:
+        active_session = None
+        for candidate in _session_snapshot():
+            with candidate.lock:
+                if candidate.waiting_for_user:
+                    active_session = candidate
+                    candidate.last_activity_at = time.time()
+                    break
 
-        if active_session is None or active_session.agent is None:
+    if active_session is None:
+        return {"success": False, "error": "Session is not waiting for reply"}
+
+    with active_session.lock:
+        if not active_session.waiting_for_user:
+            return {"success": False, "error": "Session is not waiting for reply"}
+        if active_session.agent is None:
             return {"success": False, "error": "No active session waiting for reply"}
 
         active_session.waiting_for_user = False
         active_session.running = True
         _emit(active_session, "user_reply", request.reply.strip())
         active_session.agent.reply_queue.put(request.reply.strip())
-        _persist_chat_state(active_session)
+    _persist_chat_state(active_session, force=True)
 
     # Restart drain in background
     thread = threading.Thread(
@@ -1365,21 +1515,22 @@ async def stop_task(request: Request):
         payload.get("session_id", "") if isinstance(payload, dict) else ""
     )
 
-    with _session_lock:
-        if requested_session_id:
-            session = _sessions.get(requested_session_id)
-            if session is None:
-                return {"success": False, "error": "Session not found"}
-            sessions = [session]
-        else:
-            sessions = _sessions.values()
-        for session in sessions:
-            if session.agent is not None and session.agent.is_running():
-                session.agent.stop()
-                _emit(session, "stop", "interrupt signal sent")
-                _queue_state(session, finished=False)
-                _persist_chat_state(session)
-                return {"success": True}
+    if requested_session_id:
+        session = _get_session(requested_session_id)
+        if session is None:
+            return {"success": False, "error": "Session not found"}
+        sessions = [session]
+    else:
+        sessions = _session_snapshot()
+    for session in sessions:
+        with session.lock:
+            agent = session.agent
+        if agent is not None and agent.is_running():
+            agent.stop()
+            _emit(session, "stop", "interrupt signal sent")
+            _queue_state(session, finished=False)
+            _persist_chat_state(session, force=True)
+            return {"success": True}
 
     return {"success": False, "error": "No running task"}
 
@@ -1388,7 +1539,7 @@ async def stop_task(request: Request):
 async def stream_chat(request: Request):
     """SSE stream for chat events"""
     session_id = request.query_params.get("session_id", "")
-    session = _sessions.get(session_id)
+    session = _get_session(session_id)
 
     if session is None:
         # Return empty stream
@@ -1413,10 +1564,11 @@ async def stream_chat(request: Request):
             except queue.Empty:
                 timed_out = True
 
-            with _session_lock:
-                current_events = session.events
-                new_events = current_events[last_events_len:]
-                last_events_len = len(current_events)
+            with session.lock:
+                if last_events_len > len(session.events):
+                    last_events_len = 0
+                new_events = list(session.events[last_events_len:])
+                last_events_len = len(session.events)
                 session_done = not session.running and not session.waiting_for_user
 
             for event in new_events:
@@ -1493,7 +1645,7 @@ async def create_chat(request: ChatCreateRequest):
         chat_ws=ws,
         chat_agent=agent,
     )
-    _sessions[session_id] = session
+    _register_session(session)
     return {"success": True, "data": {"metadata": metadata, "state": state}}
 
 
@@ -1524,20 +1676,28 @@ async def delete_chat(chat_id: str, ws: str = "default.ws", agent: str = ""):
     if not agent:
         return {"success": False, "error": "Agent is required"}
     session = _find_session_by_chat(ws, agent, chat_id)
-    if session is not None and session.running:
-        return {"success": False, "error": "Chat is running; stop the task before deleting it"}
+    if session is not None:
+        with session.lock:
+            if session.running:
+                return {"success": False, "error": "Chat is running; stop the task before deleting it"}
     chat_path, error = _chat_dir(ws, agent, chat_id)
     if error or chat_path is None:
         return {"success": False, "error": error}
     if not os.path.isdir(chat_path):
         return {"success": False, "error": "Chat not found"}
-    try:
-        shutil.rmtree(chat_path)
-    except OSError as exc:
-        return {"success": False, "error": str(exc)}
     if session is not None:
-        _sessions.pop(session.session_id, None)
+        with session.persist_lock:
+            try:
+                shutil.rmtree(chat_path)
+            except OSError as exc:
+                return {"success": False, "error": str(exc)}
+            _remove_session(session)
         _close_agent(session)
+    else:
+        try:
+            shutil.rmtree(chat_path)
+        except OSError as exc:
+            return {"success": False, "error": str(exc)}
     return {"success": True}
 
 
@@ -2321,7 +2481,7 @@ def _create_or_load_task_chat(task: dict[str, Any]) -> tuple[UISession | None, s
     except OSError as exc:
         return None, str(exc)
     session = UISession(session_id=session_id, chat_id=chat_id, chat_ws=ws, chat_agent=agent)
-    _sessions[session_id] = session
+    _register_session(session)
     task["chat_id"] = chat_id
     return session, None
 
@@ -2341,17 +2501,17 @@ def _dispatch_scheduled_task(task: dict[str, Any]) -> tuple[str | None, str | No
             return None, "Task chat is already running"
     else:
         session = UISession(session_id=uuid.uuid4().hex[:16])
-        _sessions[session.session_id] = session
+        _register_session(session)
 
-    _ensure_agent(
-        session,
-        str(task.get("config_path") or ""),
-        str(task.get("observability_config_path") or ""),
-        ws,
-        agent_name,
-        runtime_config,
-    )
-    _persist_chat_state(session)
+    with session.lock:
+        _ensure_agent(
+            session,
+            str(task.get("config_path") or ""),
+            str(task.get("observability_config_path") or ""),
+            ws,
+            agent_name,
+            runtime_config,
+        )
     thread = threading.Thread(
         target=_run_task_background,
         args=(session, str(task.get("prompt") or "")),
@@ -2433,7 +2593,11 @@ def _task_scheduler_loop() -> None:
         try:
             _run_due_scheduled_tasks()
         except Exception:
-            continue
+            pass
+        try:
+            _cleanup_sessions()
+        except Exception:
+            pass
 
 
 @app.on_event("startup")
