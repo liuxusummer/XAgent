@@ -268,6 +268,8 @@ class UISession:
     events: list[dict[str, Any]] = field(default_factory=list)
     waiting_for_user: bool = False
     ask_prompt: str = ""
+    starting: bool = False
+    task_start_token: str = ""
     running: bool = False
     config_path: str = ""
     observability_config_path: str = ""
@@ -294,8 +296,10 @@ class UISession:
     pending_tool_names: list[str] = field(default_factory=list)
     emitted_tool_keys: set[str] = field(default_factory=set)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    agent_init_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     persist_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     last_activity_at: float = field(default_factory=time.time)
+    starting_started_at: float = 0.0
     running_started_at: float = 0.0
     waiting_started_at: float = 0.0
     stop_requested: bool = False
@@ -352,10 +356,34 @@ _SESSION_RUNNING_TTL_SECONDS = 6 * 60 * 60
 _SESSION_WAITING_TTL_SECONDS = 24 * 60 * 60
 _SESSION_MAX_COUNT = 256
 _SESSION_CAPACITY_ERROR = "Session capacity reached; stop or close an existing session and retry"
+_SESSION_BUSY_ERROR = "Session is busy with another task"
+_SESSION_CLOSED_ERROR = "Session is closed"
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _new_daemon_thread(*args, **kwargs) -> threading.Thread:
+    kwargs["daemon"] = True
+    return threading.Thread(*args, **kwargs)
+
+
+def _consume_background_task_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+async def _run_blocking(func: Any, /, *args, **kwargs):
+    """Run synchronous work off-loop; cancellation does not abandon its result."""
+    worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        worker.add_done_callback(_consume_background_task_result)
+        raise
 
 
 def _safe_json_value(value: Any) -> Any:
@@ -829,9 +857,10 @@ def _stop_agent(session: UISession, *, unblock_reply: bool = False) -> None:
 
 
 def _close_agent(session: UISession) -> None:
-    with session.lock:
-        agent = session.agent
-        session.agent = None
+    with session.agent_init_lock:
+        with session.lock:
+            agent = session.agent
+            session.agent = None
     if agent is not None:
         agent.close()
 
@@ -996,12 +1025,49 @@ def _chat_title(metadata: dict[str, Any], messages: list[dict[str, Any]]) -> str
 def _set_session_runtime_state(session: UISession, state: str, *, now: float | None = None) -> None:
     current_time = time.time() if now is None else now
     with session.lock:
+        session.starting = False
+        session.task_start_token = ""
+        session.starting_started_at = 0.0
         session.running = state == "running"
         session.waiting_for_user = state == "waiting"
         session.running_started_at = current_time if state == "running" else 0.0
         session.waiting_started_at = current_time if state == "waiting" else 0.0
         if state != "running":
             session.stop_requested = False
+
+
+def _reserve_task_start(session: UISession) -> tuple[str | None, str | None]:
+    with session.lock:
+        if session.closing:
+            return None, _SESSION_CLOSED_ERROR
+        if session.starting or session.running or session.waiting_for_user:
+            return None, _SESSION_BUSY_ERROR
+        token = uuid.uuid4().hex
+        now = time.time()
+        session.starting = True
+        session.task_start_token = token
+        session.starting_started_at = now
+        session.last_activity_at = now
+        return token, None
+
+
+def _release_task_start(session: UISession, token: str) -> bool:
+    with session.lock:
+        if not session.starting or session.task_start_token != token:
+            return False
+        session.starting = False
+        session.task_start_token = ""
+        session.starting_started_at = 0.0
+        session.last_activity_at = time.time()
+        return True
+
+
+def _task_start_allowed_locked(session: UISession, task_start_token: str) -> bool:
+    if session.closing or session.running or session.waiting_for_user:
+        return False
+    if task_start_token:
+        return session.starting and session.task_start_token == task_start_token
+    return not session.starting
 
 
 def _touch_session(session: UISession) -> bool:
@@ -1094,6 +1160,7 @@ def _persist_chat_state(session: UISession, *, force: bool = False) -> bool:
             messages = _safe_json_value(session.messages)
             restored_llm_history = _safe_json_value(session.restored_llm_history)
             waiting_for_user = session.waiting_for_user
+            starting = session.starting
             running = session.running
             ask_prompt = session.ask_prompt
             agent = session.agent
@@ -1105,7 +1172,7 @@ def _persist_chat_state(session: UISession, *, force: bool = False) -> bool:
         metadata = _read_chat_metadata(chat_ws, chat_agent, chat_id)
         if metadata is None:
             metadata = _default_chat_metadata(chat_ws, chat_agent, chat_id)
-        status = "waiting_for_user" if waiting_for_user else ("running" if running else "idle")
+        status = "waiting_for_user" if waiting_for_user else ("running" if starting or running else "idle")
         llm_history = _extract_llm_history(agent) or restored_llm_history
         now = time.time()
         metadata.update(
@@ -1154,6 +1221,9 @@ def _session_eviction_reason_locked(
 ) -> str | None:
     if session.closing:
         return None
+    if session.starting:
+        started_at = session.starting_started_at or session.last_activity_at
+        return "running_timeout" if now - started_at >= running_ttl_seconds else None
     if session.running:
         started_at = session.running_started_at or session.last_activity_at
         return "running_timeout" if now - started_at >= running_ttl_seconds else None
@@ -1176,7 +1246,7 @@ def _prepare_session_eviction(
         if session.closing:
             return False
         if reason == "capacity":
-            eligible = not session.running and not session.waiting_for_user
+            eligible = not session.starting and not session.running and not session.waiting_for_user
         else:
             eligible = _session_eviction_reason_locked(
                 session,
@@ -1218,7 +1288,7 @@ def _cleanup_sessions(
             )
             if reason is not None:
                 candidates.append((session.session_id, session, reason))
-            elif not session.closing and not session.running and not session.waiting_for_user:
+            elif not session.closing and not session.starting and not session.running and not session.waiting_for_user:
                 inactive.append((session.last_activity_at, session.session_id, session))
 
     overflow = max(0, len(sessions) - len(candidates) - max(0, int(max_sessions)))
@@ -1259,7 +1329,7 @@ def _shutdown_sessions() -> list[str]:
         with session.lock:
             if session.closing:
                 continue
-            was_active = session.running or session.waiting_for_user
+            was_active = session.starting or session.running or session.waiting_for_user
             was_waiting = session.waiting_for_user
             if was_active:
                 _emit(session, "stop", "session closed because the Web UI is shutting down")
@@ -1346,21 +1416,40 @@ def _ensure_agent(
     team_name: str = "",
     team_config: dict[str, Any] | None = None,
     team_workflow: dict[str, Any] | None = None,
+    task_start_token: str = "",
 ):
     runtime_config = runtime_config or {}
     runtime_key_data = {"agent": runtime_config, "team": team_config or {}, "workflow": team_workflow or {}}
     runtime_config_key = json.dumps(runtime_key_data, ensure_ascii=False, sort_keys=True, default=str)
-    if (
-        session.agent is None
-        or session.config_path != config_path
-        or session.observability_config_path != observability_config_path
-        or session.workspace_dir != workspace_dir
-        or session.agent_name != agent_name
-        or session.team_name != team_name
-        or session.runtime_config_key != runtime_config_key
-    ):
-        _close_agent(session)
-        session.agent = build_agent(
+    with session.agent_init_lock:
+        with session.lock:
+            if not _task_start_allowed_locked(session, task_start_token):
+                return None
+            rebuild = (
+                session.agent is None
+                or session.config_path != config_path
+                or session.observability_config_path != observability_config_path
+                or session.workspace_dir != workspace_dir
+                or session.agent_name != agent_name
+                or session.team_name != team_name
+                or session.runtime_config_key != runtime_config_key
+            )
+            restored_history = session.restored_llm_history
+            current_agent = session.agent
+
+        if not rebuild:
+            if restored_history and current_agent is not None:
+                _restore_llm_history(current_agent, restored_history)
+            with session.lock:
+                if not _task_start_allowed_locked(session, task_start_token):
+                    return None
+                if session.restored_llm_history is restored_history:
+                    session.restored_llm_history = []
+                session.team_config = team_config
+                session.team_workflow = team_workflow
+                return session.agent
+
+        new_agent = build_agent(
             config_path=config_path or None,
             observability_config_path=observability_config_path or None,
             skills_dir=_workspace_skills_dir_input(workspace_dir),
@@ -1375,40 +1464,55 @@ def _ensure_agent(
             memory_mode=str(runtime_config.get("memory_mode", "project")),
             team_config=team_config,
         )
-        web_usage_sink = WebSessionUsageSink(session)
-        trace_log_dir = ""
-        if not _config_log_dir(observability_config_path):
-            trace_log_dir = _resolve_trace_log_dir(workspace_dir=workspace_dir)
-        trace_sink = JsonlSink(trace_log_dir) if trace_log_dir else NullSink()
-        existing_sink = getattr(session.agent, "sink", NullSink())
-        session.agent.sink = MultiSink(existing_sink, trace_sink, web_usage_sink)
-        session.agent.handler.ctx.sink = session.agent.sink
-        session.agent.handler.ctx.verbose = True
-        if session.restored_llm_history:
-            _restore_llm_history(session.agent, session.restored_llm_history)
-            session.restored_llm_history = []
-        session.config_path = config_path
-        session.observability_config_path = observability_config_path
-        session.workspace_dir = workspace_dir
-        session.agent_name = agent_name
-        session.team_name = team_name
-        session.team_config = team_config
-        session.team_workflow = team_workflow
-        session.team_step_runner = build_team_step_runner(
-            config_path=config_path or None,
-            observability_config_path=observability_config_path or None,
-            skills_dir=_workspace_skills_dir_input(workspace_dir),
-            workspace=_resolve_workspace_dir_input(workspace_dir) or workspace_dir,
-            team_config=team_config,
-        )
-        session.runtime_config_key = runtime_config_key
-    elif session.restored_llm_history:
-        _restore_llm_history(session.agent, session.restored_llm_history)
-        session.restored_llm_history = []
-    else:
-        session.team_config = team_config
-        session.team_workflow = team_workflow
-    return session.agent
+        try:
+            web_usage_sink = WebSessionUsageSink(session)
+            trace_log_dir = ""
+            if not _config_log_dir(observability_config_path):
+                trace_log_dir = _resolve_trace_log_dir(workspace_dir=workspace_dir)
+            trace_sink = JsonlSink(trace_log_dir) if trace_log_dir else NullSink()
+            existing_sink = getattr(new_agent, "sink", NullSink())
+            new_agent.sink = MultiSink(existing_sink, trace_sink, web_usage_sink)
+            new_agent.handler.ctx.sink = new_agent.sink
+            new_agent.handler.ctx.verbose = True
+            if restored_history:
+                _restore_llm_history(new_agent, restored_history)
+            team_step_runner = build_team_step_runner(
+                config_path=config_path or None,
+                observability_config_path=observability_config_path or None,
+                skills_dir=_workspace_skills_dir_input(workspace_dir),
+                workspace=_resolve_workspace_dir_input(workspace_dir) or workspace_dir,
+                team_config=team_config,
+            )
+        except Exception:
+            new_agent.close()
+            raise
+
+        with session.lock:
+            if not _task_start_allowed_locked(session, task_start_token):
+                discard_new_agent = True
+                previous_agent = None
+            else:
+                discard_new_agent = False
+                previous_agent = session.agent
+                session.agent = new_agent
+                if session.restored_llm_history is restored_history:
+                    session.restored_llm_history = []
+                session.config_path = config_path
+                session.observability_config_path = observability_config_path
+                session.workspace_dir = workspace_dir
+                session.agent_name = agent_name
+                session.team_name = team_name
+                session.team_config = team_config
+                session.team_workflow = team_workflow
+                session.team_step_runner = team_step_runner
+                session.runtime_config_key = runtime_config_key
+
+        if discard_new_agent:
+            new_agent.close()
+            return None
+        if previous_agent is not None and previous_agent is not new_agent:
+            previous_agent.close()
+        return new_agent
 
 
 def _drain_sync(session: UISession, wait: bool) -> bool:
@@ -1521,14 +1625,18 @@ def _workflow_error_result(message: str, error: str, workflow: dict[str, Any] | 
     }
 
 
-def _run_task_background(session: UISession, task: str) -> None:
+def _run_task_background(
+    session: UISession,
+    task: str,
+    task_start_token: str = "",
+) -> None:
     """Run task in background and put events into async queue"""
     workflow: dict[str, Any] | None = None
     parent_ctx: Any | None = None
     step_runner: Any | None = None
     agent: Any | None = None
     with session.lock:
-        if session.closing or session.running:
+        if not _task_start_allowed_locked(session, task_start_token):
             return
         session.events = []
         session.llm_stream_buffer = ""
@@ -1658,10 +1766,15 @@ async def submit_task(request: SubmitTaskRequest):
         ws_root, ws_error = _workspace_root(chat_ws)
         if ws_error or ws_root is None:
             return {"success": False, "error": ws_error}
-        team_config, team_error = read_team_config(ws_root, team_name)
+        team_config, team_error = await _run_blocking(read_team_config, ws_root, team_name)
         if team_error or team_config is None:
             return {"success": False, "error": team_error}
-        team_workflow, workflow_error = read_team_workflow(ws_root, team_name, team_config)
+        team_workflow, workflow_error = await _run_blocking(
+            read_team_workflow,
+            ws_root,
+            team_name,
+            team_config,
+        )
         if workflow_error:
             return {"success": False, "error": workflow_error}
         if not agent_name:
@@ -1672,9 +1785,19 @@ async def submit_task(request: SubmitTaskRequest):
     if session is None and chat_id:
         session = _find_session_by_chat(chat_ws, agent_name, chat_id)
     if session is None and chat_id:
-        session, load_error = _load_chat_into_session(chat_ws, agent_name, chat_id)
-        if load_error or session is None:
+        loaded_session, load_error = await _run_blocking(
+            _load_chat_into_session,
+            chat_ws,
+            agent_name,
+            chat_id,
+        )
+        session = loaded_session
+        if session is None and load_error == _SESSION_CAPACITY_ERROR:
+            session = _find_session_by_chat(chat_ws, agent_name, chat_id)
+        if load_error and session is None:
             return {"success": False, "error": load_error}
+        if session is None:
+            return {"success": False, "error": "Chat session could not be loaded"}
     if session is None:
         session_id = uuid.uuid4().hex[:16]
         session = UISession(session_id=session_id)
@@ -1683,40 +1806,64 @@ async def submit_task(request: SubmitTaskRequest):
     else:
         session_id = session.session_id
 
-    config_path = _normalize_path_input(request.config_path)
-    observability_config_path = _normalize_path_input(request.observability_config_path)
-    if chat_id:
-        with session.lock:
-            session.chat_id = chat_id
-            session.chat_ws = chat_ws
-            session.chat_agent = agent_name
-    runtime_config, runtime_error = _agent_runtime_config(workspace_dir, agent_name)
-    if runtime_error:
-        return {"success": False, "error": runtime_error}
+    task_start_token, reservation_error = _reserve_task_start(session)
+    if reservation_error or task_start_token is None:
+        result = {"success": False, "error": reservation_error or _SESSION_BUSY_ERROR}
+        if reservation_error == _SESSION_BUSY_ERROR:
+            result["code"] = "SESSION_BUSY"
+        return result
 
-    # Build agent
-    with session.lock:
-        _ensure_agent(
-            session,
-            config_path,
-            observability_config_path,
+    handed_off = False
+    try:
+        config_path = _normalize_path_input(request.config_path)
+        observability_config_path = _normalize_path_input(request.observability_config_path)
+        if chat_id:
+            with session.lock:
+                session.chat_id = chat_id
+                session.chat_ws = chat_ws
+                session.chat_agent = agent_name
+        runtime_config, runtime_error = await _run_blocking(
+            _agent_runtime_config,
             workspace_dir,
             agent_name,
-            runtime_config,
-            team_name,
-            team_config,
-            team_workflow,
         )
+        if runtime_error:
+            return {"success": False, "error": runtime_error}
 
-    # Start background task
-    thread = threading.Thread(
-        target=_run_task_background,
-        args=(session, request.task),
-        daemon=True,
-    )
-    thread.start()
+        # Agent construction loads configuration, prompts, skills, and memory from disk.
+        try:
+            agent = await _run_blocking(
+                _ensure_agent,
+                session,
+                config_path,
+                observability_config_path,
+                workspace_dir,
+                agent_name,
+                runtime_config,
+                team_name,
+                team_config,
+                team_workflow,
+                task_start_token,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "error": f"Failed to initialize Agent: {exc}"}
+        if agent is None:
+            return {"success": False, "error": "Session became unavailable while initializing Agent"}
 
-    return {"success": True, "data": {"session_id": session_id}}
+        try:
+            thread = _new_daemon_thread(
+                target=_run_task_background,
+                args=(session, request.task, task_start_token),
+            )
+            thread.start()
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "error": f"Failed to start task: {exc}"}
+
+        handed_off = True
+        return {"success": True, "data": {"session_id": session_id}}
+    finally:
+        if not handed_off:
+            _release_task_start(session, task_start_token)
 
 
 @app.post("/api/chat/reply")
@@ -1746,13 +1893,12 @@ async def send_reply(request: ReplyRequest):
         _set_session_runtime_state(active_session, "running")
         _emit(active_session, "user_reply", request.reply.strip())
         active_session.agent.reply_queue.put(request.reply.strip())
-    _persist_chat_state(active_session, force=True)
+    await _run_blocking(_persist_chat_state, active_session, force=True)
 
     # Restart drain in background
-    thread = threading.Thread(
+    thread = _new_daemon_thread(
         target=_drain_background,
         args=(active_session,),
-        daemon=True,
     )
     thread.start()
 
@@ -1796,12 +1942,11 @@ async def stop_task(request: Request):
             _emit(session, "stop", "interrupt signal sent")
         _stop_agent(session, unblock_reply=waiting_for_user)
         _queue_state(session, finished=False)
-        _persist_chat_state(session, force=True)
+        await _run_blocking(_persist_chat_state, session, force=True)
         if waiting_for_user:
-            threading.Thread(
+            _new_daemon_thread(
                 target=_drain_background,
                 args=(session,),
-                daemon=True,
             ).start()
         return {"success": True}
 
@@ -1842,7 +1987,11 @@ async def stream_chat(request: Request):
                     last_events_len = 0
                 new_events = list(session.events[last_events_len:])
                 last_events_len = len(session.events)
-                session_done = not session.running and not session.waiting_for_user
+                session_done = (
+                    not session.starting
+                    and not session.running
+                    and not session.waiting_for_user
+                )
 
             for event in new_events:
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
@@ -1869,8 +2018,7 @@ async def stream_chat(request: Request):
     )
 
 
-@app.get("/api/chats")
-async def list_chats(ws: str = "default.ws", agent: str = ""):
+def _list_chats_sync(ws: str, agent: str) -> dict[str, Any]:
     root, error = _chat_root(ws, agent)
     if error or root is None:
         return {"success": False, "error": error}
@@ -1890,12 +2038,12 @@ async def list_chats(ws: str = "default.ws", agent: str = ""):
     return {"success": True, "data": rows}
 
 
-@app.post("/api/chats")
-async def create_chat(request: ChatCreateRequest):
-    ws = _normalize_path_input(request.ws) or "default.ws"
-    agent = _normalize_path_input(request.agent)
-    if not agent:
-        return {"success": False, "error": "Agent is required"}
+@app.get("/api/chats")
+async def list_chats(ws: str = "default.ws", agent: str = ""):
+    return await _run_blocking(_list_chats_sync, ws, agent)
+
+
+def _create_chat_sync(ws: str, agent: str) -> dict[str, Any]:
     root, error = _chat_root(ws, agent)
     if error or root is None:
         return {"success": False, "error": error}
@@ -1924,12 +2072,16 @@ async def create_chat(request: ChatCreateRequest):
     return {"success": True, "data": {"metadata": metadata, "state": state}}
 
 
-@app.get("/api/chats/{chat_id}")
-async def read_chat(chat_id: str, ws: str = "default.ws", agent: str = ""):
-    ws = _normalize_path_input(ws) or "default.ws"
-    agent = _normalize_path_input(agent)
+@app.post("/api/chats")
+async def create_chat(request: ChatCreateRequest):
+    ws = _normalize_path_input(request.ws) or "default.ws"
+    agent = _normalize_path_input(request.agent)
     if not agent:
         return {"success": False, "error": "Agent is required"}
+    return await _run_blocking(_create_chat_sync, ws, agent)
+
+
+def _read_chat_sync(chat_id: str, ws: str, agent: str) -> dict[str, Any]:
     session = _find_session_by_chat(ws, agent, chat_id)
     if session is None:
         session, error = _load_chat_into_session(ws, agent, chat_id)
@@ -1944,16 +2096,20 @@ async def read_chat(chat_id: str, ws: str = "default.ws", agent: str = ""):
     return {"success": True, "data": {"metadata": metadata, "state": state}}
 
 
-@app.delete("/api/chats/{chat_id}")
-async def delete_chat(chat_id: str, ws: str = "default.ws", agent: str = ""):
+@app.get("/api/chats/{chat_id}")
+async def read_chat(chat_id: str, ws: str = "default.ws", agent: str = ""):
     ws = _normalize_path_input(ws) or "default.ws"
     agent = _normalize_path_input(agent)
     if not agent:
         return {"success": False, "error": "Agent is required"}
+    return await _run_blocking(_read_chat_sync, chat_id, ws, agent)
+
+
+def _delete_chat_sync(chat_id: str, ws: str, agent: str) -> dict[str, Any]:
     session = _find_session_by_chat(ws, agent, chat_id)
     if session is not None:
         with session.lock:
-            if session.running:
+            if session.starting or session.running:
                 return {"success": False, "error": "Chat is running; stop the task before deleting it"}
     chat_path, error = _chat_dir(ws, agent, chat_id)
     if error or chat_path is None:
@@ -1974,6 +2130,15 @@ async def delete_chat(chat_id: str, ws: str = "default.ws", agent: str = ""):
         except OSError as exc:
             return {"success": False, "error": str(exc)}
     return {"success": True}
+
+
+@app.delete("/api/chats/{chat_id}")
+async def delete_chat(chat_id: str, ws: str = "default.ws", agent: str = ""):
+    ws = _normalize_path_input(ws) or "default.ws"
+    agent = _normalize_path_input(agent)
+    if not agent:
+        return {"success": False, "error": "Agent is required"}
+    return await _run_blocking(_delete_chat_sync, chat_id, ws, agent)
 
 
 @app.get("/api/usage/summary")
@@ -2000,7 +2165,8 @@ async def read_usage_summary(
         }
 
     try:
-        summary = _usage_summary_from_events(load_dir(log_dir), limit=limit)
+        events = await _run_blocking(load_dir, log_dir)
+        summary = await _run_blocking(_usage_summary_from_events, events, limit=limit)
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": str(exc)}
 
@@ -2040,7 +2206,8 @@ async def read_trace_sessions(
         }
 
     try:
-        sessions = _trace_summary_from_events(load_dir(log_dir), limit=limit)
+        events = await _run_blocking(load_dir, log_dir)
+        sessions = await _run_blocking(_trace_summary_from_events, events, limit=limit)
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": str(exc)}
 
@@ -2071,11 +2238,11 @@ async def read_trace_session_detail(
         return {"success": False, "error": error}
 
     try:
-        events = load_events(file_path)
+        events = await _run_blocking(load_events, file_path)
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": str(exc)}
 
-    summaries = _trace_summary_from_events(events, limit=1)
+    summaries = await _run_blocking(_trace_summary_from_events, events, limit=1)
     summary = summaries[0] if summaries else {
         "session_id": session_id,
         "started_at": 0.0,
@@ -2774,29 +2941,46 @@ def _dispatch_scheduled_task(task: dict[str, Any]) -> tuple[str | None, str | No
         session, chat_error = _create_or_load_task_chat(task)
         if chat_error or session is None:
             return None, chat_error
-        if session.running:
-            return None, "Task chat is already running"
     else:
         session = UISession(session_id=uuid.uuid4().hex[:16])
         if not _register_session(session):
             return None, _SESSION_CAPACITY_ERROR
 
-    with session.lock:
-        _ensure_agent(
-            session,
-            str(task.get("config_path") or ""),
-            str(task.get("observability_config_path") or ""),
-            ws,
-            agent_name,
-            runtime_config,
-        )
-    thread = threading.Thread(
-        target=_run_task_background,
-        args=(session, str(task.get("prompt") or "")),
-        daemon=True,
-    )
-    thread.start()
-    return session.session_id, None
+    task_start_token, reservation_error = _reserve_task_start(session)
+    if reservation_error or task_start_token is None:
+        return None, reservation_error or _SESSION_BUSY_ERROR
+
+    handed_off = False
+    try:
+        try:
+            agent = _ensure_agent(
+                session,
+                str(task.get("config_path") or ""),
+                str(task.get("observability_config_path") or ""),
+                ws,
+                agent_name,
+                runtime_config,
+                task_start_token=task_start_token,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return None, f"Failed to initialize Agent: {exc}"
+        if agent is None:
+            return None, "Session became unavailable while initializing Agent"
+
+        try:
+            thread = _new_daemon_thread(
+                target=_run_task_background,
+                args=(session, str(task.get("prompt") or ""), task_start_token),
+            )
+            thread.start()
+        except Exception as exc:  # noqa: BLE001
+            return None, f"Failed to start task: {exc}"
+
+        handed_off = True
+        return session.session_id, None
+    finally:
+        if not handed_off:
+            _release_task_start(session, task_start_token)
 
 
 def _run_scheduled_task_record(task: dict[str, Any], now_ts: float | None = None) -> dict[str, Any]:
@@ -2886,7 +3070,7 @@ def _start_task_scheduler() -> None:
     _web_runtime_stopping.clear()
     _task_scheduler_stop.clear()
     _task_scheduler_started = True
-    _task_scheduler_thread = threading.Thread(target=_task_scheduler_loop, daemon=True)
+    _task_scheduler_thread = _new_daemon_thread(target=_task_scheduler_loop)
     _task_scheduler_thread.start()
 
 
@@ -2903,8 +3087,7 @@ def _shutdown_web_runtime() -> None:
     _shutdown_sessions()
 
 
-@app.get("/api/tasks")
-async def list_scheduled_tasks(ws: str = "default.ws"):
+def _list_scheduled_tasks_sync(ws: str) -> dict[str, Any]:
     ws = _normalize_path_input(ws) or "default.ws"
     with _task_lock:
         tasks, error = _read_scheduled_tasks(ws)
@@ -2913,8 +3096,12 @@ async def list_scheduled_tasks(ws: str = "default.ws"):
     return {"success": True, "data": tasks}
 
 
-@app.post("/api/tasks")
-async def create_scheduled_task(request: ScheduledTaskWriteRequest):
+@app.get("/api/tasks")
+async def list_scheduled_tasks(ws: str = "default.ws"):
+    return await _run_blocking(_list_scheduled_tasks_sync, ws)
+
+
+def _create_scheduled_task_sync(request: ScheduledTaskWriteRequest) -> dict[str, Any]:
     task, error = _normalize_scheduled_task(request)
     if error or task is None:
         return {"success": False, "error": error}
@@ -2930,8 +3117,15 @@ async def create_scheduled_task(request: ScheduledTaskWriteRequest):
     return {"success": True, "data": task}
 
 
-@app.put("/api/tasks/{task_id}")
-async def update_scheduled_task(task_id: str, request: ScheduledTaskWriteRequest):
+@app.post("/api/tasks")
+async def create_scheduled_task(request: ScheduledTaskWriteRequest):
+    return await _run_blocking(_create_scheduled_task_sync, request)
+
+
+def _update_scheduled_task_sync(
+    task_id: str,
+    request: ScheduledTaskWriteRequest,
+) -> dict[str, Any]:
     if not _valid_task_id(task_id):
         return {"success": False, "error": "Invalid task id"}
     ws = _normalize_path_input(request.ws) or "default.ws"
@@ -2953,8 +3147,15 @@ async def update_scheduled_task(task_id: str, request: ScheduledTaskWriteRequest
     return {"success": False, "error": "Task not found"}
 
 
-@app.post("/api/tasks/{task_id}/status")
-async def set_scheduled_task_status(task_id: str, request: ScheduledTaskStatusRequest):
+@app.put("/api/tasks/{task_id}")
+async def update_scheduled_task(task_id: str, request: ScheduledTaskWriteRequest):
+    return await _run_blocking(_update_scheduled_task_sync, task_id, request)
+
+
+def _set_scheduled_task_status_sync(
+    task_id: str,
+    request: ScheduledTaskStatusRequest,
+) -> dict[str, Any]:
     if not _valid_task_id(task_id):
         return {"success": False, "error": "Invalid task id"}
     ws = _normalize_path_input(request.ws) or "default.ws"
@@ -2982,8 +3183,12 @@ async def set_scheduled_task_status(task_id: str, request: ScheduledTaskStatusRe
     return {"success": False, "error": "Task not found"}
 
 
-@app.delete("/api/tasks/{task_id}")
-async def delete_scheduled_task(task_id: str, ws: str = "default.ws"):
+@app.post("/api/tasks/{task_id}/status")
+async def set_scheduled_task_status(task_id: str, request: ScheduledTaskStatusRequest):
+    return await _run_blocking(_set_scheduled_task_status_sync, task_id, request)
+
+
+def _delete_scheduled_task_sync(task_id: str, ws: str) -> dict[str, Any]:
     if not _valid_task_id(task_id):
         return {"success": False, "error": "Invalid task id"}
     ws = _normalize_path_input(ws) or "default.ws"
@@ -3000,11 +3205,12 @@ async def delete_scheduled_task(task_id: str, ws: str = "default.ws"):
     return {"success": True}
 
 
-@app.post("/api/tasks/{task_id}/run")
-async def run_scheduled_task_now(task_id: str, request: ScheduledTaskRunRequest):
-    if not _valid_task_id(task_id):
-        return {"success": False, "error": "Invalid task id"}
-    ws = _normalize_path_input(request.ws) or "default.ws"
+@app.delete("/api/tasks/{task_id}")
+async def delete_scheduled_task(task_id: str, ws: str = "default.ws"):
+    return await _run_blocking(_delete_scheduled_task_sync, task_id, ws)
+
+
+def _run_scheduled_task_now_sync(task_id: str, ws: str) -> dict[str, Any]:
     with _task_lock:
         tasks, read_error = _read_scheduled_tasks(ws)
         if read_error:
@@ -3020,6 +3226,14 @@ async def run_scheduled_task_now(task_id: str, request: ScheduledTaskRunRequest)
                 return {"success": False, "error": task["last_debug_error"], "data": task}
             return {"success": True, "data": task}
     return {"success": False, "error": "Task not found"}
+
+
+@app.post("/api/tasks/{task_id}/run")
+async def run_scheduled_task_now(task_id: str, request: ScheduledTaskRunRequest):
+    if not _valid_task_id(task_id):
+        return {"success": False, "error": "Invalid task id"}
+    ws = _normalize_path_input(request.ws) or "default.ws"
+    return await _run_blocking(_run_scheduled_task_now_sync, task_id, ws)
 
 
 @app.get("/api/workspace/list")
@@ -3043,7 +3257,8 @@ async def list_workspace_template_options():
 async def create_workspace(request: WorkspaceCreateRequest):
     """Create a new workspace from a template."""
     try:
-        data = create_workspace_from_template(
+        data = await _run_blocking(
+            create_workspace_from_template,
             _WORKSPACE_ROOT,
             request.name,
             request.template_id or "blank",
@@ -3219,7 +3434,7 @@ async def read_workspace_tree(ws: str = "default.ws"):
     if not os.path.isdir(ws_root):
         return {"success": True, "data": {"name": ws, "path": ws, "type": "dir", "children": []}}
     try:
-        return {"success": True, "data": _build_dir_tree(ws_root)}
+        return {"success": True, "data": await _run_blocking(_build_dir_tree, ws_root)}
     except OSError as exc:
         return {"success": False, "error": str(exc)}
 
@@ -3230,7 +3445,7 @@ async def read_workspace_index_stats(ws: str = "default.ws"):
     ws_root, error = _workspace_root(ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
-    result = get_file_index_stats(cwd=ws_root)
+    result = await _run_blocking(get_file_index_stats, cwd=ws_root)
     if result.get("status") != "OK":
         return {"success": False, "error": result.get("error", "failed to read index stats")}
     return {"success": True, "data": result}
@@ -3242,11 +3457,16 @@ async def refresh_workspace_index(request: WorkspaceIndexRefreshRequest):
     ws_root, error = _workspace_root(request.ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
-    result = refresh_file_index(
+    embedding_config = await _run_blocking(
+        _file_index_embedding_config_from_path,
+        request.config_path,
+    )
+    result = await _run_blocking(
+        refresh_file_index,
         root=request.root,
         cwd=ws_root,
         semantic=request.semantic,
-        embedding_config=_file_index_embedding_config_from_path(request.config_path),
+        embedding_config=embedding_config,
     )
     if result.get("status") != "OK":
         return {"success": False, "error": result.get("error", "failed to refresh index"), "data": result}
@@ -3268,7 +3488,12 @@ async def search_workspace_index(
     ws_root, error = _workspace_root(ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
-    result = search_file_index(
+    embedding_config = await _run_blocking(
+        _file_index_embedding_config_from_path,
+        config_path,
+    )
+    result = await _run_blocking(
+        search_file_index,
         query=q,
         cwd=ws_root,
         root=root,
@@ -3276,16 +3501,14 @@ async def search_workspace_index(
         refresh=refresh,
         path_only=path_only,
         mode=mode,
-        embedding_config=_file_index_embedding_config_from_path(config_path),
+        embedding_config=embedding_config,
     )
     if result.get("status") != "OK":
         return {"success": False, "error": result.get("error", "failed to search index"), "data": result}
     return {"success": True, "data": result}
 
 
-@app.get("/api/workspace/preview")
-async def preview_workspace_file(ws: str = "default.ws", path: str = ""):
-    """Read a workspace text file for read-only preview."""
+def _preview_workspace_file_sync(ws: str, path: str) -> dict[str, Any]:
     real_path, normalized_path, error = _resolve_workspace_preview_path(ws, path)
     if error or real_path is None or normalized_path is None:
         return {"success": False, "error": error}
@@ -3317,6 +3540,12 @@ async def preview_workspace_file(ws: str = "default.ws", path: str = ""):
         return {"success": False, "error": "File is not valid UTF-8 text"}
     except OSError as exc:
         return {"success": False, "error": str(exc)}
+
+
+@app.get("/api/workspace/preview")
+async def preview_workspace_file(ws: str = "default.ws", path: str = ""):
+    """Read a workspace text file for read-only preview."""
+    return await _run_blocking(_preview_workspace_file_sync, ws, path)
 
 
 # Built-in tools from schema
@@ -3351,9 +3580,7 @@ async def list_tools():
     return {"success": True, "data": _load_builtin_tools()}
 
 
-@app.get("/api/workspace/file")
-async def read_workspace_file(ws: str = "default.ws", path: str = ""):
-    """Read a file from workspace system/ directory"""
+def _read_workspace_file_sync(ws: str, path: str) -> dict[str, Any]:
     real_path, normalized_path, error = _resolve_system_file_path(ws, path)
     if error or real_path is None or normalized_path is None:
         return {"success": False, "error": error}
@@ -3367,10 +3594,14 @@ async def read_workspace_file(ws: str = "default.ws", path: str = ""):
         return {"success": False, "error": str(e)}
 
 
-@app.put("/api/workspace/file")
-async def write_workspace_file(request: WorkspaceFileWriteRequest):
-    """Write a file to workspace system/ directory"""
-    real_path, normalized_path, error = _resolve_system_file_path(request.ws, request.path)
+@app.get("/api/workspace/file")
+async def read_workspace_file(ws: str = "default.ws", path: str = ""):
+    """Read a file from workspace system/ directory"""
+    return await _run_blocking(_read_workspace_file_sync, ws, path)
+
+
+def _write_workspace_file_sync(ws: str, path: str, content: str) -> dict[str, Any]:
+    real_path, normalized_path, error = _resolve_system_file_path(ws, path)
     if error or real_path is None or normalized_path is None:
         return {"success": False, "error": error}
     if os.path.isdir(real_path):
@@ -3380,18 +3611,29 @@ async def write_workspace_file(request: WorkspaceFileWriteRequest):
     try:
         os.makedirs(os.path.dirname(real_path), exist_ok=True)
         with open(real_path, "w", encoding="utf-8") as f:
-            f.write(request.content)
+            f.write(content)
         return {
             "success": True,
             "data": {
                 "path": normalized_path,
-                "content": request.content,
-                "bytes": len(request.content.encode("utf-8")),
+                "content": content,
+                "bytes": len(content.encode("utf-8")),
                 "created": created,
             },
         }
     except (OSError, UnicodeError) as e:
         return {"success": False, "error": str(e)}
+
+
+@app.put("/api/workspace/file")
+async def write_workspace_file(request: WorkspaceFileWriteRequest):
+    """Write a file to workspace system/ directory"""
+    return await _run_blocking(
+        _write_workspace_file_sync,
+        request.ws,
+        request.path,
+        request.content,
+    )
 
 
 # === Eval API ===
@@ -3454,8 +3696,11 @@ async def api_list_eval_datasets(ws: str = "default.ws"):
     ws_root, error = _workspace_root(ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
-    imported = [{**item, "imported": True} for item in list_datasets(ws_root)]
-    workspace_datasets = list_workspace_eval_datasets(ws_root)
+    imported_items, workspace_datasets = await asyncio.gather(
+        _run_blocking(list_datasets, ws_root),
+        _run_blocking(list_workspace_eval_datasets, ws_root),
+    )
+    imported = [{**item, "imported": True} for item in imported_items]
     workspace_by_path = {
         str(item.get("source", {}).get("path") or ""): item
         for item in workspace_datasets
@@ -3487,7 +3732,8 @@ async def api_import_eval_dataset(request: EvalDatasetImportRequest):
         return {"success": False, "error": error}
     try:
         if request.path.strip():
-            data = import_dataset_path(
+            data = await _run_blocking(
+                import_dataset_path,
                 ws_root,
                 rel_path=request.path,
                 name=request.name,
@@ -3496,7 +3742,8 @@ async def api_import_eval_dataset(request: EvalDatasetImportRequest):
         else:
             if not request.content:
                 return {"success": False, "error": "content or path is required"}
-            data = import_dataset_content(
+            data = await _run_blocking(
+                import_dataset_content,
                 ws_root,
                 name=request.name or "dataset",
                 content=request.content,
@@ -3514,7 +3761,8 @@ async def api_download_eval_dataset(request: EvalDatasetDownloadRequest):
     if error or ws_root is None:
         return {"success": False, "error": error}
     try:
-        data = download_dataset(
+        data = await _run_blocking(
+            download_dataset,
             ws_root,
             url=request.url,
             name=request.name,
@@ -3531,7 +3779,8 @@ async def api_get_eval_dataset(dataset_id: str, ws: str = "default.ws"):
     if error or ws_root is None:
         return {"success": False, "error": error}
     try:
-        return {"success": True, "data": get_dataset_detail(ws_root, dataset_id)}
+        data = await _run_blocking(get_dataset_detail, ws_root, dataset_id)
+        return {"success": True, "data": data}
     except (EvalError, OSError, json.JSONDecodeError) as exc:
         return {"success": False, "error": str(exc)}
 
@@ -3541,7 +3790,7 @@ async def api_list_eval_runs(ws: str = "default.ws"):
     ws_root, error = _workspace_root(ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
-    return {"success": True, "data": list_eval_runs(ws_root)}
+    return {"success": True, "data": await _run_blocking(list_eval_runs, ws_root)}
 
 
 @app.post("/api/eval/runs")
@@ -3551,7 +3800,11 @@ async def api_create_eval_run(request: EvalRunCreateRequest):
         return {"success": False, "error": error}
 
     agent_name = _normalize_path_input(request.agent)
-    runtime_config, runtime_error = _agent_runtime_config(request.ws, agent_name)
+    runtime_config, runtime_error = await _run_blocking(
+        _agent_runtime_config,
+        request.ws,
+        agent_name,
+    )
     if runtime_error:
         return {"success": False, "error": runtime_error}
 
@@ -3560,7 +3813,8 @@ async def api_create_eval_run(request: EvalRunCreateRequest):
         return {"success": False, "error": "case_limit cannot exceed 500"}
 
     try:
-        result = create_eval_run(
+        result = await _run_blocking(
+            create_eval_run,
             ws_root,
             workspace=request.ws,
             dataset_id=request.dataset_id,
@@ -3582,7 +3836,7 @@ async def api_create_eval_run(request: EvalRunCreateRequest):
         observability_config_path=_normalize_path_input(request.observability_config_path),
         runtime_config=runtime_config,
     )
-    thread = threading.Thread(
+    thread = _new_daemon_thread(
         target=_run_eval_background,
         kwargs={
             "ws_root": ws_root,
@@ -3590,7 +3844,6 @@ async def api_create_eval_run(request: EvalRunCreateRequest):
             "cancel_event": cancel_event,
             "agent_factory": agent_factory,
         },
-        daemon=True,
     )
     thread.start()
     return {"success": True, "data": result}
@@ -3602,7 +3855,8 @@ async def api_get_eval_run(run_id: str, ws: str = "default.ws"):
     if error or ws_root is None:
         return {"success": False, "error": error}
     try:
-        return {"success": True, "data": read_eval_run(ws_root, run_id)}
+        data = await _run_blocking(read_eval_run, ws_root, run_id)
+        return {"success": True, "data": data}
     except (EvalError, OSError, json.JSONDecodeError) as exc:
         return {"success": False, "error": str(exc)}
 
@@ -3613,7 +3867,7 @@ async def api_cancel_eval_run(run_id: str, ws: str = "default.ws"):
     if error or ws_root is None:
         return {"success": False, "error": error}
     try:
-        result = read_eval_run(ws_root, run_id)
+        result = await _run_blocking(read_eval_run, ws_root, run_id)
     except (EvalError, OSError, json.JSONDecodeError) as exc:
         return {"success": False, "error": str(exc)}
 
@@ -3624,7 +3878,7 @@ async def api_cancel_eval_run(run_id: str, ws: str = "default.ws"):
 
     if result.get("status") in {"pending", "running"}:
         result["status"] = "canceling"
-        write_eval_run(ws_root, result)
+        await _run_blocking(write_eval_run, ws_root, result)
     return {"success": True, "data": result}
 
 

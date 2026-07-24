@@ -42,12 +42,14 @@ from src.web_ui_new import (
     _cleanup_sessions,
     _drain_background,
     _emit,
+    _ensure_agent,
     _eval_cancel_events,
     _find_session_by_chat,
     _get_session,
     _persist_chat_state,
     _queue_state,
     _register_session,
+    _run_blocking,
     _run_due_scheduled_tasks,
     _resolve_workspace_dir_input,
     _session_lock,
@@ -362,6 +364,59 @@ class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
         _web_runtime_stopping.clear()
         _sessions.clear()
 
+    async def test_run_blocking_keeps_event_loop_responsive(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_work() -> str:
+            entered.set()
+            release.wait(1)
+            return "done"
+
+        started_at = time.monotonic()
+        worker = asyncio.create_task(_run_blocking(slow_work))
+        try:
+            await asyncio.sleep(0.02)
+            self.assertLess(time.monotonic() - started_at, 0.5)
+            self.assertTrue(entered.is_set())
+            self.assertFalse(worker.done())
+        finally:
+            release.set()
+
+        self.assertEqual(await worker, "done")
+
+    async def test_run_blocking_consumes_late_exception_after_cancellation(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        loop = asyncio.get_running_loop()
+        unhandled: list[dict] = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+
+        def late_failure() -> None:
+            entered.set()
+            release.wait(1)
+            finished.set()
+            raise RuntimeError("late failure")
+
+        worker = asyncio.create_task(_run_blocking(late_failure))
+        try:
+            await asyncio.sleep(0.02)
+            self.assertTrue(entered.is_set())
+            worker.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await worker
+            release.set()
+            self.assertTrue(await asyncio.to_thread(finished.wait, 1))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        finally:
+            release.set()
+            loop.set_exception_handler(previous_handler)
+
+        self.assertFalse(unhandled)
+
     async def test_reply_targets_requested_session(self) -> None:
         left_agent = _FakeAgent()
         right_agent = _FakeAgent()
@@ -401,7 +456,7 @@ class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("src.web_ui_new._drain_background") as drain,
             patch("src.web_ui_new._persist_chat_state", return_value=True) as persist,
-            patch("src.web_ui_new.threading.Thread", _ImmediateThread),
+            patch("src.web_ui_new._new_daemon_thread", _ImmediateThread),
         ):
             first = await stop_task(_Request({"session_id": session.session_id}))
             second = await stop_task(_Request({"session_id": session.session_id}))
@@ -766,6 +821,33 @@ class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(running.events[-1]["type"], "stop")
         self.assertEqual(waiting.events[-1]["type"], "stop")
 
+    def test_cleanup_treats_starting_session_as_active_and_times_it_out(self) -> None:
+        agent = _FakeAgent()
+        session = UISession(
+            agent=agent,
+            session_id="starting",
+            starting=True,
+            task_start_token="pending",
+            starting_started_at=10,
+            last_activity_at=90,
+        )
+        _sessions[session.session_id] = session
+
+        with patch("src.web_ui_new._persist_chat_state", return_value=True):
+            removed = _cleanup_sessions(
+                now=100,
+                idle_ttl_seconds=1000,
+                running_ttl_seconds=20,
+                waiting_ttl_seconds=1000,
+                max_sessions=10,
+            )
+
+        self.assertEqual(removed, [session.session_id])
+        self.assertFalse(session.starting)
+        self.assertEqual(session.task_start_token, "")
+        self.assertTrue(session.closing)
+        self.assertTrue(agent.stopped)
+
     def test_register_enforces_hard_capacity_and_evicts_only_inactive_sessions(self) -> None:
         inactive = UISession(session_id="inactive", last_activity_at=10)
         _sessions[inactive.session_id] = inactive
@@ -958,6 +1040,253 @@ class WebUINewAgentTeamTests(unittest.IsolatedAsyncioTestCase):
             ),
             encoding="utf-8",
         )
+
+    async def test_agent_initialization_does_not_block_event_loop(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        fake_agent = _FakeAgent()
+
+        def slow_ensure_agent(*_args, **_kwargs):
+            entered.set()
+            release.wait(1)
+            return fake_agent
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir()
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
+                patch("src.web_ui_new._agent_runtime_config", return_value=({}, None)),
+                patch("src.web_ui_new._ensure_agent", side_effect=slow_ensure_agent),
+                patch("src.web_ui_new._new_daemon_thread", _NoopThread),
+            ):
+                started_at = time.monotonic()
+                worker = asyncio.create_task(
+                    submit_task(SubmitTaskRequest(task="hello", workspace_dir="default.ws"))
+                )
+                try:
+                    await asyncio.sleep(0.02)
+                    self.assertLess(time.monotonic() - started_at, 0.5)
+                    self.assertTrue(entered.is_set())
+                    self.assertFalse(worker.done())
+                finally:
+                    release.set()
+                result = await worker
+
+        self.assertTrue(result["success"])
+
+    async def test_agent_build_releases_session_lock_and_discards_after_close(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        fake_agent = _FakeAgent()
+        fake_agent.sink = NullSink()
+        fake_agent.handler = type(
+            "H",
+            (),
+            {"ctx": type("C", (), {"verbose": False, "sink": None})()},
+        )()
+        session = UISession(session_id="closing")
+
+        def slow_build_agent(**_kwargs):
+            entered.set()
+            release.wait(1)
+            return fake_agent
+
+        with (
+            patch("src.web_ui_new.build_agent", side_effect=slow_build_agent),
+            patch("src.web_ui_new.build_team_step_runner", return_value=None),
+        ):
+            worker = asyncio.create_task(
+                _run_blocking(
+                    _ensure_agent,
+                    session,
+                    "",
+                    "",
+                    "default.ws",
+                    "main",
+                )
+            )
+            try:
+                await asyncio.sleep(0.02)
+                self.assertTrue(entered.is_set())
+                acquired = session.lock.acquire(timeout=0.05)
+                self.assertTrue(acquired)
+                if acquired:
+                    session.closing = True
+                    session.lock.release()
+            finally:
+                release.set()
+            result = await worker
+
+        self.assertIsNone(result)
+        self.assertIsNone(session.agent)
+        self.assertTrue(fake_agent.stopped)
+
+    async def test_concurrent_submit_to_same_session_returns_busy(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        session = UISession(session_id="shared")
+        _sessions[session.session_id] = session
+        fake_agent = _FakeAgent()
+
+        def slow_ensure_agent(*_args, **_kwargs):
+            entered.set()
+            release.wait(1)
+            return fake_agent
+
+        with (
+            patch("src.web_ui_new._agent_runtime_config", return_value=({}, None)),
+            patch("src.web_ui_new._ensure_agent", side_effect=slow_ensure_agent) as ensure_agent,
+            patch("src.web_ui_new._new_daemon_thread", _NoopThread),
+        ):
+            first_task = asyncio.create_task(
+                submit_task(SubmitTaskRequest(task="first", session_id=session.session_id))
+            )
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                second = await submit_task(
+                    SubmitTaskRequest(task="second", session_id=session.session_id)
+                )
+            finally:
+                release.set()
+            first = await first_task
+
+        self.assertTrue(first["success"])
+        self.assertEqual(
+            second,
+            {
+                "success": False,
+                "error": "Session is busy with another task",
+                "code": "SESSION_BUSY",
+            },
+        )
+        ensure_agent.assert_called_once()
+
+    async def test_agent_initialization_failure_releases_task_reservation(self) -> None:
+        session = UISession(session_id="retry-init")
+        _sessions[session.session_id] = session
+
+        with (
+            patch("src.web_ui_new._agent_runtime_config", return_value=({}, None)),
+            patch("src.web_ui_new._ensure_agent", side_effect=RuntimeError("build failed")),
+            patch("src.web_ui_new._new_daemon_thread", return_value=_NoopThread()) as new_thread,
+        ):
+            failed = await submit_task(
+                SubmitTaskRequest(task="first", session_id=session.session_id)
+            )
+
+        self.assertFalse(failed["success"])
+        self.assertIn("Failed to initialize Agent", failed["error"])
+        self.assertFalse(session.starting)
+        self.assertEqual(session.task_start_token, "")
+        new_thread.assert_not_called()
+
+        with (
+            patch("src.web_ui_new._agent_runtime_config", return_value=({}, None)),
+            patch("src.web_ui_new._ensure_agent", return_value=_FakeAgent()),
+            patch("src.web_ui_new._new_daemon_thread", _NoopThread),
+        ):
+            retried = await submit_task(
+                SubmitTaskRequest(task="retry", session_id=session.session_id)
+            )
+
+        self.assertTrue(retried["success"])
+
+    async def test_cancelled_submit_discards_late_agent_build(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        closed = threading.Event()
+        session = UISession(session_id="cancel-init")
+        _sessions[session.session_id] = session
+        fake_agent = _FakeAgent()
+        fake_agent.sink = NullSink()
+        fake_agent.handler = type(
+            "H",
+            (),
+            {"ctx": type("C", (), {"verbose": False, "sink": None})()},
+        )()
+        original_close = fake_agent.close
+
+        def close_agent() -> None:
+            original_close()
+            closed.set()
+
+        fake_agent.close = close_agent
+
+        def slow_build_agent(**_kwargs):
+            entered.set()
+            release.wait(1)
+            return fake_agent
+
+        with (
+            patch("src.web_ui_new._agent_runtime_config", return_value=({}, None)),
+            patch("src.web_ui_new.build_agent", side_effect=slow_build_agent),
+            patch("src.web_ui_new.build_team_step_runner", return_value=None),
+            patch("src.web_ui_new._new_daemon_thread") as new_thread,
+        ):
+            submit = asyncio.create_task(
+                submit_task(SubmitTaskRequest(task="first", session_id=session.session_id))
+            )
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                submit.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await submit
+                self.assertFalse(session.starting)
+                self.assertEqual(session.task_start_token, "")
+            finally:
+                release.set()
+            self.assertTrue(await asyncio.to_thread(closed.wait, 1))
+
+        self.assertIsNone(session.agent)
+        new_thread.assert_not_called()
+
+    async def test_thread_start_failure_releases_task_reservation(self) -> None:
+        class _FailingStartThread:
+            def start(self) -> None:
+                raise RuntimeError("thread unavailable")
+
+        session = UISession(session_id="retry-thread")
+        _sessions[session.session_id] = session
+
+        with (
+            patch("src.web_ui_new._agent_runtime_config", return_value=({}, None)),
+            patch("src.web_ui_new._ensure_agent", return_value=_FakeAgent()),
+            patch("src.web_ui_new._new_daemon_thread", return_value=_FailingStartThread()),
+        ):
+            result = await submit_task(
+                SubmitTaskRequest(task="first", session_id=session.session_id)
+            )
+
+        self.assertFalse(result["success"])
+        self.assertIn("Failed to start task", result["error"])
+        self.assertFalse(session.starting)
+        self.assertFalse(session.running)
+        self.assertEqual(session.task_start_token, "")
+
+    async def test_running_agent_cannot_be_replaced(self) -> None:
+        existing_agent = _FakeAgent(running=True)
+        session = UISession(
+            agent=existing_agent,
+            session_id="running",
+            running=True,
+            runtime_config_key="old",
+        )
+
+        with patch("src.web_ui_new.build_agent") as build_agent:
+            result = await _run_blocking(
+                _ensure_agent,
+                session,
+                "",
+                "",
+                "default.ws",
+                "main",
+                {"memory_mode": "private"},
+            )
+
+        self.assertIsNone(result)
+        self.assertIs(session.agent, existing_agent)
+        self.assertFalse(existing_agent.stopped)
+        build_agent.assert_not_called()
 
     async def test_team_api_crud_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1211,7 +1540,7 @@ class WebUINewAgentTeamTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch("src.web_ui_new._WORKSPACE_ROOT", str(root)),
                 patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
-                patch("src.web_ui_new.threading.Thread", _NoopThread),
+                patch("src.web_ui_new._new_daemon_thread", _NoopThread),
             ):
                 result = await submit_task(
                     SubmitTaskRequest(task="hello", workspace_dir="default.ws", team="dev-team")
@@ -1260,7 +1589,7 @@ class WebUINewAgentTeamTests(unittest.IsolatedAsyncioTestCase):
                 patch("src.web_ui_new._WORKSPACE_ROOT", str(root)),
                 patch("src.web_ui_new.build_agent", return_value=fake_agent),
                 patch("src.web_ui_new.build_team_step_runner", return_value=_fake_runner),
-                patch("src.web_ui_new.threading.Thread", _ImmediateThread),
+                patch("src.web_ui_new._new_daemon_thread", _ImmediateThread),
             ):
                 result = await submit_task(
                     SubmitTaskRequest(task="hello", workspace_dir="default.ws", team="dev-team")
@@ -1347,7 +1676,7 @@ class WebUINewAgentTeamTests(unittest.IsolatedAsyncioTestCase):
                 patch("src.web_ui_new.build_agent", return_value=fake_agent),
                 patch("src.web_ui_new.build_team_step_runner", return_value=lambda **_kwargs: {}),
                 patch("src.web_ui_new.run_team_workflow", side_effect=RuntimeError("workflow exploded")),
-                patch("src.web_ui_new.threading.Thread", _ImmediateThread),
+                patch("src.web_ui_new._new_daemon_thread", _ImmediateThread),
             ):
                 result = await submit_task(
                     SubmitTaskRequest(task="hello", workspace_dir="default.ws", team="dev-team")
@@ -1376,7 +1705,7 @@ class WebUINewAgentTeamTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))),
                 patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
-                patch("src.web_ui_new.threading.Thread", _NoopThread),
+                patch("src.web_ui_new._new_daemon_thread", _NoopThread),
                 patch.dict("os.environ", {"XAGENT_LOG_DIR": ""}, clear=False),
             ):
                 result = await submit_task(SubmitTaskRequest(task="hello", workspace_dir="default.ws", agent="main"))
@@ -1468,7 +1797,7 @@ class WebUINewPersistentChatTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))),
                 patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
-                patch("src.web_ui_new.threading.Thread", _ImmediateThread),
+                patch("src.web_ui_new._new_daemon_thread", _ImmediateThread),
                 patch.dict("os.environ", {"XAGENT_LOG_DIR": ""}, clear=False),
             ):
                 created = await create_chat(ChatCreateRequest(ws="default.ws", agent="coding"))
@@ -1508,7 +1837,7 @@ class WebUINewPersistentChatTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))),
                 patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
-                patch("src.web_ui_new.threading.Thread", _NoopThread),
+                patch("src.web_ui_new._new_daemon_thread", _NoopThread),
                 patch.dict("os.environ", {"XAGENT_LOG_DIR": ""}, clear=False),
             ):
                 created = await create_chat(ChatCreateRequest(ws="default.ws", agent="coding"))
@@ -1542,7 +1871,7 @@ class WebUINewPersistentChatTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))),
                 patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
-                patch("src.web_ui_new.threading.Thread", _NoopThread),
+                patch("src.web_ui_new._new_daemon_thread", _NoopThread),
                 patch.dict("os.environ", {"XAGENT_LOG_DIR": ""}, clear=False),
             ):
                 result = await submit_task(SubmitTaskRequest(task="global", workspace_dir="default.ws"))
@@ -1897,7 +2226,7 @@ project_agents:
             with (
                 patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
                 patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
-                patch("src.web_ui_new.threading.Thread", _NoopThread),
+                patch("src.web_ui_new._new_daemon_thread", _NoopThread),
             ):
                 result = await submit_task(
                     SubmitTaskRequest(task="hello", workspace_dir="default.ws", agent="coding")
@@ -1927,8 +2256,7 @@ project_agents:
             built_agents = []
 
             def _fake_build_agent(**_kwargs):
-                fake_agent = _FakeAgent()
-                fake_agent.handler = type("H", (), {"ctx": type("C", (), {"verbose": False})()})()
+                fake_agent = _HistoryFakeAgent()
                 built_agents.append(fake_agent)
                 return fake_agent
 
@@ -1936,7 +2264,7 @@ project_agents:
             with (
                 patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
                 patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
-                patch("src.web_ui_new.threading.Thread", _NoopThread),
+                patch("src.web_ui_new._new_daemon_thread", _ImmediateThread),
             ):
                 first = await submit_task(
                     SubmitTaskRequest(task="hello", workspace_dir="default.ws", agent="coding")
@@ -1966,7 +2294,7 @@ project_agents:
             with (
                 patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
                 patch("src.web_ui_new.build_agent") as build_agent_mock,
-                patch("src.web_ui_new.threading.Thread", _NoopThread),
+                patch("src.web_ui_new._new_daemon_thread", _NoopThread),
             ):
                 result = await submit_task(
                     SubmitTaskRequest(task="hello", workspace_dir="default.ws", agent="../bad")
@@ -2049,7 +2377,7 @@ class WebUINewScheduledTaskTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
                 patch("src.web_ui_new.build_agent", side_effect=_fake_build_agent),
-                patch("src.web_ui_new.threading.Thread", _NoopThread),
+                patch("src.web_ui_new._new_daemon_thread", _NoopThread),
             ):
                 created = await create_scheduled_task(
                     ScheduledTaskWriteRequest(
@@ -2097,6 +2425,51 @@ class WebUINewScheduledTaskTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result["success"])
             self.assertEqual(result["error"], "boom")
             self.assertEqual(result["data"]["last_debug_error"], "boom")
+
+    async def test_manual_scheduled_task_dispatch_does_not_block_event_loop(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_dispatch(_task):
+            entered.set()
+            release.wait(1)
+            return "debug-session", None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir(parents=True)
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                created = await create_scheduled_task(
+                    ScheduledTaskWriteRequest(
+                        ws="default.ws",
+                        name="Manual",
+                        prompt="run now",
+                        repeat="none",
+                        date="2099-01-01",
+                        time="00:00",
+                    )
+                )
+                with patch(
+                    "src.web_ui_new._dispatch_scheduled_task",
+                    side_effect=slow_dispatch,
+                ):
+                    started_at = time.monotonic()
+                    worker = asyncio.create_task(
+                        run_scheduled_task_now(
+                            created["data"]["id"],
+                            ScheduledTaskRunRequest(ws="default.ws"),
+                        )
+                    )
+                    try:
+                        await asyncio.sleep(0.02)
+                        self.assertLess(time.monotonic() - started_at, 0.5)
+                        self.assertTrue(entered.is_set())
+                        self.assertFalse(worker.done())
+                    finally:
+                        release.set()
+                    result = await worker
+
+            self.assertTrue(result["success"])
+            self.assertEqual(result["data"]["last_debug_session_id"], "debug-session")
 
     async def test_debug_run_does_not_advance_schedule_or_pause_one_off_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2463,6 +2836,41 @@ class WebUINewScheduledTaskTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result["success"])
             self.assertEqual(result["data"]["source"]["type"], "url")
 
+    async def test_eval_dataset_download_does_not_block_event_loop(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_download(*_args, **_kwargs):
+            entered.set()
+            release.wait(1)
+            return {"source": {"type": "url"}}
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir()
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
+                patch("src.web_ui_new.download_dataset", side_effect=slow_download),
+            ):
+                started_at = time.monotonic()
+                worker = asyncio.create_task(
+                    api_download_eval_dataset(
+                        EvalDatasetDownloadRequest(
+                            ws="default.ws",
+                            url="https://example.test/eval.jsonl",
+                        )
+                    )
+                )
+                try:
+                    await asyncio.sleep(0.02)
+                    self.assertLess(time.monotonic() - started_at, 0.5)
+                    self.assertTrue(entered.is_set())
+                    self.assertFalse(worker.done())
+                finally:
+                    release.set()
+                result = await worker
+
+        self.assertTrue(result["success"])
+
     async def test_eval_run_create_list_get_and_cancel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             ws_root = Path(tmp_dir) / "default.ws"
@@ -2483,7 +2891,7 @@ class WebUINewScheduledTaskTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
                 patch("src.web_ui_new.build_agent", side_effect=fake_build_agent),
-                patch("src.web_ui_new.threading.Thread", _ImmediateThread),
+                patch("src.web_ui_new._new_daemon_thread", _ImmediateThread),
             ):
                 created = await api_create_eval_run(
                     EvalRunCreateRequest(ws="default.ws", dataset_id=metadata["id"], agent="")
