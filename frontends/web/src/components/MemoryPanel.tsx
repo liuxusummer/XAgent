@@ -25,6 +25,7 @@ export function MemoryPanel({ workspace, agentName }: MemoryPanelProps) {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [statusMessage, setStatusMessage] = useState('');
 
   // Load agents list
   useEffect(() => {
@@ -95,12 +96,18 @@ export function MemoryPanel({ workspace, agentName }: MemoryPanelProps) {
         : `system/agents/${selectedAgent}/${selectedFile}`;
     setSaving(true);
     setSaveStatus('idle');
+    setStatusMessage('');
     const res = await api.writeWorkspaceFile(workspace, path, content);
     if (res.success) {
       setSaveStatus('success');
-      setTimeout(() => setSaveStatus('idle'), 2000);
+      setStatusMessage('保存成功');
+      setTimeout(() => {
+        setSaveStatus('idle');
+        setStatusMessage('');
+      }, 2000);
     } else {
       setSaveStatus('error');
+      setStatusMessage(res.error || '保存失败');
     }
     setSaving(false);
   };
@@ -111,10 +118,19 @@ export function MemoryPanel({ workspace, agentName }: MemoryPanelProps) {
       selectedAgent === 'global'
         ? `system/memory/${selectedFile}`
         : `system/agents/${selectedAgent}/${selectedFile}`;
+    setSaveStatus('idle');
+    setStatusMessage('');
     const res = await api.deleteWorkspaceFile(workspace, path);
     if (res.success) {
-      setFiles((prev) => prev.filter((f) => f !== selectedFile));
-      setSelectedFile(files.find((f) => f !== selectedFile) || null);
+      const remainingFiles = files.filter((file) => file !== selectedFile);
+      setFiles(remainingFiles);
+      setSelectedFile(remainingFiles[0] || null);
+      setContent('');
+      setSaveStatus('success');
+      setStatusMessage('删除成功');
+    } else {
+      setSaveStatus('error');
+      setStatusMessage(res.error || '删除失败');
     }
   };
 
@@ -261,10 +277,10 @@ export function MemoryPanel({ workspace, agentName }: MemoryPanelProps) {
           {/* Footer status */}
           <div className="flex items-center justify-end px-4 py-2 border-t border-border shrink-0">
             {saveStatus === 'success' && (
-              <span className="text-xs text-status-success">保存成功</span>
+              <span className="text-xs text-status-success">{statusMessage}</span>
             )}
             {saveStatus === 'error' && (
-              <span className="text-xs text-status-error">保存失败</span>
+              <span className="text-xs text-status-error">{statusMessage}</span>
             )}
           </div>
         </div>

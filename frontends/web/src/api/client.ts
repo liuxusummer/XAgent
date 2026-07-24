@@ -158,10 +158,12 @@ class ApiClient {
     });
   }
 
-  createEventSource(sessionId?: string): EventSource {
-    const path = sessionId
-      ? `/api/chat/stream?session_id=${sessionId}`
-      : '/api/chat/stream';
+  createEventSource(sessionId?: string, after?: number): EventSource {
+    const params = new URLSearchParams();
+    if (sessionId) params.set('session_id', sessionId);
+    if (after !== undefined && after > 0) params.set('after', String(after));
+    const query = params.toString();
+    const path = `/api/chat/stream${query ? `?${query}` : ''}`;
     const url = this.baseUrl ? `${this.baseUrl}${path}` : path;
     return new EventSource(url);
   }

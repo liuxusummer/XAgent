@@ -266,6 +266,7 @@ class ScheduledTaskRunRequest(BaseModel):
 class UISession:
     agent: object | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
+    event_sequence: int = 0
     waiting_for_user: bool = False
     ask_prompt: str = ""
     starting: bool = False
@@ -784,7 +785,8 @@ def _emit(session: UISession, event_type: str, data: Any = None) -> None:
             session.last_assistant_delta = str(data)
         elif event_type == "thinking_delta":
             session.last_thinking_delta = str(data)
-        session.events.append({"type": event_type, "data": data})
+        session.event_sequence += 1
+        session.events.append({"id": session.event_sequence, "type": event_type, "data": data})
         _update_session_messages(session, event_type, data)
         if event_type in _PERSISTED_SESSION_EVENT_TYPES:
             session.persist_revision += 1
@@ -950,6 +952,7 @@ def _default_chat_state(ws: str, agent: str, chat_id: str, session_id: str = "")
         "workspace": ws,
         "agent": agent,
         "backend_session_id": session_id,
+        "event_cursor": 0,
         "runtime_config_key": "",
         "messages": [],
         "llm_history": [],
@@ -1969,8 +1972,18 @@ async def stream_chat(request: Request):
             media_type="text/event-stream",
         )
 
+    cursor = 0
+    for value in (
+        request.query_params.get("after", ""),
+        request.headers.get("last-event-id", ""),
+    ):
+        try:
+            cursor = max(cursor, max(0, int(value)))
+        except (TypeError, ValueError):
+            continue
+
     async def event_generator():
-        last_events_len = 0
+        last_event_id = cursor
 
         while True:
             state: dict[str, Any] = {}
@@ -1983,10 +1996,13 @@ async def stream_chat(request: Request):
                 timed_out = True
 
             with session.lock:
-                if last_events_len > len(session.events):
-                    last_events_len = 0
-                new_events = list(session.events[last_events_len:])
-                last_events_len = len(session.events)
+                new_events = [
+                    dict(event)
+                    for event in session.events
+                    if int(event.get("id", 0)) > last_event_id
+                ]
+                if new_events:
+                    last_event_id = int(new_events[-1]["id"])
                 session_done = (
                     not session.starting
                     and not session.running
@@ -1994,7 +2010,10 @@ async def stream_chat(request: Request):
                 )
 
             for event in new_events:
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                yield (
+                    f"id: {event['id']}\n"
+                    f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                )
 
             if finished:
                 break
@@ -2091,8 +2110,27 @@ def _read_chat_sync(chat_id: str, ws: str, agent: str) -> dict[str, Any]:
     state = _read_chat_state(ws, agent, chat_id)
     if metadata is None or state is None:
         return {"success": False, "error": "Chat not found"}
-    state = {**state, "backend_session_id": session.session_id, "status": "idle"}
-    metadata = {**metadata, "status": "idle" if metadata.get("status") == "running" else metadata.get("status", "idle")}
+    with session.lock:
+        waiting_for_user = session.waiting_for_user
+        status = (
+            "waiting_for_user"
+            if waiting_for_user
+            else ("running" if session.starting or session.running else "idle")
+        )
+        state = {
+            **state,
+            "backend_session_id": session.session_id,
+            "event_cursor": session.event_sequence,
+            "messages": _safe_json_value(session.messages),
+            "waiting_for_user": waiting_for_user,
+            "ask_prompt": session.ask_prompt,
+            "status": status,
+        }
+        metadata = {
+            **metadata,
+            "message_count": len(session.messages),
+            "status": status,
+        }
     return {"success": True, "data": {"metadata": metadata, "state": state}}
 
 
@@ -3634,6 +3672,38 @@ async def write_workspace_file(request: WorkspaceFileWriteRequest):
         request.path,
         request.content,
     )
+
+
+def _delete_workspace_file_sync(ws: str, path: str) -> dict[str, Any]:
+    real_path, normalized_path, error = _resolve_system_file_path(ws, path)
+    if error or real_path is None or normalized_path is None:
+        return {"success": False, "error": error}
+
+    ws_root, workspace_error = _workspace_root(ws)
+    if workspace_error or ws_root is None:
+        return {"success": False, "error": workspace_error}
+    lexical_path = os.path.abspath(os.path.join(ws_root, normalized_path))
+    system_root = os.path.abspath(os.path.join(ws_root, "system"))
+    if os.path.commonpath([system_root, lexical_path]) != system_root:
+        return {"success": False, "error": "Only system/ files can be managed via this endpoint"}
+    if os.path.islink(lexical_path):
+        return {"success": False, "error": "Symbolic links cannot be deleted via this endpoint"}
+    if not os.path.exists(lexical_path):
+        return {"success": False, "error": "File not found"}
+    if not os.path.isfile(lexical_path):
+        return {"success": False, "error": "Path is not a regular file"}
+
+    try:
+        os.remove(lexical_path)
+    except OSError:
+        return {"success": False, "error": "Failed to delete file"}
+    return {"success": True, "data": {"path": normalized_path}}
+
+
+@app.delete("/api/workspace/file")
+async def delete_workspace_file(ws: str = "default.ws", path: str = ""):
+    """Delete a regular file from workspace system/ directory."""
+    return await _run_blocking(_delete_workspace_file_sync, ws, path)
 
 
 # === Eval API ===

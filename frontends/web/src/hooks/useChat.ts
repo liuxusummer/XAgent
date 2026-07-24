@@ -114,6 +114,7 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
   const [isWaitingForUser, setIsWaitingForUser] = useState(false);
   const [askPrompt, setAskPrompt] = useState('');
   const eventSourceRef = useRef<EventSource | null>(null);
+  const eventCursorRef = useRef(0);
   const backendSessionIdRef = useRef<string>('');
   const persistentChatIdRef = useRef<string>('');
   const streamRunIdRef = useRef(0);
@@ -341,6 +342,29 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
     }
   }, [addMessage, closeEventSource]);
 
+  const openEventStream = useCallback((sessionId: string, after = eventCursorRef.current) => {
+    if (!sessionId) return;
+
+    closeEventSource();
+    const streamRunId = streamRunIdRef.current;
+    const es = api.createEventSource(sessionId, after);
+    eventSourceRef.current = es;
+
+    es.onmessage = event => {
+      if (streamRunId !== streamRunIdRef.current) return;
+      const eventId = Number(event.lastEventId);
+      if (Number.isSafeInteger(eventId) && eventId > eventCursorRef.current) {
+        eventCursorRef.current = eventId;
+      }
+      handleSSEMessage(event);
+    };
+
+    es.onerror = () => {
+      if (streamRunId !== streamRunIdRef.current) return;
+      console.warn('SSE connection interrupted; waiting for automatic reconnect');
+    };
+  }, [closeEventSource, handleSSEMessage]);
+
   const submitTask = useCallback(async (task: string, config?: {
     configPath?: string;
     observabilityConfigPath?: string;
@@ -397,29 +421,7 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
       if (config?.chatId) {
         persistentChatIdRef.current = config.chatId;
       }
-      const streamRunId = streamRunIdRef.current + 1;
-      streamRunIdRef.current = streamRunId;
-
-      // Connect to SSE stream
-      const es = api.createEventSource(backendSessionIdRef.current);
-      eventSourceRef.current = es;
-
-      es.onmessage = event => {
-        if (streamRunId !== streamRunIdRef.current) return;
-        handleSSEMessage(event);
-      };
-
-      es.onerror = () => {
-        if (streamRunId !== streamRunIdRef.current) return;
-        console.error('SSE connection error');
-        setAgentStatus({ state: 'error' });
-        setSession(prev => ({ ...prev, status: 'error' }));
-        closeEventSource();
-      };
-
-      es.onopen = () => {
-        console.debug('SSE connection opened');
-      };
+      openEventStream(backendSessionIdRef.current);
 
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
@@ -427,7 +429,7 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
       setAgentStatus({ state: 'idle' });
       setSession(prev => ({ ...prev, status: 'idle' }));
     }
-  }, [addMessage, closeEventSource, handleSSEMessage]);
+  }, [addMessage, closeEventSource, openEventStream]);
 
   const attachRunningSession = useCallback((sessionId: string, options: {
     title?: string;
@@ -459,24 +461,9 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
       config: options.config,
     });
 
-    const streamRunId = streamRunIdRef.current + 1;
-    streamRunIdRef.current = streamRunId;
-    const es = api.createEventSource(sessionId);
-    eventSourceRef.current = es;
-
-    es.onmessage = event => {
-      if (streamRunId !== streamRunIdRef.current) return;
-      handleSSEMessage(event);
-    };
-
-    es.onerror = () => {
-      if (streamRunId !== streamRunIdRef.current) return;
-      console.error('SSE connection error');
-      setAgentStatus({ state: 'error' });
-      setSession(prev => ({ ...prev, status: 'error' }));
-      closeEventSource();
-    };
-  }, [closeEventSource, handleSSEMessage]);
+    eventCursorRef.current = 0;
+    openEventStream(sessionId, 0);
+  }, [closeEventSource, openEventStream]);
 
   const sendReply = useCallback(async (reply: string) => {
     if (!reply.trim() || !isWaitingForUser) return;
@@ -502,13 +489,16 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
         return;
       }
 
+      if (!eventSourceRef.current || eventSourceRef.current.readyState === EventSource.CLOSED) {
+        openEventStream(backendSessionIdRef.current);
+      }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
       addMessage(createMessage('system', `[Error] ${errorMsg}`, { status: 'error' }));
       setAgentStatus({ state: 'idle' });
       setSession(prev => ({ ...prev, status: 'idle' }));
     }
-  }, [addMessage, isWaitingForUser]);
+  }, [addMessage, isWaitingForUser, openEventStream]);
 
   const stopTask = useCallback(async () => {
     try {
@@ -526,6 +516,7 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
     closeEventSource();
     backendSessionIdRef.current = '';
     persistentChatIdRef.current = '';
+    eventCursorRef.current = 0;
     setSession({
       id: generateId(),
       title: 'New Chat',
@@ -546,23 +537,38 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
     const state = detail.state;
     backendSessionIdRef.current = state.backend_session_id || '';
     persistentChatIdRef.current = metadata.chat_id;
+    eventCursorRef.current = state.event_cursor || 0;
+    const restoredStatus = state.waiting_for_user
+      ? 'waiting_for_user'
+      : state.status === 'running'
+        ? 'running'
+        : 'idle';
     setSession({
       id: metadata.chat_id,
       title: metadata.title || 'New Chat',
       messages: state.messages || [],
       createdAt: Math.round((metadata.created_at || Date.now() / 1000) * 1000),
       updatedAt: Math.round((metadata.updated_at || Date.now() / 1000) * 1000),
-      status: state.waiting_for_user ? 'waiting_for_user' : 'idle',
+      status: restoredStatus,
       config: {
         workspaceDir: metadata.workspace,
         agent: metadata.agent,
       },
     });
-    setAgentStatus({ state: state.waiting_for_user ? 'waiting_for_user' : 'idle' });
+    setAgentStatus({
+      state: state.waiting_for_user
+        ? 'waiting_for_user'
+        : restoredStatus === 'running'
+          ? 'thinking'
+          : 'idle',
+    });
     setIsWaitingForUser(Boolean(state.waiting_for_user));
     setAskPrompt(state.ask_prompt || '');
     setLiveTokenUsage(null);
-  }, [closeEventSource]);
+    if (restoredStatus === 'running' && backendSessionIdRef.current) {
+      openEventStream(backendSessionIdRef.current, eventCursorRef.current);
+    }
+  }, [closeEventSource, openEventStream]);
 
   // Cleanup on unmount
   useEffect(() => {

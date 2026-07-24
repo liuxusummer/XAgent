@@ -54,6 +54,7 @@ export interface ChatState {
   workspace: string;
   agent: string;
   backend_session_id: string;
+  event_cursor: number;
   runtime_config_key: string;
   messages: Message[];
   llm_history: unknown[];
@@ -76,6 +77,7 @@ export interface AgentStatus {
 }
 
 export interface SSEEvent {
+  id?: number;
   type:
     | 'user_task'
     | 'assistant_delta'

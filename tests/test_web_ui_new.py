@@ -61,6 +61,7 @@ from src.web_ui_new import (
     create_scheduled_task,
     create_workspace,
     create_chat,
+    delete_workspace_file,
     delete_scheduled_task,
     delete_chat,
     list_scheduled_tasks,
@@ -177,8 +178,13 @@ class _Request:
 
 
 class _StreamRequest:
-    def __init__(self, session_id: str) -> None:
+    def __init__(self, session_id: str, after: int | None = None, last_event_id: int | None = None) -> None:
         self.query_params = {"session_id": session_id}
+        if after is not None:
+            self.query_params["after"] = str(after)
+        self.headers = {}
+        if last_event_id is not None:
+            self.headers["last-event-id"] = str(last_event_id)
 
     async def is_disconnected(self) -> bool:
         return False
@@ -576,7 +582,7 @@ class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stream_reads_events_from_session_log_not_queue_payload(self) -> None:
         session = UISession(session_id="stream")
-        session.events.append({"type": "assistant_delta", "data": "hello"})
+        _emit(session, "assistant_delta", "hello")
         session.running = False
         session.waiting_for_user = False
         _sessions["stream"] = session
@@ -590,6 +596,36 @@ class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
         payload = "".join(chunks)
         self.assertIn('"type": "assistant_delta"', payload)
         self.assertIn("hello", payload)
+
+    async def test_stream_resumes_after_latest_client_cursor(self) -> None:
+        session = UISession(session_id="resumable")
+        _emit(session, "assistant_delta", "old")
+        _emit(session, "assistant_delta", "missed")
+        _emit(session, "assistant_delta", "latest")
+        _sessions[session.session_id] = session
+        _queue_state(session, finished=True)
+
+        response = await stream_chat(
+            _StreamRequest(session.session_id, after=1, last_event_id=2)
+        )
+        chunks: list[str] = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+
+        payload = "".join(chunks)
+        self.assertNotIn('"data": "old"', payload)
+        self.assertNotIn('"data": "missed"', payload)
+        self.assertIn('id: 3', payload)
+        self.assertIn('"data": "latest"', payload)
+
+    def test_event_ids_remain_monotonic_when_a_new_run_clears_the_event_log(self) -> None:
+        session = UISession(session_id="monotonic")
+        _emit(session, "log", "first run")
+        session.events = []
+
+        _emit(session, "log", "second run")
+
+        self.assertEqual(session.events[0]["id"], 2)
 
     def test_web_usage_sink_emits_delta_and_done_events(self) -> None:
         session = UISession(session_id="usage")
@@ -1761,6 +1797,51 @@ class WebUINewPersistentChatTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(deleted["success"])
             self.assertFalse((Path(tmp_dir) / "default.ws" / "runtime" / "chats" / "coding" / chat_id).exists())
 
+    async def test_read_chat_returns_atomic_live_state_and_event_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir()
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))):
+                created = await create_chat(ChatCreateRequest(ws="default.ws", agent="coding"))
+                chat_id = created["data"]["metadata"]["chat_id"]
+                session = _find_session_by_chat("default.ws", "coding", chat_id)
+                self.assertIsNotNone(session)
+                assert session is not None
+                with session.lock:
+                    session.running = True
+                    _emit(session, "assistant_delta", "live output")
+
+                restored = await read_chat(chat_id, ws="default.ws", agent="coding")
+
+            state = restored["data"]["state"]
+            self.assertEqual(state["status"], "running")
+            self.assertFalse(state["waiting_for_user"])
+            self.assertEqual(state["event_cursor"], 1)
+            self.assertEqual(state["messages"][-1]["content"], "live output")
+            self.assertEqual(restored["data"]["metadata"]["status"], "running")
+            self.assertEqual(restored["data"]["metadata"]["message_count"], 1)
+
+    async def test_read_chat_preserves_live_waiting_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            (Path(tmp_dir) / "default.ws").mkdir()
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))):
+                created = await create_chat(ChatCreateRequest(ws="default.ws", agent="coding"))
+                chat_id = created["data"]["metadata"]["chat_id"]
+                session = _find_session_by_chat("default.ws", "coding", chat_id)
+                self.assertIsNotNone(session)
+                assert session is not None
+                with session.lock:
+                    session.waiting_for_user = True
+                    session.ask_prompt = "continue?"
+                    _emit(session, "ask_user", session.ask_prompt)
+
+                restored = await read_chat(chat_id, ws="default.ws", agent="coding")
+
+            state = restored["data"]["state"]
+            self.assertEqual(state["status"], "waiting_for_user")
+            self.assertTrue(state["waiting_for_user"])
+            self.assertEqual(state["ask_prompt"], "continue?")
+            self.assertEqual(state["event_cursor"], 1)
+
     async def test_list_chats_is_scoped_by_agent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             (Path(tmp_dir) / "default.ws").mkdir()
@@ -1933,6 +2014,88 @@ class WebUINewWorkspaceFileTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result["data"]["created"])
             self.assertEqual(result["data"]["bytes"], len("new text".encode("utf-8")))
             self.assertEqual(target.read_text(encoding="utf-8"), "new text")
+
+    async def test_delete_workspace_file_removes_regular_system_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "default.ws" / "system" / "memory" / "project.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("memory", encoding="utf-8")
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                result = await delete_workspace_file(
+                    ws="default.ws",
+                    path="system/memory/project.md",
+                )
+
+            self.assertEqual(
+                result,
+                {"success": True, "data": {"path": "system/memory/project.md"}},
+            )
+            self.assertFalse(target.exists())
+
+    async def test_delete_workspace_file_rejects_directories_and_symbolic_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            system_root = Path(tmp_dir) / "default.ws" / "system"
+            directory = system_root / "memory"
+            directory.mkdir(parents=True)
+            target = directory / "target.md"
+            target.write_text("keep", encoding="utf-8")
+            link = directory / "link.md"
+            link.symlink_to(target)
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                directory_result = await delete_workspace_file(
+                    ws="default.ws",
+                    path="system/memory",
+                )
+                link_result = await delete_workspace_file(
+                    ws="default.ws",
+                    path="system/memory/link.md",
+                )
+
+            self.assertFalse(directory_result["success"])
+            self.assertFalse(link_result["success"])
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(target.read_text(encoding="utf-8"), "keep")
+
+    async def test_delete_workspace_file_rejects_paths_outside_system(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ws_root = Path(tmp_dir) / "default.ws"
+            outside = ws_root / "business" / "keep.md"
+            outside.parent.mkdir(parents=True)
+            outside.write_text("keep", encoding="utf-8")
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                result = await delete_workspace_file(
+                    ws="default.ws",
+                    path="business/keep.md",
+                )
+
+            self.assertFalse(result["success"])
+            self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
+
+    def test_frontend_delete_workspace_file_contract_is_registered(self) -> None:
+        route_methods = {
+            (route.path, method)
+            for route in app.routes
+            for method in getattr(route, "methods", set())
+        }
+        self.assertIn(("/api/workspace/file", "DELETE"), route_methods)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "default.ws" / "system" / "memory" / "project.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("memory", encoding="utf-8")
+            client = TestClient(app, client=("127.0.0.1", 50000))
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                response = client.delete(
+                    "/api/workspace/file",
+                    params={"ws": "default.ws", "path": "system/memory/project.md"},
+                )
+            self.assertFalse(target.exists())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["success"])
 
     async def test_workspace_file_api_rejects_invalid_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
