@@ -1,0 +1,25 @@
+docs/agent-bound-persistent-chat-sessions-spec.md
+  s_72af05a5dabd4c::t_d0e184435a9c4d 27-29,37-39
+src/web_ui_new.py
+  s_72af05a5dabd4c::t_b081de3067c3f9 214-219,246-257,261-263,604-617,657-670,728-730,892-984,986,988-1034,1057,1062-1067,1161-1162,1168-1169,1175-1208,1237-1239,1272-1273,1293-1297,1310-1311,1350,1366,1372,1388,1416,1426,1433-1436,1442-1453,1470-1482,1484-1487,1494,1518-1533,1542,1567-1571,1648,1679-1682,1689-1694,1696-1700,2484,2504,2506-2514,2596-2600
+tests/test_web_ui_new.py
+  s_72af05a5dabd4c::t_02f657127c22dc 38-40,42,46,369-460
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "acd50ec0ce361dab1debc5e81e77ef62b81e61db",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
