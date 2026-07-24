@@ -1,0 +1,31 @@
+frontends/web/src/api/client.ts
+  s_72af05a5dabd4c::t_ba06d30012390d 161-166
+frontends/web/src/components/MemoryPanel.tsx
+  s_72af05a5dabd4c::t_ed37fa2e40b3e1 28,99,103-107,110,121-122,125-133,280,283
+frontends/web/src/hooks/useChat.ts
+  s_72af05a5dabd4c::t_15c32ba921e55a 117,345-367,424,432,464-466,492-494,501,519,540-545,552,558-564,568-571
+frontends/web/src/types/index.ts
+  s_72af05a5dabd4c::t_715a02e4351ce4 57,80
+src/web_ui_new.py
+  s_72af05a5dabd4c::t_297b8d9fa32cdd 269,788-789,955,1975-1984,1986,1999-2005,2013-2016,2113-2133,3677-3708
+tests/test_web_ui_new.py
+  s_72af05a5dabd4c::t_1a7c93fd5ed1a4 64,181,183-187,585,600-629,1800-1844,2018-2099
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "356543dd60635b1362f8049d81311165974ec9bd",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
