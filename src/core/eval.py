@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import ipaddress
 import io
 import json
 import os
 import re
+import socket
 import threading
 import time
 import urllib.parse
@@ -406,12 +408,76 @@ def get_dataset_detail(workspace_root: str | Path, dataset_id: str) -> dict[str,
     return {**metadata, "cases": read_dataset_cases(workspace_root, dataset_id)}
 
 
-def _read_url_limited(url: str, timeout: float = DOWNLOAD_TIMEOUT_SEC) -> tuple[bytes, str]:
-    parsed = urllib.parse.urlparse(url)
+def _is_public_ip_address(value: str) -> bool:
+    address = ipaddress.ip_address(value.split("%", 1)[0])
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return (
+        address.is_global
+        and not address.is_multicast
+        and not address.is_reserved
+        and not address.is_unspecified
+    )
+
+
+def _validate_dataset_url(url: str) -> str:
+    normalized = str(url or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(normalized)
+        port = parsed.port
+    except ValueError as exc:
+        raise EvalError("Invalid dataset URL") from exc
     if parsed.scheme not in {"http", "https"}:
         raise EvalError("Only http/https dataset URLs are allowed")
-    request = urllib.request.Request(url, headers={"User-Agent": "XAgent-Eval/1.0"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - caller limits scheme and size.
+    if not parsed.hostname:
+        raise EvalError("Dataset URL must include a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise EvalError("Dataset URL credentials are not allowed")
+
+    host = parsed.hostname.rstrip(".")
+    try:
+        addresses = {host} if _is_public_ip_address(host) else set()
+    except ValueError:
+        try:
+            address_info = socket.getaddrinfo(
+                host,
+                port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        except (OSError, UnicodeError) as exc:
+            raise EvalError("Dataset URL host could not be resolved") from exc
+        addresses = {str(info[4][0]) for info in address_info if info[4]}
+
+    if not addresses:
+        raise EvalError("Dataset URL host did not resolve to a public address")
+    try:
+        if any(not _is_public_ip_address(address) for address in addresses):
+            raise EvalError("Dataset URL resolves to a non-public address")
+    except ValueError as exc:
+        raise EvalError("Dataset URL resolved to an invalid address") from exc
+    return normalized
+
+
+class _DatasetRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = 5
+    max_repeats = 2
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_dataset_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_dataset_url(request: urllib.request.Request, timeout: float):
+    opener = urllib.request.build_opener(_DatasetRedirectHandler())
+    return opener.open(request, timeout=timeout)
+
+
+def _read_url_limited(url: str, timeout: float = DOWNLOAD_TIMEOUT_SEC) -> tuple[bytes, str]:
+    validated_url = _validate_dataset_url(url)
+    request = urllib.request.Request(validated_url, headers={"User-Agent": "XAgent-Eval/1.0"})
+    with _open_dataset_url(request, timeout) as response:
+        final_url = str(getattr(response, "url", validated_url))
+        _validate_dataset_url(final_url)
         content_length = response.headers.get("Content-Length")
         if content_length:
             try:
@@ -429,8 +495,7 @@ def _read_url_limited(url: str, timeout: float = DOWNLOAD_TIMEOUT_SEC) -> tuple[
             if total > MAX_DATASET_BYTES:
                 raise EvalError("Download exceeds 20MB limit")
             chunks.append(chunk)
-        final_url = getattr(response, "url", url)
-    return b"".join(chunks), str(final_url)
+    return b"".join(chunks), final_url
 
 
 def download_dataset(

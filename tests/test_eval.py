@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import socket
 import tempfile
 import threading
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
 from src.core.eval import (
+    _DatasetRedirectHandler,
+    _validate_dataset_url,
     EvalError,
     create_eval_run,
     download_dataset,
@@ -96,7 +100,11 @@ class EvalDatasetTests(unittest.TestCase):
     def test_download_dataset_limits_protocol_and_saves_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             payload = b'{"task": "downloaded", "assertions": {"contains": ["ok"]}}\n'
-            with patch("src.core.eval.urllib.request.urlopen", return_value=_FakeResponse(payload)):
+            public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+            with (
+                patch("src.core.eval.socket.getaddrinfo", return_value=public_dns),
+                patch("src.core.eval._open_dataset_url", return_value=_FakeResponse(payload)),
+            ):
                 metadata = download_dataset(tmp_dir, url="https://example.test/data.jsonl")
 
             self.assertEqual(metadata["source"]["type"], "url")
@@ -105,6 +113,76 @@ class EvalDatasetTests(unittest.TestCase):
 
             with self.assertRaises(EvalError):
                 download_dataset(tmp_dir, url="file:///tmp/data.jsonl")
+
+    def test_dataset_url_rejects_private_and_credentialed_hosts(self) -> None:
+        blocked_urls = [
+            "http://0.0.0.0/data.jsonl",
+            "http://127.0.0.1/data.jsonl",
+            "http://[::1]/data.jsonl",
+            "http://[fc00::1]/data.jsonl",
+            "http://[fe80::1]/data.jsonl",
+            "http://100.64.0.1/data.jsonl",
+            "http://169.254.169.254/latest/meta-data",
+            "http://10.0.0.1/data.jsonl",
+            "http://192.0.2.1/data.jsonl",
+            "http://224.0.0.1/data.jsonl",
+            "https://user:password@example.test/data.jsonl",
+        ]
+
+        for url in blocked_urls:
+            with self.subTest(url=url), self.assertRaises(EvalError):
+                _validate_dataset_url(url)
+
+    def test_dataset_url_rejects_dns_answers_containing_private_address(self) -> None:
+        mixed_dns = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 443)),
+        ]
+
+        with (
+            patch("src.core.eval.socket.getaddrinfo", return_value=mixed_dns),
+            self.assertRaises(EvalError),
+        ):
+            _validate_dataset_url("https://example.test/data.jsonl")
+
+    def test_download_revalidates_final_response_url(self) -> None:
+        public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+        response = _FakeResponse(b'{"task":"blocked"}', url="http://127.0.0.1/private.jsonl")
+
+        with (
+            patch("src.core.eval.socket.getaddrinfo", return_value=public_dns),
+            patch("src.core.eval._open_dataset_url", return_value=response),
+            tempfile.TemporaryDirectory() as tmp_dir,
+            self.assertRaises(EvalError),
+        ):
+            download_dataset(tmp_dir, url="https://example.test/data.jsonl")
+
+    def test_dataset_redirect_revalidates_destination(self) -> None:
+        handler = _DatasetRedirectHandler()
+        request = urllib.request.Request("https://example.test/data.jsonl")
+
+        with self.assertRaises(EvalError):
+            handler.redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "http://127.0.0.1/private.jsonl",
+            )
+
+        public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+        with patch("src.core.eval.socket.getaddrinfo", return_value=public_dns):
+            redirected = handler.redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "https://cdn.example.test/data.jsonl",
+            )
+
+        self.assertEqual(redirected.full_url, "https://cdn.example.test/data.jsonl")
 
 
 class EvalAssertionTests(unittest.TestCase):

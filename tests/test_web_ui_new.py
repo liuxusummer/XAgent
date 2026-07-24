@@ -2446,7 +2446,11 @@ class WebUINewScheduledTaskTests(unittest.IsolatedAsyncioTestCase):
 
             with (
                 patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
-                patch("src.core.eval.urllib.request.urlopen", return_value=_FakeDownloadResponse(payload)),
+                patch(
+                    "src.core.eval.socket.getaddrinfo",
+                    return_value=[(None, None, None, "", ("93.184.216.34", 443))],
+                ),
+                patch("src.core.eval._open_dataset_url", return_value=_FakeDownloadResponse(payload)),
             ):
                 result = await api_download_eval_dataset(
                     EvalDatasetDownloadRequest(
