@@ -238,6 +238,19 @@ Open:
 http://127.0.0.1:7861/
 ```
 
+The Web UI accepts loopback clients only. Its built-in frontend is same-origin, and
+local Vite development is allowed from `http://127.0.0.1:5173` and
+`http://localhost:5173`. Add other exact local development origins before startup
+when needed:
+
+```bash
+XAGENT_WEB_ALLOWED_ORIGINS=http://127.0.0.1:4173 \
+  .venv/bin/python -m src.web_ui_new --host 127.0.0.1 --port 7861
+```
+
+Wildcard origins are ignored. For remote use, keep the backend on loopback and use
+an SSH tunnel.
+
 ### Dev mode (Vite)
 
 ```bash

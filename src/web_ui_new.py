@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import os
 import queue
@@ -12,6 +13,7 @@ import re
 import shutil
 import threading
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -20,7 +22,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from src.config import load_config
@@ -57,16 +59,96 @@ from src.tools.file_index import get_file_index_stats, refresh_file_index, searc
 from src.tools.reflect.reader import group_by_session, load_dir, load_events
 from src.tools.reflect.stats import TOKEN_FIELDS
 
+
+_DEFAULT_WEB_ALLOWED_ORIGINS = {
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+}
+
+
+def _normalize_web_origin(value: str) -> str | None:
+    try:
+        parsed = urllib.parse.urlsplit(str(value or "").strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return None
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        return None
+    host = parsed.hostname.lower()
+    authority = f"[{host}]" if ":" in host else host
+    default_port = 80 if parsed.scheme == "http" else 443
+    if port is not None and port != default_port:
+        authority = f"{authority}:{port}"
+    return f"{parsed.scheme}://{authority}"
+
+
+def _configured_web_allowed_origins() -> list[str]:
+    origins = set(_DEFAULT_WEB_ALLOWED_ORIGINS)
+    for value in os.environ.get("XAGENT_WEB_ALLOWED_ORIGINS", "").split(","):
+        normalized = _normalize_web_origin(value)
+        if normalized is not None:
+            origins.add(normalized)
+    return sorted(origins)
+
+
+_WEB_ALLOWED_ORIGINS = frozenset(_configured_web_allowed_origins())
+
 app = FastAPI(title="XAgent Web UI")
 
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=sorted(_WEB_ALLOWED_ORIGINS),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Content-Type"],
 )
+
+
+def _is_loopback_client(host: str | None) -> bool:
+    if not host:
+        return False
+    normalized = host.split("%", 1)[0].strip()
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        return normalized.lower() == "localhost"
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback
+
+
+def _request_origin(request: Request) -> str | None:
+    host = request.headers.get("host", "")
+    if not host:
+        return None
+    return _normalize_web_origin(f"{request.url.scheme}://{host}")
+
+
+def _is_allowed_web_origin(request: Request, origin: str) -> bool:
+    normalized = _normalize_web_origin(origin)
+    if normalized is None:
+        return False
+    return normalized == _request_origin(request) or normalized in _WEB_ALLOWED_ORIGINS
+
+
+@app.middleware("http")
+async def enforce_local_web_access(request: Request, call_next):
+    client_host = request.client.host if request.client is not None else None
+    if not _is_loopback_client(client_host):
+        return JSONResponse(
+            status_code=403,
+            content={"success": False, "error": "Web UI only accepts local connections"},
+        )
+    origin = request.headers.get("origin")
+    if origin and not _is_allowed_web_origin(request, origin):
+        return JSONResponse(
+            status_code=403,
+            content={"success": False, "error": "Origin is not allowed"},
+        )
+    return await call_next(request)
 
 
 class SubmitTaskRequest(BaseModel):
@@ -214,6 +296,10 @@ class UISession:
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     persist_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     last_activity_at: float = field(default_factory=time.time)
+    running_started_at: float = 0.0
+    waiting_started_at: float = 0.0
+    stop_requested: bool = False
+    closing: bool = False
     persist_revision: int = 0
     persisted_revision: int = 0
     last_persist_at: float = 0.0
@@ -258,9 +344,14 @@ _PERSISTED_SESSION_EVENT_TYPES = {
 _task_lock = threading.Lock()
 _task_scheduler_started = False
 _task_scheduler_stop = threading.Event()
+_task_scheduler_thread: threading.Thread | None = None
+_web_runtime_stopping = threading.Event()
 _CHAT_PERSIST_INTERVAL_SECONDS = 1.0
 _SESSION_IDLE_TTL_SECONDS = 60 * 60
+_SESSION_RUNNING_TTL_SECONDS = 6 * 60 * 60
+_SESSION_WAITING_TTL_SECONDS = 24 * 60 * 60
 _SESSION_MAX_COUNT = 256
+_SESSION_CAPACITY_ERROR = "Session capacity reached; stop or close an existing session and retry"
 
 
 def _now_ms() -> int:
@@ -655,6 +746,8 @@ def _append_llm_delta(session: UISession, delta: str) -> None:
 
 def _emit(session: UISession, event_type: str, data: Any = None) -> None:
     with session.lock:
+        if session.closing:
+            return
         if event_type == "assistant_delta" and data == session.last_assistant_delta:
             return
         if event_type == "thinking_delta" and data == session.last_thinking_delta:
@@ -722,6 +815,17 @@ def _append_progress(session: UISession, message: str) -> None:
         return
 
     _emit(session, "log", message)
+
+
+def _stop_agent(session: UISession, *, unblock_reply: bool = False) -> None:
+    with session.lock:
+        agent = session.agent
+    if agent is not None:
+        agent.stop()
+        if unblock_reply:
+            reply_queue = getattr(agent, "reply_queue", None)
+            if reply_queue is not None:
+                reply_queue.put("")
 
 
 def _close_agent(session: UISession) -> None:
@@ -889,18 +993,37 @@ def _chat_title(metadata: dict[str, Any], messages: list[dict[str, Any]]) -> str
     return current
 
 
-def _touch_session(session: UISession) -> None:
+def _set_session_runtime_state(session: UISession, state: str, *, now: float | None = None) -> None:
+    current_time = time.time() if now is None else now
     with session.lock:
+        session.running = state == "running"
+        session.waiting_for_user = state == "waiting"
+        session.running_started_at = current_time if state == "running" else 0.0
+        session.waiting_started_at = current_time if state == "waiting" else 0.0
+        if state != "running":
+            session.stop_requested = False
+
+
+def _touch_session(session: UISession) -> bool:
+    with session.lock:
+        if session.closing:
+            return False
         session.last_activity_at = time.time()
+        return True
 
 
 def _get_session(session_id: str, *, touch: bool = True) -> UISession | None:
     with _session_lock:
         session = _sessions.get(session_id)
-        if session is not None and touch:
-            with session.lock:
-                session.last_activity_at = time.time()
-        return session
+    if session is None:
+        return None
+    with session.lock:
+        if session.closing:
+            return None
+        if touch:
+            session.last_activity_at = time.time()
+    with _session_lock:
+        return session if _sessions.get(session_id) is session else None
 
 
 def _session_snapshot() -> list[UISession]:
@@ -908,14 +1031,38 @@ def _session_snapshot() -> list[UISession]:
         return list(_sessions.values())
 
 
-def _register_session(session: UISession) -> None:
-    _touch_session(session)
+def _register_session(session: UISession, *, max_sessions: int = _SESSION_MAX_COUNT) -> bool:
+    if _web_runtime_stopping.is_set():
+        return False
+    limit = max(1, int(max_sessions))
     with _session_lock:
+        if _web_runtime_stopping.is_set():
+            return False
+        existing = _sessions.get(session.session_id)
+        current_count = len(_sessions)
+    if existing is session:
+        return _touch_session(session)
+    if existing is not None:
+        return False
+    if current_count >= limit:
+        _cleanup_sessions(max_sessions=limit - 1)
+    if not _touch_session(session):
+        return False
+    with _session_lock:
+        if _web_runtime_stopping.is_set():
+            return False
+        existing = _sessions.get(session.session_id)
+        if existing is not None:
+            return existing is session
+        if len(_sessions) >= limit:
+            return False
         _sessions[session.session_id] = session
-    _cleanup_sessions()
+        return True
 
 
 def _remove_session(session: UISession) -> None:
+    with session.lock:
+        session.closing = True
     with _session_lock:
         if _sessions.get(session.session_id) is session:
             _sessions.pop(session.session_id, None)
@@ -997,41 +1144,143 @@ def _persist_chat_state(session: UISession, *, force: bool = False) -> bool:
         return True
 
 
+def _session_eviction_reason_locked(
+    session: UISession,
+    *,
+    now: float,
+    idle_ttl_seconds: float,
+    running_ttl_seconds: float,
+    waiting_ttl_seconds: float,
+) -> str | None:
+    if session.closing:
+        return None
+    if session.running:
+        started_at = session.running_started_at or session.last_activity_at
+        return "running_timeout" if now - started_at >= running_ttl_seconds else None
+    if session.waiting_for_user:
+        started_at = session.waiting_started_at or session.last_activity_at
+        return "waiting_timeout" if now - started_at >= waiting_ttl_seconds else None
+    return "idle_timeout" if now - session.last_activity_at >= idle_ttl_seconds else None
+
+
+def _prepare_session_eviction(
+    session: UISession,
+    reason: str,
+    *,
+    now: float,
+    idle_ttl_seconds: float,
+    running_ttl_seconds: float,
+    waiting_ttl_seconds: float,
+) -> bool:
+    with session.lock:
+        if session.closing:
+            return False
+        if reason == "capacity":
+            eligible = not session.running and not session.waiting_for_user
+        else:
+            eligible = _session_eviction_reason_locked(
+                session,
+                now=now,
+                idle_ttl_seconds=idle_ttl_seconds,
+                running_ttl_seconds=running_ttl_seconds,
+                waiting_ttl_seconds=waiting_ttl_seconds,
+            ) == reason
+        if not eligible:
+            return False
+        if reason in {"running_timeout", "waiting_timeout"}:
+            _emit(session, "stop", f"session closed after {reason.replace('_', ' ')}")
+            _set_session_runtime_state(session, "idle", now=now)
+            session.ask_prompt = ""
+        session.closing = True
+        return True
+
+
 def _cleanup_sessions(
     *,
     now: float | None = None,
     idle_ttl_seconds: float = _SESSION_IDLE_TTL_SECONDS,
+    running_ttl_seconds: float = _SESSION_RUNNING_TTL_SECONDS,
+    waiting_ttl_seconds: float = _SESSION_WAITING_TTL_SECONDS,
     max_sessions: int = _SESSION_MAX_COUNT,
 ) -> list[str]:
     current_time = time.time() if now is None else now
-    removed: list[tuple[str, UISession]] = []
-    with _session_lock:
-        for session_id, session in list(_sessions.items()):
-            with session.lock:
-                active = session.running or session.waiting_for_user
-                expired = current_time - session.last_activity_at >= idle_ttl_seconds
-            if not active and expired:
-                removed.append((session_id, session))
-                _sessions.pop(session_id, None)
+    sessions = _session_snapshot()
+    candidates: list[tuple[str, UISession, str]] = []
+    inactive: list[tuple[float, str, UISession]] = []
+    for session in sessions:
+        with session.lock:
+            reason = _session_eviction_reason_locked(
+                session,
+                now=current_time,
+                idle_ttl_seconds=idle_ttl_seconds,
+                running_ttl_seconds=running_ttl_seconds,
+                waiting_ttl_seconds=waiting_ttl_seconds,
+            )
+            if reason is not None:
+                candidates.append((session.session_id, session, reason))
+            elif not session.closing and not session.running and not session.waiting_for_user:
+                inactive.append((session.last_activity_at, session.session_id, session))
 
-        overflow = max(0, len(_sessions) - max(1, max_sessions))
-        if overflow:
-            inactive: list[tuple[float, str, UISession]] = []
-            for session_id, session in _sessions.items():
-                with session.lock:
-                    if not session.running and not session.waiting_for_user:
-                        inactive.append((session.last_activity_at, session_id, session))
-            for _, session_id, session in sorted(inactive)[:overflow]:
-                removed.append((session_id, session))
-                _sessions.pop(session_id, None)
+    overflow = max(0, len(sessions) - len(candidates) - max(0, int(max_sessions)))
+    for _, session_id, session in sorted(inactive)[:overflow]:
+        candidates.append((session_id, session, "capacity"))
 
-    for _, session in removed:
+    removed: list[tuple[str, UISession, str]] = []
+    for session_id, session, reason in candidates:
+        if not _prepare_session_eviction(
+            session,
+            reason,
+            now=current_time,
+            idle_ttl_seconds=idle_ttl_seconds,
+            running_ttl_seconds=running_ttl_seconds,
+            waiting_ttl_seconds=waiting_ttl_seconds,
+        ):
+            continue
+        with _session_lock:
+            if _sessions.get(session_id) is session:
+                _sessions.pop(session_id, None)
+        removed.append((session_id, session, reason))
+
+    for _, session, reason in removed:
+        if reason in {"running_timeout", "waiting_timeout"}:
+            _stop_agent(session, unblock_reply=reason == "waiting_timeout")
         with session.lock:
             persist_dirty = session.persist_revision > session.persisted_revision
         if persist_dirty:
             _persist_chat_state(session, force=True)
         _close_agent(session)
-    return [session_id for session_id, _ in removed]
+        _queue_state(session, finished=True)
+    return [session_id for session_id, _, _ in removed]
+
+
+def _shutdown_sessions() -> list[str]:
+    removed: list[tuple[str, UISession, bool, bool]] = []
+    for session in _session_snapshot():
+        with session.lock:
+            if session.closing:
+                continue
+            was_active = session.running or session.waiting_for_user
+            was_waiting = session.waiting_for_user
+            if was_active:
+                _emit(session, "stop", "session closed because the Web UI is shutting down")
+            _set_session_runtime_state(session, "idle")
+            session.ask_prompt = ""
+            session.closing = True
+        with _session_lock:
+            if _sessions.get(session.session_id) is session:
+                _sessions.pop(session.session_id, None)
+        removed.append((session.session_id, session, was_active, was_waiting))
+
+    for _, session, stop_agent, unblock_reply in removed:
+        if stop_agent:
+            _stop_agent(session, unblock_reply=unblock_reply)
+        with session.lock:
+            persist_dirty = session.persist_revision > session.persisted_revision
+        if persist_dirty:
+            _persist_chat_state(session, force=True)
+        _close_agent(session)
+        _queue_state(session, finished=True)
+    return [session_id for session_id, _, _, _ in removed]
 
 
 def _load_chat_into_session(ws: str, agent: str, chat_id: str, session: UISession | None = None) -> tuple[UISession | None, str | None]:
@@ -1051,21 +1300,27 @@ def _load_chat_into_session(ws: str, agent: str, chat_id: str, session: UISessio
     session.messages = _safe_json_value(messages) if isinstance(messages, list) else []
     history = state.get("llm_history")
     session.restored_llm_history = _safe_json_value(history) if isinstance(history, list) else []
-    session.waiting_for_user = False
-    session.running = False
+    _set_session_runtime_state(session, "idle")
     session.ask_prompt = ""
-    _register_session(session)
+    if not _register_session(session):
+        return None, _SESSION_CAPACITY_ERROR
     return session, None
 
 
 def _find_session_by_chat(ws: str, agent: str, chat_id: str) -> UISession | None:
+    matched: UISession | None = None
+    for session in _session_snapshot():
+        with session.lock:
+            if session.closing:
+                continue
+            if session.chat_ws == ws and session.chat_agent == agent and session.chat_id == chat_id:
+                session.last_activity_at = time.time()
+                matched = session
+                break
+    if matched is None:
+        return None
     with _session_lock:
-        for session in _sessions.values():
-            with session.lock:
-                if session.chat_ws == ws and session.chat_agent == agent and session.chat_id == chat_id:
-                    session.last_activity_at = time.time()
-                    return session
-    return None
+        return matched if _sessions.get(matched.session_id) is matched else None
 
 
 def _file_index_embedding_config_from_path(config_path: str) -> dict[str, Any] | None:
@@ -1159,6 +1414,8 @@ def _ensure_agent(
 def _drain_sync(session: UISession, wait: bool) -> bool:
     """Synchronous drain for background thread"""
     with session.lock:
+        if session.closing:
+            return True
         agent = session.agent
     if agent is None:
         return True
@@ -1175,11 +1432,12 @@ def _drain_sync(session: UISession, wait: bool) -> bool:
         force_persist = False
         stop_draining = False
         with session.lock:
+            if session.closing:
+                return True
             if "progress" in msg:
                 _append_progress(session, msg["progress"])
             elif "ask_user" in msg:
-                session.waiting_for_user = True
-                session.running = False
+                _set_session_runtime_state(session, "waiting")
                 session.ask_prompt = msg["ask_user"]
                 _emit(session, "ask_user", msg["ask_user"])
                 force_persist = True
@@ -1197,8 +1455,7 @@ def _drain_sync(session: UISession, wait: bool) -> bool:
                         "team_workflow": result.get("team_workflow"),
                     },
                 )
-                session.running = False
-                session.waiting_for_user = False
+                _set_session_runtime_state(session, "idle")
                 session.ask_prompt = ""
                 force_persist = True
                 finished = True
@@ -1271,7 +1528,7 @@ def _run_task_background(session: UISession, task: str) -> None:
     step_runner: Any | None = None
     agent: Any | None = None
     with session.lock:
-        if session.running:
+        if session.closing or session.running:
             return
         session.events = []
         session.llm_stream_buffer = ""
@@ -1282,9 +1539,9 @@ def _run_task_background(session: UISession, task: str) -> None:
         session.parsed_tool_use_count = 0
         session.pending_tool_names = []
         session.emitted_tool_keys = set()
-        session.waiting_for_user = False
+        session.stop_requested = False
+        _set_session_runtime_state(session, "running")
         session.ask_prompt = ""
-        session.running = True
         if task.strip():
             _emit(session, "user_task", task.strip())
         workflow = session.team_workflow
@@ -1359,8 +1616,7 @@ def _run_task_background(session: UISession, task: str) -> None:
                         "team_workflow": result.get("team_workflow"),
                     },
                 )
-                session.running = False
-                session.waiting_for_user = False
+                _set_session_runtime_state(session, "idle")
                 session.ask_prompt = ""
                 _queue_state(session, finished=True)
             _persist_chat_state(session, force=True)
@@ -1381,8 +1637,7 @@ def _run_task_background(session: UISession, task: str) -> None:
                     "team_workflow": result.get("team_workflow"),
                 },
             )
-            session.running = False
-            session.waiting_for_user = False
+            _set_session_runtime_state(session, "idle")
             session.ask_prompt = ""
             _queue_state(session, finished=True)
         _persist_chat_state(session, force=True)
@@ -1423,7 +1678,8 @@ async def submit_task(request: SubmitTaskRequest):
     if session is None:
         session_id = uuid.uuid4().hex[:16]
         session = UISession(session_id=session_id)
-        _register_session(session)
+        if not _register_session(session):
+            return {"success": False, "error": _SESSION_CAPACITY_ERROR}
     else:
         session_id = session.session_id
 
@@ -1487,8 +1743,7 @@ async def send_reply(request: ReplyRequest):
         if active_session.agent is None:
             return {"success": False, "error": "No active session waiting for reply"}
 
-        active_session.waiting_for_user = False
-        active_session.running = True
+        _set_session_runtime_state(active_session, "running")
         _emit(active_session, "user_reply", request.reply.strip())
         active_session.agent.reply_queue.put(request.reply.strip())
     _persist_chat_state(active_session, force=True)
@@ -1524,13 +1779,31 @@ async def stop_task(request: Request):
         sessions = _session_snapshot()
     for session in sessions:
         with session.lock:
+            if session.closing:
+                continue
             agent = session.agent
-        if agent is not None and agent.is_running():
-            agent.stop()
+            if agent is None:
+                continue
+            if session.stop_requested:
+                return {"success": True, "data": {"already_stopping": True}}
+            waiting_for_user = session.waiting_for_user
+            if not waiting_for_user and not agent.is_running():
+                continue
+            if waiting_for_user:
+                _set_session_runtime_state(session, "running")
+                session.ask_prompt = ""
+            session.stop_requested = True
             _emit(session, "stop", "interrupt signal sent")
-            _queue_state(session, finished=False)
-            _persist_chat_state(session, force=True)
-            return {"success": True}
+        _stop_agent(session, unblock_reply=waiting_for_user)
+        _queue_state(session, finished=False)
+        _persist_chat_state(session, force=True)
+        if waiting_for_user:
+            threading.Thread(
+                target=_drain_background,
+                args=(session,),
+                daemon=True,
+            ).start()
+        return {"success": True}
 
     return {"success": False, "error": "No running task"}
 
@@ -1634,18 +1907,20 @@ async def create_chat(request: ChatCreateRequest):
     state_path, state_error = _chat_state_path(ws, agent, chat_id)
     if metadata_error or state_error or metadata_path is None or state_path is None:
         return {"success": False, "error": metadata_error or state_error}
-    try:
-        _write_json_file(metadata_path, metadata)
-        _write_json_file(state_path, state)
-    except OSError as exc:
-        return {"success": False, "error": str(exc)}
     session = UISession(
         session_id=session_id,
         chat_id=chat_id,
         chat_ws=ws,
         chat_agent=agent,
     )
-    _register_session(session)
+    if not _register_session(session):
+        return {"success": False, "error": _SESSION_CAPACITY_ERROR}
+    try:
+        _write_json_file(metadata_path, metadata)
+        _write_json_file(state_path, state)
+    except OSError as exc:
+        _remove_session(session)
+        return {"success": False, "error": str(exc)}
     return {"success": True, "data": {"metadata": metadata, "state": state}}
 
 
@@ -2475,13 +2750,15 @@ def _create_or_load_task_chat(task: dict[str, Any]) -> tuple[UISession | None, s
     state_path, state_error = _chat_state_path(ws, agent, chat_id)
     if metadata_error or state_error or metadata_path is None or state_path is None:
         return None, metadata_error or state_error
+    session = UISession(session_id=session_id, chat_id=chat_id, chat_ws=ws, chat_agent=agent)
+    if not _register_session(session):
+        return None, _SESSION_CAPACITY_ERROR
     try:
         _write_json_file(metadata_path, metadata)
         _write_json_file(state_path, state)
     except OSError as exc:
+        _remove_session(session)
         return None, str(exc)
-    session = UISession(session_id=session_id, chat_id=chat_id, chat_ws=ws, chat_agent=agent)
-    _register_session(session)
     task["chat_id"] = chat_id
     return session, None
 
@@ -2501,7 +2778,8 @@ def _dispatch_scheduled_task(task: dict[str, Any]) -> tuple[str | None, str | No
             return None, "Task chat is already running"
     else:
         session = UISession(session_id=uuid.uuid4().hex[:16])
-        _register_session(session)
+        if not _register_session(session):
+            return None, _SESSION_CAPACITY_ERROR
 
     with session.lock:
         _ensure_agent(
@@ -2602,11 +2880,27 @@ def _task_scheduler_loop() -> None:
 
 @app.on_event("startup")
 def _start_task_scheduler() -> None:
-    global _task_scheduler_started
-    if _task_scheduler_started:
+    global _task_scheduler_started, _task_scheduler_thread
+    if _task_scheduler_thread is not None and _task_scheduler_thread.is_alive():
         return
+    _web_runtime_stopping.clear()
+    _task_scheduler_stop.clear()
     _task_scheduler_started = True
-    threading.Thread(target=_task_scheduler_loop, daemon=True).start()
+    _task_scheduler_thread = threading.Thread(target=_task_scheduler_loop, daemon=True)
+    _task_scheduler_thread.start()
+
+
+@app.on_event("shutdown")
+def _shutdown_web_runtime() -> None:
+    global _task_scheduler_started, _task_scheduler_thread
+    _web_runtime_stopping.set()
+    _task_scheduler_stop.set()
+    scheduler_thread = _task_scheduler_thread
+    if scheduler_thread is not None and scheduler_thread is not threading.current_thread():
+        scheduler_thread.join(timeout=1)
+    _task_scheduler_thread = None
+    _task_scheduler_started = False
+    _shutdown_sessions()
 
 
 @app.get("/api/tasks")
@@ -3338,6 +3632,19 @@ async def api_cancel_eval_run(run_id: str, ws: str = "default.ws"):
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
+
+def _resolve_frontend_file_path(root: str, request_path: str) -> tuple[str | None, bool]:
+    real_root = os.path.realpath(root)
+    candidate = os.path.realpath(os.path.join(real_root, request_path))
+    try:
+        contained = os.path.commonpath([real_root, candidate]) == real_root
+    except ValueError:
+        contained = False
+    if not contained:
+        return None, False
+    return (candidate if os.path.isfile(candidate) else None), True
+
+
 # Check if build directory exists
 build_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../frontends/web/dist"))
 print(f"Build dir: {build_dir}, exists: {os.path.exists(build_dir)}")
@@ -3351,8 +3658,10 @@ if os.path.exists(build_dir):
         # API routes should not be handled here
         if path.startswith("api/"):
             return {"error": "Not found"}
-        file_path = os.path.join(build_dir, path)
-        if os.path.exists(file_path) and os.path.isfile(file_path):
+        file_path, contained = _resolve_frontend_file_path(build_dir, path)
+        if not contained:
+            return JSONResponse(status_code=404, content={"error": "Not found"})
+        if file_path is not None:
             return FileResponse(file_path)
         return FileResponse(os.path.join(build_dir, "index.html"))
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import threading
@@ -9,6 +10,8 @@ import json
 import time
 from pathlib import Path
 from unittest.mock import patch
+
+from fastapi.testclient import TestClient
 
 from src.core.eval import create_eval_run, import_dataset_content
 from src.core.agent_loop import AgentContext, exhaust
@@ -34,17 +37,25 @@ from src.web_ui_new import (
     ScheduledTaskWriteRequest,
     TeamWorkflowWriteRequest,
     TeamWriteRequest,
+    _resolve_frontend_file_path,
     _agent_runtime_config,
     _cleanup_sessions,
     _drain_background,
     _emit,
     _eval_cancel_events,
+    _find_session_by_chat,
+    _get_session,
     _persist_chat_state,
     _queue_state,
+    _register_session,
     _run_due_scheduled_tasks,
     _resolve_workspace_dir_input,
     _session_lock,
     _sessions,
+    _shutdown_sessions,
+    _web_runtime_stopping,
+    app,
+    build_dir,
     create_scheduled_task,
     create_workspace,
     create_chat,
@@ -103,12 +114,14 @@ class _FakeAgent:
         self.reply_queue = _Queue()
         self._running = running
         self.stopped = False
+        self.stop_count = 0
 
     def is_running(self) -> bool:
         return self._running
 
     def stop(self) -> None:
         self.stopped = True
+        self.stop_count += 1
 
     def close(self) -> None:
         self.stopped = True
@@ -120,6 +133,37 @@ class _Queue:
 
     def put(self, item: str) -> None:
         self.items.append(item)
+
+
+class _BlockingReplyAgent:
+    def __init__(self) -> None:
+        self.reply_queue: queue.Queue[str] = queue.Queue()
+        self.display_queue: queue.Queue[dict] = queue.Queue()
+        self.stop_event = threading.Event()
+        self._running = True
+        self.worker = threading.Thread(target=self._wait_for_reply, daemon=True)
+        self.worker.start()
+
+    def _wait_for_reply(self) -> None:
+        self.reply_queue.get()
+        exit_reason = "INTERRUPTED" if self.stop_event.is_set() else "CURRENT_TASK_DONE"
+        self.display_queue.put(
+            {
+                "done": {
+                    "response": "",
+                    "exit_reason": exit_reason,
+                    "tool_results": [],
+                    "turns": 1,
+                }
+            }
+        )
+        self._running = False
+
+    def is_running(self) -> bool:
+        return self._running
+
+    def stop(self) -> None:
+        self.stop_event.set()
 
 
 class _Request:
@@ -154,6 +198,20 @@ class _ImmediateThread:
 
     def start(self) -> None:
         self.target(*self.args, **self.kwargs)
+
+
+class _BlockingContextLock:
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __enter__(self):
+        self.entered.set()
+        self.release.wait(1)
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        return None
 
 
 class _EvalFakeAgent:
@@ -221,8 +279,87 @@ class _FakeDownloadResponse:
         return None
 
 
+class WebUINewSecurityTests(unittest.TestCase):
+    def test_frontend_file_resolution_rejects_paths_outside_build_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            frontend_root = root / "dist"
+            frontend_root.mkdir()
+            asset = frontend_root / "app.js"
+            asset.write_text("safe", encoding="utf-8")
+            secret = root / "secret.txt"
+            secret.write_text("hidden", encoding="utf-8")
+
+            safe_path, safe_contained = _resolve_frontend_file_path(str(frontend_root), "app.js")
+            escaped_path, escaped_contained = _resolve_frontend_file_path(
+                str(frontend_root),
+                "../secret.txt",
+            )
+
+        self.assertTrue(safe_contained)
+        self.assertEqual(safe_path, str(asset.resolve()))
+        self.assertFalse(escaped_contained)
+        self.assertIsNone(escaped_path)
+
+    def test_spa_route_rejects_encoded_path_traversal(self) -> None:
+        if not (Path(build_dir) / "index.html").is_file():
+            self.skipTest("frontend build is not available")
+        client = TestClient(app, client=("127.0.0.1", 50000))
+
+        response = client.get("/%2e%2e/%2e%2e/%2e%2e/pyproject.toml")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn('name = "xagent"', response.text)
+
+    def test_cors_rejects_untrusted_origin(self) -> None:
+        client = TestClient(app, client=("127.0.0.1", 50000))
+
+        response = client.options(
+            "/api/workspace/file",
+            headers={
+                "Origin": "https://example.invalid",
+                "Access-Control-Request-Method": "PUT",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertNotEqual(
+            response.headers.get("access-control-allow-origin"),
+            "https://example.invalid",
+        )
+
+    def test_cors_allows_local_vite_origin(self) -> None:
+        client = TestClient(app, client=("127.0.0.1", 50000))
+
+        response = client.options(
+            "/api/workspace/file",
+            headers={
+                "Origin": "http://127.0.0.1:5173",
+                "Access-Control-Request-Method": "PUT",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers.get("access-control-allow-origin"),
+            "http://127.0.0.1:5173",
+        )
+        self.assertIsNone(response.headers.get("access-control-allow-credentials"))
+
+    def test_web_app_rejects_non_loopback_client(self) -> None:
+        client = TestClient(app, client=("192.0.2.10", 50000))
+
+        response = client.get("/api/workspace/tools")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"], "Web UI only accepts local connections")
+
+
 class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
+        _web_runtime_stopping.clear()
         _sessions.clear()
 
     async def test_reply_targets_requested_session(self) -> None:
@@ -249,6 +386,66 @@ class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["success"])
         self.assertFalse(left_agent.stopped)
         self.assertTrue(right_agent.stopped)
+
+    async def test_stop_unblocks_waiting_session_and_is_idempotent(self) -> None:
+        agent = _FakeAgent(running=True)
+        session = UISession(
+            agent=agent,
+            session_id="waiting",
+            waiting_for_user=True,
+            waiting_started_at=time.time(),
+            ask_prompt="continue?",
+        )
+        _sessions[session.session_id] = session
+
+        with (
+            patch("src.web_ui_new._drain_background") as drain,
+            patch("src.web_ui_new._persist_chat_state", return_value=True) as persist,
+            patch("src.web_ui_new.threading.Thread", _ImmediateThread),
+        ):
+            first = await stop_task(_Request({"session_id": session.session_id}))
+            second = await stop_task(_Request({"session_id": session.session_id}))
+
+        self.assertTrue(first["success"])
+        self.assertEqual(second, {"success": True, "data": {"already_stopping": True}})
+        self.assertEqual(agent.stop_count, 1)
+        self.assertEqual(agent.reply_queue.items, [""])
+        self.assertFalse(session.waiting_for_user)
+        self.assertTrue(session.running)
+        self.assertTrue(session.stop_requested)
+        self.assertEqual(session.ask_prompt, "")
+        self.assertEqual([event["type"] for event in session.events], ["stop"])
+        drain.assert_called_once_with(session)
+        persist.assert_called_once_with(session, force=True)
+
+    async def test_stop_waiting_session_reaches_interrupted_terminal_state(self) -> None:
+        agent = _BlockingReplyAgent()
+        session = UISession(
+            agent=agent,
+            session_id="waiting",
+            waiting_for_user=True,
+            waiting_started_at=time.time(),
+            ask_prompt="continue?",
+        )
+        _sessions[session.session_id] = session
+
+        result = await stop_task(_Request({"session_id": session.session_id}))
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            with session.lock:
+                if not session.running:
+                    break
+            await asyncio.sleep(0.01)
+        agent.worker.join(timeout=1)
+
+        self.assertTrue(result["success"])
+        self.assertFalse(agent.worker.is_alive())
+        self.assertFalse(session.running)
+        self.assertFalse(session.waiting_for_user)
+        self.assertFalse(session.stop_requested)
+        self.assertEqual([event["type"] for event in session.events], ["stop", "done"])
+        self.assertEqual(session.events[-1]["data"]["exit_reason"], "INTERRUPTED")
+        self.assertTrue(session.event_queue.get_nowait()["finished"])
 
     def test_queue_state_is_bounded_wakeup_without_event_copy(self) -> None:
         session = UISession(session_id="bounded")
@@ -399,6 +596,76 @@ class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
             worker.join(timeout=1)
         self.assertFalse(worker.is_alive())
 
+    def test_session_lookup_does_not_hold_registry_lock_while_waiting_for_session(self) -> None:
+        blocker = _BlockingContextLock()
+        session = UISession(session_id="blocked")
+        session.lock = blocker
+        _sessions[session.session_id] = session
+        worker = threading.Thread(target=_get_session, args=(session.session_id,), daemon=True)
+        worker.start()
+        self.assertTrue(blocker.entered.wait(1))
+
+        acquired = _session_lock.acquire(timeout=0.05)
+        try:
+            self.assertTrue(acquired)
+        finally:
+            if acquired:
+                _session_lock.release()
+            blocker.release.set()
+            worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+
+    def test_chat_lookup_does_not_hold_registry_lock_while_waiting_for_session(self) -> None:
+        blocker = _BlockingContextLock()
+        session = UISession(
+            session_id="blocked",
+            chat_id="chat",
+            chat_ws="default.ws",
+            chat_agent="coding",
+        )
+        session.lock = blocker
+        _sessions[session.session_id] = session
+        worker = threading.Thread(
+            target=_find_session_by_chat,
+            args=("default.ws", "coding", "chat"),
+            daemon=True,
+        )
+        worker.start()
+        self.assertTrue(blocker.entered.wait(1))
+
+        acquired = _session_lock.acquire(timeout=0.05)
+        try:
+            self.assertTrue(acquired)
+        finally:
+            if acquired:
+                _session_lock.release()
+            blocker.release.set()
+            worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+
+    def test_cleanup_does_not_hold_registry_lock_while_waiting_for_session(self) -> None:
+        blocker = _BlockingContextLock()
+        session = UISession(
+            session_id="blocked",
+            running=True,
+            running_started_at=time.time(),
+        )
+        session.lock = blocker
+        _sessions[session.session_id] = session
+        worker = threading.Thread(target=_cleanup_sessions, daemon=True)
+        worker.start()
+        self.assertTrue(blocker.entered.wait(1))
+
+        acquired = _session_lock.acquire(timeout=0.05)
+        try:
+            self.assertTrue(acquired)
+        finally:
+            if acquired:
+                _session_lock.release()
+            blocker.release.set()
+            worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+
     def test_chat_persistence_is_debounced_and_force_flushes(self) -> None:
         session = UISession(
             session_id="persist",
@@ -458,6 +725,96 @@ class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(removed, ["active"])
         self.assertEqual(list(_sessions), ["fresh"])
+
+    def test_cleanup_times_out_running_and_waiting_sessions(self) -> None:
+        running_agent = _FakeAgent(running=True)
+        waiting_agent = _FakeAgent()
+        running = UISession(
+            agent=running_agent,
+            session_id="running",
+            running=True,
+            running_started_at=10,
+            last_activity_at=90,
+        )
+        waiting = UISession(
+            agent=waiting_agent,
+            session_id="waiting",
+            waiting_for_user=True,
+            waiting_started_at=10,
+            last_activity_at=90,
+        )
+        _sessions.update({"running": running, "waiting": waiting})
+
+        with patch("src.web_ui_new._persist_chat_state", return_value=True) as persist:
+            removed = _cleanup_sessions(
+                now=100,
+                idle_ttl_seconds=1000,
+                running_ttl_seconds=20,
+                waiting_ttl_seconds=20,
+                max_sessions=10,
+            )
+
+        self.assertEqual(removed, ["running", "waiting"])
+        self.assertEqual(persist.call_count, 2)
+        self.assertFalse(running.running)
+        self.assertFalse(waiting.waiting_for_user)
+        self.assertTrue(running.closing)
+        self.assertTrue(waiting.closing)
+        self.assertTrue(running_agent.stopped)
+        self.assertTrue(waiting_agent.stopped)
+        self.assertEqual(waiting_agent.reply_queue.items, [""])
+        self.assertEqual(running.events[-1]["type"], "stop")
+        self.assertEqual(waiting.events[-1]["type"], "stop")
+
+    def test_register_enforces_hard_capacity_and_evicts_only_inactive_sessions(self) -> None:
+        inactive = UISession(session_id="inactive", last_activity_at=10)
+        _sessions[inactive.session_id] = inactive
+
+        admitted = UISession(session_id="admitted")
+        self.assertTrue(_register_session(admitted, max_sessions=1))
+        self.assertNotIn(inactive.session_id, _sessions)
+        self.assertIs(_sessions.get(admitted.session_id), admitted)
+
+        _sessions.clear()
+        active = UISession(
+            session_id="active",
+            running=True,
+            running_started_at=time.time(),
+        )
+        _sessions[active.session_id] = active
+        rejected = UISession(session_id="rejected")
+
+        self.assertFalse(_register_session(rejected, max_sessions=1))
+        self.assertEqual(list(_sessions), [active.session_id])
+        self.assertNotIn(rejected.session_id, _sessions)
+
+    def test_runtime_shutdown_rejects_new_session_admission(self) -> None:
+        _web_runtime_stopping.set()
+
+        self.assertFalse(_register_session(UISession(session_id="late")))
+        self.assertFalse(_sessions)
+
+    def test_shutdown_flushes_stops_and_closes_all_sessions(self) -> None:
+        agent = _FakeAgent(running=True)
+        session = UISession(
+            agent=agent,
+            session_id="running",
+            running=True,
+            running_started_at=time.time(),
+        )
+        _sessions[session.session_id] = session
+
+        with patch("src.web_ui_new._persist_chat_state", return_value=True) as persist:
+            removed = _shutdown_sessions()
+
+        self.assertEqual(removed, [session.session_id])
+        persist.assert_called_once_with(session, force=True)
+        self.assertFalse(_sessions)
+        self.assertFalse(session.running)
+        self.assertTrue(session.closing)
+        self.assertTrue(agent.stopped)
+        self.assertIsNone(session.agent)
+        self.assertTrue(session.event_queue.get_nowait()["finished"])
 
 
 class WebUINewUsageSummaryTests(unittest.IsolatedAsyncioTestCase):

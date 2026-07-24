@@ -238,6 +238,18 @@ cd ../..
 http://127.0.0.1:7861/
 ```
 
+Web UI 仅接受回环客户端。内置前端使用同源访问，本地 Vite 开发默认允许
+`http://127.0.0.1:5173` 和 `http://localhost:5173`。如需增加其他本地
+开发 Origin，启动前显式配置完整地址：
+
+```bash
+XAGENT_WEB_ALLOWED_ORIGINS=http://127.0.0.1:4173 \
+  .venv/bin/python -m src.web_ui_new --host 127.0.0.1 --port 7861
+```
+
+通配符 Origin 会被忽略。远程使用时应保持后端监听回环地址，并通过 SSH
+隧道访问。
+
 ### 前端开发模式（Vite）
 
 ```bash
