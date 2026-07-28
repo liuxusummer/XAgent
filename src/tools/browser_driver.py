@@ -13,6 +13,7 @@ from src.tools.file_ops import WorkspacePermissionError, resolve_path, truncate_
 
 
 WEB_CHAR_LIMIT = 8000
+_ASYNC_SCRIPT_STATUS_KEY = "__xagent_script_status__"
 
 
 @dataclass
@@ -27,6 +28,9 @@ class BrowserSession:
 
 
 class BrowserDriver(Protocol):
+    def close(self) -> None:
+        ...
+
     def list_sessions(self) -> list[BrowserSession]:
         ...
 
@@ -55,12 +59,28 @@ class BrowserDriver(Protocol):
 class SeleniumBrowserDriver:
     def __init__(self) -> None:
         self._driver: Any = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._connected_at: dict[str, float] = {}
+        self._closed = False
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            driver = self._driver
+            self._driver = None
+            self._connected_at.clear()
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
 
     def list_sessions(self) -> list[BrowserSession]:
-        driver = self._get_driver()
-        return self._list_sessions(driver)
+        with self._lock:
+            driver = self._get_driver()
+            return self._list_sessions(driver)
 
     def scan(
         self,
@@ -70,38 +90,39 @@ class SeleniumBrowserDriver:
         max_chars: int = WEB_CHAR_LIMIT,
         tab_index: int | None = None,
     ) -> dict[str, Any]:
-        try:
-            driver = self._get_driver()
-            self._select_session(driver, session_id=session_id, tab_index=tab_index)
-            if url:
-                driver.get(url)
+        with self._lock:
+            try:
+                driver = self._get_driver()
+                self._select_session(driver, session_id=session_id, tab_index=tab_index)
+                if url:
+                    driver.get(url)
 
-            content, elements = self._scan_content(driver, mode)
-            sessions = self._list_sessions(driver)
-            current_session_id = driver.current_window_handle
-            truncated = len(content) > max_chars
-            return {
-                "status": "OK",
-                "sessions": [asdict(session) for session in sessions],
-                "current_session_id": current_session_id,
-                "page": {
+                content, elements = self._scan_content(driver, mode)
+                sessions = self._list_sessions(driver)
+                current_session_id = driver.current_window_handle
+                truncated = len(content) > max_chars
+                return {
+                    "status": "OK",
+                    "sessions": [asdict(session) for session in sessions],
+                    "current_session_id": current_session_id,
+                    "page": {
+                        "url": driver.current_url,
+                        "title": driver.title,
+                        "mode": mode,
+                        "content": truncate_text(content, max_chars),
+                        "truncated": truncated,
+                        "elements": elements,
+                    },
+                    # Backward-compatible top-level fields.
                     "url": driver.current_url,
                     "title": driver.title,
                     "mode": mode,
                     "content": truncate_text(content, max_chars),
-                    "truncated": truncated,
-                    "elements": elements,
-                },
-                # Backward-compatible top-level fields.
-                "url": driver.current_url,
-                "title": driver.title,
-                "mode": mode,
-                "content": truncate_text(content, max_chars),
-            }
-        except ImportError:
-            return self._error("BRIDGE_DISCONNECTED", "selenium is not installed")
-        except Exception as exc:
-            return self._error("JS_ERROR", str(exc))
+                }
+            except ImportError:
+                return self._error("BRIDGE_DISCONNECTED", "selenium is not installed")
+            except Exception as exc:
+                return self._error("JS_ERROR", str(exc))
 
     def execute_js(
         self,
@@ -114,45 +135,81 @@ class SeleniumBrowserDriver:
     ) -> dict[str, Any]:
         exec_id = f"exec-{uuid.uuid4().hex}"
         start = time.time()
-        try:
-            driver = self._get_driver()
-            self._select_session(driver, session_id=session_id, tab_index=None)
-            before_url = driver.current_url
-            before_handles = set(driver.window_handles)
-            current_session_id = driver.current_window_handle
+        with self._lock:
+            try:
+                if timeout <= 0:
+                    return self._error(
+                        "INVALID_ARGUMENT",
+                        "timeout must be greater than zero",
+                        exec_id=exec_id,
+                    )
+                driver = self._get_driver()
+                self._select_session(driver, session_id=session_id, tab_index=None)
+                before_url = driver.current_url
+                before_handles = set(driver.window_handles)
+                current_session_id = driver.current_window_handle
 
-            result = driver.execute_script(script)
-            result_str = serialize_result(result)
-            after_handles = set(driver.window_handles)
-            new_tabs = sorted(after_handles - before_handles)
-            diagnostics = {
-                "navigation": await_navigation and driver.current_url != before_url,
-                "reloaded": False,
-                "new_tabs": new_tabs,
-                "duration_ms": int((time.time() - start) * 1000),
-            }
+                driver.set_script_timeout(timeout)
+                payload = driver.execute_async_script(_wrap_async_script(script))
+                if not isinstance(payload, dict) or _ASYNC_SCRIPT_STATUS_KEY not in payload:
+                    return self._error(
+                        "JS_ERROR",
+                        "browser returned an invalid JavaScript result",
+                        exec_id=exec_id,
+                        ack=True,
+                        result_received=True,
+                    )
+                if payload[_ASYNC_SCRIPT_STATUS_KEY] != "ok":
+                    return self._error(
+                        "JS_ERROR",
+                        str(payload.get("error") or "JavaScript execution failed"),
+                        exec_id=exec_id,
+                        ack=True,
+                        result_received=True,
+                    )
 
-            response: dict[str, Any] = {
-                "status": "OK",
-                "session_id": current_session_id,
-                "exec_id": exec_id,
-                "ack": True,
-                "result_received": True,
-                "diagnostics": diagnostics,
-            }
-            if save_to_file:
-                response.update(save_result(result_str, save_to_file, cwd))
-            else:
-                response["result"] = truncate_text(result_str, WEB_CHAR_LIMIT)
-                response["truncated"] = len(result_str) > WEB_CHAR_LIMIT
-            return response
-        except ImportError:
-            return self._error("BRIDGE_DISCONNECTED", "selenium is not installed", exec_id=exec_id)
-        except Exception as exc:
-            return self._error("JS_ERROR", str(exc), exec_id=exec_id, ack=True, result_received=True)
+                result_str = serialize_result(payload.get("value"))
+                after_handles = set(driver.window_handles)
+                new_tabs = sorted(after_handles - before_handles)
+                diagnostics = {
+                    "navigation": await_navigation and driver.current_url != before_url,
+                    "reloaded": False,
+                    "new_tabs": new_tabs,
+                    "duration_ms": int((time.time() - start) * 1000),
+                }
+
+                response: dict[str, Any] = {
+                    "status": "OK",
+                    "session_id": current_session_id,
+                    "exec_id": exec_id,
+                    "ack": True,
+                    "result_received": True,
+                    "diagnostics": diagnostics,
+                }
+                if save_to_file:
+                    response.update(save_result(result_str, save_to_file, cwd))
+                else:
+                    response["result"] = truncate_text(result_str, WEB_CHAR_LIMIT)
+                    response["truncated"] = len(result_str) > WEB_CHAR_LIMIT
+                return response
+            except ImportError:
+                return self._error("BRIDGE_DISCONNECTED", "selenium is not installed", exec_id=exec_id)
+            except Exception as exc:
+                if _is_script_timeout(exc):
+                    return self._error(
+                        "TIMEOUT",
+                        f"JavaScript execution exceeded {timeout} seconds",
+                        exec_id=exec_id,
+                        ack=True,
+                        result_received=False,
+                        status="TIMEOUT",
+                    )
+                return self._error("JS_ERROR", str(exc), exec_id=exec_id, ack=True, result_received=True)
 
     def _get_driver(self) -> Any:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("browser driver is closed")
             if self._driver is not None:
                 try:
                     self._driver.current_url
@@ -234,9 +291,10 @@ class SeleniumBrowserDriver:
         exec_id: str | None = None,
         ack: bool = False,
         result_received: bool = False,
+        status: str = "ERROR",
     ) -> dict[str, Any]:
         data: dict[str, Any] = {
-            "status": "ERROR",
+            "status": status,
             "error_type": error_type,
             "message": message,
             "error": message,
@@ -247,6 +305,33 @@ class SeleniumBrowserDriver:
         if exec_id:
             data["exec_id"] = exec_id
         return data
+
+
+def _wrap_async_script(script: str) -> str:
+    return f"""
+const __xagentDone = arguments[arguments.length - 1];
+(async function () {{
+  try {{
+    const __xagentValue = await (async function () {{
+{script}
+    }}).call(window);
+    __xagentDone({{"{_ASYNC_SCRIPT_STATUS_KEY}": "ok", "value": __xagentValue}});
+  }} catch (__xagentError) {{
+    const __xagentMessage = __xagentError && (__xagentError.stack || __xagentError.message)
+      ? (__xagentError.stack || __xagentError.message)
+      : String(__xagentError);
+    __xagentDone({{"{_ASYNC_SCRIPT_STATUS_KEY}": "error", "error": __xagentMessage}});
+  }}
+}})();
+"""
+
+
+def _is_script_timeout(exc: Exception) -> bool:
+    try:
+        from selenium.common.exceptions import TimeoutException
+    except ImportError:
+        return False
+    return isinstance(exc, TimeoutException)
 
 
 def extract_text(driver: Any) -> str:

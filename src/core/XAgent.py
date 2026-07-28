@@ -397,7 +397,12 @@ class XAgent:
         self.stop_event.set()
 
     def close(self) -> None:
-        self.sink.close()
+        try:
+            handler = getattr(self, "handler", None)
+            if handler is not None:
+                handler.close()
+        finally:
+            self.sink.close()
 
     def run(self) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []

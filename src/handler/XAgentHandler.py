@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,8 @@ from src.core.agent_loop import ActionResult, AgentContext, BaseHandler, TurnEnd
 from src.core.memory import load_effective_memory, load_global_memory, record_self_evolution_lesson
 from src.core.skills import SkillRegistry, dedupe_skill_names, render_active_skills
 from src.core.telemetry import Event
-from src.tools import ask_user, delete_file, patch_file, plan_update, read_file, search_file_index, start_long_term_update, update_working_checkpoint, web_execute_js, web_scan, write_file
+from src.tools import ask_user, create_browser_driver, delete_file, patch_file, plan_update, read_file, search_file_index, start_long_term_update, update_working_checkpoint, web_execute_js, web_scan, write_file
+from src.tools.browser_driver import BrowserDriver
 from src.tools.file_ops import resolve_path_for_operation
 from src.tools.code_run import run_code_stream
 
@@ -48,9 +50,19 @@ def _is_delete_authorized(user_reply: str) -> bool:
 class XAgentHandler(BaseHandler):
     run_code_stream = staticmethod(run_code_stream)
 
-    def __init__(self, ctx: AgentContext | None = None, task_dir: str | None = None) -> None:
+    def __init__(
+        self,
+        ctx: AgentContext | None = None,
+        task_dir: str | None = None,
+        browser_driver: BrowserDriver | None = None,
+        browser_driver_factory: Callable[[], BrowserDriver] = create_browser_driver,
+    ) -> None:
         super().__init__(ctx=ctx)
         self.task_dir = task_dir
+        self._browser_driver = browser_driver
+        self._browser_driver_factory = browser_driver_factory
+        self._browser_driver_lock = threading.Lock()
+        self._browser_driver_closed = False
         self._turn_end_hooks.extend([
             TurnEndHook(name="external_intervene", fn=self._external_intervene_hook, priority=30),
             TurnEndHook(name="plan_reminder", fn=self._plan_reminder_hook, priority=25),
@@ -58,6 +70,24 @@ class XAgentHandler(BaseHandler):
             TurnEndHook(name="periodic_inject", fn=self._periodic_inject_hook, priority=20),
             TurnEndHook(name="summary_extract", fn=self._summary_extract_hook, priority=10),
         ])
+
+    def close(self) -> None:
+        with self._browser_driver_lock:
+            if self._browser_driver_closed:
+                return
+            self._browser_driver_closed = True
+            driver = self._browser_driver
+            self._browser_driver = None
+        if driver is not None:
+            driver.close()
+
+    def _get_browser_driver(self) -> BrowserDriver:
+        with self._browser_driver_lock:
+            if self._browser_driver_closed:
+                raise RuntimeError("handler is closed")
+            if self._browser_driver is None:
+                self._browser_driver = self._browser_driver_factory()
+            return self._browser_driver
 
     def _summary_extract_hook(
         self,
@@ -624,6 +654,7 @@ class XAgentHandler(BaseHandler):
         max_chars = args.get("max_chars")
         tab_index = args.get("tab_index")
         result = web_scan(
+            self._get_browser_driver(),
             url=str(url) if url else None,
             mode=mode,
             session_id=str(session_id) if session_id else None,
@@ -643,6 +674,7 @@ class XAgentHandler(BaseHandler):
         no_monitor = bool(args.get("no_monitor", False))
         await_navigation = args.get("await_navigation")
         result = web_execute_js(
+            self._get_browser_driver(),
             script=script,
             session_id=str(session_id) if session_id else None,
             timeout=int(timeout) if timeout is not None else 10,

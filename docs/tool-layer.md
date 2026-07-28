@@ -136,6 +136,8 @@ web_execute_js → BrowserDriver.execute_js → exec_id + ACK/结果诊断
 
 - `web_scan` 返回 `sessions`、`current_session_id`、`page`，tab 以稳定 `session_id` 寻址；`tab_index` 仅保留兼容
 - `web_execute_js` 返回 `exec_id`、`ack`、`result_received`、`diagnostics`，用于区分送达、执行、导航和失败状态
+- 每个 Agent/Handler 延迟创建并独占一个 BrowserDriver；Agent 关闭时同步释放，禁止进程级共享浏览器实例
+- 同一 BrowserDriver 内的扫描、标签切换、导航和脚本执行必须串行；`web_execute_js.timeout` 由 WebDriver 原生脚本超时强制执行
 - 长结果通过 `save_to_file` 落盘，tool_result 只返回路径、字节数和摘要
 - 默认扫描模式为 `summary`，只返回语义压缩内容；需要精确状态时应执行局部 JS 查询
 
