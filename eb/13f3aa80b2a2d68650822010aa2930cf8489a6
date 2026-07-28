@@ -1,0 +1,49 @@
+docs/architecture.md
+  s_72af05a5dabd4c::t_34af2a06a174ca 49-50
+docs/outlines.md
+  s_72af05a5dabd4c::t_9d3d0184be0cdc 332,411
+docs/tool-layer.md
+  s_72af05a5dabd4c::t_19445e2f346348 148-149,203
+frontends/web/src/hooks/useChat.ts
+  s_72af05a5dabd4c::t_31991b824b4f67 31,150-179
+frontends/web/src/types/index.ts
+  s_72af05a5dabd4c::t_c892276bc82144 85
+src/core/eval.py
+  s_72af05a5dabd4c::t_2fece4dffac791 11,19-24,431-436,449-474,481-506
+src/core/network_guard.py
+  s_72af05a5dabd4c::t_35c8c8909bc3bc 1-331
+src/tools/browser_driver.py
+  s_72af05a5dabd4c::t_07b968f28d7405 14-18,75,83,85,92-93,261-262,264,266-271,369,371-379,404,408-409
+src/tools/file_index.py
+  s_72af05a5dabd4c::t_371d31b26e0a88 33,100,123-130,451-469
+src/web_ui_new.py
+  s_72af05a5dabd4c::t_f581d9ec1a4d4d 8,350-354,382-391,420-423,660,799-809,811-812,816-817,824-826,829-853,856-914,923-925,1939-1943,2286-2317
+tests/test_eval.py
+  s_72af05a5dabd4c::t_e2cc633a9ea605 14,62-71,116-124,129,162,172,174,195,207-222
+tests/test_file_index.py
+  s_72af05a5dabd4c::t_f87b446ac8257b 8-12,115-147
+tests/test_network_guard.py
+  s_72af05a5dabd4c::t_89cc530d033509 1-80
+tests/test_web_tools.py
+  s_72af05a5dabd4c::t_fcc6eaea33c592 239,249,262-272
+tests/test_web_ui_new.py
+  s_72af05a5dabd4c::t_bea5d82f5fddd1 44-47,311-320,764-845,3676,3680-3683
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "eb13f3aa80b2a2d68650822010aa2930cf8489a6",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
