@@ -1,0 +1,23 @@
+src/core/XAgent.py
+  s_72af05a5dabd4c::t_b045731706543a 207-212,219-221,395-406
+src/core/checkpoint.py
+  s_72af05a5dabd4c::t_b5b807b36bcbb1 10-11,78-81
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "80ff20f7548ffbf79a6cbc99569f70d4de964e25",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
