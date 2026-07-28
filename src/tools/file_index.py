@@ -30,7 +30,7 @@ DEFAULT_EXCLUDE_GLOBS = (
     "build/**",
     "runtime/**",
 )
-DEFAULT_MAX_FILE_BYTES: int | None = None
+DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024
 SNIPPET_CONTEXT_CHARS = 80
 QUERY_TOKEN_PATTERN = re.compile(r"[\w\u4e00-\u9fff]+", re.UNICODE)
 SYMBOL_QUERY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:[.:/][A-Za-z0-9_]+)*")
@@ -97,6 +97,7 @@ def refresh_file_index(
         "skipped": {
             "directories": 0,
             "excluded": 0,
+            "symlinks": 0,
             "too_large": 0,
             "binary_or_non_utf8": 0,
             "errors": 0,
@@ -119,7 +120,14 @@ def refresh_file_index(
             existing = _load_existing(conn)
             seen: set[str] = set()
             for file_path in _walk_files(scan_root, workspace, exclude, stats):
-                rel_path = _relative_path(file_path, workspace)
+                try:
+                    if file_path.is_symlink():
+                        stats["skipped"]["symlinks"] += 1
+                        continue
+                    rel_path = _relative_path(file_path, workspace)
+                except (OSError, ValueError):
+                    stats["skipped"]["errors"] += 1
+                    continue
                 if _matches_any(rel_path, exclude) or (include and not _matches_any(rel_path, include)):
                     stats["skipped"]["excluded"] += 1
                     continue
@@ -440,15 +448,25 @@ def _load_existing(conn: sqlite3.Connection) -> dict[str, tuple[int, int]]:
 
 
 def _walk_files(root: Path, workspace: Path, exclude: Iterable[str], stats: dict[str, Any]):
-    for child in root.iterdir():
-        rel_path = _relative_path(child, workspace)
-        if child.is_dir():
-            if _matches_any(rel_path, exclude) or _matches_any(rel_path + "/", exclude):
-                stats["skipped"]["directories"] += 1
-                continue
-            yield from _walk_files(child, workspace, exclude, stats)
-        elif child.is_file():
-            yield child
+    try:
+        children = root.iterdir()
+        for child in children:
+            try:
+                if child.is_symlink():
+                    stats["skipped"]["symlinks"] += 1
+                    continue
+                rel_path = _relative_path(child, workspace)
+                if child.is_dir():
+                    if _matches_any(rel_path, exclude) or _matches_any(rel_path + "/", exclude):
+                        stats["skipped"]["directories"] += 1
+                        continue
+                    yield from _walk_files(child, workspace, exclude, stats)
+                elif child.is_file():
+                    yield child
+            except (OSError, ValueError):
+                stats["skipped"]["errors"] += 1
+    except OSError:
+        stats["skipped"]["errors"] += 1
 
 
 def _matches_any(path: str, patterns: Iterable[str]) -> bool:

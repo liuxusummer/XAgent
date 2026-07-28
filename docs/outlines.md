@@ -329,7 +329,7 @@ BaseSession
 - 首次搜索或 `refresh=true` 时增量刷新索引，按 `relative_path + mtime_ns + size` 判断文件是否变化
 - `mode=keyword|semantic|hybrid` 控制检索模式；默认 `hybrid`，但未配置 embedding 或缺少 `sqlite-vec` 时保持 FTS5 兼容降级
 - 只返回候选路径、行号、短片段和基础元信息；修改或依赖精确内容前仍需 `file_read`
-- `root` 只能位于当前 workspace 内，索引跳过二进制、超大文件、依赖/构建目录和 `runtime/**`
+- `root` 只能位于当前 workspace 内，索引默认跳过 symlink、超过 5 MiB 的文件、二进制、依赖/构建目录和 `runtime/**`
 
 #### 4.2.4 file_patch
 - 精确替换，唯一性校验（0 匹配 / >1 匹配均报错）
@@ -408,6 +408,7 @@ Handler 具有双重身份：分发器（`exec_*` 命名约定分发工具调用
 ### 5.7 exec_web_scan / exec_web_execute_js
 - web_scan：懒初始化 WebDriver → 获取标签页 → 简化 HTML → smart_format 截断
 - web_execute_js：提取 JS 代码 → 执行 → save_to_file 保存长结果（相对路径基于 `ctx.cwd`）→ 截断至 8000 字符
+- WebDriver 全部 HTTP(S)/WebSocket 出口经本地过滤代理；每次连接只使用当次已校验的公网解析结果，页面 JS 不能绕过 SSRF 边界
 
 ### 5.8 exec_update_working_checkpoint
 - 更新 `self.ctx.working['key_info']` / `['related_sop']`

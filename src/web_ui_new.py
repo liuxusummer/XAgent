@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import ipaddress
 import json
 import logging
@@ -346,10 +347,11 @@ class UISession:
     restored_llm_history: list[dict[str, Any]] = field(default_factory=list)
     event_queue: queue.Queue[dict[str, Any]] = field(default_factory=lambda: queue.Queue(maxsize=1))
     llm_stream_buffer: str = ""
-    assistant_stream_emitted_len: int = 0
-    thinking_stream_emitted_len: int = 0
-    last_assistant_delta: str = ""
-    last_thinking_delta: str = ""
+    llm_parse_buffer: str = ""
+    llm_parse_mode: str = "visible"
+    llm_hidden_leading_whitespace: bool = False
+    llm_tool_payload: str = ""
+    llm_tool_payload_truncated: bool = False
     parsed_tool_use_count: int = 0
     pending_tool_names: list[str] = field(default_factory=list)
     emitted_tool_keys: set[str] = field(default_factory=set)
@@ -377,13 +379,16 @@ _TURN_RE = re.compile(r"^\[Turn (\d+)\]$")
 _TOOL_RE = re.compile(r"^\s*tool:\s*(.+)$")
 _DONE_RE = re.compile(r"^\[Done\]\s+exit_reason=([^,]+),\s*turns=(\d+)")
 
-_THINKING_BLOCK_RE = re.compile(r"<thinking>\s*([\s\S]*?)(?:</thinking>|$)", re.IGNORECASE)
-_TOOL_USE_BLOCK_RE = re.compile(r"<tool_use>\s*([\s\S]*?)\s*</tool_use>", re.IGNORECASE)
-_HIDDEN_BLOCK_RE = re.compile(
-    r"<(?:summary|thinking|tool_use|tool_result|history|key_info|earlier_context)[^>]*>[\s\S]*?(?:</(?:summary|thinking|tool_use|tool_result|history|key_info|earlier_context)>|$)",
-    re.IGNORECASE,
-)
-_TRAILING_PARTIAL_TAG_RE = re.compile(r"<[^>]*$")
+_LLM_TAG_NAME_RE = re.compile(r"^\s*(/?)\s*([A-Za-z][A-Za-z0-9_:-]*)")
+_LLM_HIDDEN_TAGS = {
+    "summary",
+    "thinking",
+    "tool_use",
+    "tool_result",
+    "history",
+    "key_info",
+    "earlier_context",
+}
 _TRACE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _CHAT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -412,6 +417,10 @@ _SESSION_IDLE_TTL_SECONDS = 60 * 60
 _SESSION_RUNNING_TTL_SECONDS = 6 * 60 * 60
 _SESSION_WAITING_TTL_SECONDS = 24 * 60 * 60
 _SESSION_MAX_COUNT = 256
+_SESSION_EVENT_MAX_COUNT = 2048
+_LLM_STREAM_BUFFER_MAX_CHARS = 64 * 1024
+_LLM_STREAM_TAG_MAX_CHARS = 4096
+_LLM_TOOL_PAYLOAD_MAX_CHARS = 64 * 1024
 _SESSION_CAPACITY_ERROR = "Session capacity reached; stop or close an existing session and retry"
 _SESSION_BUSY_ERROR = "Session is busy with another task"
 _SESSION_CLOSED_ERROR = "Session is closed"
@@ -625,12 +634,6 @@ class WebSessionUsageSink:
         return None
 
 
-def _visible_llm_output(text: str) -> str:
-    visible = _HIDDEN_BLOCK_RE.sub("", text)
-    visible = _TRAILING_PARTIAL_TAG_RE.sub("", visible)
-    return visible
-
-
 def _tool_key(name: str, arguments: dict[str, Any]) -> str:
     return f"{name}:{json.dumps(arguments, ensure_ascii=False, sort_keys=True)}"
 
@@ -654,7 +657,7 @@ def _ensure_ui_agent_message(session: UISession) -> dict[str, Any]:
 
 
 def _append_ui_delta(current: str, delta: str) -> str:
-    if not delta or current.endswith(delta):
+    if not delta:
         return current
     return current + delta
 
@@ -793,56 +796,133 @@ def _emit_tool_call(session: UISession, name: str, arguments: dict[str, Any], to
         )
 
 
-def _emit_tool_uses(session: UISession) -> None:
-    matches = list(_TOOL_USE_BLOCK_RE.finditer(session.llm_stream_buffer))
-    for match in matches[session.parsed_tool_use_count:]:
-        raw_payload = match.group(1).strip()
+def _emit_completed_tool_use(session: UISession) -> None:
+    raw_payload = session.llm_tool_payload.strip()
+    if session.llm_tool_payload_truncated:
+        payload: dict[str, Any] = {
+            "name": "bad_json",
+            "arguments": {
+                "error": f"tool payload exceeded {_LLM_TOOL_PAYLOAD_MAX_CHARS} characters",
+                "raw_prefix": raw_payload[:1024],
+            },
+        }
+    else:
         try:
-            payload = json.loads(raw_payload)
+            parsed = json.loads(raw_payload)
+            payload = parsed if isinstance(parsed, dict) else {}
         except json.JSONDecodeError:
             payload = {"name": "bad_json", "arguments": {"raw": raw_payload}}
 
-        name = str(payload.get("name", "")).strip()
-        if not name:
-            continue
+    name = str(payload.get("name", "")).strip()
+    if name:
         arguments = payload.get("arguments")
         if not isinstance(arguments, dict):
             arguments = {}
         tool_id = str(payload.get("id") or uuid.uuid4().hex[:8])
         session.pending_tool_names.append(name)
         _emit_tool_call(session, name, arguments, tool_id)
-    session.parsed_tool_use_count = len(matches)
+    session.parsed_tool_use_count += 1
+    session.llm_tool_payload = ""
+    session.llm_tool_payload_truncated = False
+
+
+def _consume_llm_stream_text(session: UISession, text: str) -> None:
+    if not text:
+        return
+    if session.llm_hidden_leading_whitespace:
+        text = text.lstrip()
+        if not text:
+            return
+        session.llm_hidden_leading_whitespace = False
+    if session.llm_parse_mode == "visible":
+        _emit(session, "assistant_delta", text)
+    elif session.llm_parse_mode == "thinking":
+        _emit(session, "thinking_delta", text)
+    elif session.llm_parse_mode == "tool_use":
+        remaining = _LLM_TOOL_PAYLOAD_MAX_CHARS - len(session.llm_tool_payload)
+        if remaining > 0:
+            session.llm_tool_payload += text[:remaining]
+        if len(text) > remaining:
+            session.llm_tool_payload_truncated = True
+
+
+def _parse_llm_stream_tag(raw_tag: str) -> tuple[bool, str] | None:
+    match = _LLM_TAG_NAME_RE.match(raw_tag[1:-1])
+    if not match:
+        return None
+    return bool(match.group(1)), match.group(2).lower()
+
+
+def _process_llm_stream(session: UISession) -> None:
+    while session.llm_parse_buffer:
+        tag_start = session.llm_parse_buffer.find("<")
+        if tag_start < 0:
+            _consume_llm_stream_text(session, session.llm_parse_buffer)
+            session.llm_parse_buffer = ""
+            return
+        if tag_start:
+            _consume_llm_stream_text(session, session.llm_parse_buffer[:tag_start])
+            session.llm_parse_buffer = session.llm_parse_buffer[tag_start:]
+
+        tag_end = session.llm_parse_buffer.find(">")
+        if tag_end < 0:
+            if len(session.llm_parse_buffer) <= _LLM_STREAM_TAG_MAX_CHARS:
+                return
+            _consume_llm_stream_text(session, session.llm_parse_buffer[0])
+            session.llm_parse_buffer = session.llm_parse_buffer[1:]
+            continue
+
+        raw_tag = session.llm_parse_buffer[: tag_end + 1]
+        session.llm_parse_buffer = session.llm_parse_buffer[tag_end + 1 :]
+        parsed_tag = _parse_llm_stream_tag(raw_tag)
+        if parsed_tag is None:
+            _consume_llm_stream_text(session, raw_tag)
+            continue
+        closing, tag_name = parsed_tag
+
+        if session.llm_parse_mode == "visible":
+            if not closing and tag_name in _LLM_HIDDEN_TAGS:
+                session.llm_parse_mode = tag_name
+                session.llm_hidden_leading_whitespace = tag_name in {"thinking", "tool_use"}
+                if tag_name == "tool_use":
+                    session.llm_tool_payload = ""
+                    session.llm_tool_payload_truncated = False
+                continue
+            _consume_llm_stream_text(session, raw_tag)
+            continue
+
+        if closing and tag_name == session.llm_parse_mode:
+            if session.llm_parse_mode == "tool_use":
+                _emit_completed_tool_use(session)
+            session.llm_parse_mode = "visible"
+            session.llm_hidden_leading_whitespace = False
+            continue
+        _consume_llm_stream_text(session, raw_tag)
 
 
 def _append_llm_delta(session: UISession, delta: str) -> None:
-    session.llm_stream_buffer += delta
-    _emit_tool_uses(session)
-
-    thinking = "".join(match.group(1) for match in _THINKING_BLOCK_RE.finditer(session.llm_stream_buffer))
-    if len(thinking) > session.thinking_stream_emitted_len:
-        _emit(session, "thinking_delta", thinking[session.thinking_stream_emitted_len:])
-        session.thinking_stream_emitted_len = len(thinking)
-
-    visible = _visible_llm_output(session.llm_stream_buffer)
-    if len(visible) > session.assistant_stream_emitted_len:
-        _emit(session, "assistant_delta", visible[session.assistant_stream_emitted_len:])
-        session.assistant_stream_emitted_len = len(visible)
+    if not delta:
+        return
+    with session.lock:
+        if len(delta) >= _LLM_STREAM_BUFFER_MAX_CHARS:
+            session.llm_stream_buffer = delta[-_LLM_STREAM_BUFFER_MAX_CHARS:]
+        else:
+            session.llm_stream_buffer = (
+                session.llm_stream_buffer + delta
+            )[-_LLM_STREAM_BUFFER_MAX_CHARS:]
+        session.llm_parse_buffer += delta
+        _process_llm_stream(session)
 
 
 def _emit(session: UISession, event_type: str, data: Any = None) -> None:
     with session.lock:
         if session.closing:
             return
-        if event_type == "assistant_delta" and data == session.last_assistant_delta:
-            return
-        if event_type == "thinking_delta" and data == session.last_thinking_delta:
-            return
-        if event_type == "assistant_delta":
-            session.last_assistant_delta = str(data)
-        elif event_type == "thinking_delta":
-            session.last_thinking_delta = str(data)
         session.event_sequence += 1
         session.events.append({"id": session.event_sequence, "type": event_type, "data": data})
+        overflow = len(session.events) - _SESSION_EVENT_MAX_COUNT
+        if overflow > 0:
+            del session.events[:overflow]
         _update_session_messages(session, event_type, data)
         if event_type in _PERSISTED_SESSION_EVENT_TYPES:
             session.persist_revision += 1
@@ -1856,10 +1936,11 @@ def _run_task_background(
             return
         session.events = []
         session.llm_stream_buffer = ""
-        session.assistant_stream_emitted_len = 0
-        session.thinking_stream_emitted_len = 0
-        session.last_assistant_delta = ""
-        session.last_thinking_delta = ""
+        session.llm_parse_buffer = ""
+        session.llm_parse_mode = "visible"
+        session.llm_hidden_leading_whitespace = False
+        session.llm_tool_payload = ""
+        session.llm_tool_payload_truncated = False
         session.parsed_tool_use_count = 0
         session.pending_tool_names = []
         session.emitted_tool_keys = set()
@@ -2202,11 +2283,38 @@ async def stream_chat(request: Request):
                 timed_out = True
 
             with session.lock:
-                new_events = [
-                    dict(event)
-                    for event in session.events
-                    if int(event.get("id", 0)) > last_event_id
-                ]
+                first_available_id = (
+                    int(session.events[0].get("id", 0))
+                    if session.events
+                    else session.event_sequence + 1
+                )
+                if last_event_id < first_available_id - 1:
+                    if session.waiting_for_user:
+                        snapshot_status = "waiting_for_user"
+                    elif session.starting or session.running:
+                        snapshot_status = "running"
+                    elif session.interrupted:
+                        snapshot_status = "interrupted"
+                    else:
+                        snapshot_status = "idle"
+                    new_events = [
+                        {
+                            "id": session.event_sequence,
+                            "type": "session_snapshot",
+                            "data": {
+                                "messages": copy.deepcopy(session.messages),
+                                "status": snapshot_status,
+                                "waiting_for_user": session.waiting_for_user,
+                                "ask_prompt": session.ask_prompt,
+                            },
+                        }
+                    ]
+                else:
+                    new_events = [
+                        dict(event)
+                        for event in session.events
+                        if int(event.get("id", 0)) > last_event_id
+                    ]
                 if new_events:
                     last_event_id = int(new_events[-1]["id"])
                 session_done = (

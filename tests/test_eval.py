@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from src.core.eval import (
     _DatasetRedirectHandler,
+    _NoBypassProxyHandler,
     _validate_dataset_url,
     EvalError,
     create_eval_run,
@@ -50,6 +51,16 @@ class _FakeResponse:
         chunk = self._data[self._offset : self._offset + size]
         self._offset += len(chunk)
         return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        return None
+
+
+class _FakeEgressProxy:
+    url = "http://127.0.0.1:43210"
 
     def __enter__(self):
         return self
@@ -102,12 +113,20 @@ class EvalDatasetTests(unittest.TestCase):
             payload = b'{"task": "downloaded", "assertions": {"contains": ["ok"]}}\n'
             public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
             with (
-                patch("src.core.eval.socket.getaddrinfo", return_value=public_dns),
-                patch("src.core.eval._open_dataset_url", return_value=_FakeResponse(payload)),
+                patch("src.core.network_guard.socket.getaddrinfo", return_value=public_dns),
+                patch(
+                    "src.core.eval._open_dataset_url",
+                    return_value=_FakeResponse(payload),
+                ) as open_url,
+                patch(
+                    "src.core.eval.PublicEgressProxy",
+                    return_value=_FakeEgressProxy(),
+                ),
             ):
                 metadata = download_dataset(tmp_dir, url="https://example.test/data.jsonl")
 
             self.assertEqual(metadata["source"]["type"], "url")
+            self.assertTrue(open_url.call_args.args[2].startswith("http://127.0.0.1:"))
             detail = get_dataset_detail(tmp_dir, metadata["id"])
             self.assertEqual(detail["cases"][0]["task"], "downloaded")
 
@@ -140,7 +159,7 @@ class EvalDatasetTests(unittest.TestCase):
         ]
 
         with (
-            patch("src.core.eval.socket.getaddrinfo", return_value=mixed_dns),
+            patch("src.core.network_guard.socket.getaddrinfo", return_value=mixed_dns),
             self.assertRaises(EvalError),
         ):
             _validate_dataset_url("https://example.test/data.jsonl")
@@ -150,8 +169,9 @@ class EvalDatasetTests(unittest.TestCase):
         response = _FakeResponse(b'{"task":"blocked"}', url="http://127.0.0.1/private.jsonl")
 
         with (
-            patch("src.core.eval.socket.getaddrinfo", return_value=public_dns),
+            patch("src.core.network_guard.socket.getaddrinfo", return_value=public_dns),
             patch("src.core.eval._open_dataset_url", return_value=response),
+            patch("src.core.eval.PublicEgressProxy", return_value=_FakeEgressProxy()),
             tempfile.TemporaryDirectory() as tmp_dir,
             self.assertRaises(EvalError),
         ):
@@ -172,7 +192,7 @@ class EvalDatasetTests(unittest.TestCase):
             )
 
         public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
-        with patch("src.core.eval.socket.getaddrinfo", return_value=public_dns):
+        with patch("src.core.network_guard.socket.getaddrinfo", return_value=public_dns):
             redirected = handler.redirect_request(
                 request,
                 None,
@@ -183,6 +203,22 @@ class EvalDatasetTests(unittest.TestCase):
             )
 
         self.assertEqual(redirected.full_url, "https://cdn.example.test/data.jsonl")
+
+    def test_dataset_proxy_ignores_process_no_proxy_bypass(self) -> None:
+        handler = _NoBypassProxyHandler(
+            {
+                "http": "http://127.0.0.1:43210",
+                "https": "http://127.0.0.1:43210",
+            }
+        )
+        request = urllib.request.Request("https://example.test/data.jsonl")
+
+        with patch("urllib.request.proxy_bypass", return_value=True) as proxy_bypass:
+            handler.proxy_open(request, "http://127.0.0.1:43210", "https")
+
+        proxy_bypass.assert_not_called()
+        self.assertEqual(request.host, "127.0.0.1:43210")
+        self.assertEqual(request._tunnel_host, "example.test")
 
 
 class EvalAssertionTests(unittest.TestCase):

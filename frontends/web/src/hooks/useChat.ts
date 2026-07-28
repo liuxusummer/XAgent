@@ -28,7 +28,7 @@ function ensureAgentMessage(messages: Message[]): Message {
 }
 
 function appendDelta(current: string, delta: string): string {
-  if (!delta || current.endsWith(delta)) return current;
+  if (!delta) return current;
   return current + delta;
 }
 
@@ -147,6 +147,36 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
       const data = JSON.parse(event.data);
 
       switch (data.type) {
+        case 'session_snapshot': {
+          const snapshot = data.data as {
+            messages?: Message[];
+            status?: ChatSession['status'];
+            waiting_for_user?: boolean;
+            ask_prompt?: string;
+          };
+          const status = snapshot.status || 'idle';
+          setSession(prev => ({
+            ...prev,
+            messages: Array.isArray(snapshot.messages) ? snapshot.messages : prev.messages,
+            status,
+            updatedAt: Date.now(),
+          }));
+          setIsWaitingForUser(Boolean(snapshot.waiting_for_user));
+          setAskPrompt(snapshot.ask_prompt || '');
+          setAgentStatus({
+            state: status === 'running'
+              ? 'thinking'
+              : status === 'waiting_for_user'
+                ? 'waiting_for_user'
+                : status === 'interrupted'
+                  ? 'interrupted'
+                  : status === 'error'
+                    ? 'error'
+                    : 'idle',
+          });
+          break;
+        }
+
         case 'assistant_delta': {
           const content = data.data as string;
           setSession(prev => {

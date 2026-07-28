@@ -145,7 +145,8 @@ web_execute_js → BrowserDriver.execute_js → exec_id + ACK/结果诊断
 - `web_execute_js` 返回 `exec_id`、`ack`、`result_received`、`diagnostics`，用于区分送达、执行、导航和失败状态
 - 每个 Agent/Handler 延迟创建并独占一个 BrowserDriver；Agent 关闭时同步释放，禁止进程级共享浏览器实例
 - 同一 BrowserDriver 内的扫描、标签切换、导航和脚本执行必须串行；`web_execute_js.timeout` 由 WebDriver 原生脚本超时强制执行
-- 导航前解析 DNS 并拒绝 loopback、私网、链路本地、保留地址及带凭证 URL；页面加载默认 30 秒且最多 120 秒
+- 浏览器的导航、页面脚本网络请求、iframe 与 WebSocket 统一经过本地过滤代理；代理在每次实际连接时解析目标、拒绝任一非公网地址，并直接连接该次校验得到的 IP，避免 DNS rebinding 的校验—使用间隙
+- 导航 URL 仅允许无凭证的 HTTP/HTTPS；页面加载默认 30 秒且最多 120 秒
 - Chrome 沙箱默认启用；只有受控部署显式设置 `XAGENT_CHROME_NO_SANDBOX=1` 时才添加 `--no-sandbox`
 - 长结果通过 `save_to_file` 落盘，tool_result 只返回路径、字节数和摘要
 - 默认扫描模式为 `summary`，只返回语义压缩内容；需要精确状态时应执行局部 JS 查询
@@ -199,7 +200,7 @@ patch 是最危险的操作——改错一行可能破坏整个文件。唯一�
 
 - 索引文件位于 `<ctx.cwd>/runtime/file_index.sqlite3`，`runtime/` 视为 workspace 运行时元数据，不参与业务文件读写语义
 - 首次搜索或 `refresh=true` 时扫描并增量更新索引；增量依据 `relative_path + mtime_ns + size`
-- 只索引 UTF-8 文本文件，跳过二进制、超大文件、常见依赖/构建目录和 `runtime/**`
+- 只索引 UTF-8 文本文件；默认单文件上限为 5 MiB，并跳过 symlink、二进制、常见依赖/构建目录和 `runtime/**`
 - `root` 必须位于当前 workspace 内，避免检索工作区外路径
 - `mode=keyword|semantic|hybrid` 控制检索模式；`path_only=true` 强制只走路径/关键词检索
 - 语义检索默认关闭，仅在 `file_index_embedding.enabled=true` 或 `XAGENT_FILE_INDEX_EMBEDDING=1` 且 embedding 配置完整时启用

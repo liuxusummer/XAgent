@@ -41,6 +41,10 @@ from src.web_ui_new import (
     ScheduledTaskWriteRequest,
     TeamWorkflowWriteRequest,
     TeamWriteRequest,
+    _LLM_STREAM_BUFFER_MAX_CHARS,
+    _LLM_TOOL_PAYLOAD_MAX_CHARS,
+    _SESSION_EVENT_MAX_COUNT,
+    _append_llm_delta,
     _resolve_frontend_file_path,
     _agent_runtime_config,
     _cleanup_sessions,
@@ -296,6 +300,16 @@ class _FakeDownloadResponse:
         chunk = self.data[self.offset : self.offset + size]
         self.offset += len(chunk)
         return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        return None
+
+
+class _FakeEgressProxy:
+    url = "http://127.0.0.1:43210"
 
     def __enter__(self):
         return self
@@ -746,6 +760,88 @@ class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
         state = session.event_queue.get_nowait()
         self.assertNotIn("events", state)
         self.assertTrue(session.event_queue.empty())
+
+    def test_llm_stream_parser_handles_split_hidden_and_tool_blocks_incrementally(self) -> None:
+        session = UISession(session_id="parser")
+
+        _append_llm_delta(session, "hello<thin")
+        _append_llm_delta(
+            session,
+            'king>\nreason</thinking>world<tool_use> '
+            '{"id":"tool-1","name":"file_read","arguments":{"path":"README.md"}}'
+            " </tool_use>!",
+        )
+
+        assistant = [
+            event["data"] for event in session.events if event["type"] == "assistant_delta"
+        ]
+        thinking = [
+            event["data"] for event in session.events if event["type"] == "thinking_delta"
+        ]
+        tools = [event["data"] for event in session.events if event["type"] == "tool_call"]
+        self.assertEqual("".join(assistant), "helloworld!")
+        self.assertEqual("".join(thinking), "reason")
+        self.assertEqual(tools[0]["id"], "tool-1")
+        self.assertEqual(tools[0]["arguments"], {"path": "README.md"})
+        self.assertEqual(session.llm_parse_buffer, "")
+
+    def test_llm_stream_keeps_repeated_deltas_and_bounds_raw_buffer(self) -> None:
+        session = UISession(session_id="repeated")
+
+        _append_llm_delta(session, "same")
+        _append_llm_delta(session, "same")
+        _append_llm_delta(session, "x" * (_LLM_STREAM_BUFFER_MAX_CHARS + 1))
+
+        self.assertTrue(session.messages[-1]["content"].startswith("samesame"))
+        self.assertEqual(len(session.llm_stream_buffer), _LLM_STREAM_BUFFER_MAX_CHARS)
+
+    def test_llm_stream_bounds_unclosed_tool_payload(self) -> None:
+        session = UISession(session_id="large-tool")
+
+        _append_llm_delta(
+            session,
+            "<tool_use>" + "x" * (_LLM_TOOL_PAYLOAD_MAX_CHARS + 100),
+        )
+        _append_llm_delta(session, "</tool_use>")
+
+        self.assertLessEqual(len(session.llm_tool_payload), _LLM_TOOL_PAYLOAD_MAX_CHARS)
+        tool = next(event for event in session.events if event["type"] == "tool_call")
+        self.assertEqual(tool["data"]["name"], "bad_json")
+        self.assertIn("exceeded", tool["data"]["arguments"]["error"])
+
+    def test_session_event_log_has_hard_count_limit(self) -> None:
+        session = UISession(session_id="bounded-events")
+
+        for index in range(_SESSION_EVENT_MAX_COUNT + 10):
+            _emit(session, "log", str(index))
+
+        self.assertEqual(len(session.events), _SESSION_EVENT_MAX_COUNT)
+        self.assertEqual(session.events[0]["id"], 11)
+
+    async def test_stream_sends_snapshot_when_cursor_predates_retained_events(self) -> None:
+        session = UISession(session_id="snapshot")
+        session.messages.append(
+            {
+                "id": "agent-1",
+                "role": "agent",
+                "content": "current",
+                "timestamp": 1,
+                "status": "streaming",
+            }
+        )
+        for index in range(_SESSION_EVENT_MAX_COUNT + 1):
+            _emit(session, "log", str(index))
+        _sessions[session.session_id] = session
+        _queue_state(session, finished=True)
+
+        response = await stream_chat(_StreamRequest(session.session_id, after=0))
+        chunks: list[str] = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+
+        payload = "".join(chunks)
+        self.assertIn('"type": "session_snapshot"', payload)
+        self.assertIn('"content": "current"', payload)
 
     def test_finished_wakeup_replaces_stale_wakeup(self) -> None:
         session = UISession(session_id="finished")
@@ -3577,10 +3673,14 @@ class WebUINewScheduledTaskTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)),
                 patch(
-                    "src.core.eval.socket.getaddrinfo",
+                    "src.core.network_guard.socket.getaddrinfo",
                     return_value=[(None, None, None, "", ("93.184.216.34", 443))],
                 ),
                 patch("src.core.eval._open_dataset_url", return_value=_FakeDownloadResponse(payload)),
+                patch(
+                    "src.core.eval.PublicEgressProxy",
+                    return_value=_FakeEgressProxy(),
+                ),
             ):
                 result = await api_download_eval_dataset(
                     EvalDatasetDownloadRequest(

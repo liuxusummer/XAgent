@@ -5,7 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.tools.file_index import refresh_file_index, search_file_index
+from src.tools.file_index import (
+    DEFAULT_MAX_FILE_BYTES,
+    refresh_file_index,
+    search_file_index,
+)
 
 
 class FakeEmbeddingProvider:
@@ -107,6 +111,39 @@ class FileIndexTests(unittest.TestCase):
             self.assertGreaterEqual(refresh["skipped"]["directories"], 1)
             self.assertEqual(refresh["skipped"]["too_large"], 1)
             self.assertEqual([match["path"] for match in result["matches"]], ["visible.txt"])
+
+    def test_refresh_skips_external_and_recursive_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            container = Path(tmp)
+            root = container / "workspace"
+            root.mkdir()
+            outside = container / "outside.txt"
+            outside.write_text("outside_secret\n", encoding="utf-8")
+            (root / "visible.txt").write_text("visible_token\n", encoding="utf-8")
+            (root / "external.txt").symlink_to(outside)
+            (root / "recursive").symlink_to(root, target_is_directory=True)
+
+            refresh = refresh_file_index(cwd=str(root))
+            outside_result = search_file_index(query="outside_secret", cwd=str(root))
+            visible_result = search_file_index(query="visible_token", cwd=str(root))
+
+            self.assertEqual(refresh["status"], "OK")
+            self.assertEqual(refresh["skipped"]["symlinks"], 2)
+            self.assertEqual(outside_result["matches"], [])
+            self.assertEqual(visible_result["matches"][0]["path"], "visible.txt")
+
+    def test_refresh_applies_default_file_size_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            large = root / "large.txt"
+            with large.open("wb") as stream:
+                stream.truncate(DEFAULT_MAX_FILE_BYTES + 1)
+
+            refresh = refresh_file_index(cwd=str(root))
+
+            self.assertEqual(refresh["status"], "OK")
+            self.assertEqual(refresh["skipped"]["too_large"], 1)
+            self.assertEqual(refresh["indexed"], 0)
 
     def test_root_outside_workspace_returns_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

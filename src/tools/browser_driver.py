@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import ipaddress
 import json
 import os
 import re
-import socket
 import threading
 import time
 import urllib.parse
@@ -13,6 +11,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from src.core.network_guard import (
+    PublicEgressProxy,
+    UnsafeNetworkTargetError,
+    resolve_public_endpoint,
+)
 from src.core.workspace_storage import atomic_write_text, workspace_write_lock
 from src.tools.file_ops import WorkspacePermissionError, resolve_path, truncate_text
 
@@ -69,6 +72,7 @@ class SeleniumBrowserDriver:
         self._lock = threading.RLock()
         self._connected_at: dict[str, float] = {}
         self._closed = False
+        self._proxy: PublicEgressProxy | None = None
 
     def close(self) -> None:
         with self._lock:
@@ -76,13 +80,17 @@ class SeleniumBrowserDriver:
                 return
             self._closed = True
             driver = self._driver
+            proxy = self._proxy
             self._driver = None
+            self._proxy = None
             self._connected_at.clear()
             if driver is not None:
                 try:
                     driver.quit()
                 except Exception:
                     pass
+            if proxy is not None:
+                proxy.close()
 
     def list_sessions(self) -> list[BrowserSession]:
         with self._lock:
@@ -250,10 +258,17 @@ class SeleniumBrowserDriver:
             from selenium import webdriver
             from selenium.webdriver.chrome.options import Options
 
+            if self._proxy is None:
+                self._proxy = PublicEgressProxy().start()
             options = Options()
-            for argument in _chrome_launch_arguments():
+            for argument in _chrome_launch_arguments(self._proxy.url):
                 options.add_argument(argument)
-            self._driver = webdriver.Chrome(options=options)
+            try:
+                self._driver = webdriver.Chrome(options=options)
+            except Exception:
+                self._proxy.close()
+                self._proxy = None
+                raise
             self._driver.set_page_load_timeout(_page_load_timeout())
             return self._driver
 
@@ -351,8 +366,17 @@ def _page_load_timeout() -> int:
     return max(1, min(timeout, MAX_PAGE_LOAD_TIMEOUT))
 
 
-def _chrome_launch_arguments() -> list[str]:
+def _chrome_launch_arguments(proxy_url: str | None = None) -> list[str]:
     arguments = ["--headless=new", "--disable-dev-shm-usage"]
+    if proxy_url:
+        arguments.extend(
+            [
+                f"--proxy-server={proxy_url}",
+                "--proxy-bypass-list=<-loopback>",
+                "--disable-quic",
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            ]
+        )
     if os.environ.get("XAGENT_CHROME_NO_SANDBOX", "").strip().lower() in {
         "1",
         "true",
@@ -377,26 +401,12 @@ def _validate_navigation_url(url: str) -> None:
         raise UnsafeNavigationError("navigation URL must include a hostname")
 
     try:
-        literal_ip = ipaddress.ip_address(hostname)
-    except ValueError:
-        literal_ip = None
-    if literal_ip is not None:
-        _reject_non_public_address(literal_ip)
-        return
-
-    try:
-        records = socket.getaddrinfo(
+        resolve_public_endpoint(
             hostname,
             port or (443 if parsed.scheme.lower() == "https" else 80),
-            type=socket.SOCK_STREAM,
         )
-    except socket.gaierror as exc:
-        raise UnsafeNavigationError(f"failed to resolve navigation host: {hostname}") from exc
-    if not records:
-        raise UnsafeNavigationError(f"navigation host resolved to no addresses: {hostname}")
-    for record in records:
-        address = ipaddress.ip_address(record[4][0].split("%", 1)[0])
-        _reject_non_public_address(address)
+    except UnsafeNetworkTargetError as exc:
+        raise UnsafeNavigationError(str(exc)) from exc
 
 
 def _validate_existing_page_url(url: str) -> None:
@@ -404,13 +414,6 @@ def _validate_existing_page_url(url: str) -> None:
     if normalized in {"", "about:blank", "data:,"}:
         return
     _validate_navigation_url(normalized)
-
-
-def _reject_non_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> None:
-    if not address.is_global:
-        raise UnsafeNavigationError(
-            f"navigation to non-public address is blocked: {address}"
-        )
 
 
 def _wrap_async_script(script: str) -> str:

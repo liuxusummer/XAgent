@@ -82,6 +82,7 @@ export interface SSEEvent {
   id?: number;
   type:
     | 'user_task'
+    | 'session_snapshot'
     | 'assistant_delta'
     | 'thinking_delta'
     | 'turn_start'

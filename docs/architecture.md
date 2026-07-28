@@ -46,6 +46,8 @@
 - 会话准入：任务提交在 Agent 构建前用一次性令牌原子预占会话；`starting`、`running`、`waiting_for_user` 均拒绝重复提交，初始化或线程启动失败时释放预占
 - 会话恢复：Web 持久化聊天对应的任务级 checkpoint ID；服务重启后将遗留的运行态标记为 `interrupted`，仅允许按该聊天绑定的 checkpoint 恢复，禁止回退到工作区级 `latest`
 - Web 访问边界：除校验 TCP 对端为 loopback 外，还必须校验 `Host` 属于本地或显式配置的 allowlist；不得用任意 `Origin == Host` 作为准入依据
+- Web 出口边界：浏览器和 Eval URL 下载统一通过仅允许公网目标的本地代理；代理将 DNS 校验结果绑定到实际 TCP 连接，所有重定向和页面脚本发起的请求都重复执行该约束
+- Web 流式状态：LLM XML 包装按 chunk 增量解析，原始诊断尾部与单个工具载荷均设 65,536 字符上限；会话事件日志最多保留 2048 条，落后于保留窗口的 SSE 客户端通过 `session_snapshot` 恢复当前消息状态
 - 共享存储：Runbook、Memory、定时任务等工作区级“读—改—写”必须持有统一工作区锁；写盘使用同目录唯一临时文件并原子替换，禁止直接覆盖
 - 数据格式：层间只传 `ActionResult` 或 `ChatResponse`，禁止跨层直接访问内部状态
 

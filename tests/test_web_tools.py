@@ -236,7 +236,7 @@ class WebToolTests(unittest.TestCase):
 
     def test_navigation_validation_rejects_dns_resolving_to_private_address(self) -> None:
         private_record = [(2, 1, 6, "", ("10.0.0.8", 443))]
-        with patch("src.tools.browser_driver.socket.getaddrinfo", return_value=private_record):
+        with patch("src.core.network_guard.socket.getaddrinfo", return_value=private_record):
             with self.assertRaises(UnsafeNavigationError):
                 _validate_navigation_url("https://internal.example/data")
 
@@ -246,7 +246,7 @@ class WebToolTests(unittest.TestCase):
         driver._driver = raw_driver
         public_record = [(2, 1, 6, "", ("93.184.216.34", 443))]
 
-        with patch("src.tools.browser_driver.socket.getaddrinfo", return_value=public_record):
+        with patch("src.core.network_guard.socket.getaddrinfo", return_value=public_record):
             result = driver.scan("https://example.com")
 
         self.assertEqual(result["status"], "TIMEOUT")
@@ -258,6 +258,17 @@ class WebToolTests(unittest.TestCase):
             self.assertNotIn("--no-sandbox", _chrome_launch_arguments())
         with patch.dict("os.environ", {"XAGENT_CHROME_NO_SANDBOX": "1"}, clear=True):
             self.assertIn("--no-sandbox", _chrome_launch_arguments())
+
+    def test_chrome_routes_all_supported_network_traffic_through_guard_proxy(self) -> None:
+        arguments = _chrome_launch_arguments("http://127.0.0.1:43210")
+
+        self.assertIn("--proxy-server=http://127.0.0.1:43210", arguments)
+        self.assertIn("--proxy-bypass-list=<-loopback>", arguments)
+        self.assertIn("--disable-quic", arguments)
+        self.assertIn(
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            arguments,
+        )
 
     def test_page_load_timeout_is_bounded(self) -> None:
         with patch.dict("os.environ", {"XAGENT_CHROME_PAGE_LOAD_TIMEOUT": "999"}, clear=True):
