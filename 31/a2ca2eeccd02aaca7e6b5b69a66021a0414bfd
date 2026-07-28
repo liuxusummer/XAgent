@@ -1,0 +1,33 @@
+docs/architecture.md
+  s_72af05a5dabd4c::t_71887525ade00a 47
+src/core/memory.py
+  s_72af05a5dabd4c::t_3c8bd310ec497b 6-7,268-299
+src/core/runbook.py
+  s_72af05a5dabd4c::t_719cd1ee51613d 11-12,67-71,128-146,151-152,159-160,165-195,202-222
+src/core/workspace_storage.py
+  s_72af05a5dabd4c::t_a9ceee1881de33 1-126
+src/web_ui_new.py
+  s_72af05a5dabd4c::t_d17e1f1f7a1674 18,40,2669-2676,2702,3077,3139,3156,3179,3212,3242,3261,3657-3659,3661-3663,3702-3709
+tests/test_memory_provider.py
+  s_72af05a5dabd4c::t_2720b0e7fe3fff 6,222-243,569-593
+tests/test_web_ui_new.py
+  s_72af05a5dabd4c::t_d89d3862ecd6cb 21,2530-2564
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "31a2ca2eeccd02aaca7e6b5b69a66021a0414bfd",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
