@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from src.core.eval import create_eval_run, import_dataset_content
 from src.core.agent_loop import AgentContext, exhaust
+from src.core.checkpoint import build_task_checkpoint, write_task_checkpoint
 from src.core.team_workflows import normalize_team_workflow, run_team_workflow
 from src.core.telemetry import Event, JsonlSink, MultiSink, NullSink
 from src.core.XAgent import XAgent
@@ -251,9 +252,19 @@ class _HistoryFakeAgent(_FakeAgent):
         self.handler = type("H", (), {"ctx": type("C", (), {"verbose": False, "sink": None})()})()
         self.display_queue = queue.Queue()
         self.ran_tasks: list[str] = []
+        self.resume_checkpoints: list[str | None] = []
+        self.checkpoint_ids: list[str | None] = []
 
-    def run_task_async(self, task: str) -> None:
+    def run_task_async(
+        self,
+        task: str,
+        *,
+        resume_checkpoint: str | None = None,
+        checkpoint_id: str | None = None,
+    ) -> None:
         self.ran_tasks.append(task)
+        self.resume_checkpoints.append(resume_checkpoint)
+        self.checkpoint_ids.append(checkpoint_id)
         self.client.backend.history.append({"role": "user", "content": task})
         self.display_queue.put(
             {
@@ -504,6 +515,7 @@ class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(agent.worker.is_alive())
         self.assertFalse(session.running)
         self.assertFalse(session.waiting_for_user)
+        self.assertTrue(session.interrupted)
         self.assertFalse(session.stop_requested)
         self.assertEqual([event["type"] for event in session.events], ["stop", "done"])
         self.assertEqual(session.events[-1]["data"]["exit_reason"], "INTERRUPTED")
@@ -930,6 +942,7 @@ class WebUINewSessionRoutingTests(unittest.IsolatedAsyncioTestCase):
         persist.assert_called_once_with(session, force=True)
         self.assertFalse(_sessions)
         self.assertFalse(session.running)
+        self.assertTrue(session.interrupted)
         self.assertTrue(session.closing)
         self.assertTrue(agent.stopped)
         self.assertIsNone(session.agent)
@@ -1842,6 +1855,173 @@ class WebUINewPersistentChatTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(state["waiting_for_user"])
             self.assertEqual(state["ask_prompt"], "continue?")
             self.assertEqual(state["event_cursor"], 1)
+
+    async def test_restart_marks_running_chat_interrupted_with_exact_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "default.ws"
+            workspace.mkdir()
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))):
+                created = await create_chat(ChatCreateRequest(ws="default.ws", agent="coding"))
+                chat_id = created["data"]["metadata"]["chat_id"]
+                checkpoint = build_task_checkpoint(
+                    workspace,
+                    checkpoint_id="chat-checkpoint",
+                    session_id="chat-checkpoint",
+                    task="Long task",
+                    agent_name="coding",
+                )
+                write_task_checkpoint(workspace, checkpoint)
+                chat_dir = workspace / "runtime" / "chats" / "coding" / chat_id
+                state_path = chat_dir / "state.json"
+                metadata_path = chat_dir / "metadata.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state.update(
+                    {
+                        "status": "running",
+                        "checkpoint_id": "chat-checkpoint",
+                        "resume_available": False,
+                    }
+                )
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                metadata["status"] = "running"
+                metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+                _sessions.clear()
+
+                listed = await list_chats(ws="default.ws", agent="coding")
+                restored = await read_chat(chat_id, ws="default.ws", agent="coding")
+                persisted = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(listed["data"][0]["status"], "interrupted")
+        self.assertEqual(restored["data"]["state"]["status"], "interrupted")
+        self.assertEqual(restored["data"]["state"]["checkpoint_id"], "chat-checkpoint")
+        self.assertTrue(restored["data"]["state"]["resume_available"])
+        self.assertFalse(restored["data"]["state"]["waiting_for_user"])
+        self.assertEqual(persisted["status"], "interrupted")
+
+    async def test_resume_uses_chat_checkpoint_instead_of_workspace_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "default.ws"
+            agent_dir = workspace / "system" / "agents" / "coding"
+            agent_dir.mkdir(parents=True)
+            (agent_dir / "AGENT.md").write_text(
+                '---\nname: "coding"\ntools: []\nskills: []\nproject_agents: []\n---\n\n# Coding\n',
+                encoding="utf-8",
+            )
+            fake_agent = _HistoryFakeAgent()
+            with (
+                patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))),
+                patch("src.web_ui_new.build_agent", return_value=fake_agent),
+                patch("src.web_ui_new._new_daemon_thread", _ImmediateThread),
+                patch.dict("os.environ", {"XAGENT_LOG_DIR": ""}, clear=False),
+            ):
+                created = await create_chat(ChatCreateRequest(ws="default.ws", agent="coding"))
+                chat_id = created["data"]["metadata"]["chat_id"]
+                for checkpoint_id in ("chat-checkpoint", "other-chat-checkpoint"):
+                    write_task_checkpoint(
+                        workspace,
+                        build_task_checkpoint(
+                            workspace,
+                            checkpoint_id=checkpoint_id,
+                            session_id=checkpoint_id,
+                            task=checkpoint_id,
+                            agent_name="coding",
+                        ),
+                    )
+                state_path = workspace / "runtime" / "chats" / "coding" / chat_id / "state.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state.update({"status": "running", "checkpoint_id": "chat-checkpoint"})
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                _sessions.clear()
+
+                result = await submit_task(
+                    SubmitTaskRequest(
+                        resume=True,
+                        chat_id=chat_id,
+                        workspace_dir="default.ws",
+                        agent="coding",
+                    )
+                )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["data"]["resumed"])
+        self.assertEqual(result["data"]["checkpoint_id"], "chat-checkpoint")
+        self.assertEqual(fake_agent.resume_checkpoints, ["chat-checkpoint"])
+        self.assertEqual(fake_agent.checkpoint_ids, ["chat-checkpoint"])
+
+    async def test_restart_does_not_resume_a_checkpoint_that_already_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "default.ws"
+            workspace.mkdir()
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))):
+                created = await create_chat(ChatCreateRequest(ws="default.ws", agent="coding"))
+                chat_id = created["data"]["metadata"]["chat_id"]
+                write_task_checkpoint(
+                    workspace,
+                    build_task_checkpoint(
+                        workspace,
+                        checkpoint_id="completed-checkpoint",
+                        session_id="completed-checkpoint",
+                        task="Completed task",
+                        agent_name="coding",
+                        status="completed",
+                    ),
+                )
+                chat_dir = workspace / "runtime" / "chats" / "coding" / chat_id
+                state_path = chat_dir / "state.json"
+                metadata_path = chat_dir / "metadata.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state.update({"status": "running", "checkpoint_id": "completed-checkpoint"})
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                metadata["status"] = "running"
+                metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+                _sessions.clear()
+
+                listed = await list_chats(ws="default.ws", agent="coding")
+                restored = await read_chat(chat_id, ws="default.ws", agent="coding")
+
+        self.assertEqual(listed["data"][0]["status"], "idle")
+        self.assertEqual(restored["data"]["state"]["status"], "idle")
+        self.assertFalse(restored["data"]["state"]["resume_available"])
+
+    async def test_restart_does_not_offer_latest_when_chat_checkpoint_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "default.ws"
+            workspace.mkdir()
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(Path(tmp_dir))):
+                created = await create_chat(ChatCreateRequest(ws="default.ws", agent="coding"))
+                chat_id = created["data"]["metadata"]["chat_id"]
+                write_task_checkpoint(
+                    workspace,
+                    build_task_checkpoint(
+                        workspace,
+                        checkpoint_id="other-chat-checkpoint",
+                        session_id="other-chat-checkpoint",
+                        task="Other task",
+                        agent_name="coding",
+                    ),
+                )
+                state_path = workspace / "runtime" / "chats" / "coding" / chat_id / "state.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state.update({"status": "running", "checkpoint_id": "missing-chat-checkpoint"})
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                _sessions.clear()
+
+                restored = await read_chat(chat_id, ws="default.ws", agent="coding")
+                result = await submit_task(
+                    SubmitTaskRequest(
+                        resume=True,
+                        chat_id=chat_id,
+                        workspace_dir="default.ws",
+                        agent="coding",
+                    )
+                )
+
+        self.assertEqual(restored["data"]["state"]["status"], "interrupted")
+        self.assertFalse(restored["data"]["state"]["resume_available"])
+        self.assertFalse(result["success"])
+        self.assertIn("checkpoint not found", result["error"])
 
     async def test_list_chats_is_scoped_by_agent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

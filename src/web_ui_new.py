@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from src.config import load_config
 from src.core.XAgent import XAgent
 from src.core.agent_profiles import load_agent_runtime_config
+from src.core.checkpoint import load_task_checkpoint
 from src.core.agent_teams import (
     delete_team_config,
     list_team_configs,
@@ -154,7 +155,7 @@ async def enforce_local_web_access(request: Request, call_next):
 
 
 class SubmitTaskRequest(BaseModel):
-    task: str
+    task: str = ""
     session_id: str = ""
     chat_id: str = ""
     config_path: str = ""
@@ -162,6 +163,7 @@ class SubmitTaskRequest(BaseModel):
     workspace_dir: str = ""
     agent: str = ""
     team: str = ""
+    resume: bool = False
 
 
 class ReplyRequest(BaseModel):
@@ -270,6 +272,8 @@ class UISession:
     events: list[dict[str, Any]] = field(default_factory=list)
     event_sequence: int = 0
     waiting_for_user: bool = False
+    interrupted: bool = False
+    resume_available: bool = False
     ask_prompt: str = ""
     starting: bool = False
     task_start_token: str = ""
@@ -284,6 +288,7 @@ class UISession:
     team_step_runner: Any | None = None
     runtime_config_key: str = ""
     session_id: str = ""
+    checkpoint_id: str = ""
     chat_id: str = ""
     chat_ws: str = ""
     chat_agent: str = ""
@@ -953,6 +958,8 @@ def _default_chat_state(ws: str, agent: str, chat_id: str, session_id: str = "")
         "workspace": ws,
         "agent": agent,
         "backend_session_id": session_id,
+        "checkpoint_id": "",
+        "resume_available": False,
         "event_cursor": 0,
         "runtime_config_key": "",
         "messages": [],
@@ -1034,6 +1041,8 @@ def _set_session_runtime_state(session: UISession, state: str, *, now: float | N
         session.starting_started_at = 0.0
         session.running = state == "running"
         session.waiting_for_user = state == "waiting"
+        session.interrupted = state == "interrupted"
+        session.resume_available = state == "interrupted" and bool(session.checkpoint_id)
         session.running_started_at = current_time if state == "running" else 0.0
         session.waiting_started_at = current_time if state == "waiting" else 0.0
         if state != "running":
@@ -1164,8 +1173,11 @@ def _persist_chat_state(session: UISession, *, force: bool = False) -> bool:
             messages = _safe_json_value(session.messages)
             restored_llm_history = _safe_json_value(session.restored_llm_history)
             waiting_for_user = session.waiting_for_user
+            interrupted = session.interrupted
+            resume_available = session.resume_available
             starting = session.starting
             running = session.running
+            checkpoint_id = session.checkpoint_id
             ask_prompt = session.ask_prompt
             agent = session.agent
 
@@ -1176,7 +1188,11 @@ def _persist_chat_state(session: UISession, *, force: bool = False) -> bool:
         metadata = _read_chat_metadata(chat_ws, chat_agent, chat_id)
         if metadata is None:
             metadata = _default_chat_metadata(chat_ws, chat_agent, chat_id)
-        status = "waiting_for_user" if waiting_for_user else ("running" if starting or running else "idle")
+        status = (
+            "waiting_for_user"
+            if waiting_for_user
+            else ("running" if starting or running else ("interrupted" if interrupted else "idle"))
+        )
         llm_history = _extract_llm_history(agent) or restored_llm_history
         now = time.time()
         metadata.update(
@@ -1193,6 +1209,8 @@ def _persist_chat_state(session: UISession, *, force: bool = False) -> bool:
         state = {
             **_default_chat_state(chat_ws, chat_agent, chat_id, session_id),
             "backend_session_id": session_id,
+            "checkpoint_id": checkpoint_id,
+            "resume_available": interrupted and resume_available,
             "runtime_config_key": runtime_config_key,
             "team": team_name or None,
             "team_workflow": team_workflow_name,
@@ -1263,7 +1281,7 @@ def _prepare_session_eviction(
             return False
         if reason in {"running_timeout", "waiting_timeout"}:
             _emit(session, "stop", f"session closed after {reason.replace('_', ' ')}")
-            _set_session_runtime_state(session, "idle", now=now)
+            _set_session_runtime_state(session, "interrupted", now=now)
             session.ask_prompt = ""
         session.closing = True
         return True
@@ -1337,7 +1355,7 @@ def _shutdown_sessions() -> list[str]:
             was_waiting = session.waiting_for_user
             if was_active:
                 _emit(session, "stop", "session closed because the Web UI is shutting down")
-            _set_session_runtime_state(session, "idle")
+            _set_session_runtime_state(session, "interrupted" if was_active else "idle")
             session.ask_prompt = ""
             session.closing = True
         with _session_lock:
@@ -1357,6 +1375,55 @@ def _shutdown_sessions() -> list[str]:
     return [session_id for session_id, _, _, _ in removed]
 
 
+def _load_bound_chat_checkpoint(
+    ws: str,
+    agent: str,
+    checkpoint_id: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not checkpoint_id:
+        return None, "Chat has no checkpoint to resume"
+    workspace_root, workspace_error = _workspace_root(ws)
+    if workspace_error or workspace_root is None:
+        return None, workspace_error
+    loaded = load_task_checkpoint(workspace_root, checkpoint_id)
+    if loaded.get("status") != "OK":
+        return None, str(loaded.get("error") or "checkpoint could not be loaded")
+    checkpoint = loaded.get("checkpoint")
+    if not isinstance(checkpoint, dict):
+        return None, "invalid checkpoint payload"
+    if str(checkpoint.get("checkpoint_id") or "") != checkpoint_id:
+        return None, "checkpoint id does not match this chat"
+    checkpoint_agent = str(checkpoint.get("agent_name") or "")
+    if checkpoint_agent and checkpoint_agent != agent:
+        return None, "checkpoint agent does not match this chat"
+    return checkpoint, None
+
+
+def _recover_persisted_chat_runtime(
+    ws: str,
+    agent: str,
+    state: dict[str, Any],
+) -> tuple[str, bool]:
+    persisted_status = str(state.get("status") or "idle")
+    was_active = bool(state.get("waiting_for_user")) or persisted_status in {
+        "running",
+        "waiting_for_user",
+        "interrupted",
+    }
+    if not was_active:
+        return "idle", False
+    checkpoint, _ = _load_bound_chat_checkpoint(
+        ws,
+        agent,
+        str(state.get("checkpoint_id") or ""),
+    )
+    if checkpoint is None:
+        return "interrupted", False
+    if str(checkpoint.get("status") or "") in {"completed", "failed"}:
+        return "idle", False
+    return "interrupted", True
+
+
 def _load_chat_into_session(ws: str, agent: str, chat_id: str, session: UISession | None = None) -> tuple[UISession | None, str | None]:
     chat_path, error = _chat_dir(ws, agent, chat_id)
     if error or chat_path is None:
@@ -1374,10 +1441,19 @@ def _load_chat_into_session(ws: str, agent: str, chat_id: str, session: UISessio
     session.messages = _safe_json_value(messages) if isinstance(messages, list) else []
     history = state.get("llm_history")
     session.restored_llm_history = _safe_json_value(history) if isinstance(history, list) else []
-    _set_session_runtime_state(session, "idle")
+    session.checkpoint_id = str(state.get("checkpoint_id") or "")
+    persisted_status = str(state.get("status") or "idle")
+    recovered_status, resume_available = _recover_persisted_chat_runtime(ws, agent, state)
+    if recovered_status == "interrupted":
+        _set_session_runtime_state(session, "interrupted")
+        session.resume_available = resume_available
+    else:
+        _set_session_runtime_state(session, "idle")
     session.ask_prompt = ""
     if not _register_session(session):
         return None, _SESSION_CAPACITY_ERROR
+    if persisted_status in {"running", "waiting_for_user"} or bool(state.get("waiting_for_user")):
+        _persist_chat_state(session, force=True)
     return session, None
 
 
@@ -1563,7 +1639,12 @@ def _drain_sync(session: UISession, wait: bool) -> bool:
                         "team_workflow": result.get("team_workflow"),
                     },
                 )
-                _set_session_runtime_state(session, "idle")
+                runtime_state = (
+                    "interrupted"
+                    if str(result.get("exit_reason") or "") == "INTERRUPTED"
+                    else "idle"
+                )
+                _set_session_runtime_state(session, runtime_state)
                 session.ask_prompt = ""
                 force_persist = True
                 finished = True
@@ -1633,6 +1714,8 @@ def _run_task_background(
     session: UISession,
     task: str,
     task_start_token: str = "",
+    checkpoint_id: str = "",
+    resume_checkpoint: str = "",
 ) -> None:
     """Run task in background and put events into async queue"""
     workflow: dict[str, Any] | None = None
@@ -1652,6 +1735,7 @@ def _run_task_background(
         session.pending_tool_names = []
         session.emitted_tool_keys = set()
         session.stop_requested = False
+        session.checkpoint_id = checkpoint_id
         _set_session_runtime_state(session, "running")
         session.ask_prompt = ""
         if task.strip():
@@ -1663,7 +1747,11 @@ def _run_task_background(
     _persist_chat_state(session, force=True)
 
     if not workflow and agent is not None:
-        agent.run_task_async(task.strip())
+        agent.run_task_async(
+            task.strip() or "继续执行 checkpoint 中未完成的任务。",
+            resume_checkpoint=resume_checkpoint or None,
+            checkpoint_id=checkpoint_id or None,
+        )
 
     if workflow:
         try:
@@ -1758,6 +1846,9 @@ def _run_task_background(
 @app.post("/api/chat")
 async def submit_task(request: SubmitTaskRequest):
     """Submit a new task"""
+    task = request.task.strip()
+    if not request.resume and not task:
+        return {"success": False, "error": "Task is required"}
     requested_session_id = _normalize_path_input(request.session_id)
     chat_id = _normalize_path_input(request.chat_id)
     workspace_dir = _normalize_path_input(request.workspace_dir)
@@ -1810,6 +1901,35 @@ async def submit_task(request: SubmitTaskRequest):
     else:
         session_id = session.session_id
 
+    if request.resume:
+        with session.lock:
+            if not session.interrupted:
+                return {"success": False, "error": "Chat has no interrupted task to resume"}
+            if (
+                not chat_id
+                or session.chat_id != chat_id
+                or session.chat_ws != chat_ws
+                or session.chat_agent != agent_name
+            ):
+                return {"success": False, "error": "Resume request does not match the checkpoint chat"}
+            checkpoint_id = session.checkpoint_id
+            checkpoint_ws = session.chat_ws
+            checkpoint_agent = session.chat_agent
+        if not checkpoint_ws or not checkpoint_agent:
+            return {"success": False, "error": "Resume requires a persistent agent chat"}
+        _, checkpoint_error = await _run_blocking(
+            _load_bound_chat_checkpoint,
+            checkpoint_ws,
+            checkpoint_agent,
+            checkpoint_id,
+        )
+        if checkpoint_error:
+            return {"success": False, "error": f"Checkpoint is not resumable: {checkpoint_error}"}
+        resume_checkpoint = checkpoint_id
+    else:
+        checkpoint_id = uuid.uuid4().hex[:16]
+        resume_checkpoint = ""
+
     task_start_token, reservation_error = _reserve_task_start(session)
     if reservation_error or task_start_token is None:
         result = {"success": False, "error": reservation_error or _SESSION_BUSY_ERROR}
@@ -1857,14 +1977,27 @@ async def submit_task(request: SubmitTaskRequest):
         try:
             thread = _new_daemon_thread(
                 target=_run_task_background,
-                args=(session, request.task, task_start_token),
+                args=(
+                    session,
+                    task,
+                    task_start_token,
+                    checkpoint_id,
+                    resume_checkpoint,
+                ),
             )
             thread.start()
         except Exception as exc:  # noqa: BLE001
             return {"success": False, "error": f"Failed to start task: {exc}"}
 
         handed_off = True
-        return {"success": True, "data": {"session_id": session_id}}
+        return {
+            "success": True,
+            "data": {
+                "session_id": session_id,
+                "checkpoint_id": checkpoint_id,
+                "resumed": bool(resume_checkpoint),
+            },
+        }
     finally:
         if not handed_off:
             _release_task_start(session, task_start_token)
@@ -2051,6 +2184,14 @@ def _list_chats_sync(ws: str, agent: str) -> dict[str, Any]:
                 continue
             metadata = _read_chat_metadata(ws, agent, entry.name)
             if metadata is not None:
+                if (
+                    str(metadata.get("status") or "") in {"running", "waiting_for_user"}
+                    and _find_session_by_chat(ws, agent, entry.name) is None
+                ):
+                    state = _read_chat_state(ws, agent, entry.name)
+                    if state is not None:
+                        recovered_status, _ = _recover_persisted_chat_runtime(ws, agent, state)
+                        metadata = {**metadata, "status": recovered_status}
                 rows.append(metadata)
     except OSError as exc:
         return {"success": False, "error": str(exc)}
@@ -2116,11 +2257,17 @@ def _read_chat_sync(chat_id: str, ws: str, agent: str) -> dict[str, Any]:
         status = (
             "waiting_for_user"
             if waiting_for_user
-            else ("running" if session.starting or session.running else "idle")
+            else (
+                "running"
+                if session.starting or session.running
+                else ("interrupted" if session.interrupted else "idle")
+            )
         )
         state = {
             **state,
             "backend_session_id": session.session_id,
+            "checkpoint_id": session.checkpoint_id,
+            "resume_available": session.interrupted and session.resume_available,
             "event_cursor": session.event_sequence,
             "messages": _safe_json_value(session.messages),
             "waiting_for_user": waiting_for_user,

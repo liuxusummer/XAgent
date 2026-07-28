@@ -1,19 +1,23 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Send, Square, CornerDownLeft } from 'lucide-react';
+import { Send, Square, CornerDownLeft, RotateCcw } from 'lucide-react';
 
 interface InputAreaProps {
   onSubmit: (message: string) => void;
   onStop: () => void;
+  onResume: () => void;
   isRunning: boolean;
   isWaitingForUser: boolean;
+  canResume: boolean;
   placeholder?: string;
 }
 
 export function InputArea({
   onSubmit,
   onStop,
+  onResume,
   isRunning,
   isWaitingForUser,
+  canResume,
   placeholder = 'Tell XAgent what to do...',
 }: InputAreaProps) {
   const [input, setInput] = useState('');
@@ -76,6 +80,16 @@ export function InputArea({
           />
 
           <div className="flex items-center gap-1 pr-2 pb-2">
+            {canResume && !isRunning && (
+              <button
+                onClick={onResume}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-button bg-status-warning/15 hover:bg-status-warning/25 text-status-warning transition-colors"
+                title="Resume interrupted task from its checkpoint"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span className="text-xs font-medium">Resume</span>
+              </button>
+            )}
             {showStopButton ? (
               <button
                 onClick={onStop}
@@ -103,6 +117,8 @@ export function InputArea({
           <div className="text-xs text-text-muted">
             {isWaitingForUser ? (
               <span className="text-status-warning">Agent is waiting for your reply</span>
+            ) : canResume ? (
+              <span className="text-status-warning">Task interrupted — resume from its saved checkpoint or start a new task</span>
             ) : isRunning ? (
               <span className="text-accent">Agent is working...</span>
             ) : (

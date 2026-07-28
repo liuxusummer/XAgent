@@ -45,6 +45,14 @@ export function StatusBar({ status, activeAgent, activeTeam, chatTitle }: Status
           bgColor: 'bg-status-error/10',
           pulse: false,
         };
+      case 'interrupted':
+        return {
+          icon: <Pause className="w-4 h-4" />,
+          text: 'Task interrupted',
+          color: 'text-status-warning',
+          bgColor: 'bg-status-warning/10',
+          pulse: false,
+        };
       default:
         return {
           icon: <Bot className="w-4 h-4" />,

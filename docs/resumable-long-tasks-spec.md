@@ -31,7 +31,6 @@ tools already completed, which files mattered, and what remains.
 - No rollback of file changes.
 - No migration of `plan.md` into `runtime/`.
 - No change to `Session.history` trimming or provider protocol behavior.
-- No Web UI resume button in this first backend slice.
 
 ## Runtime Contract
 
@@ -50,6 +49,13 @@ duration of the task. If `resume_checkpoint` is provided, it loads the checkpoin
 from the current workspace and prepends a resume prompt to the query.
 
 `XAgent.resume_task(checkpoint_id="latest", query="")` is a convenience wrapper.
+
+The Web frontend assigns a task-specific checkpoint id before starting an Agent
+run and stores it in that persistent chat's `state.json`. After a service
+restart, a chat persisted as `running` or `waiting_for_user` is exposed as
+`interrupted`. Resume is offered only when that exact checkpoint exists and
+belongs to the chat's agent; Web never falls back to workspace-level
+`latest.json`.
 
 ## Persistence Contract
 

@@ -204,15 +204,21 @@ class XAgent:
     def put_task(self, query: str) -> None:
         self.task_queue.put(query)
 
-    def run_task(self, query: str, resume_checkpoint: str | None = None) -> dict[str, Any]:
+    def run_task(
+        self,
+        query: str,
+        resume_checkpoint: str | None = None,
+        checkpoint_id: str | None = None,
+    ) -> dict[str, Any]:
         self._running.set()
         self.stop_event.clear()
         base_sink = self.handler.ctx.sink
         base_checkpoint_callback = self.handler.ctx.checkpoint_callback
         runbook_collector = _RunbookEventCollector()
         self.handler.ctx.sink = MultiSink(base_sink, runbook_collector)
-        # Phase 8：每次任务刷新 session_id，便于事件流按会话归集
-        self.handler.ctx.session_id = uuid.uuid4().hex[:16]
+        # 每次任务使用独立 session_id；Web 等前端可预先指定，从而把聊天
+        # 状态与该任务的 checkpoint 稳定关联起来。
+        self.handler.ctx.session_id = str(checkpoint_id or uuid.uuid4().hex[:16])
         if resume_checkpoint:
             query = self._query_with_resume_checkpoint(query, resume_checkpoint)
         self.handler.ctx.checkpoint_callback = self._build_checkpoint_callback(query)
@@ -386,8 +392,18 @@ class XAgent:
                 )
             )
 
-    def run_task_async(self, query: str) -> None:
-        thread = threading.Thread(target=self.run_task, args=(query,), daemon=True)
+    def run_task_async(
+        self,
+        query: str,
+        *,
+        resume_checkpoint: str | None = None,
+        checkpoint_id: str | None = None,
+    ) -> None:
+        thread = threading.Thread(
+            target=self.run_task,
+            args=(query, resume_checkpoint, checkpoint_id),
+            daemon=True,
+        )
         thread.start()
 
     def is_running(self) -> bool:

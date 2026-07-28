@@ -71,7 +71,11 @@ class ApiClient {
     }
   }
 
-  async submitTask(request: SubmitTaskRequest): Promise<ApiResponse<{ session_id: string }>> {
+  async submitTask(request: SubmitTaskRequest): Promise<ApiResponse<{
+    session_id: string;
+    checkpoint_id: string;
+    resumed: boolean;
+  }>> {
     return this.fetch('/api/chat', {
       method: 'POST',
       body: JSON.stringify(request),

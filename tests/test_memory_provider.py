@@ -747,6 +747,38 @@ class TaskCheckpointTests(unittest.TestCase):
         self.assertIn("不要重放已完成工具动作", prompt)
         self.assertIn("用户补充", prompt)
 
+    def test_concurrent_checkpoint_writes_preserve_each_session_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "demo.ws"
+            workspace.mkdir()
+
+            def _write(index: int) -> None:
+                write_task_checkpoint(
+                    workspace,
+                    build_task_checkpoint(
+                        workspace,
+                        checkpoint_id=f"session-{index}",
+                        session_id=f"session-{index}",
+                        task=f"Task {index}",
+                    ),
+                )
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(_write, range(20)))
+
+            checkpoint_dir = workspace / "runtime" / "checkpoints"
+            payloads = [
+                json.loads((checkpoint_dir / f"session-{index}.json").read_text(encoding="utf-8"))
+                for index in range(20)
+            ]
+            latest = json.loads((checkpoint_dir / "latest.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(
+                {payload["checkpoint_id"] for payload in payloads},
+                {f"session-{index}" for index in range(20)},
+            )
+            self.assertIn(latest["checkpoint_id"], {f"session-{index}" for index in range(20)})
+
     def test_agent_loop_invokes_checkpoint_callback_during_run(self) -> None:
         class DummyClient:
             backend = type("Backend", (), {"history": []})()
@@ -855,6 +887,32 @@ class TaskCheckpointTests(unittest.TestCase):
             assert dummy.messages is not None
             self.assertIn("[Resume Checkpoint]", dummy.messages[1]["content"])
             self.assertIn("Original task", dummy.messages[1]["content"])
+
+    def test_xagent_uses_frontend_checkpoint_id_for_the_run(self) -> None:
+        class DummyClient:
+            backend = type("Backend", (), {"history": []})()
+
+            def chat(self, messages, tools):  # noqa: ANN001
+                del messages, tools
+                return ChatResponse(thinking="", content="done", tool_calls=[])
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "demo.ws"
+            agent = XAgent(
+                system_prompt="sys",
+                tools_schema=[],
+                workspace_dir=str(workspace),
+                runbook_min_interaction_records=99,
+            )
+            agent.client = DummyClient()
+
+            result = agent.run_task("Long task", checkpoint_id="web-chat-task")
+            loaded = load_task_checkpoint(workspace, "web-chat-task")
+
+            self.assertEqual(result["exit_reason"], "CURRENT_TASK_DONE")
+            self.assertEqual(loaded["status"], "OK")
+            self.assertEqual(loaded["checkpoint"]["checkpoint_id"], "web-chat-task")
+            self.assertEqual(loaded["checkpoint"]["session_id"], "web-chat-task")
 
     def test_xagent_writes_failed_checkpoint_when_loop_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

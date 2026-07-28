@@ -61,6 +61,7 @@ function App() {
     session,
     agentStatus,
     isWaitingForUser,
+    canResume,
     askPrompt,
     liveTokenUsage,
     submitTask,
@@ -100,6 +101,17 @@ function App() {
       agent: selectedAgent || undefined,
       team: selectedTeam?.name || undefined,
       chatId: chatId || undefined,
+    });
+  };
+
+  const handleResumeTask = () => {
+    submitTask('', {
+      ...agentConfig,
+      workspaceDir: agentConfig.workspaceDir || currentWorkspace,
+      agent: selectedAgent || undefined,
+      team: selectedTeam?.name || undefined,
+      chatId: activeChatId || undefined,
+      resume: true,
     });
   };
 
@@ -260,6 +272,8 @@ function App() {
           isWaitingForUser={isWaitingForUser}
           askPrompt={askPrompt}
           onSubmitTask={handleSubmitTask}
+          canResume={canResume}
+          onResumeTask={handleResumeTask}
           onSendReply={sendReply}
           onStopTask={stopTask}
           view={mainView}

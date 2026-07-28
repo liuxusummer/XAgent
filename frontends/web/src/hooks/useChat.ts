@@ -112,10 +112,12 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
   const [liveTokenUsage, setLiveTokenUsage] = useState<LiveTokenUsage | null>(null);
 
   const [isWaitingForUser, setIsWaitingForUser] = useState(false);
+  const [canResume, setCanResume] = useState(false);
   const [askPrompt, setAskPrompt] = useState('');
   const eventSourceRef = useRef<EventSource | null>(null);
   const eventCursorRef = useRef(0);
   const backendSessionIdRef = useRef<string>('');
+  const checkpointIdRef = useRef<string>('');
   const persistentChatIdRef = useRef<string>('');
   const streamRunIdRef = useRef(0);
   const onPersistentChatUpdatedRef = useRef(options.onPersistentChatUpdated);
@@ -280,9 +282,10 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
             }>;
           };
           const completedAt = Date.now();
+          const interrupted = result.exit_reason === 'INTERRUPTED';
 
-          setAgentStatus({ state: 'idle' });
-          setSession(prev => ({ ...prev, status: 'idle' }));
+          setAgentStatus({ state: interrupted ? 'interrupted' : 'idle' });
+          setCanResume(interrupted && Boolean(checkpointIdRef.current));
 
           setSession(prev => {
             const messages = [...prev.messages];
@@ -318,7 +321,11 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
               }));
             }
 
-            return { ...prev, messages, status: 'idle' as const };
+            return {
+              ...prev,
+              messages,
+              status: interrupted ? 'interrupted' as const : 'idle' as const,
+            };
           });
 
           closeEventSource();
@@ -372,19 +379,24 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
     agent?: string;
     chatId?: string;
     team?: string;
+    resume?: boolean;
   }) => {
-    if (!task.trim()) return;
+    const resume = Boolean(config?.resume);
+    if (!task.trim() && !resume) return;
+    const resumeWasAvailable = canResume;
 
     // Close any existing connection
     closeEventSource();
 
     // Add user message
-    addMessage(createMessage('user', task.trim()));
+    if (task.trim()) {
+      addMessage(createMessage('user', task.trim()));
+    }
 
     // Update session status
     setSession(prev => ({
       ...prev,
-      title: (config?.chatId || persistentChatIdRef.current) && prev.title === 'New Chat'
+      title: task.trim() && (config?.chatId || persistentChatIdRef.current) && prev.title === 'New Chat'
         ? task.trim().slice(0, 40)
         : prev.title,
       status: 'running',
@@ -392,6 +404,7 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
     }));
     setAgentStatus({ state: 'thinking' });
     setIsWaitingForUser(false);
+    setCanResume(false);
     setAskPrompt('');
     setLiveTokenUsage(null);
 
@@ -406,18 +419,21 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
         workspace_dir: config?.workspaceDir,
         agent: config?.agent,
         team: config?.team,
+        resume,
       });
 
       if (!response.success) {
         addMessage(createMessage('system', `[Error] Failed to submit task: ${response.error}`, {
           status: 'error',
         }));
-        setAgentStatus({ state: 'idle' });
-        setSession(prev => ({ ...prev, status: 'idle' }));
+        setAgentStatus({ state: resumeWasAvailable ? 'interrupted' : 'idle' });
+        setCanResume(resumeWasAvailable);
+        setSession(prev => ({ ...prev, status: resumeWasAvailable ? 'interrupted' : 'idle' }));
         return;
       }
 
       backendSessionIdRef.current = response.data?.session_id || '';
+      checkpointIdRef.current = response.data?.checkpoint_id || '';
       if (config?.chatId) {
         persistentChatIdRef.current = config.chatId;
       }
@@ -426,10 +442,11 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
       addMessage(createMessage('system', `[Error] ${errorMsg}`, { status: 'error' }));
-      setAgentStatus({ state: 'idle' });
-      setSession(prev => ({ ...prev, status: 'idle' }));
+      setAgentStatus({ state: resumeWasAvailable ? 'interrupted' : 'idle' });
+      setCanResume(resumeWasAvailable);
+      setSession(prev => ({ ...prev, status: resumeWasAvailable ? 'interrupted' : 'idle' }));
     }
-  }, [addMessage, closeEventSource, openEventStream]);
+  }, [addMessage, canResume, closeEventSource, openEventStream]);
 
   const attachRunningSession = useCallback((sessionId: string, options: {
     title?: string;
@@ -446,8 +463,10 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
 
     closeEventSource();
     backendSessionIdRef.current = sessionId;
+    checkpointIdRef.current = '';
     persistentChatIdRef.current = '';
     setIsWaitingForUser(false);
+    setCanResume(false);
     setAskPrompt('');
     setLiveTokenUsage(null);
     setAgentStatus({ state: 'thinking' });
@@ -515,6 +534,7 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
   const clearChat = useCallback(() => {
     closeEventSource();
     backendSessionIdRef.current = '';
+    checkpointIdRef.current = '';
     persistentChatIdRef.current = '';
     eventCursorRef.current = 0;
     setSession({
@@ -527,6 +547,7 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
     });
     setAgentStatus({ state: 'idle' });
     setIsWaitingForUser(false);
+    setCanResume(false);
     setAskPrompt('');
     setLiveTokenUsage(null);
   }, [closeEventSource]);
@@ -536,12 +557,15 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
     const metadata = detail.metadata;
     const state = detail.state;
     backendSessionIdRef.current = state.backend_session_id || '';
+    checkpointIdRef.current = state.checkpoint_id || '';
     persistentChatIdRef.current = metadata.chat_id;
     eventCursorRef.current = state.event_cursor || 0;
     const restoredStatus = state.waiting_for_user
       ? 'waiting_for_user'
       : state.status === 'running'
         ? 'running'
+        : state.status === 'interrupted'
+          ? 'interrupted'
         : 'idle';
     setSession({
       id: metadata.chat_id,
@@ -560,9 +584,12 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
         ? 'waiting_for_user'
         : restoredStatus === 'running'
           ? 'thinking'
+          : restoredStatus === 'interrupted'
+            ? 'interrupted'
           : 'idle',
     });
     setIsWaitingForUser(Boolean(state.waiting_for_user));
+    setCanResume(restoredStatus === 'interrupted' && Boolean(state.resume_available));
     setAskPrompt(state.ask_prompt || '');
     setLiveTokenUsage(null);
     if (restoredStatus === 'running' && backendSessionIdRef.current) {
@@ -581,6 +608,7 @@ export function useChat(options: { onPersistentChatUpdated?: () => void } = {}) 
     session,
     agentStatus,
     isWaitingForUser,
+    canResume,
     askPrompt,
     liveTokenUsage,
     submitTask,

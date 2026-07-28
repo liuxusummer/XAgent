@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import time
 from pathlib import Path
 from typing import Any
+
+from src.core.workspace_storage import atomic_write_json, workspace_write_lock
 
 CHECKPOINT_SCHEMA_VERSION = 1
 CHECKPOINT_DIR = Path("runtime") / "checkpoints"
@@ -74,9 +75,10 @@ def write_task_checkpoint(workspace_root: str | Path, checkpoint: dict[str, Any]
     path = directory / f"{checkpoint_id}.json"
     latest_path = directory / LATEST_CHECKPOINT_FILE
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        _atomic_write_json(path, checkpoint)
-        _atomic_write_json(latest_path, checkpoint)
+        with workspace_write_lock(root):
+            directory.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(path, checkpoint)
+            atomic_write_json(latest_path, checkpoint)
     except OSError as exc:
         return {"status": "ERROR", "error": type(exc).__name__, "path": str(path)}
     except TypeError as exc:
@@ -158,12 +160,6 @@ def _checkpoint_path(root: Path, checkpoint_id: str) -> Path | None:
     if not safe:
         return None
     return root / CHECKPOINT_DIR / f"{safe}.json"
-
-
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp_path, path)
 
 
 def _read_plan(root: Path) -> str:

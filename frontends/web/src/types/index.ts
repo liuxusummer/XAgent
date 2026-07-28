@@ -28,7 +28,7 @@ export interface ChatSession {
   messages: Message[];
   createdAt: number;
   updatedAt: number;
-  status: 'idle' | 'running' | 'waiting_for_user' | 'error';
+  status: 'idle' | 'running' | 'waiting_for_user' | 'interrupted' | 'error';
   config?: {
     configPath?: string;
     observabilityConfigPath?: string;
@@ -54,6 +54,8 @@ export interface ChatState {
   workspace: string;
   agent: string;
   backend_session_id: string;
+  checkpoint_id: string;
+  resume_available: boolean;
   event_cursor: number;
   runtime_config_key: string;
   messages: Message[];
@@ -70,7 +72,7 @@ export interface PersistentChatDetail {
 }
 
 export interface AgentStatus {
-  state: 'idle' | 'thinking' | 'executing' | 'waiting_for_user' | 'error';
+  state: 'idle' | 'thinking' | 'executing' | 'waiting_for_user' | 'interrupted' | 'error';
   currentTurn?: number;
   maxTurns?: number;
   currentTool?: string;
@@ -171,6 +173,7 @@ export interface SubmitTaskRequest {
   workspace_dir?: string;
   agent?: string;
   team?: string;
+  resume?: boolean;
 }
 
 export interface ScheduledTask {

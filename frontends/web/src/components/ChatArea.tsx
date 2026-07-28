@@ -12,6 +12,8 @@ interface ChatAreaProps {
   isWaitingForUser: boolean;
   askPrompt: string;
   onSubmitTask: (task: string) => void;
+  canResume: boolean;
+  onResumeTask: () => void;
   onSendReply: (reply: string) => void;
   onStopTask: () => void;
   view: 'chat' | 'agents' | 'teams' | 'skills';
@@ -62,6 +64,8 @@ export function ChatArea({
   isWaitingForUser,
   askPrompt,
   onSubmitTask,
+  canResume,
+  onResumeTask,
   onSendReply,
   onStopTask,
   view,
@@ -88,7 +92,7 @@ export function ChatArea({
     }
   };
 
-  const isRunning = agentStatus.state !== 'idle' && agentStatus.state !== 'error';
+  const isRunning = ['thinking', 'executing', 'waiting_for_user'].includes(agentStatus.state);
 
   const showChat = view === 'chat';
 
@@ -126,8 +130,10 @@ export function ChatArea({
         <InputArea
           onSubmit={handleSubmit}
           onStop={onStopTask}
+          onResume={onResumeTask}
           isRunning={isRunning}
           isWaitingForUser={isWaitingForUser}
+          canResume={canResume}
           placeholder={isWaitingForUser ? 'Reply to the agent...' : 'Tell XAgent what to do...'}
         />
       )}
