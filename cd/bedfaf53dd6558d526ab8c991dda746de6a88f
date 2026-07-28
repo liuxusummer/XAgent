@@ -1,0 +1,27 @@
+docs/architecture.md
+  s_72af05a5dabd4c::t_68f4a951a0ccd4 48,94-95
+src/core/XAgent.py
+  s_72af05a5dabd4c::t_702c03185f7eaf 91,213-214,217-218,405,407-408,412
+src/core/team_workflows.py
+  s_72af05a5dabd4c::t_d29f5bb1dc4d19 201-206,225-227,271-273
+src/main.py
+  s_72af05a5dabd4c::t_7f872f737457ed 8,110-126,188,192-196,282,286-290
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cdbedfaf53dd6558d526ab8c991dda746de6a88f",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
