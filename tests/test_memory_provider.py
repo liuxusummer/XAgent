@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -217,6 +218,28 @@ class MemoryProviderTests(unittest.TestCase):
             self.assertNotIn("lesson-1", content)
             self.assertIn("- lesson-2", content)
             self.assertIn("- lesson-3", content)
+
+    def test_concurrent_self_evolution_writes_preserve_all_lessons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "demo.ws"
+            root.mkdir()
+
+            with ThreadPoolExecutor(max_workers=20) as pool:
+                records = list(
+                    pool.map(
+                        lambda index: record_self_evolution_lesson(
+                            root,
+                            f"lesson-{index}",
+                            max_lessons=30,
+                        ),
+                        range(20),
+                    )
+                )
+
+            content = (root / "system" / "memory" / "self_evolution.md").read_text(encoding="utf-8")
+            lessons = {line[2:] for line in content.splitlines() if line.startswith("- lesson-")}
+            self.assertTrue(all(record["status"] == "OK" for record in records))
+            self.assertEqual(lessons, {f"lesson-{index}" for index in range(20)})
 
 
 class MemoryProviderIntegrationTests(unittest.TestCase):
@@ -542,6 +565,31 @@ class RunbookDistillationTests(unittest.TestCase):
             self.assertNotIn("### Task A", skill_text)
             self.assertIn("### Task B", skill_text)
             self.assertIn("### Task C", skill_text)
+
+    def test_concurrent_distillation_preserves_all_runbook_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "demo.ws"
+            workspace.mkdir()
+            result = {"exit_reason": "CURRENT_TASK_DONE", "turns": 10, "tool_results": []}
+
+            with ThreadPoolExecutor(max_workers=20) as pool:
+                records = list(
+                    pool.map(
+                        lambda index: distill_runbook_from_task(
+                            workspace,
+                            f"Task {index}",
+                            result,
+                            max_entries=30,
+                        ),
+                        range(20),
+                    )
+                )
+
+            skill_text = (workspace / "system" / "skills" / RUNBOOK_SKILL_NAME / "SKILL.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertTrue(all(record["status"] == "OK" for record in records))
+            self.assertEqual(skill_text.count("- Key: `"), 20)
 
     def test_template_creation_preserves_existing_user_template(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from src.core.workspace_storage import atomic_write_json, atomic_write_text, workspace_write_lock
+
 RUNBOOK_SKILL_NAME = "auto-runbooks"
 RUNBOOK_TASK_ID = "managed-runbook-auto-distillation-review"
 RUNBOOK_TASK_NAME = "Runbook Auto Distillation Review"
@@ -62,10 +64,11 @@ def distill_runbook_from_task(
             agent_name=agent_name,
             trace_events=trace_events or [],
         )
-        skill_path = update_runbook_skill(root, entry, max_entries=max_entries)
-        meta_path = write_runbook_skill_meta(root)
-        template_path = ensure_runbook_template(root)
-        task_path = upsert_runbook_review_task(root, agent_name=agent_name)
+        with workspace_write_lock(root):
+            skill_path = update_runbook_skill(root, entry, max_entries=max_entries)
+            meta_path = write_runbook_skill_meta(root)
+            template_path = ensure_runbook_template(root)
+            task_path = upsert_runbook_review_task(root, agent_name=agent_name)
     except OSError as exc:
         return {"status": "ERROR", "error": type(exc).__name__, "path": str(root)}
     except UnicodeError as exc:
@@ -122,97 +125,101 @@ def build_runbook_entry(
 def update_runbook_skill(workspace_root: str | Path, entry: dict[str, Any], *, max_entries: int = 30) -> Path:
     root = Path(workspace_root)
     path = root / RUNBOOK_SKILL_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    content = path.read_text(encoding="utf-8") if path.is_file() else _default_skill_content()
+    with workspace_write_lock(root):
+        content = path.read_text(encoding="utf-8") if path.is_file() else _default_skill_content()
 
-    entries = _parse_runbook_entries(content)
-    key = str(entry["key"])
-    rendered = _render_entry(entry)
-    filtered = [item for item in entries if item["key"] != key]
-    filtered.append({"key": key, "body": rendered})
-    limit = max(1, int(max_entries))
-    filtered = filtered[-limit:]
+        entries = _parse_runbook_entries(content)
+        key = str(entry["key"])
+        rendered = _render_entry(entry)
+        filtered = [item for item in entries if item["key"] != key]
+        filtered.append({"key": key, "body": rendered})
+        limit = max(1, int(max_entries))
+        filtered = filtered[-limit:]
 
-    section = RUNBOOK_SECTION_HEADER + "\n\n" + "\n".join(item["body"].rstrip() for item in filtered).rstrip() + "\n"
-    updated = _replace_runbook_section(content, section)
-    path.write_text(updated, encoding="utf-8")
+        section = (
+            RUNBOOK_SECTION_HEADER
+            + "\n\n"
+            + "\n".join(item["body"].rstrip() for item in filtered).rstrip()
+            + "\n"
+        )
+        updated = _replace_runbook_section(content, section)
+        atomic_write_text(path, updated)
     return path
 
 
 def write_runbook_skill_meta(workspace_root: str | Path) -> Path:
-    path = Path(workspace_root) / RUNBOOK_META_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
+    root = Path(workspace_root)
+    path = root / RUNBOOK_META_FILE
     payload = {
         "name": RUNBOOK_SKILL_NAME,
         "description": "Workspace-local SOPs distilled from successful and failed XAgent runs.",
         "triggers": ["runbook", "sop", "SOP", "复盘", "经验", "自动沉淀", "故障", "成功路径"],
         "max_inject_chars": 12000,
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with workspace_write_lock(root):
+        atomic_write_json(path, payload)
     return path
 
 
 def ensure_runbook_template(workspace_root: str | Path) -> Path:
-    path = Path(workspace_root) / RUNBOOK_TEMPLATE_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        path.write_text(
-            "\n".join(
-                [
-                    "# Runbook SOP",
-                    "",
-                    "## Trigger",
-                    "",
-                    "- When this SOP should be used.",
-                    "",
-                    "## Preconditions",
-                    "",
-                    "- Required workspace state, files, credentials, or user confirmations.",
-                    "",
-                    "## Steps",
-                    "",
-                    "1. Inspect the current state before making changes.",
-                    "2. Execute the smallest safe action.",
-                    "3. Verify the result with a read-only check or targeted test.",
-                    "",
-                    "## Failure Handling",
-                    "",
-                    "- Record the failing tool/status and switch strategy before retrying.",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
+    root = Path(workspace_root)
+    path = root / RUNBOOK_TEMPLATE_PATH
+    with workspace_write_lock(root):
+        if not path.exists():
+            atomic_write_text(
+                path,
+                "\n".join(
+                    [
+                        "# Runbook SOP",
+                        "",
+                        "## Trigger",
+                        "",
+                        "- When this SOP should be used.",
+                        "",
+                        "## Preconditions",
+                        "",
+                        "- Required workspace state, files, credentials, or user confirmations.",
+                        "",
+                        "## Steps",
+                        "",
+                        "1. Inspect the current state before making changes.",
+                        "2. Execute the smallest safe action.",
+                        "3. Verify the result with a read-only check or targeted test.",
+                        "",
+                        "## Failure Handling",
+                        "",
+                        "- Record the failing tool/status and switch strategy before retrying.",
+                        "",
+                    ]
+                ),
+            )
     return path
 
 
 def upsert_runbook_review_task(workspace_root: str | Path, *, agent_name: str = "") -> Path:
     root = Path(workspace_root)
     path = root / RUNBOOK_TASK_STORE
-    payload = _read_task_payload(path)
-    tasks = payload.get("tasks")
-    if not isinstance(tasks, list):
-        tasks = []
+    with workspace_write_lock(root):
+        payload = _read_task_payload(path)
+        tasks = payload.get("tasks")
+        if not isinstance(tasks, list):
+            tasks = []
 
-    now = time.time()
-    workspace_name = root.name if root.name.endswith(".ws") else ""
-    task = _managed_review_task(agent_name=agent_name, workspace_name=workspace_name, now_ts=now)
-    replaced = False
-    for index, existing in enumerate(tasks):
-        if isinstance(existing, dict) and existing.get("id") == RUNBOOK_TASK_ID:
-            merged = {**existing, **task}
-            merged.setdefault("created_at", existing.get("created_at", now))
-            tasks[index] = merged
-            replaced = True
-            break
-    if not replaced:
-        tasks.append(task)
+        now = time.time()
+        workspace_name = root.name if root.name.endswith(".ws") else ""
+        task = _managed_review_task(agent_name=agent_name, workspace_name=workspace_name, now_ts=now)
+        replaced = False
+        for index, existing in enumerate(tasks):
+            if isinstance(existing, dict) and existing.get("id") == RUNBOOK_TASK_ID:
+                merged = {**existing, **task}
+                merged.setdefault("created_at", existing.get("created_at", now))
+                tasks[index] = merged
+                replaced = True
+                break
+        if not replaced:
+            tasks.append(task)
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"tasks": tasks, "updated_at": now}, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+        atomic_write_json(path, {"tasks": tasks, "updated_at": now})
     return path
 
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.core.workspace_storage import atomic_write_text, workspace_write_lock
+
 
 BOOT_MEMORY_FILES = ("global_mem_insight.txt", "insight_fixed_structure.txt")
 GLOBAL_MEMORY_FILE = "global_mem.txt"
@@ -263,7 +265,38 @@ def record_self_evolution_lesson(
         }
 
     try:
-        content = target.read_text(encoding="utf-8") if target.is_file() else ""
+        with workspace_write_lock(root):
+            content = target.read_text(encoding="utf-8") if target.is_file() else ""
+            lines = content.splitlines()
+            header_idx = next(
+                (index for index, line in enumerate(lines) if line.strip() == SELF_EVOLUTION_HEADER),
+                None,
+            )
+            existing: list[str] = []
+            if header_idx is not None:
+                end_idx = header_idx + 1
+                while end_idx < len(lines):
+                    stripped = lines[end_idx].strip()
+                    if stripped.startswith("## ") and stripped != SELF_EVOLUTION_HEADER:
+                        break
+                    if stripped.startswith("- "):
+                        existing.append(_normalize_lesson(stripped[2:]))
+                    end_idx += 1
+
+            if normalized in existing:
+                return {
+                    "status": "OK",
+                    "path": str(target),
+                    "lesson": normalized,
+                    "written": False,
+                }
+
+            limit = max(1, int(max_lessons))
+            lessons = [item for item in existing if item]
+            lessons.append(normalized)
+            lessons = lessons[-limit:]
+            updated = _replace_self_evolution_section(content, lessons)
+            atomic_write_text(target, updated)
     except OSError as exc:
         return {
             "status": "ERROR",
@@ -273,48 +306,6 @@ def record_self_evolution_lesson(
             "written": False,
         }
     except UnicodeError as exc:
-        return {
-            "status": "ERROR",
-            "error": type(exc).__name__,
-            "path": str(target),
-            "lesson": normalized,
-            "written": False,
-        }
-
-    lines = content.splitlines()
-    header_idx = next(
-        (index for index, line in enumerate(lines) if line.strip() == SELF_EVOLUTION_HEADER),
-        None,
-    )
-    existing: list[str] = []
-    if header_idx is not None:
-        end_idx = header_idx + 1
-        while end_idx < len(lines):
-            stripped = lines[end_idx].strip()
-            if stripped.startswith("## ") and stripped != SELF_EVOLUTION_HEADER:
-                break
-            if stripped.startswith("- "):
-                existing.append(_normalize_lesson(stripped[2:]))
-            end_idx += 1
-
-    if normalized in existing:
-        return {
-            "status": "OK",
-            "path": str(target),
-            "lesson": normalized,
-            "written": False,
-        }
-
-    limit = max(1, int(max_lessons))
-    lessons = [item for item in existing if item]
-    lessons.append(normalized)
-    lessons = lessons[-limit:]
-    updated = _replace_self_evolution_section(content, lessons)
-
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(updated, encoding="utf-8")
-    except OSError as exc:
         return {
             "status": "ERROR",
             "error": type(exc).__name__,

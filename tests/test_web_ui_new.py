@@ -18,6 +18,7 @@ from src.core.agent_loop import AgentContext, exhaust
 from src.core.team_workflows import normalize_team_workflow, run_team_workflow
 from src.core.telemetry import Event, JsonlSink, MultiSink, NullSink
 from src.core.XAgent import XAgent
+from src.core.runbook import RUNBOOK_TASK_ID, upsert_runbook_review_task
 from src.core.skills import SkillRegistry
 from src.handler import XAgentHandler
 from src.main import build_system_prompt, build_team_step_runner, filter_tools_schema
@@ -2525,6 +2526,41 @@ class WebUINewScheduledTaskTests(unittest.IsolatedAsyncioTestCase):
 
                 store_path = ws_root / "runtime" / "tasks" / "tasks.json"
                 self.assertTrue(store_path.is_file())
+
+    async def test_runbook_upsert_and_task_creation_do_not_overwrite_each_other(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ws_root = Path(tmp_dir) / "default.ws"
+            ws_root.mkdir(parents=True)
+            requests = [
+                ScheduledTaskWriteRequest(
+                    ws="default.ws",
+                    name=f"Task {index}",
+                    prompt=f"run task {index}",
+                    repeat="none",
+                    date="2099-01-01",
+                    time="09:00",
+                )
+                for index in range(20)
+            ]
+
+            with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                results = await asyncio.gather(
+                    *(create_scheduled_task(request) for request in requests),
+                    *(
+                        asyncio.to_thread(upsert_runbook_review_task, ws_root, agent_name="main")
+                        for _ in range(20)
+                    ),
+                )
+                listed = await list_scheduled_tasks("default.ws")
+
+            self.assertTrue(all(result["success"] for result in results[: len(requests)]))
+            self.assertTrue(listed["success"])
+            tasks = listed["data"]
+            self.assertEqual(len([task for task in tasks if task["id"] == RUNBOOK_TASK_ID]), 1)
+            self.assertEqual(
+                {task["name"] for task in tasks if task["id"] != RUNBOOK_TASK_ID},
+                {f"Task {index}" for index in range(20)},
+            )
 
     async def test_due_scheduled_task_dispatches_existing_task_runner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

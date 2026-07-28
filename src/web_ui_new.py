@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -36,6 +37,7 @@ from src.core.agent_teams import (
 )
 from src.core.team_workflows import read_team_workflow, run_team_workflow, write_team_workflow
 from src.core.telemetry import Event, JsonlSink, MultiSink, NullSink
+from src.core.workspace_storage import atomic_write_json, atomic_write_text, workspace_write_lock
 from src.core.workspace_templates import (
     create_workspace_from_template,
     list_workspace_templates,
@@ -346,7 +348,6 @@ _PERSISTED_SESSION_EVENT_TYPES = {
     "error",
     "stop",
 }
-_task_lock = threading.Lock()
 _task_scheduler_started = False
 _task_scheduler_stop = threading.Event()
 _task_scheduler_thread: threading.Thread | None = None
@@ -2665,6 +2666,14 @@ def _task_store_path(ws: str) -> tuple[str | None, str | None]:
     return os.path.join(ws_root, "runtime", "tasks", "tasks.json"), None
 
 
+def _scheduled_task_store_lock(ws: str):
+    path, _ = _task_store_path(ws)
+    if path is None:
+        return nullcontext()
+    workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(path)))
+    return workspace_write_lock(workspace_root)
+
+
 def _read_scheduled_tasks(ws: str) -> tuple[list[dict[str, Any]], str | None]:
     path, error = _task_store_path(ws)
     if error or path is None:
@@ -2690,7 +2699,7 @@ def _write_scheduled_tasks(ws: str, tasks: list[dict[str, Any]]) -> str | None:
     if error or path is None:
         return error
     try:
-        _write_json_file(path, {"tasks": tasks, "updated_at": time.time()})
+        atomic_write_json(path, {"tasks": tasks, "updated_at": time.time()})
     except OSError as exc:
         return str(exc)
     return None
@@ -3065,7 +3074,7 @@ def _run_due_scheduled_tasks(now_ts: float | None = None) -> None:
     for ws in sorted(os.listdir(_WORKSPACE_ROOT)):
         if not _is_workspace_name(ws):
             continue
-        with _task_lock:
+        with _scheduled_task_store_lock(ws):
             tasks, error = _read_scheduled_tasks(ws)
             if error:
                 continue
@@ -3127,7 +3136,7 @@ def _shutdown_web_runtime() -> None:
 
 def _list_scheduled_tasks_sync(ws: str) -> dict[str, Any]:
     ws = _normalize_path_input(ws) or "default.ws"
-    with _task_lock:
+    with _scheduled_task_store_lock(ws):
         tasks, error = _read_scheduled_tasks(ws)
     if error:
         return {"success": False, "error": error}
@@ -3144,7 +3153,7 @@ def _create_scheduled_task_sync(request: ScheduledTaskWriteRequest) -> dict[str,
     if error or task is None:
         return {"success": False, "error": error}
     ws = task["workspace"]
-    with _task_lock:
+    with _scheduled_task_store_lock(ws):
         tasks, read_error = _read_scheduled_tasks(ws)
         if read_error:
             return {"success": False, "error": read_error}
@@ -3167,7 +3176,7 @@ def _update_scheduled_task_sync(
     if not _valid_task_id(task_id):
         return {"success": False, "error": "Invalid task id"}
     ws = _normalize_path_input(request.ws) or "default.ws"
-    with _task_lock:
+    with _scheduled_task_store_lock(ws):
         tasks, read_error = _read_scheduled_tasks(ws)
         if read_error:
             return {"success": False, "error": read_error}
@@ -3200,7 +3209,7 @@ def _set_scheduled_task_status_sync(
     status = _normalize_path_input(request.status)
     if status not in _TASK_STATUSES:
         return {"success": False, "error": "Invalid status"}
-    with _task_lock:
+    with _scheduled_task_store_lock(ws):
         tasks, read_error = _read_scheduled_tasks(ws)
         if read_error:
             return {"success": False, "error": read_error}
@@ -3230,7 +3239,7 @@ def _delete_scheduled_task_sync(task_id: str, ws: str) -> dict[str, Any]:
     if not _valid_task_id(task_id):
         return {"success": False, "error": "Invalid task id"}
     ws = _normalize_path_input(ws) or "default.ws"
-    with _task_lock:
+    with _scheduled_task_store_lock(ws):
         tasks, read_error = _read_scheduled_tasks(ws)
         if read_error:
             return {"success": False, "error": read_error}
@@ -3249,7 +3258,7 @@ async def delete_scheduled_task(task_id: str, ws: str = "default.ws"):
 
 
 def _run_scheduled_task_now_sync(task_id: str, ws: str) -> dict[str, Any]:
-    with _task_lock:
+    with _scheduled_task_store_lock(ws):
         tasks, read_error = _read_scheduled_tasks(ws)
         if read_error:
             return {"success": False, "error": read_error}
@@ -3645,11 +3654,13 @@ def _write_workspace_file_sync(ws: str, path: str, content: str) -> dict[str, An
     if os.path.isdir(real_path):
         return {"success": False, "error": "Path is a directory"}
 
-    created = not os.path.exists(real_path)
+    ws_root, workspace_error = _workspace_root(ws)
+    if workspace_error or ws_root is None:
+        return {"success": False, "error": workspace_error}
     try:
-        os.makedirs(os.path.dirname(real_path), exist_ok=True)
-        with open(real_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        with workspace_write_lock(ws_root):
+            created = not os.path.exists(real_path)
+            atomic_write_text(real_path, content)
         return {
             "success": True,
             "data": {
@@ -3686,15 +3697,16 @@ def _delete_workspace_file_sync(ws: str, path: str) -> dict[str, Any]:
     system_root = os.path.abspath(os.path.join(ws_root, "system"))
     if os.path.commonpath([system_root, lexical_path]) != system_root:
         return {"success": False, "error": "Only system/ files can be managed via this endpoint"}
-    if os.path.islink(lexical_path):
-        return {"success": False, "error": "Symbolic links cannot be deleted via this endpoint"}
-    if not os.path.exists(lexical_path):
-        return {"success": False, "error": "File not found"}
-    if not os.path.isfile(lexical_path):
-        return {"success": False, "error": "Path is not a regular file"}
 
     try:
-        os.remove(lexical_path)
+        with workspace_write_lock(ws_root):
+            if os.path.islink(lexical_path):
+                return {"success": False, "error": "Symbolic links cannot be deleted via this endpoint"}
+            if not os.path.exists(lexical_path):
+                return {"success": False, "error": "File not found"}
+            if not os.path.isfile(lexical_path):
+                return {"success": False, "error": "Path is not a regular file"}
+            os.remove(lexical_path)
     except OSError:
         return {"success": False, "error": "Failed to delete file"}
     return {"success": True, "data": {"path": normalized_path}}
