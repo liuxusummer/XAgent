@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import threading
@@ -45,6 +46,16 @@ def _is_relative_to(path: Path, base: Path) -> bool:
 def _is_delete_authorized(user_reply: str) -> bool:
     normalized = user_reply.strip().lower()
     return normalized in {"yes", "y", "ok", "confirm", "confirmed", "delete", "确认", "授权", "同意", "删除"}
+
+
+def _is_code_run_authorized(user_reply: str) -> bool:
+    normalized = user_reply.strip().lower()
+    return normalized in {"yes", "y", "ok", "confirm", "confirmed", "run", "确认", "授权", "同意", "执行"}
+
+
+def _is_outside_read_authorized(user_reply: str) -> bool:
+    normalized = user_reply.strip().lower()
+    return normalized in {"yes", "y", "ok", "confirm", "confirmed", "read", "确认", "授权", "同意", "读取"}
 
 
 class XAgentHandler(BaseHandler):
@@ -346,11 +357,29 @@ class XAgentHandler(BaseHandler):
     def exec_code_run(self, args: dict[str, Any]) -> ActionResult:
         script = self._extract_code_script(args)
         language = str(args.get("language", "python"))
+        if not script.strip():
+            return ActionResult(
+                data={"status": "ERROR", "error": "script is empty"},
+                next_prompt="代码未执行：script 不能为空。",
+            )
         try:
             timeout = int(args.get("timeout", 60))
         except (TypeError, ValueError):
             result = {"status": "ERROR", "error": f"invalid timeout: {args.get('timeout')!r}"}
         else:
+            if timeout <= 0:
+                return ActionResult(
+                    data={"status": "ERROR", "error": f"timeout must be positive: {timeout}"},
+                    next_prompt="代码未执行：timeout 必须为正数。",
+                )
+            if language not in {"python", "shell", "bash", "sh"}:
+                return ActionResult(
+                    data={"status": "ERROR", "error": f"unsupported language: {language}"},
+                    next_prompt="代码未执行：language 仅支持 python 或 shell。",
+                )
+            authorization_error = self._authorize_code_run(script, language, timeout)
+            if authorization_error is not None:
+                return authorization_error
             stdout_chunks: list[str] = []
             result = {
                 "status": "ERROR",
@@ -364,6 +393,7 @@ class XAgentHandler(BaseHandler):
                 timeout=timeout,
                 cwd=self.ctx.cwd or None,
                 stop_signal=stop_signal,
+                allow_unsafe=True,
             ):
                 chunk_type = chunk.get("type", "")
                 chunk_data = chunk.get("data")
@@ -380,6 +410,64 @@ class XAgentHandler(BaseHandler):
             next_prompt="代码执行完成，请基于 tool_results 判断任务是否完成；若未完成，继续调用工具。",
         )
 
+    def _authorize_code_run(
+        self,
+        script: str,
+        language: str,
+        timeout: int,
+    ) -> ActionResult | None:
+        stop_signal = self._stop_signal()
+        if stop_signal is not None and stop_signal.is_set():
+            return ActionResult(
+                data={"status": "INTERRUPTED", "error": "code execution cancelled before authorization"},
+                next_prompt="",
+                should_exit=True,
+            )
+
+        policy = os.environ.get("XAGENT_CODE_RUN_POLICY", "confirm").strip().lower()
+        if policy == "allow":
+            return None
+        if policy == "deny":
+            return ActionResult(
+                data={"status": "SKIP", "error": "code execution is disabled by policy"},
+                next_prompt="代码未执行：当前策略禁止 code_run。请改用其他工具或请用户调整策略。",
+            )
+        if policy != "confirm":
+            return ActionResult(
+                data={"status": "ERROR", "error": f"invalid XAGENT_CODE_RUN_POLICY: {policy!r}"},
+                next_prompt="代码未执行：code_run 安全策略配置无效。",
+            )
+
+        digest = hashlib.sha256(script.encode("utf-8")).hexdigest()[:16]
+        preview_limit = 2000
+        preview = script[:preview_limit]
+        if len(script) > preview_limit:
+            preview += f"\n... [truncated, total {len(script)} chars]"
+        auth = ask_user(
+            (
+                "Agent 请求执行未使用 OS 沙箱的代码。该代码仍可能访问工作区外文件或网络，"
+                "但进程不会继承 API key 等宿主敏感环境变量。\n"
+                f"- 语言：{language}\n"
+                f"- 超时：{timeout}s\n"
+                f"- SHA256：{digest}\n"
+                "```text\n"
+                f"{preview}\n"
+                "```\n"
+                "如确认执行，请回复 yes / 确认 / 授权。"
+            ),
+            input_fn=self.ctx.user_input_fn,
+        )
+        if _is_code_run_authorized(auth.get("user_reply", "")):
+            return None
+        return ActionResult(
+            data={
+                "status": "SKIP",
+                "error": "code execution not authorized by user",
+                "script_sha256": digest,
+            },
+            next_prompt="代码未执行：用户未授权本次 code_run。请改用其他工具或停止。",
+        )
+
     def _stop_signal(self) -> threading.Event | None:
         signal = getattr(self.ctx, "stop_signal", None)
         if isinstance(signal, threading.Event):
@@ -391,12 +479,68 @@ class XAgentHandler(BaseHandler):
         start_line = args.get("start_line")
         end_line = args.get("end_line")
         keyword = args.get("keyword")
+        workspace = Path(self.ctx.cwd or Path.cwd()).resolve()
+        try:
+            resolved_path = resolve_path_for_operation(
+                path,
+                str(workspace),
+                operation="read",
+                allow_outside_read=True,
+            )
+        except (OSError, ValueError) as exc:
+            return ActionResult(
+                data={"status": "ERROR", "error": str(exc)},
+                next_prompt="文件未读取：路径无效。",
+            )
+
+        outside_workspace = not _is_relative_to(resolved_path, workspace)
+        if outside_workspace:
+            policy = os.environ.get("XAGENT_OUTSIDE_READ_POLICY", "confirm").strip().lower()
+            if policy == "deny":
+                return ActionResult(
+                    data={
+                        "status": "SKIP",
+                        "error": "outside-workspace reads are disabled by policy",
+                        "path": str(resolved_path),
+                    },
+                    next_prompt="文件未读取：当前策略禁止读取工作区外路径。",
+                )
+            if policy == "confirm":
+                auth = ask_user(
+                    (
+                        "Agent 请求读取工作区外路径。内容可能包含隐私、凭证或针对 Agent 的恶意指令；"
+                        "本次授权仅对下列规范化路径生效：\n"
+                        f"- 工作区：{workspace}\n"
+                        f"- 读取路径：{resolved_path}\n"
+                        "如确认读取，请回复 yes / 确认 / 授权。"
+                    ),
+                    input_fn=self.ctx.user_input_fn,
+                )
+                if not _is_outside_read_authorized(auth.get("user_reply", "")):
+                    return ActionResult(
+                        data={
+                            "status": "SKIP",
+                            "error": "outside-workspace read not authorized by user",
+                            "path": str(resolved_path),
+                        },
+                        next_prompt="文件未读取：用户未授权本次工作区外读取。",
+                    )
+            elif policy != "allow":
+                return ActionResult(
+                    data={
+                        "status": "ERROR",
+                        "error": f"invalid XAGENT_OUTSIDE_READ_POLICY: {policy!r}",
+                    },
+                    next_prompt="文件未读取：工作区外读取安全策略配置无效。",
+                )
+
         result = read_file(
-            path=path,
+            path=str(resolved_path),
             cwd=self.ctx.cwd or None,
             start_line=int(start_line) if start_line is not None else None,
             end_line=int(end_line) if end_line is not None else None,
             keyword=str(keyword) if keyword is not None else None,
+            allow_outside=outside_workspace,
         )
         next_prompt = "文件读取完成，请基于 tool_results 继续分析或执行下一步。"
         if self._is_memory_path(path):
@@ -481,7 +625,12 @@ class XAgentHandler(BaseHandler):
             )
 
         try:
-            target = resolve_path_for_operation(path, self.ctx.cwd or None, operation="read")
+            target = resolve_path_for_operation(
+                path,
+                self.ctx.cwd or None,
+                operation="read",
+                allow_outside_read=True,
+            )
             workspace = Path(self.ctx.cwd or os.getcwd()).resolve()
             location = "工作区内" if _is_relative_to(target, workspace) else "工作区外"
         except (OSError, ValueError) as exc:

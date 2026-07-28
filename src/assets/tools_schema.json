@@ -28,7 +28,7 @@
     "type": "function",
     "function": {
       "name": "file_read",
-      "description": "Read a file or list a directory. Supports keyword search with context lines.",
+      "description": "Read a file or list a directory. Workspace paths are allowed; outside-workspace paths require an independent per-read authorization. Supports keyword search with context lines.",
       "parameters": {
         "type": "object",
         "properties": {

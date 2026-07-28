@@ -197,6 +197,16 @@ export OPENAI_BASE_URL="https://api.openai.com/v1/chat/completions"
 export OPENAI_MODEL="gpt-4o"
 ```
 
+`code_run` asks for explicit confirmation before every execution by default. In a controlled environment, configure:
+
+```bash
+export XAGENT_CODE_RUN_POLICY="confirm"  # confirm | deny | allow
+export XAGENT_OUTSIDE_READ_POLICY="confirm"  # confirm | deny | allow
+export XAGENT_CHROME_PAGE_LOAD_TIMEOUT="30"  # 1..120 seconds
+```
+
+`allow` for code execution accepts the risk of running without an OS filesystem sandbox. Outside-workspace reads require per-read confirmation by default. Regardless of policy, child processes do not inherit host secrets such as model API keys. Chrome keeps its sandbox enabled unless a controlled deployment explicitly sets `XAGENT_CHROME_NO_SANDBOX=1`. The Web service accepts local Host values only; add custom local hostnames explicitly with the comma-separated `XAGENT_WEB_ALLOWED_HOSTS` setting.
+
 You can also provide a JSON config file with one or more named sessions (OpenAI text, Claude text, OpenAI native tools, Claude native tools, failover mixins).
 
 **Tip:** do not commit secrets. Prefer `config.example.json` for shareable defaults.

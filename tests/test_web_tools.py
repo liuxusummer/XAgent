@@ -6,12 +6,21 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from selenium.common.exceptions import TimeoutException
 
 from src.core.agent_loop import AgentContext
 from src.handler import XAgentHandler
-from src.tools.browser_driver import BrowserSession, SeleniumBrowserDriver, save_result
+from src.tools.browser_driver import (
+    BrowserSession,
+    SeleniumBrowserDriver,
+    UnsafeNavigationError,
+    _chrome_launch_arguments,
+    _page_load_timeout,
+    _validate_navigation_url,
+    save_result,
+)
 from src.tools.file_ops import resolve_path
 from src.tools.web import web_scan
 
@@ -89,14 +98,23 @@ class FakeBrowserDriver:
 
 
 class FakeSeleniumDriver:
-    def __init__(self, *, delay: float = 0.0, timeout: bool = False) -> None:
-        self.current_url = "https://example.com"
+    def __init__(
+        self,
+        *,
+        delay: float = 0.0,
+        timeout: bool = False,
+        navigation_timeout: bool = False,
+    ) -> None:
+        self.current_url = "about:blank"
         self.current_window_handle = "tab-1"
         self.window_handles = ["tab-1"]
         self.title = "Example"
         self.delay = delay
         self.timeout = timeout
+        self.navigation_timeout = navigation_timeout
         self.script_timeout: float | None = None
+        self.page_load_timeout: float | None = None
+        self.requested_urls: list[str] = []
         self.async_script = ""
         self.active_calls = 0
         self.max_active_calls = 0
@@ -109,6 +127,15 @@ class FakeSeleniumDriver:
 
     def set_script_timeout(self, timeout: float) -> None:
         self.script_timeout = timeout
+
+    def set_page_load_timeout(self, timeout: float) -> None:
+        self.page_load_timeout = timeout
+
+    def get(self, url: str) -> None:
+        self.requested_urls.append(url)
+        if self.navigation_timeout:
+            raise TimeoutException("page load timeout")
+        self.current_url = url
 
     def execute_async_script(self, script: str) -> dict[str, Any]:
         self.async_script = script
@@ -195,6 +222,46 @@ class WebToolTests(unittest.TestCase):
         self.assertEqual(result["result"], "done")
         self.assertEqual(raw_driver.script_timeout, 3)
         self.assertIn("return document.title", raw_driver.async_script)
+
+    def test_selenium_scan_blocks_cloud_metadata_address_before_navigation(self) -> None:
+        raw_driver = FakeSeleniumDriver()
+        driver = SeleniumBrowserDriver()
+        driver._driver = raw_driver
+
+        result = driver.scan("http://169.254.169.254/latest/meta-data/")
+
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["error_type"], "SSRF_BLOCKED")
+        self.assertEqual(raw_driver.requested_urls, [])
+
+    def test_navigation_validation_rejects_dns_resolving_to_private_address(self) -> None:
+        private_record = [(2, 1, 6, "", ("10.0.0.8", 443))]
+        with patch("src.tools.browser_driver.socket.getaddrinfo", return_value=private_record):
+            with self.assertRaises(UnsafeNavigationError):
+                _validate_navigation_url("https://internal.example/data")
+
+    def test_selenium_scan_enforces_page_load_timeout(self) -> None:
+        raw_driver = FakeSeleniumDriver(navigation_timeout=True)
+        driver = SeleniumBrowserDriver()
+        driver._driver = raw_driver
+        public_record = [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+        with patch("src.tools.browser_driver.socket.getaddrinfo", return_value=public_record):
+            result = driver.scan("https://example.com")
+
+        self.assertEqual(result["status"], "TIMEOUT")
+        self.assertEqual(result["error_type"], "TIMEOUT")
+        self.assertEqual(raw_driver.page_load_timeout, 30)
+
+    def test_chrome_sandbox_is_disabled_only_by_explicit_opt_in(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertNotIn("--no-sandbox", _chrome_launch_arguments())
+        with patch.dict("os.environ", {"XAGENT_CHROME_NO_SANDBOX": "1"}, clear=True):
+            self.assertIn("--no-sandbox", _chrome_launch_arguments())
+
+    def test_page_load_timeout_is_bounded(self) -> None:
+        with patch.dict("os.environ", {"XAGENT_CHROME_PAGE_LOAD_TIMEOUT": "999"}, clear=True):
+            self.assertEqual(_page_load_timeout(), 120)
 
     def test_selenium_driver_reports_script_timeout(self) -> None:
         raw_driver = FakeSeleniumDriver(timeout=True)

@@ -45,6 +45,7 @@
 - 线程模型：前端主线程或事件循环只负责请求协调；高开销的 Agent 构建、文件/索引/网络 I/O 等阻塞工作进入工作线程，`agent.run()` 由独立后台线程执行
 - 会话准入：任务提交在 Agent 构建前用一次性令牌原子预占会话；`starting`、`running`、`waiting_for_user` 均拒绝重复提交，初始化或线程启动失败时释放预占
 - 会话恢复：Web 持久化聊天对应的任务级 checkpoint ID；服务重启后将遗留的运行态标记为 `interrupted`，仅允许按该聊天绑定的 checkpoint 恢复，禁止回退到工作区级 `latest`
+- Web 访问边界：除校验 TCP 对端为 loopback 外，还必须校验 `Host` 属于本地或显式配置的 allowlist；不得用任意 `Origin == Host` 作为准入依据
 - 共享存储：Runbook、Memory、定时任务等工作区级“读—改—写”必须持有统一工作区锁；写盘使用同目录唯一临时文件并原子替换，禁止直接覆盖
 - 数据格式：层间只传 `ActionResult` 或 `ChatResponse`，禁止跨层直接访问内部状态
 
@@ -89,6 +90,8 @@
 ### 中断机制
 
 三层中断信号：`stop_sig`（全局）+ `code_stop_signal`（代码执行）+ `consume_file(task_dir, '_stop')`（文件信号）
+
+停止检查覆盖轮次开始、LLM 返回后和每个工具分发前。委派子 Agent 与团队 workflow 步骤共享父级 `stop_sig`，不得各自创建无法由父任务取消的独立停止域。
 
 ## 4. 关键设计决策
 

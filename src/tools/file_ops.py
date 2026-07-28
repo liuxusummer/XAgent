@@ -5,6 +5,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from src.core.workspace_storage import atomic_write_text, workspace_write_lock
+
 
 FILE_READ_CHAR_LIMIT = 20000
 FILE_REF_PATTERN = re.compile(r"\{\{file:(.+?):(\d+):(\d+)}}")
@@ -38,9 +40,16 @@ def read_file(
     start_line: int | None = None,
     end_line: int | None = None,
     keyword: str | None = None,
+    *,
+    allow_outside: bool = False,
 ) -> dict[str, Any]:
     try:
-        file_path = resolve_path(path, cwd, operation="read")
+        file_path = resolve_path_for_operation(
+            path,
+            cwd,
+            operation="read",
+            allow_outside_read=allow_outside,
+        )
     except WorkspacePermissionError as exc:
         return exc.to_result()
     except (OSError, ValueError) as exc:
@@ -138,24 +147,35 @@ def write_file(
     if file_path.exists() and file_path.is_dir():
         return {"status": "ERROR", "error": f"path is a directory: {file_path}", "path": str(file_path)}
     try:
-        file_path.parent.mkdir(parents=True, exist_ok=True)
         content = expand_file_refs(content, cwd)
     except (FileNotFoundError, ValueError, OSError) as exc:
         return {"status": "ERROR", "error": str(exc), "path": str(file_path)}
 
     try:
-        if mode == "overwrite":
-            final_content = content
-        elif mode == "append":
-            previous = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
-            final_content = previous + content
-        elif mode == "prepend":
-            previous = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
-            final_content = content + previous
-        else:
-            return {"status": "ERROR", "error": f"unsupported mode: {mode}", "path": str(file_path)}
+        with workspace_write_lock(Path(cwd or Path.cwd()).resolve()):
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            if file_path.exists() and file_path.is_dir():
+                return {
+                    "status": "ERROR",
+                    "error": f"path is a directory: {file_path}",
+                    "path": str(file_path),
+                }
+            if mode == "overwrite":
+                final_content = content
+            elif mode == "append":
+                previous = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
+                final_content = previous + content
+            elif mode == "prepend":
+                previous = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
+                final_content = content + previous
+            else:
+                return {
+                    "status": "ERROR",
+                    "error": f"unsupported mode: {mode}",
+                    "path": str(file_path),
+                }
 
-        file_path.write_text(final_content, encoding="utf-8")
+            atomic_write_text(file_path, final_content)
     except (OSError, UnicodeDecodeError) as exc:
         return {"status": "ERROR", "error": f"failed to write file: {exc}", "path": str(file_path)}
 
@@ -178,11 +198,6 @@ def patch_file(
         return exc.to_result()
     except (OSError, ValueError) as exc:
         return {"status": "ERROR", "error": str(exc)}
-    if not file_path.exists():
-        return {"status": "ERROR", "error": f"file not found: {file_path}"}
-    if file_path.is_dir():
-        return {"status": "ERROR", "error": f"path is a directory: {file_path}"}
-
     try:
         old_content = expand_file_refs(old_content, cwd)
         new_content = expand_file_refs(new_content, cwd)
@@ -197,30 +212,31 @@ def patch_file(
         }
 
     try:
-        current = file_path.read_text(encoding="utf-8")
+        with workspace_write_lock(Path(cwd or Path.cwd()).resolve()):
+            if not file_path.exists():
+                return {"status": "ERROR", "error": f"file not found: {file_path}"}
+            if file_path.is_dir():
+                return {"status": "ERROR", "error": f"path is a directory: {file_path}"}
+            current = file_path.read_text(encoding="utf-8")
+            match_count = current.count(old_content)
+            if match_count == 0:
+                return {
+                    "status": "ERROR",
+                    "error": "patch matched 0 times; please use file_read to confirm current content first",
+                    "path": str(file_path),
+                }
+            if match_count > 1:
+                return {
+                    "status": "ERROR",
+                    "error": f"patch matched {match_count} times; please provide longer old_content to make it unique",
+                    "path": str(file_path),
+                    "match_count": match_count,
+                }
+
+            updated = current.replace(old_content, new_content, 1)
+            atomic_write_text(file_path, updated)
     except (OSError, UnicodeDecodeError) as exc:
-        return {"status": "ERROR", "error": f"failed to read file: {exc}", "path": str(file_path)}
-
-    match_count = current.count(old_content)
-    if match_count == 0:
-        return {
-            "status": "ERROR",
-            "error": "patch matched 0 times; please use file_read to confirm current content first",
-            "path": str(file_path),
-        }
-    if match_count > 1:
-        return {
-            "status": "ERROR",
-            "error": f"patch matched {match_count} times; please provide longer old_content to make it unique",
-            "path": str(file_path),
-            "match_count": match_count,
-        }
-
-    updated = current.replace(old_content, new_content, 1)
-    try:
-        file_path.write_text(updated, encoding="utf-8")
-    except OSError as exc:
-        return {"status": "ERROR", "error": f"failed to write file: {exc}", "path": str(file_path)}
+        return {"status": "ERROR", "error": f"failed to patch file: {exc}", "path": str(file_path)}
     return {
         "status": "OK",
         "path": str(file_path),
@@ -236,20 +252,24 @@ def delete_file(path: str, cwd: str | None = None, recursive: bool = False) -> d
         return exc.to_result()
     except (OSError, ValueError) as exc:
         return {"status": "ERROR", "error": str(exc)}
-    if not file_path.exists():
-        return {"status": "ERROR", "error": f"file not found: {file_path}", "path": str(file_path)}
-
     try:
-        if file_path.is_dir():
-            if not recursive:
+        with workspace_write_lock(Path(cwd or Path.cwd()).resolve()):
+            if not file_path.exists():
                 return {
                     "status": "ERROR",
-                    "error": f"path is a directory; recursive=true is required: {file_path}",
+                    "error": f"file not found: {file_path}",
                     "path": str(file_path),
                 }
-            shutil.rmtree(file_path)
-            return {"status": "OK", "path": str(file_path), "deleted": True, "recursive": True}
-        file_path.unlink()
+            if file_path.is_dir():
+                if not recursive:
+                    return {
+                        "status": "ERROR",
+                        "error": f"path is a directory; recursive=true is required: {file_path}",
+                        "path": str(file_path),
+                    }
+                shutil.rmtree(file_path)
+                return {"status": "OK", "path": str(file_path), "deleted": True, "recursive": True}
+            file_path.unlink()
     except OSError as exc:
         return {"status": "ERROR", "error": f"failed to delete file: {exc}", "path": str(file_path)}
     return {"status": "OK", "path": str(file_path), "deleted": True, "recursive": False}
@@ -259,7 +279,13 @@ def resolve_path(path: str, cwd: str | None = None, operation: str = "write") ->
     return resolve_path_for_operation(path, cwd, operation)
 
 
-def resolve_path_for_operation(path: str, cwd: str | None = None, operation: str = "read") -> Path:
+def resolve_path_for_operation(
+    path: str,
+    cwd: str | None = None,
+    operation: str = "read",
+    *,
+    allow_outside_read: bool = False,
+) -> Path:
     if operation not in SUPPORTED_OPERATIONS:
         raise ValueError(f"unsupported operation: {operation}")
     base = Path(cwd or Path.cwd()).resolve()
@@ -272,7 +298,17 @@ def resolve_path_for_operation(path: str, cwd: str | None = None, operation: str
         resolved.relative_to(base)
     except ValueError as exc:
         if operation in READ_OPERATIONS:
-            return resolved
+            if allow_outside_read:
+                return resolved
+            raise WorkspacePermissionError(
+                (
+                    "path outside workspace requires explicit read authorization: "
+                    f"{resolved} (workspace: {base}, operation: {operation})"
+                ),
+                resolved,
+                base,
+                operation,
+            ) from exc
         if operation in WRITE_OPERATIONS:
             raise WorkspacePermissionError(
                 f"path outside workspace is read-only: {resolved} (workspace: {base}, operation: {operation})",

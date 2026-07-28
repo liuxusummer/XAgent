@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import ipaddress
 import json
+import logging
 import os
 import queue
 import re
@@ -67,6 +68,11 @@ _DEFAULT_WEB_ALLOWED_ORIGINS = {
     "http://127.0.0.1:5173",
     "http://localhost:5173",
 }
+_DEFAULT_WEB_ALLOWED_HOSTS = {
+    "127.0.0.1",
+    "::1",
+    "localhost",
+}
 
 
 def _normalize_web_origin(value: str) -> str | None:
@@ -96,7 +102,37 @@ def _configured_web_allowed_origins() -> list[str]:
     return sorted(origins)
 
 
+def _normalize_web_host(value: str) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(f"http://{raw}")
+    except ValueError:
+        return None
+    if (
+        not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    return parsed.hostname.split("%", 1)[0].lower()
+
+
+def _configured_web_allowed_hosts() -> list[str]:
+    hosts = set(_DEFAULT_WEB_ALLOWED_HOSTS)
+    for value in os.environ.get("XAGENT_WEB_ALLOWED_HOSTS", "").split(","):
+        normalized = _normalize_web_host(value)
+        if normalized is not None:
+            hosts.add(normalized)
+    return sorted(hosts)
+
+
 _WEB_ALLOWED_ORIGINS = frozenset(_configured_web_allowed_origins())
+_WEB_ALLOWED_HOSTS = frozenset(_configured_web_allowed_hosts())
 
 app = FastAPI(title="XAgent Web UI")
 
@@ -108,6 +144,8 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Accept", "Content-Type"],
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _is_loopback_client(host: str | None) -> bool:
@@ -130,11 +168,18 @@ def _request_origin(request: Request) -> str | None:
     return _normalize_web_origin(f"{request.url.scheme}://{host}")
 
 
+def _is_allowed_web_host(request: Request) -> bool:
+    normalized = _normalize_web_host(request.headers.get("host", ""))
+    return normalized is not None and normalized in _WEB_ALLOWED_HOSTS
+
+
 def _is_allowed_web_origin(request: Request, origin: str) -> bool:
     normalized = _normalize_web_origin(origin)
     if normalized is None:
         return False
-    return normalized == _request_origin(request) or normalized in _WEB_ALLOWED_ORIGINS
+    return normalized in _WEB_ALLOWED_ORIGINS or (
+        _is_allowed_web_host(request) and normalized == _request_origin(request)
+    )
 
 
 @app.middleware("http")
@@ -144,6 +189,11 @@ async def enforce_local_web_access(request: Request, call_next):
         return JSONResponse(
             status_code=403,
             content={"success": False, "error": "Web UI only accepts local connections"},
+        )
+    if not _is_allowed_web_host(request):
+        return JSONResponse(
+            status_code=403,
+            content={"success": False, "error": "Host is not allowed"},
         )
     origin = request.headers.get("origin")
     if origin and not _is_allowed_web_origin(request, origin):
@@ -1710,6 +1760,85 @@ def _workflow_error_result(message: str, error: str, workflow: dict[str, Any] | 
     }
 
 
+def _run_team_workflow_background(
+    session: UISession,
+    workflow: dict[str, Any],
+    task: str,
+    step_runner: Any,
+    parent_ctx: Any | None,
+    agent: Any | None,
+) -> None:
+    try:
+        if agent is None:
+            result = _workflow_error_result(
+                "[error] active team workflow has no agent",
+                "missing parent agent",
+                workflow,
+            )
+        else:
+
+            def _emit_workflow_progress(message: str) -> None:
+                agent.display_queue.put({"progress": message})
+                _drain_sync(session, wait=False)
+                _queue_state(session, finished=False)
+
+            def _suppress_child_progress(_message: str) -> None:
+                return None
+
+            workflow_parent_ctx = parent_ctx
+            if parent_ctx is not None:
+                workflow_parent_ctx = SimpleNamespace(
+                    sink=getattr(parent_ctx, "sink", None) or NullSink(),
+                    verbose=getattr(parent_ctx, "verbose", False),
+                    display_fn=_suppress_child_progress,
+                    user_input_fn=getattr(parent_ctx, "user_input_fn", None),
+                    stop_signal=getattr(parent_ctx, "stop_signal", None),
+                )
+
+            if not callable(step_runner):
+                result = _workflow_error_result(
+                    "[error] active team workflow has no step runner",
+                    "missing team step runner",
+                    workflow,
+                )
+            else:
+                result = run_team_workflow(
+                    workflow,
+                    task.strip(),
+                    step_runner,
+                    parent_ctx=workflow_parent_ctx,
+                    emit=_emit_workflow_progress,
+                )
+            if not isinstance(result, dict):
+                result = _workflow_error_result(
+                    "[error] team workflow returned an invalid result",
+                    f"invalid workflow result type: {type(result)!r}",
+                    workflow,
+                )
+    except Exception as exc:  # noqa: BLE001
+        result = _workflow_error_result(f"[error] team workflow failed: {exc}", str(exc), workflow)
+
+    if agent is not None:
+        agent.display_queue.put({"done": result})
+    else:
+        with session.lock:
+            _emit(
+                session,
+                "done",
+                {
+                    "response": result.get("response", ""),
+                    "exit_reason": result.get("exit_reason", ""),
+                    "tool_results": result.get("tool_results", []),
+                    "turns": result.get("turns", 0),
+                    "team_workflow": result.get("team_workflow"),
+                },
+            )
+            _set_session_runtime_state(session, "idle")
+            session.ask_prompt = ""
+            _queue_state(session, finished=True)
+        _persist_chat_state(session, force=True)
+
+
 def _run_task_background(
     session: UISession,
     task: str,
@@ -1736,6 +1865,10 @@ def _run_task_background(
         session.emitted_tool_keys = set()
         session.stop_requested = False
         session.checkpoint_id = checkpoint_id
+        current_agent = session.agent
+        stop_event = getattr(current_agent, "stop_event", None)
+        if isinstance(stop_event, threading.Event) and getattr(current_agent, "owns_stop_event", True):
+            stop_event.clear()
         _set_session_runtime_state(session, "running")
         session.ask_prompt = ""
         if task.strip():
@@ -1751,75 +1884,14 @@ def _run_task_background(
             task.strip() or "继续执行 checkpoint 中未完成的任务。",
             resume_checkpoint=resume_checkpoint or None,
             checkpoint_id=checkpoint_id or None,
+            reset_stop_event=False,
         )
 
     if workflow:
-        try:
-            if agent is None:
-                result = _workflow_error_result(
-                    "[error] active team workflow has no agent",
-                    "missing parent agent",
-                    workflow,
-                )
-            else:
-                def _emit_workflow_progress(message: str) -> None:
-                    agent.display_queue.put({"progress": message})
-                    _drain_sync(session, wait=False)
-                    _queue_state(session, finished=False)
-
-                def _suppress_child_progress(_message: str) -> None:
-                    return None
-
-                workflow_parent_ctx = parent_ctx
-                if parent_ctx is not None:
-                    workflow_parent_ctx = SimpleNamespace(
-                        sink=getattr(parent_ctx, "sink", None) or NullSink(),
-                        verbose=getattr(parent_ctx, "verbose", False),
-                        display_fn=_suppress_child_progress,
-                    )
-
-                if not callable(step_runner):
-                    result = _workflow_error_result(
-                        "[error] active team workflow has no step runner",
-                        "missing team step runner",
-                        workflow,
-                    )
-                else:
-                    result = run_team_workflow(
-                        workflow,
-                        task.strip(),
-                        step_runner,
-                        parent_ctx=workflow_parent_ctx,
-                        emit=_emit_workflow_progress,
-                    )
-                if not isinstance(result, dict):
-                    result = _workflow_error_result(
-                        "[error] team workflow returned an invalid result",
-                        f"invalid workflow result type: {type(result)!r}",
-                        workflow,
-                    )
-        except Exception as exc:  # noqa: BLE001
-            result = _workflow_error_result(f"[error] team workflow failed: {exc}", str(exc), workflow)
-
-        if agent is not None:
-            agent.display_queue.put({"done": result})
-        else:
-            with session.lock:
-                _emit(
-                    session,
-                    "done",
-                    {
-                        "response": result.get("response", ""),
-                        "exit_reason": result.get("exit_reason", ""),
-                        "tool_results": result.get("tool_results", []),
-                        "turns": result.get("turns", 0),
-                        "team_workflow": result.get("team_workflow"),
-                    },
-                )
-                _set_session_runtime_state(session, "idle")
-                session.ask_prompt = ""
-                _queue_state(session, finished=True)
-            _persist_chat_state(session, force=True)
+        _new_daemon_thread(
+            target=_run_team_workflow_background,
+            args=(session, workflow, task, step_runner, parent_ctx, agent),
+        ).start()
 
     try:
         _drain_background(session)
@@ -2070,7 +2142,7 @@ async def stop_task(request: Request):
             if session.stop_requested:
                 return {"success": True, "data": {"already_stopping": True}}
             waiting_for_user = session.waiting_for_user
-            if not waiting_for_user and not agent.is_running():
+            if not waiting_for_user and not session.running and not agent.is_running():
                 continue
             if waiting_for_user:
                 _set_session_runtime_state(session, "running")
@@ -3177,27 +3249,43 @@ def _dispatch_scheduled_task(task: dict[str, Any]) -> tuple[str | None, str | No
             _release_task_start(session, task_start_token)
 
 
-def _run_scheduled_task_record(task: dict[str, Any], now_ts: float | None = None) -> dict[str, Any]:
-    now_ts = time.time() if now_ts is None else now_ts
-    session_id, error = _dispatch_scheduled_task(task)
+def _claim_scheduled_task_record(task: dict[str, Any], now_ts: float) -> None:
     task["updated_at"] = time.time()
-    if error:
-        task["last_error"] = error
-        return task
     task["last_run"] = _format_task_datetime(now_ts)
-    task["last_session_id"] = session_id or ""
+    task["last_dispatch_id"] = uuid.uuid4().hex
+    task["last_session_id"] = ""
     task["last_error"] = ""
     if task.get("repeat") == "none":
         task["next_run"] = None
         task["status"] = "paused"
-    else:
-        try:
-            task["next_run"] = _next_task_run(task, after_ts=now_ts, first=False)
-        except ValueError as exc:
-            task["next_run"] = None
-            task["last_error"] = str(exc)
-        if not task.get("next_run"):
-            task["status"] = "paused"
+        return
+    try:
+        task["next_run"] = _next_task_run(task, after_ts=now_ts, first=False)
+    except ValueError as exc:
+        task["next_run"] = None
+        task["last_error"] = str(exc)
+    if not task.get("next_run"):
+        task["status"] = "paused"
+
+
+def _record_scheduled_task_dispatch_result(
+    task: dict[str, Any],
+    session_id: str | None,
+    error: str | None,
+) -> None:
+    task["updated_at"] = time.time()
+    if error:
+        task["last_error"] = error
+        return
+    task["last_session_id"] = session_id or ""
+    task["last_error"] = ""
+
+
+def _run_scheduled_task_record(task: dict[str, Any], now_ts: float | None = None) -> dict[str, Any]:
+    now_ts = time.time() if now_ts is None else now_ts
+    _claim_scheduled_task_record(task, now_ts)
+    session_id, error = _dispatch_scheduled_task(task)
+    _record_scheduled_task_dispatch_result(task, session_id, error)
     return task
 
 
@@ -3238,10 +3326,38 @@ def _run_due_scheduled_tasks(now_ts: float | None = None) -> None:
                     changed = True
                     continue
                 if due_ts <= now_ts:
-                    _run_scheduled_task_record(task, now_ts=now_ts)
-                    changed = True
+                    _claim_scheduled_task_record(task, now_ts)
+                    claim_error = _write_scheduled_tasks(ws, tasks)
+                    if claim_error:
+                        logger.error(
+                            "Failed to persist scheduled task claim for workspace %s: %s",
+                            ws,
+                            claim_error,
+                        )
+                        changed = False
+                        break
+                    session_id, dispatch_error = _dispatch_scheduled_task(task)
+                    _record_scheduled_task_dispatch_result(
+                        task,
+                        session_id,
+                        dispatch_error,
+                    )
+                    result_error = _write_scheduled_tasks(ws, tasks)
+                    if result_error:
+                        logger.error(
+                            "Failed to persist scheduled task result for workspace %s: %s",
+                            ws,
+                            result_error,
+                        )
+                    changed = False
             if changed:
-                _write_scheduled_tasks(ws, tasks)
+                write_error = _write_scheduled_tasks(ws, tasks)
+                if write_error:
+                    logger.error(
+                        "Failed to persist scheduled task validation for workspace %s: %s",
+                        ws,
+                        write_error,
+                    )
 
 
 def _task_scheduler_loop() -> None:
@@ -3249,11 +3365,11 @@ def _task_scheduler_loop() -> None:
         try:
             _run_due_scheduled_tasks()
         except Exception:
-            pass
+            logger.exception("Scheduled task loop failed")
         try:
             _cleanup_sessions()
         except Exception:
-            pass
+            logger.exception("Session cleanup loop failed")
 
 
 @app.on_event("startup")

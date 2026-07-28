@@ -198,6 +198,12 @@ def _dependency_context(step: dict[str, Any], step_results: dict[str, dict[str, 
     return "\n\n".join(part for part in parts if part)
 
 
+def _workflow_stop_requested(parent_ctx: Any | None) -> bool:
+    signal = getattr(parent_ctx, "stop_signal", None)
+    is_set = getattr(signal, "is_set", None)
+    return bool(is_set()) if callable(is_set) else False
+
+
 def run_team_workflow(
     workflow: dict[str, Any],
     task: str,
@@ -216,6 +222,9 @@ def run_team_workflow(
         emit(f"[Team Workflow] start {workflow.get('name', '')} ({len(steps)} steps)")
 
     for step in steps:
+        if _workflow_stop_requested(parent_ctx):
+            exit_reason = "INTERRUPTED"
+            break
         step_id = str(step.get("id") or "")
         agent = str(step.get("agent") or "")
         rendered_task = render_workflow_template(str(step.get("task") or ""), task, step_results)
@@ -259,6 +268,9 @@ def run_team_workflow(
         )
         if emit:
             emit(f"[Team Workflow] step {step_id}: {agent} {step_result['status']}")
+        if step_result["exit_reason"] == "INTERRUPTED" or _workflow_stop_requested(parent_ctx):
+            exit_reason = "INTERRUPTED"
+            break
         if step_result["status"] != "OK" and step.get("on_error") != "continue":
             exit_reason = "ERROR"
             break

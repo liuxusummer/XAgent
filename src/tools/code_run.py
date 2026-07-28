@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import os
 import queue
 import signal
@@ -13,6 +14,20 @@ from typing import Any, Generator
 
 HEADER_FILE = Path(__file__).resolve().parent.parent / "assets" / "code_run_header.py"
 STREAM_POLL_INTERVAL = 0.05
+STREAM_READ_BYTE_SIZE = 8192
+CODE_OUTPUT_CHAR_LIMIT = 200_000
+SAFE_SUBPROCESS_ENV_KEYS = {
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "PATHEXT",
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
+    "SYSTEMROOT",
+    "TERM",
+    "TZ",
+}
 
 
 def run_code(
@@ -20,69 +35,29 @@ def run_code(
     language: str = "python",
     timeout: int = 60,
     cwd: str | None = None,
+    *,
+    allow_unsafe: bool = False,
 ) -> dict[str, Any]:
-    if not script.strip():
-        return {"status": "ERROR", "error": "script is empty"}
-    if timeout <= 0:
-        return {"status": "ERROR", "error": f"timeout must be positive: {timeout}"}
-
-    command, error = _build_command(script, language)
-    if error:
-        return {"status": "ERROR", "error": f"unsupported language: {language}"}
-
-    try:
-        process = _start_process(command, cwd)
-    except (OSError, ValueError) as exc:
-        return {"status": "ERROR", "error": str(exc)}
-
     stdout_chunks: list[str] = []
-    stderr_chunks: list[str] = []
-
-    def read_stdout() -> None:
-        assert process.stdout is not None
-        for line in process.stdout:
-            stdout_chunks.append(line)
-
-    def read_stderr() -> None:
-        assert process.stderr is not None
-        for line in process.stderr:
-            stderr_chunks.append(line)
-
-    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
-    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-    stdout_thread.start()
-    stderr_thread.start()
-
-    try:
-        process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_process_tree(process)
-        process.wait()
-        stdout_thread.join(timeout=5)
-        stderr_thread.join(timeout=5)
-        _close_popen_streams(process)
-        return {
-            "status": "TIMEOUT",
-            "language": language,
-            "command": _command_preview(command),
-            "stdout": "".join(stdout_chunks),
-            "stderr": "".join(stderr_chunks),
-            "exit_code": None,
-            "error": f"process exceeded timeout: {timeout}s",
-        }
-
-    stdout_thread.join(timeout=5)
-    stderr_thread.join(timeout=5)
-    _close_popen_streams(process)
-
-    return {
-        "status": "OK" if process.returncode == 0 else "ERROR",
-        "language": language,
-        "command": _command_preview(command),
-        "stdout": "".join(stdout_chunks),
-        "stderr": "".join(stderr_chunks),
-        "exit_code": process.returncode,
+    result: dict[str, Any] = {
+        "status": "ERROR",
+        "error": "code execution did not produce a final result",
     }
+    for event in run_code_stream(
+        script=script,
+        language=language,
+        timeout=timeout,
+        cwd=cwd,
+        allow_unsafe=allow_unsafe,
+    ):
+        event_type = event.get("type")
+        data = event.get("data")
+        if event_type == "stdout" and isinstance(data, str):
+            stdout_chunks.append(data)
+        elif event_type in {"result", "error"} and isinstance(data, dict):
+            result = dict(data)
+    result["stdout"] = "".join(stdout_chunks)
+    return result
 
 
 def _inject_header(script: str) -> str:
@@ -115,8 +90,40 @@ def _start_process(command: list[str], cwd: str | None) -> subprocess.Popen[str]
         stderr=subprocess.PIPE,
         text=True,
         cwd=cwd or None,
+        env=_sanitized_subprocess_env(cwd),
         start_new_session=True,
     )
+
+
+def _sanitized_subprocess_env(cwd: str | None) -> dict[str, str]:
+    """Build a minimal environment without forwarding host credentials."""
+
+    workspace = Path(cwd or Path.cwd()).resolve()
+    env = {
+        key: value
+        for key in SAFE_SUBPROCESS_ENV_KEYS
+        if (value := os.environ.get(key))
+    }
+    env["PATH"] = _sanitized_path(env.get("PATH", os.defpath))
+    env["HOME"] = str(workspace)
+    env["TMPDIR"] = str(workspace)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["XAGENT_CODE_RUN_WORKSPACE"] = str(workspace)
+    return env
+
+
+def _sanitized_path(value: str) -> str:
+    entries: list[str] = []
+    for entry in value.split(os.pathsep):
+        if not entry:
+            continue
+        candidate = Path(entry).expanduser()
+        if not candidate.is_absolute():
+            continue
+        normalized = str(candidate.resolve())
+        if normalized not in entries:
+            entries.append(normalized)
+    return os.pathsep.join(entries) or os.defpath
 
 
 def _kill_process_tree(process: subprocess.Popen[Any]) -> None:
@@ -145,12 +152,28 @@ def _close_popen_streams(process: subprocess.Popen[Any]) -> None:
             stream.close()
 
 
+def _read_stream_chunks(stream: Any) -> Generator[str, None, None]:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while True:
+        data = os.read(stream.fileno(), STREAM_READ_BYTE_SIZE)
+        if not data:
+            break
+        chunk = decoder.decode(data)
+        if chunk:
+            yield chunk
+    tail = decoder.decode(b"", final=True)
+    if tail:
+        yield tail
+
+
 def run_code_stream(
     script: str,
     language: str = "python",
     timeout: int = 60,
     cwd: str | None = None,
     stop_signal: threading.Event | None = None,
+    *,
+    allow_unsafe: bool = False,
 ) -> Generator[dict[str, Any], None, None]:
     if not script.strip():
         yield {"type": "error", "data": {"status": "ERROR", "error": "script is empty"}}
@@ -159,6 +182,15 @@ def run_code_stream(
         yield {
             "type": "error",
             "data": {"status": "ERROR", "error": f"timeout must be positive: {timeout}"},
+        }
+        return
+    if not allow_unsafe:
+        yield {
+            "type": "error",
+            "data": {
+                "status": "ERROR",
+                "error": "unsafe code execution requires explicit authorization",
+            },
         }
         return
 
@@ -178,14 +210,32 @@ def run_code_stream(
 
     stdout_queue: queue.Queue[str] = queue.Queue()
     stderr_chunks: list[str] = []
+    stdout_chars = 0
+    stderr_chars = 0
+    stdout_truncated = False
+    stderr_truncated = False
 
     def read_stdout() -> None:
-        for line in process.stdout:
-            stdout_queue.put(line)
+        nonlocal stdout_chars, stdout_truncated
+        for chunk in _read_stream_chunks(process.stdout):
+            remaining = CODE_OUTPUT_CHAR_LIMIT - stdout_chars
+            if remaining > 0:
+                retained = chunk[:remaining]
+                stdout_chars += len(retained)
+                stdout_queue.put(retained)
+            if len(chunk) > remaining:
+                stdout_truncated = True
 
     def read_stderr() -> None:
-        for line in process.stderr:
-            stderr_chunks.append(line)
+        nonlocal stderr_chars, stderr_truncated
+        for chunk in _read_stream_chunks(process.stderr):
+            remaining = CODE_OUTPUT_CHAR_LIMIT - stderr_chars
+            if remaining > 0:
+                retained = chunk[:remaining]
+                stderr_chars += len(retained)
+                stderr_chunks.append(retained)
+            if len(chunk) > remaining:
+                stderr_truncated = True
 
     stdout_thread = threading.Thread(target=read_stdout, daemon=True)
     stderr_thread = threading.Thread(target=read_stderr, daemon=True)
@@ -258,6 +308,9 @@ def run_code_stream(
             "language": language,
             "command": _command_preview(command),
             "stderr": stderr_text,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+            "output_char_limit": CODE_OUTPUT_CHAR_LIMIT,
             "exit_code": process.returncode,
             **({"error": f"process exceeded timeout: {timeout}s"} if timed_out else {}),
         },

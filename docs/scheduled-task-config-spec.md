@@ -29,7 +29,7 @@ Each task record is a JSON object with:
 - optional `config_path`, optional `observability_config_path`
 - `keep_one_chat`, optional `chat_id`
 - `status`: `running` or `paused`
-- `next_run`, `last_run`, `last_session_id`, `last_error`
+- `next_run`, `last_run`, `last_dispatch_id`, `last_session_id`, `last_error`
 - `last_debug_run`, `last_debug_session_id`, `last_debug_error`
 - `created_at`, `updated_at`
 
@@ -50,10 +50,12 @@ The scheduler loop checks workspace task files periodically. A task is due when 
 
 When a task runs:
 
+- First update `last_run`, generate `last_dispatch_id`, and advance/pause `next_run`, then atomically persist this claim.
+- Do not dispatch the Agent unless the claim write succeeds.
 - Build the selected workspace agent using the same runtime config path as `/api/chat`.
 - If `keep_one_chat` is true and an agent is selected, create or reuse an agent-bound persistent chat.
 - Start the task asynchronously with the existing `UISession` and `_run_task_background` path.
-- Record `last_run`, `last_session_id`, clear `last_error`, and compute the next run.
+- After dispatch, record `last_session_id` or `last_error`. A failure to persist this result must not roll back the already persisted claim.
 - One-off tasks are paused after their first run.
 
 When a user clicks debug run:
@@ -66,6 +68,7 @@ When a user clicks debug run:
 
 - Invalid workspace, agent, task id, empty name, empty prompt, invalid date/time, or unsupported repeat returns `{success: false, error}`.
 - Scheduler failures are stored on the task as `last_error` and do not stop the scheduler thread.
+- Claim persistence failure skips dispatch for that poll. Result persistence failure may lose diagnostic metadata, but the same scheduled occurrence is not dispatched again.
 - If `end_date` is before the computed next occurrence, `next_run` becomes `null` and the task is paused.
 
 ## Tests

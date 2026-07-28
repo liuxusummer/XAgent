@@ -52,8 +52,15 @@ class AgentContext:
 代码执行和浏览器操作都有不可控的一面。隔离原则：
 
 - **代码执行**：子进程，不在线程。超时即 kill，不等待优雅退出
-- **浏览器操作**：独立 WebDriver session，不共享主进程的浏览器状态
-- **文件操作**：路径必须转换为绝对路径；相对路径一律基于 `ctx.cwd`（当前 Agent 工作区）解析
+- **浏览器操作**：独立 WebDriver session，不共享主进程的浏览器状态；导航只允许解析到公网地址的 HTTP(S) URL
+- **文件操作**：路径必须转换为绝对路径；相对路径一律基于 `ctx.cwd`（当前 Agent 工作区）解析，工作区外读取默认逐次确认
+
+`code_run` 仍不是 OS 文件系统沙箱，因此必须经过独立的执行策略门禁：
+
+- 默认 `XAGENT_CODE_RUN_POLICY=confirm`，每次执行前向用户展示脚本摘要、哈希、语言和超时并等待明确授权
+- `deny` 完全禁用代码执行
+- `allow` 仅用于用户明确接受未沙箱化风险的受控环境
+- 无论策略为何，子进程只继承最小运行环境；API key、代理、SSH agent 等宿主敏感变量不得透传，`HOME` / `TMPDIR` 固定到当前工作区
 
 工作区约定：
 
@@ -65,9 +72,9 @@ class AgentContext:
 
 - 文件类：20000 字符硬上限
 - 浏览器类：8000 字符硬上限
-- 代码执行：stdout 不截断，但超长行会动态计算截断阈值
+- 代码执行：stdout、stderr 各保留最多 200000 字符，读取线程继续排空并丢弃超限内容
 
-截断时保留首尾，丢弃中间，让 LLM 知道有内容被省略。
+文件与浏览器结果截断时保留首尾；流式代码输出只保留最先到达的上限内容，并通过 `stdout_truncated` / `stderr_truncated` 明确标记后续内容已丢弃。
 
 ### 失败要可诊断，不要静默吞错
 
@@ -138,6 +145,8 @@ web_execute_js → BrowserDriver.execute_js → exec_id + ACK/结果诊断
 - `web_execute_js` 返回 `exec_id`、`ack`、`result_received`、`diagnostics`，用于区分送达、执行、导航和失败状态
 - 每个 Agent/Handler 延迟创建并独占一个 BrowserDriver；Agent 关闭时同步释放，禁止进程级共享浏览器实例
 - 同一 BrowserDriver 内的扫描、标签切换、导航和脚本执行必须串行；`web_execute_js.timeout` 由 WebDriver 原生脚本超时强制执行
+- 导航前解析 DNS 并拒绝 loopback、私网、链路本地、保留地址及带凭证 URL；页面加载默认 30 秒且最多 120 秒
+- Chrome 沙箱默认启用；只有受控部署显式设置 `XAGENT_CHROME_NO_SANDBOX=1` 时才添加 `--no-sandbox`
 - 长结果通过 `save_to_file` 落盘，tool_result 只返回路径、字节数和摘要
 - 默认扫描模式为 `summary`，只返回语义压缩内容；需要精确状态时应执行局部 JS 查询
 
@@ -153,8 +162,9 @@ web_execute_js → BrowserDriver.execute_js → exec_id + ACK/结果诊断
 ```
 LLM 输出代码
   → 提取代码（script 参数 / 回复代码块）
+  → code_run 策略检查（默认逐次用户确认）
   → 注入 code_run_header.py（公共 import）
-  → subprocess.Popen(cwd=ctx.cwd) 执行
+  → subprocess.Popen(cwd=ctx.cwd, env=最小环境) 执行
   → stream_reader 线程流式读取 stdout
   → 超时 / 停止信号 → process.kill()
   → 返回 {status, stdout, exit_code}
@@ -163,7 +173,11 @@ LLM 输出代码
 关键约束：
 
 - **不用 eval/exec**：除非 `inline_eval` 显式开启（仅内部使用），一律走子进程
+- **默认禁止静默执行**：未设置策略时按 `confirm` 处理；无明确授权不启动子进程
+- **底层 API 同样 fail closed**：`run_code` / `run_code_stream` 必须由完成策略检查的 Handler 显式传入内部授权标记
+- **宿主环境最小化**：不向脚本透传模型密钥、代理、云凭证或 SSH agent 环境
 - **流式读取**：stdout 不等进程结束才返回，边读边 yield，前端可实时展示
+- **有界保留**：stdout/stderr 达到硬上限后仍持续排空子进程管道，但不再进入队列或结果对象
 - **双信号停止**：`code_stop_signal`（Handler 级）+ `stop_sig`（全局级），每个循环轮次检查
 - **工作目录固定**：代码执行的进程 `cwd` 固定为 `ctx.cwd`，因此脚本内相对路径也默认落在工作区
 
@@ -232,7 +246,7 @@ LLM 回复无 tool_calls
 - **不做工具编排**：工具之间的调用顺序由 LLM 决定，工具层不实现 DAG 或流水线
 - **不做工具结果缓存**：文件和浏览器状态随时变化，缓存会导致过期数据
 - **不做自动重试**：工具失败返回错误信息，由 LLM 决定是否重试、换参数还是换方案
-- **不做工具权限分级**：所有工具对 LLM 平等可见，权限控制在 Schema 描述中引导（如 `inline_eval: "DO NOT USE except explicitly specified"`）
+- **不做通用 RBAC**：工具可见性由 Agent allowlist 控制；`code_run` 等高风险能力仍可有独立的执行策略门禁
 - **不做浏览器自动化框架**：只提供 scan + execute_js 两个原语，不封装点击/填写等高级操作
 - **不做文件变更回滚**：patch/write 是不可逆的，依赖 LLM 的探测优先策略避免误操作
 

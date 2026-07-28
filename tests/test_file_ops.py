@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from src.tools.file_ops import delete_file, patch_file, read_file, write_file
@@ -151,7 +152,7 @@ class FilePatchTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "ERROR")
 
-    def test_read_file_allows_outside_workspace_path(self) -> None:
+    def test_read_file_denies_outside_workspace_path_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "workspace"
             outside = Path(tmp_dir) / "outside.txt"
@@ -160,10 +161,11 @@ class FilePatchTests(unittest.TestCase):
 
             result = read_file(path="../outside.txt", cwd=str(root))
 
-            self.assertEqual(result["status"], "OK")
-            self.assertEqual(result["content"], "secret")
+            self.assertEqual(result["status"], "ERROR")
+            self.assertEqual(result["operation"], "read")
+            self.assertIn("explicit read authorization", result["error"])
 
-    def test_read_file_lists_outside_workspace_directory(self) -> None:
+    def test_read_file_allows_explicitly_authorized_outside_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "workspace"
             outside = Path(tmp_dir) / "outside"
@@ -171,7 +173,7 @@ class FilePatchTests(unittest.TestCase):
             outside.mkdir()
             (outside / "item.txt").write_text("ok", encoding="utf-8")
 
-            result = read_file(path=str(outside), cwd=str(root))
+            result = read_file(path=str(outside), cwd=str(root), allow_outside=True)
 
             self.assertEqual(result["status"], "OK")
             self.assertTrue(result["is_directory"])
@@ -208,7 +210,7 @@ class FilePatchTests(unittest.TestCase):
             self.assertEqual(result["operation"], "patch")
             self.assertEqual(outside.read_text(encoding="utf-8"), "before\n")
 
-    def test_write_file_can_expand_outside_workspace_file_ref(self) -> None:
+    def test_write_file_cannot_silently_expand_outside_workspace_file_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "workspace"
             outside = Path(tmp_dir) / "outside.txt"
@@ -221,8 +223,30 @@ class FilePatchTests(unittest.TestCase):
                 cwd=str(root),
             )
 
-            self.assertEqual(result["status"], "OK")
-            self.assertEqual((root / "inside.txt").read_text(encoding="utf-8"), "copied\nA\nB\n")
+            self.assertEqual(result["status"], "ERROR")
+            self.assertIn("explicit read authorization", result["error"])
+            self.assertFalse((root / "inside.txt").exists())
+
+    def test_concurrent_appends_do_not_lose_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            writes = 64
+
+            def append(index: int) -> dict[str, object]:
+                return write_file(
+                    path="events.log",
+                    content=f"{index}\n",
+                    mode="append",
+                    cwd=str(root),
+                )
+
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                results = list(pool.map(append, range(writes)))
+
+            self.assertTrue(all(result["status"] == "OK" for result in results))
+            lines = (root / "events.log").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), writes)
+            self.assertEqual({int(line) for line in lines}, set(range(writes)))
 
     def test_delete_file_inside_workspace_deletes_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

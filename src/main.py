@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -106,6 +107,23 @@ def _append_unique_tool(allowed_tools: list[str] | None, tool_name: str) -> list
     return normalized
 
 
+def _inherit_parent_runtime(child: XAgent, parent_ctx: Any | None) -> None:
+    if parent_ctx is None:
+        return
+    child.handler.ctx.sink = parent_ctx.sink
+    child.sink = parent_ctx.sink
+    child.handler.ctx.verbose = getattr(parent_ctx, "verbose", False)
+    child.handler.ctx.display_fn = parent_ctx.display_fn
+    parent_input_fn = getattr(parent_ctx, "user_input_fn", None)
+    if callable(parent_input_fn):
+        child.handler.ctx.user_input_fn = parent_input_fn
+    parent_stop_signal = getattr(parent_ctx, "stop_signal", None)
+    if isinstance(parent_stop_signal, threading.Event):
+        child.stop_event = parent_stop_signal
+        child.owns_stop_event = False
+        child.handler.ctx.stop_signal = parent_stop_signal
+
+
 def _build_delegate_runner(
     *,
     config_path: str | None,
@@ -167,15 +185,15 @@ def _build_delegate_runner(
             team_config=None,
         )
         original_child_sink = child.sink
-        if parent_ctx is not None:
-            child.handler.ctx.sink = parent_ctx.sink
-            child.sink = parent_ctx.sink
-            child.handler.ctx.verbose = getattr(parent_ctx, "verbose", False)
-            child.handler.ctx.display_fn = parent_ctx.display_fn
+        _inherit_parent_runtime(child, parent_ctx)
         try:
             result = child.run_task(child_prompt)
             exit_reason = str(result.get("exit_reason", ""))
-            status = "ERROR" if exit_reason == "ERROR" else "OK"
+            status = (
+                "ERROR"
+                if exit_reason == "ERROR"
+                else ("INTERRUPTED" if exit_reason == "INTERRUPTED" else "OK")
+            )
             return {
                 "status": status,
                 "agent": target,
@@ -261,15 +279,15 @@ def build_team_step_runner(
             team_config=None,
         )
         original_child_sink = child.sink
-        if parent_ctx is not None:
-            child.handler.ctx.sink = parent_ctx.sink
-            child.sink = parent_ctx.sink
-            child.handler.ctx.verbose = getattr(parent_ctx, "verbose", False)
-            child.handler.ctx.display_fn = parent_ctx.display_fn
+        _inherit_parent_runtime(child, parent_ctx)
         try:
             result = child.run_task(step_prompt)
             exit_reason = str(result.get("exit_reason", ""))
-            status = "ERROR" if exit_reason == "ERROR" else "OK"
+            status = (
+                "ERROR"
+                if exit_reason == "ERROR"
+                else ("INTERRUPTED" if exit_reason == "INTERRUPTED" else "OK")
+            )
             return {
                 "status": status,
                 "agent": target,

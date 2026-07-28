@@ -197,6 +197,16 @@ export OPENAI_BASE_URL="https://api.openai.com/v1/chat/completions"
 export OPENAI_MODEL="gpt-4o"
 ```
 
+`code_run` 默认逐次请求用户确认。可在受控环境中显式配置：
+
+```bash
+export XAGENT_CODE_RUN_POLICY="confirm"  # confirm | deny | allow
+export XAGENT_OUTSIDE_READ_POLICY="confirm"  # confirm | deny | allow
+export XAGENT_CHROME_PAGE_LOAD_TIMEOUT="30"  # 1..120 秒
+```
+
+代码执行的 `allow` 表示接受未使用 OS 文件系统沙箱的风险；工作区外读取默认逐次确认。无论策略为何，子进程都不会继承模型密钥等宿主敏感环境变量。Chrome 默认保留沙箱，只有受控部署显式设置 `XAGENT_CHROME_NO_SANDBOX=1` 才会关闭。Web 服务只接受本地 Host；如需自定义本地域名，使用逗号分隔的 `XAGENT_WEB_ALLOWED_HOSTS` 显式加入。
+
 也可以提供 JSON 配置文件（支持 OpenAI/Claude 的 text 模式、原生 tools 模式、以及 failover mixin）。
 
 **建议：** 不要把密钥提交到仓库。可维护一个 `config.example.json` 用于示例与共享。

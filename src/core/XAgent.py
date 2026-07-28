@@ -88,6 +88,7 @@ class XAgent:
     display_queue: Queue[dict[str, Any]] = field(default_factory=Queue)
     reply_queue: Queue[str] = field(default_factory=Queue)
     stop_event: threading.Event = field(default_factory=threading.Event)
+    owns_stop_event: bool = True
     _running: threading.Event = field(default_factory=threading.Event)
     sink: EventSink = field(default_factory=NullSink)
     skills_dir: str | None = None
@@ -209,9 +210,12 @@ class XAgent:
         query: str,
         resume_checkpoint: str | None = None,
         checkpoint_id: str | None = None,
+        *,
+        reset_stop_event: bool = True,
     ) -> dict[str, Any]:
         self._running.set()
-        self.stop_event.clear()
+        if self.owns_stop_event and reset_stop_event:
+            self.stop_event.clear()
         base_sink = self.handler.ctx.sink
         base_checkpoint_callback = self.handler.ctx.checkpoint_callback
         runbook_collector = _RunbookEventCollector()
@@ -398,10 +402,14 @@ class XAgent:
         *,
         resume_checkpoint: str | None = None,
         checkpoint_id: str | None = None,
+        reset_stop_event: bool = True,
     ) -> None:
+        if self.owns_stop_event and reset_stop_event:
+            self.stop_event.clear()
         thread = threading.Thread(
             target=self.run_task,
             args=(query, resume_checkpoint, checkpoint_id),
+            kwargs={"reset_stop_event": False},
             daemon=True,
         )
         thread.start()

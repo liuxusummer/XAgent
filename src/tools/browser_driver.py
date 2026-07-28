@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+import ipaddress
 import json
+import os
 import re
+import socket
 import threading
 import time
+import urllib.parse
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from src.core.workspace_storage import atomic_write_text, workspace_write_lock
 from src.tools.file_ops import WorkspacePermissionError, resolve_path, truncate_text
 
 
 WEB_CHAR_LIMIT = 8000
+DEFAULT_PAGE_LOAD_TIMEOUT = 30
+MAX_PAGE_LOAD_TIMEOUT = 120
 _ASYNC_SCRIPT_STATUS_KEY = "__xagent_script_status__"
 
 
@@ -95,7 +102,12 @@ class SeleniumBrowserDriver:
                 driver = self._get_driver()
                 self._select_session(driver, session_id=session_id, tab_index=tab_index)
                 if url:
+                    _validate_navigation_url(url)
+                    driver.set_page_load_timeout(_page_load_timeout())
                     driver.get(url)
+                    _validate_navigation_url(driver.current_url)
+                else:
+                    _validate_existing_page_url(driver.current_url)
 
                 content, elements = self._scan_content(driver, mode)
                 sessions = self._list_sessions(driver)
@@ -121,7 +133,15 @@ class SeleniumBrowserDriver:
                 }
             except ImportError:
                 return self._error("BRIDGE_DISCONNECTED", "selenium is not installed")
+            except UnsafeNavigationError as exc:
+                return self._error("SSRF_BLOCKED", str(exc))
             except Exception as exc:
+                if _is_script_timeout(exc):
+                    return self._error(
+                        "TIMEOUT",
+                        f"page navigation exceeded {_page_load_timeout()} seconds",
+                        status="TIMEOUT",
+                    )
                 return self._error("JS_ERROR", str(exc))
 
     def execute_js(
@@ -146,6 +166,7 @@ class SeleniumBrowserDriver:
                 driver = self._get_driver()
                 self._select_session(driver, session_id=session_id, tab_index=None)
                 before_url = driver.current_url
+                _validate_existing_page_url(before_url)
                 before_handles = set(driver.window_handles)
                 current_session_id = driver.current_window_handle
 
@@ -169,6 +190,8 @@ class SeleniumBrowserDriver:
                     )
 
                 result_str = serialize_result(payload.get("value"))
+                if await_navigation and driver.current_url != before_url:
+                    _validate_existing_page_url(driver.current_url)
                 after_handles = set(driver.window_handles)
                 new_tabs = sorted(after_handles - before_handles)
                 diagnostics = {
@@ -194,6 +217,14 @@ class SeleniumBrowserDriver:
                 return response
             except ImportError:
                 return self._error("BRIDGE_DISCONNECTED", "selenium is not installed", exec_id=exec_id)
+            except UnsafeNavigationError as exc:
+                return self._error(
+                    "SSRF_BLOCKED",
+                    str(exc),
+                    exec_id=exec_id,
+                    ack=True,
+                    result_received=False,
+                )
             except Exception as exc:
                 if _is_script_timeout(exc):
                     return self._error(
@@ -220,10 +251,10 @@ class SeleniumBrowserDriver:
             from selenium.webdriver.chrome.options import Options
 
             options = Options()
-            options.add_argument("--headless=new")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
+            for argument in _chrome_launch_arguments():
+                options.add_argument(argument)
             self._driver = webdriver.Chrome(options=options)
+            self._driver.set_page_load_timeout(_page_load_timeout())
             return self._driver
 
     def _select_session(self, driver: Any, session_id: str | None, tab_index: int | None) -> None:
@@ -305,6 +336,81 @@ class SeleniumBrowserDriver:
         if exec_id:
             data["exec_id"] = exec_id
         return data
+
+
+class UnsafeNavigationError(ValueError):
+    pass
+
+
+def _page_load_timeout() -> int:
+    raw = os.environ.get("XAGENT_CHROME_PAGE_LOAD_TIMEOUT", str(DEFAULT_PAGE_LOAD_TIMEOUT))
+    try:
+        timeout = int(raw)
+    except ValueError:
+        return DEFAULT_PAGE_LOAD_TIMEOUT
+    return max(1, min(timeout, MAX_PAGE_LOAD_TIMEOUT))
+
+
+def _chrome_launch_arguments() -> list[str]:
+    arguments = ["--headless=new", "--disable-dev-shm-usage"]
+    if os.environ.get("XAGENT_CHROME_NO_SANDBOX", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        arguments.append("--no-sandbox")
+    return arguments
+
+
+def _validate_navigation_url(url: str) -> None:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise UnsafeNavigationError(f"invalid navigation URL: {exc}") from exc
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise UnsafeNavigationError("navigation URL must use http or https")
+    if parsed.username is not None or parsed.password is not None:
+        raise UnsafeNavigationError("navigation URL must not contain credentials")
+    hostname = parsed.hostname
+    if not hostname:
+        raise UnsafeNavigationError("navigation URL must include a hostname")
+
+    try:
+        literal_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None:
+        _reject_non_public_address(literal_ip)
+        return
+
+    try:
+        records = socket.getaddrinfo(
+            hostname,
+            port or (443 if parsed.scheme.lower() == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise UnsafeNavigationError(f"failed to resolve navigation host: {hostname}") from exc
+    if not records:
+        raise UnsafeNavigationError(f"navigation host resolved to no addresses: {hostname}")
+    for record in records:
+        address = ipaddress.ip_address(record[4][0].split("%", 1)[0])
+        _reject_non_public_address(address)
+
+
+def _validate_existing_page_url(url: str) -> None:
+    normalized = str(url or "").strip()
+    if normalized in {"", "about:blank", "data:,"}:
+        return
+    _validate_navigation_url(normalized)
+
+
+def _reject_non_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> None:
+    if not address.is_global:
+        raise UnsafeNavigationError(
+            f"navigation to non-public address is blocked: {address}"
+        )
 
 
 def _wrap_async_script(script: str) -> str:
@@ -403,12 +509,20 @@ def serialize_result(result: Any) -> str:
 
 
 def save_result(result_str: str, save_to_file: str, cwd: str | None) -> dict[str, Any]:
+    path: Path | None = None
     try:
         path = resolve_path(save_to_file, cwd, operation="write")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(result_str, encoding="utf-8")
+        with workspace_write_lock(Path(cwd or Path.cwd()).resolve()):
+            atomic_write_text(path, result_str)
     except WorkspacePermissionError as exc:
         return exc.to_result()
+    except OSError as exc:
+        return {
+            "status": "ERROR",
+            "error": f"failed to save browser result: {exc}",
+            "path": str(path or save_to_file),
+        }
+    assert path is not None
     return {
         "saved_to": str(path),
         "bytes": len(result_str.encode("utf-8")),
