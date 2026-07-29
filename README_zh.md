@@ -63,6 +63,12 @@ flowchart TB
     Handler["XAgentHandler<br/>分发工具调用"]
   end
 
+  subgraph O["可选 Durable Orchestration"]
+    Workflow["版本化 Workflow"]
+    Scheduler["Scheduler / Event Store"]
+    Guard["Policy / Approval / Executor"]
+  end
+
   subgraph L[LLM Layer]
     Session["Session<br/>历史 / 裁剪 / 故障转移"]
     ToolClient["ToolClient<br/>OpenAI/Claude 适配器"]
@@ -80,6 +86,8 @@ flowchart TB
   end
 
   F --> C
+  F -. 显式启用 .-> O
+  O --> C
   C --> L
   L --> C
   C --> T
@@ -135,12 +143,92 @@ sequenceDiagram
 
 ---
 
+## 🧱 可选 Durable Orchestration 控制面
+
+`src.orchestration` 是包裹现有 Agent Core 的显式可选控制面。仅导入该包不会启动
+worker、创建存储，也不会改变默认 CLI、Gradio、FastAPI、React 或 Team Workflow
+行为。
+
+它的小型顶层 API 提供以下主要组合入口：
+
+- 不可变、内容寻址的 Artifact、有界 `ArtifactRef`，以及保守、可恢复的本地孤立
+  Artifact 清理
+- 版本化声明式 Workflow、DAG 调度、deadline、lease、fencing、暂停/取消/恢复，以及
+  有界父子 Run
+- 以 SQLite Domain Event 为事实、可重建的 projection
+- policy、持久 approval 等待/恢复/拒绝与可信执行门禁
+- 无副作用 replay、不变量/故障评测，以及基于显式证据的可靠性指标
+- 无会话 MCP 2026-07-28 discovery 与编排工具；协议元数据和授权上下文均按请求校验；
+  malformed、oversized、over-deep 输入使用独立的预解析 token budget，不消耗正常合法
+  请求预算
+
+高级适配器仍从各自的 `src.orchestration.<module>` 模块导入。顶层包刻意不导入 Web
+projection，因此核心 API 不要求安装 FastAPI。
+
+### 正确性边界
+
+- Activity Attempt 采用 **at-least-once** 语义。Domain Event 与本地 projection
+  原子提交，但外部副作用与 SQLite 不共享事务。
+- 幂等或可从外部探测结果的操作可以复用稳定身份重试；无法确认结果的非幂等操作停在
+  `OUTCOME_UNKNOWN` / `WAITING_RECOVERY`，禁止盲目重放。
+- legacy `AgentActivity` 只把现有多轮 Agent Loop 保守地包装为一个 opaque Activity。
+  其内部工具调用不会自动变成逐工具 verified receipt，因此中断后的 legacy Activity
+  不能声称精确的工具级恢复。
+- Runtime 创建的 Run 会持久化已验证的不可变 Workflow Artifact identity。Scheduler
+  缓存丢失或进程重启后会重新验证并编译该精确定义；外部 resolver 只是覆盖能力，不是
+  正确性依赖。定义字节缺失或身份不匹配时 fail closed。
+- `(workflow_id, workflow_version)` 在整个 Store 中只能绑定一个不可变定义 digest，
+  低层 API 和子 Run 创建也不能绕过。Workflow v2 的输入映射把 Run/上游 Artifact
+  identity 精确绑定到 Activity 请求，join 顺序保持确定。
+- `REQUIRE_APPROVAL` 会释放 worker lease，并把同一 Attempt 持久停在等待状态。可信
+  grant 以更高 fencing token 重新调度；拒绝或取消在不调用 backend 的前提下终止。
+- XAgent **不承诺**任意工具 exactly-once、外部系统自动回滚、分布式共识，或进程 /
+  provider / 浏览器内部状态的精确恢复。
+- checkpoint 摘要与 telemetry 是有用的 projection，不是执行事实；大型或敏感内容只能
+  通过经过审查的 Artifact 引用跨越控制面。
+- Event Store、Artifact 根、GC 隔离区和锁必须位于所有 Agent 可写 workspace 之外，
+  由独立控制面服务/OS identity 持有，且不得挂载给 legacy 文件、代码或浏览器工具。
+  旧 Web UI 不会自动挂载 Durable 数据库；GET-only Web adapter 只接受显式的受信
+  tenant→database resolver，用于独立部署的投影服务。隐藏路径或同 UID 权限不是安全
+  边界。
+- 可信 Executor 会在 backend 执行前拒绝与 Store 或 Artifact 根重叠的 Sandbox
+  `cwd`/allowed root。该组合防护用于阻止危险挂载配置，但不能替代 OS/container
+  隔离。
+- 持久化 Run、Node、Attempt 和 Artifact metadata 会在 Unicode / 大小写 / 分隔符
+  规范化后递归拒绝凭据形态的键。系统直接失败，不会静默脱敏并造成身份碰撞；敏感内容
+  必须进入受保护 Artifact。
+- 本地 Artifact 清理默认仅预览，只把已提交的完整 `ArtifactRef` 视为可达引用。Store
+  schema v3 在同一个 Domain Event 事务内登记 canonical 引用，并与持久化的逐对象 GC
+  claim 线性化，因此新提交的引用不会指向已隔离的内容。最小 grace period、清理前二次
+  可达性扫描、跨进程 GC 锁和同文件系统隔离区使清理保持保守且可恢复；该保证不覆盖
+  `DurableRunStore` Event 事务之外的任意外部登记。超过 grace 的崩溃写入临时文件也
+  共用该锁和有界隔离流程；收集器不会 unlink 隔离内容，最终保留期由运维策略显式决定。
+- hierarchy 子 Run 使用带索引、有上限的 Store 查询。Web 详情与 SSE snapshot 对
+  Run/Node/Attempt projection 使用同一个 SQLite snapshot，并实施分页和响应硬上限；
+  常规页面不会为每个 Run 重放完整 Event History，全量 replay 校验由显式的单 Run
+  integrity endpoint 提供。该运维端点只有在 router 显式注入 authorizer 后才可访问；
+  流式 reducer 与 live projection 比较共享同一个 SQLite read snapshot，并同时限制
+  Event 总数、canonical payload 累计字节数和协作式 wall-time。
+
+组合部署前，请先阅读[设计规范](docs/durable-orchestration-spec.md)，运行
+[本地 quickstart](docs/durable-orchestration-quickstart.md)，并检查
+[故障矩阵](docs/durable-orchestration-fault-matrix.md)。
+
+最小可运行组合：
+
+```bash
+.venv/bin/python examples/orchestration_runtime_minimal.py
+```
+
+---
+
 ## 🗺️ 仓库结构
 
 ```text
 XAgent/
 ├── src/
 │   ├── core/                 # agent loop、LLM clients、telemetry、skills
+│   ├── orchestration/        # 可选持久编排控制面
 │   ├── handler/              # XAgentHandler：工具调用分发
 │   ├── tools/                # 无状态工具实现
 │   ├── assets/               # system prompt、tool schema、code-run header
