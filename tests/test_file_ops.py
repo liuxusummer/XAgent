@@ -331,6 +331,38 @@ class FilePatchTests(unittest.TestCase):
             self.assertIn("cannot be deleted", result["error"])
             self.assertTrue(target.exists())
 
+    def test_file_tools_deny_legacy_orchestration_control_plane_paths(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            database = runtime / "orchestration.sqlite3"
+            database.write_bytes(b"durable-store")
+            artifact = runtime / "orchestration-artifacts" / "sha256" / "aa"
+
+            write_result = write_file(
+                path="runtime/orchestration.sqlite3",
+                content="attacker-controlled",
+                cwd=str(root),
+            )
+            delete_result = delete_file(
+                path="runtime/orchestration.sqlite3-wal",
+                cwd=str(root),
+            )
+            artifact_result = write_file(
+                path=str(artifact),
+                content="attacker-controlled",
+                cwd=str(root),
+            )
+
+            self.assertEqual(write_result["status"], "ERROR")
+            self.assertEqual(delete_result["status"], "ERROR")
+            self.assertEqual(artifact_result["status"], "ERROR")
+            self.assertEqual(database.read_bytes(), b"durable-store")
+            self.assertFalse(artifact.exists())
+
     def test_file_ops_allow_absolute_path_inside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

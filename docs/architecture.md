@@ -15,6 +15,9 @@
 │  Frontends（多端适配层）           │
 │  CLI / Feishu / Telegram / ...   │
 ├──────────────────────────────────┤
+│  Durable Orchestration（可选控制面）│
+│  Workflow / Scheduler / Event Log│
+├──────────────────────────────────┤
 │  AgentCore（核心引擎层）          │
 │  XAgent → agent_loop → handler   │
 ├──────────────────────────────────┤
@@ -34,6 +37,7 @@
 | 层 | 职责 | 上行输出 | 下行依赖 |
 |---|---|---|---|
 | Frontends | 用户 IO、消息渲染 | 用户输入 → task_queue | display_queue |
+| Durable Orchestration | 长任务状态机、DAG/父子 Run、策略门禁、恢复与回放 | Run/Event/Artifact 引用 | AgentCore adapter + Tool adapter + SQLite |
 | AgentCore | 循环调度、状态管理 | ActionResult（含 flags）/ 退出信号 | LLM Layer + Tool Layer |
 | LLM Layer | API 调用、历史裁剪、SSE 解析 | ChatResponse（统一格式） | API Key / Endpoint |
 | Tool Layer | 工具执行、结果封装 | ActionResult | 文件系统 / 浏览器 / 子进程 |
@@ -50,6 +54,21 @@
 - Web 流式状态：LLM XML 包装按 chunk 增量解析，原始诊断尾部与单个工具载荷均设 65,536 字符上限；会话事件日志最多保留 2048 条，落后于保留窗口的 SSE 客户端通过 `session_snapshot` 恢复当前消息状态
 - 共享存储：Runbook、Memory、定时任务等工作区级“读—改—写”必须持有统一工作区锁；写盘使用同目录唯一临时文件并原子替换，禁止直接覆盖
 - 数据格式：层间只传 `ActionResult` 或 `ChatResponse`，禁止跨层直接访问内部状态
+- Durable Orchestration 是显式启用的外层控制面：它只持久化 Run、Node、Attempt、Domain
+  Event 和 Artifact 引用，不持久化 Agent Loop 的 provider 内部状态，也不允许原始工具输出越过
+  Artifact 边界。未启用时，现有 CLI、Web 单 Agent 和 Team Workflow 行为保持不变。完整协议见
+  `docs/durable-orchestration-spec.md`
+- Durable Store、Artifact、GC 和锁必须放在 Agent workspace 外，由独立控制面
+  service/OS identity 持有，且不挂载给 legacy 文件、代码或浏览器工具。旧 Web UI 不会
+  自动发现数据库；投影服务必须显式注入受信 tenant→database 映射。同 UID 隐藏路径不构成
+  隔离。
+- Orchestration Runtime 的进程内 Scheduler 仅是有界 LRU 加速层，默认最多缓存 64 个，
+  构造参数只接受 1–1024；
+  Domain Store 与不可变 Workflow Artifact 才是事实源。缓存优先淘汰 terminal Run；
+  Runtime 提交的 active Run 通过持久化 `runtime_workflow_ref` 自治验证、读取、编译并
+  重建 Scheduler，外部 `scheduler_resolver` 只用于部署覆盖或非 Runtime 创建的 Run。
+  缺失/损坏/身份不匹配的 definition fail closed。LRU 锁串行化缓存替换，但缓存容量不
+  限制可持久 Run 数量。
 
 ## 3. 核心数据流
 
@@ -182,12 +201,14 @@ XAgent/
 
 ## 6. 约束与边界
 
-### 不做的事
+### 默认单 Agent 路径不做的事
 
-- **不做 ORM / 数据库**：记忆系统基于文件，不引入 DB 依赖
+- **不做 ORM / 业务数据库**：记忆系统和业务工作区仍基于文件；仅 Durable
+  Orchestration 控制面使用 Python 标准库 SQLite 保存编排元数据
 - **不做插件热加载**：工具集编译期确定，运行期不动态增删
-- **不做分布式**：单进程单 Agent，不设计 RPC/消息中间件
-- **不做通用 Agent 框架**：面向物理执行场景，不抽象为通用对话框架
+- **不要求分布式基础设施**：默认仍是单机进程；Durable Orchestration 的租约和 fencing
+  只为崩溃恢复及多 worker 安全预留，不引入消息中间件
+- **不做无边界的通用 Agent 框架**：编排抽象只覆盖物理执行所需的确定性控制面
 - **不做前端渲染引擎**：前端只负责消息展示，不做 Markdown/Rich 渲染
 
 ### 必须做的事

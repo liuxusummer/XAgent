@@ -63,6 +63,12 @@ flowchart TB
     Handler["XAgentHandler<br/>dispatch tool calls"]
   end
 
+  subgraph O["Optional Durable Orchestration"]
+    Workflow["Versioned Workflow"]
+    Scheduler["Scheduler / Event Store"]
+    Guard["Policy / Approval / Executor"]
+  end
+
   subgraph L[LLM Layer]
     Session["Session<br/>history / trimming / failover"]
     ToolClient["ToolClient<br/>OpenAI/Claude adapters"]
@@ -80,6 +86,8 @@ flowchart TB
   end
 
   F --> C
+  F -. explicit opt-in .-> O
+  O --> C
   C --> L
   L --> C
   C --> T
@@ -135,12 +143,117 @@ Design docs live in [`docs/`](docs/):
 
 ---
 
+## 🧱 Optional Durable Orchestration Control Plane
+
+`src.orchestration` is an opt-in control plane around the existing Agent Core.
+Importing it does not start a worker, create storage, or change the default CLI,
+Gradio, FastAPI, React, or Team Workflow behavior.
+
+Its small top-level API exposes the main composition entries for:
+
+- immutable, content-addressed Artifacts, bounded `ArtifactRef` values, and
+  conservative recoverable local orphan collection
+- versioned declarative Workflows, DAG scheduling, deadlines, leases, fencing,
+  pause/cancel/recovery, and bounded parent/child Runs
+- a SQLite Domain Event truth with rebuildable projections
+- policy, durable approval waiting/resume/rejection, and trusted execution
+  gates
+- side-effect-free replay, invariant/fault evaluation, and explicit reliability
+  evidence
+- stateless MCP 2026-07-28 discovery and orchestration tools, with protocol
+  metadata and authorization context checked per request; malformed,
+  oversized, and over-deep inputs use a separate pre-parse token budget and do
+  not consume the normal valid-request budget
+
+Advanced adapters remain available from their defining
+`src.orchestration.<module>` modules. Web projections are deliberately not
+imported by the top-level package, so the core API does not require FastAPI.
+
+### Correctness boundary
+
+- Activity Attempts are **at-least-once**. Domain Events and local projections
+  commit atomically, but an external side effect and SQLite do not share a
+  transaction.
+- Idempotent or externally probeable operations may be retried with stable
+  identities. An uncertain non-idempotent outcome stops in
+  `OUTCOME_UNKNOWN` / `WAITING_RECOVERY`; it is not blindly replayed.
+- A legacy `AgentActivity` conservatively wraps the existing multi-turn Agent
+  Loop as one opaque Activity. Its internal tool calls do not become verified
+  per-tool receipts, so an interrupted legacy Activity cannot claim precise
+  tool-level recovery.
+- Runtime-created Runs persist the verified immutable Workflow Artifact
+  identity. Scheduler cache loss or process restart re-verifies and recompiles
+  that exact definition; an external resolver is an override, not a
+  correctness requirement. Missing or mismatched definition bytes fail closed.
+- `(workflow_id, workflow_version)` has one Store-wide immutable definition
+  digest, including Runs created through low-level and child-Run paths.
+  Workflow v2 input mappings bind exact Run/upstream Artifact identities into
+  the Activity request, with deterministic join order.
+- `REQUIRE_APPROVAL` releases the worker lease and durably parks the same
+  Attempt. A trusted grant re-schedules it with a higher fencing token;
+  rejection or cancellation reaches a terminal state without dispatching the
+  backend.
+- XAgent does **not** claim exactly-once execution for arbitrary tools, automatic
+  rollback of external systems, distributed consensus, or exact restoration of
+  process/provider/browser state.
+- Checkpoint summaries and telemetry are useful projections, not execution
+  truth. Large or sensitive content crosses the control plane only through
+  reviewed Artifact references.
+- The Event Store, Artifact root, GC quarantine, and locks must live outside
+  every Agent-writable workspace under a separate control-plane service/OS
+  identity and must not be mounted into legacy file, code, or browser tools.
+  The legacy Web UI does not auto-mount a durable database. The GET-only Web
+  adapter accepts an explicit trusted tenant-to-database resolver for a
+  separately deployed projection service; path hiding or same-UID permissions
+  are not a security boundary.
+- The trusted executor rejects any Sandbox `cwd` or allowed root that overlaps
+  the configured Store or Artifact roots before backend execution. This
+  composition guard catches unsafe mounts but does not replace OS/container
+  isolation.
+- Durable Run, Node, Attempt, and Artifact metadata rejects nested
+  credential-shaped keys after Unicode/case/separator normalization. It fails
+  instead of silently redacting identity-bearing input; secret content belongs
+  in a protected Artifact.
+- Local Artifact collection is dry-run by default and only treats complete,
+  committed `ArtifactRef` values as reachable. Store schema v3 indexes
+  canonical references in the same Domain Event transaction and linearizes
+  them against a durable per-object GC claim, so a newly committed reference
+  cannot point to quarantined bytes. A minimum grace period, a second
+  reachability scan, a cross-process GC lock, and same-filesystem quarantine
+  keep cleanup conservative and recoverable. This guarantee does not cover
+  arbitrary registration outside `DurableRunStore` Event transactions.
+  Expired crashed-write temporary files use the same lock and bounded
+  quarantine path; the collector never unlinks quarantine content, whose final
+  retention remains an explicit operator policy.
+- Hierarchy child lookups use indexed, bounded Store queries. Web detail and
+  SSE snapshots read Run/Node/Attempt projections from one SQLite snapshot and
+  page them with hard response limits. Routine pages do not replay every Run's
+  full Event History; full replay verification is an explicit per-Run integrity
+  endpoint. That operator endpoint is denied unless the router receives an
+  explicit authorizer. Its streaming reducer and live-projection comparison
+  share one SQLite read snapshot and have fixed Event-count, cumulative
+  canonical-payload-byte, and cooperative wall-time budgets.
+
+Read the [design specification](docs/durable-orchestration-spec.md), run the
+[local quickstart](docs/durable-orchestration-quickstart.md), and review the
+[fault matrix](docs/durable-orchestration-fault-matrix.md) before composing this
+control plane into a deployment.
+
+The smallest runnable composition is:
+
+```bash
+.venv/bin/python examples/orchestration_runtime_minimal.py
+```
+
+---
+
 ## 🗺️ Repository Layout
 
 ```text
 XAgent/
 ├── src/
 │   ├── core/                 # agent loop, LLM clients, telemetry, skills
+│   ├── orchestration/        # optional durable control plane
 │   ├── handler/              # XAgentHandler tool dispatch
 │   ├── tools/                # stateless tool implementations
 │   ├── assets/               # system prompt, tool schema, code-run header

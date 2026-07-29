@@ -1,0 +1,106 @@
+{
+  "schema_version": 2,
+  "name": "durable-orchestration-demo",
+  "version": 1,
+  "metadata": {
+    "purpose": "local acceptance demo"
+  },
+  "nodes": [
+    {
+      "id": "fan_out",
+      "kind": "parallel",
+      "config": {
+        "branches": [
+          "analyze_alpha",
+          "analyze_beta"
+        ]
+      },
+      "effect_class": "read_only"
+    },
+    {
+      "id": "analyze_alpha",
+      "kind": "tool",
+      "depends_on": [
+        "fan_out"
+      ],
+      "input_mapping": {
+        "source": {
+          "source": "run_input"
+        }
+      },
+      "config": {
+        "tool": "analyze_fragment",
+        "arguments": {
+          "shard": "alpha"
+        }
+      },
+      "effect_class": "read_only"
+    },
+    {
+      "id": "analyze_beta",
+      "kind": "tool",
+      "depends_on": [
+        "fan_out"
+      ],
+      "input_mapping": {
+        "source": {
+          "source": "run_input"
+        }
+      },
+      "config": {
+        "tool": "analyze_fragment",
+        "arguments": {
+          "shard": "beta"
+        }
+      },
+      "effect_class": "read_only"
+    },
+    {
+      "id": "join_analysis",
+      "kind": "join",
+      "depends_on": [
+        "analyze_alpha",
+        "analyze_beta"
+      ],
+      "input_mapping": {
+        "alpha": {
+          "source": "node_output",
+          "node_id": "analyze_alpha"
+        },
+        "beta": {
+          "source": "node_output",
+          "node_id": "analyze_beta"
+        }
+      },
+      "config": {
+        "mode": "all"
+      },
+      "effect_class": "read_only"
+    },
+    {
+      "id": "publish_report",
+      "kind": "tool",
+      "depends_on": [
+        "join_analysis"
+      ],
+      "input_mapping": {
+        "fragments": {
+          "source": "node_output",
+          "node_id": "join_analysis"
+        }
+      },
+      "config": {
+        "tool": "publish_report",
+        "arguments": {
+          "destination": "local-visible-ledger",
+          "report_contract": "aggregate-v1"
+        }
+      },
+      "effect_class": "idempotent_write",
+      "resource_keys": [
+        "ledger:demo-publication"
+      ],
+      "idempotency_key_template": "{{workflow_id}}:{{run_id}}:{{node_id}}:{{logical_operation_key}}"
+    }
+  ]
+}

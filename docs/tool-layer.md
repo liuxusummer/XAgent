@@ -167,7 +167,7 @@ LLM 输出代码
   → 注入 code_run_header.py（公共 import）
   → subprocess.Popen(cwd=ctx.cwd, env=最小环境) 执行
   → stream_reader 线程流式读取 stdout
-  → 超时 / 停止信号 → process.kill()
+  → 超时 / 停止信号 → 独立进程组 TERM → 有界等待 → KILL → wait
   → 返回 {status, stdout, exit_code}
 ```
 
@@ -181,6 +181,76 @@ LLM 输出代码
 - **有界保留**：stdout/stderr 达到硬上限后仍持续排空子进程管道，但不再进入队列或结果对象
 - **双信号停止**：`code_stop_signal`（Handler 级）+ `stop_sig`（全局级），每个循环轮次检查
 - **工作目录固定**：代码执行的进程 `cwd` 固定为 `ctx.cwd`，因此脚本内相对路径也默认落在工作区
+
+Durable Orchestration 的 `TrustedActivityExecutor` 在 approval/policy 提交前
+还会计算完整 execution binding：非秘密 argv 摘要、规范化 cwd 摘要、
+profile/limits、输入 Artifact identity、稳定 operation/idempotency key 摘要、
+EnvironmentBinding 的受信摘要、capabilities 和 resource locks 都进入
+`ActionRequest` 的 action digest。脚本不能只提交 caller 声称的 digest：
+必须提供通过 `artifact_verifier` 校验的 immutable `ArtifactRef`，由受信
+`artifact_reader` 物化为不可变 bytes；`ExecutionRequest` 和 Dispatcher 会再次
+校验 bytes 的长度与 SHA-256，且只有显式声明支持该物化契约的 backend 才可接收。
+会执行脚本或动态代码的工具还必须在 `ToolPolicy` 中声明
+`requires_script_artifact=true`；此时仅把可变路径放进 argv 而不提交
+ArtifactRef 会在 `attempt.started` 前被拒绝。固定受信函数或 immutable image
+命令可以显式声明不需要脚本 Artifact。
+审批签发后替换 argv、Artifact、脚本 bytes、key、资源限制、工作目录或 profile
+都会在 backend 执行前失败。
+argv 明确禁止承载秘密；执行请求只允许携带环境变量名及受信边界生成的
+redaction/HMAC digest，不携带秘密值。需要秘密的部署必须由后端侧可信 broker
+按该 `EnvironmentBinding` 解析，且不得把解析值写回 Domain Event 或 Receipt。
+敏感键识别复用元数据边界的 NFKC、casefold 和分隔符移除规则，避免
+`accessToken`、全角 `PASSWORD`、`api.key` 或零宽字符绕过。Executor 会针对
+`sensitive_keys` 和内置敏感字段名提取非 null、非空的 JSON scalar（包括
+numeric/bool；兼容受信边界的 bytes-like 值），并在 policy 之前拒绝这些值出现
+在 argv、cwd 或 resource locks 中；该检查不做通用熵猜测，也不会在错误、
+digest 或 SQLite 中回显被拒绝值或其可离线枚举的直接 hash。
+
+稳定 operation/idempotency key 在 Scheduler、Policy 和 Sandbox 共享 1024 字符
+硬上限。渲染结果超限时不会创建 Attempt；合法上限内的 key 可完整交给 backend，
+并作为恢复/probe 所需的内部 durable identity 保存在 Attempt projection 和
+idempotency state。模板只能引用编译器 allowlist 中的 workflow/run/node 固定字段
+及 input digest，禁止把 key 当作秘密传输通道。Policy/approval/receipt 公共
+payload 只携带 key digest，Web/telemetry 不导出原值。
+
+当 policy 返回 `REQUIRE_APPROVAL` 时，Executor 不会把它当作终态失败：Store 原子释放
+claim lease，把 Run/Node/同一 Attempt 置为 `WAITING_APPROVAL`，并持久化有界的
+`approval.requested`。可信 grant 将同一 Attempt 恢复为 `SCHEDULED`，下次 claim
+获得更高 fencing token；可信 rejection 或 durable cancel 在 backend 调用前终止。
+终态工具结果通过 `DurableRunStore.get_tool_receipt(run_id, attempt_id)` 查询时会重新
+验证 Receipt digest、Run/Attempt identity 和 Event 状态，禁止把任意 result dict
+冒充已验证 Receipt。
+
+编排可写工具的 `ToolPolicy` 必须显式声明 idempotency-key、status-probe、
+compensation、timeout behavior，以及 allowed/required resource keys；
+动态代码工具另需声明 `requires_script_artifact`。Policy
+会拒绝缺少业务幂等键能力的 `idempotent_write`、写操作的 `safe_to_retry`
+超时声明、无 probe 能力却声称 `probe_before_retry`，以及缺失或越权的资源锁。
+原始 operation key 仅在上述内部 durable state 与受信 backend 之间流转。
+
+`LocalProcessSupervisorBackend` 仅证明进程树监管和有界输出，安全等级为
+`development_unsafe`，不继承宿主环境且只接受声明为 read-only 的 Action；
+它不是任意代码隔离。闭集受信函数使用独立的 `trusted_function` 等级，
+默认 `os_sandbox` profile 不会接受这两种较弱 attestation。
+运行中的本地进程由活着的 worker 周期性读取 DurableRunStore 的 Run 取消意图；
+发现 `CANCELLING` / `CANCELLED` 后必须对整个进程组执行
+TERM→有界 grace→KILL→reap，并由 Executor 确认 durable CANCELLED 终态。
+该协作模型不声称 controller/worker 崩溃后能重新发现或 attach 已失去监管的本地
+进程；需要此能力的部署必须使用保存外部进程身份并支持重新 attach 的 supervisor。
+`Popen` 成功后，selector 注册、读取或监督逻辑的任意异常都必须走同一
+TERM→有界等待→KILL→wait 进程组清理，并在异常返回前关闭 selector 与
+stdout/stderr；初始化失败不能绕过 parent/child/grandchild 的回收契约。
+
+Executor 会从 Store 文件、已绑定 ArtifactStore 和 backend ArtifactStore 推导控制面
+根，并在构造执行请求前解析 profile allowed roots 与 cwd；任何相等、祖先或后代重叠
+都会抛出组合错误且不调用 backend。该检查用于防止把控制面误挂进 Agent sandbox，
+不能替代不同 UID/service、mount namespace 或容器隔离。
+
+无状态 MCP stdio 入口对单条消息同时施加 1 MiB、32 层和 4096 个容器 item
+的上限。JSON 解码的 `RecursionError`/畸形输入返回固定 Parse error；已解码但
+超过结构上限的请求返回固定 Invalid Request。两类拒绝都发生在限流和 runtime
+authorization 之前，不回显 payload，并且只丢弃当前 newline-delimited 消息，
+后续合法请求必须继续处理。
 
 ### 4.2 file_patch 的唯一性契约
 
@@ -244,7 +314,8 @@ LLM 回复无 tool_calls
 
 ## 5. 不做的事
 
-- **不做工具编排**：工具之间的调用顺序由 LLM 决定，工具层不实现 DAG 或流水线
+- **Tool Layer 内不做工具编排**：普通工具调用顺序仍由 LLM 决定；显式启用 Durable
+  Orchestration 时，外层控制面只通过受策略约束的 Tool Activity adapter 调度 DAG
 - **不做工具结果缓存**：文件和浏览器状态随时变化，缓存会导致过期数据
 - **不做自动重试**：工具失败返回错误信息，由 LLM 决定是否重试、换参数还是换方案
 - **不做通用 RBAC**：工具可见性由 Agent allowlist 控制；`code_run` 等高风险能力仍可有独立的执行策略门禁

@@ -15,6 +15,14 @@ READ_OPERATIONS = {"read"}
 WRITE_OPERATIONS = {"create", "update", "write", "patch", "delete"}
 SUPPORTED_OPERATIONS = READ_OPERATIONS | WRITE_OPERATIONS
 WORKSPACE_SYSTEM_DIR = "system"
+WORKSPACE_RUNTIME_DIR = "runtime"
+_LEGACY_ORCHESTRATION_NAMES = frozenset(
+    {
+        "orchestration.sqlite3",
+        "orchestration.sqlite3-shm",
+        "orchestration.sqlite3-wal",
+    }
+)
 
 
 class WorkspacePermissionError(ValueError):
@@ -316,11 +324,22 @@ def resolve_path_for_operation(
                 base,
                 operation,
             ) from exc
-    if operation in WRITE_OPERATIONS and _is_workspace_system_path(resolved, base):
+    protected_control_plane = _is_legacy_orchestration_path(resolved, base)
+    if operation in WRITE_OPERATIONS and (
+        _is_workspace_system_path(resolved, base) or protected_control_plane
+    ):
         if operation == "delete":
-            message = "workspace system files cannot be deleted by agent file tools"
+            message = (
+                "control-plane files cannot be deleted by agent file tools"
+                if protected_control_plane
+                else "workspace system files cannot be deleted by agent file tools"
+            )
         else:
-            message = "workspace system files are read-only for agent file tools"
+            message = (
+                "control-plane files are read-only for agent file tools"
+                if protected_control_plane
+                else "workspace system files are read-only for agent file tools"
+            )
         raise WorkspacePermissionError(
             f"{message}: {resolved} (workspace: {base}, operation: {operation})",
             resolved,
@@ -337,6 +356,30 @@ def _is_workspace_system_path(path: Path, workspace: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _is_legacy_orchestration_path(path: Path, workspace: Path) -> bool:
+    """Protect obsolete in-workspace control-plane names as defense in depth.
+
+    A supported deployment keeps the durable Store, Artifact root, GC
+    quarantine, and locks outside the Agent workspace and under a separate
+    service/OS identity.  These names remain blocked so an old deployment
+    cannot be corrupted through ordinary file tools while it is migrated.
+    """
+
+    runtime_root = workspace / WORKSPACE_RUNTIME_DIR
+    try:
+        relative = path.relative_to(runtime_root)
+    except ValueError:
+        return False
+    if not relative.parts:
+        return False
+    name = relative.parts[0]
+    return (
+        name in _LEGACY_ORCHESTRATION_NAMES
+        or name.startswith("orchestration-artifacts")
+        or name.startswith("orchestration-gc-")
+    )
 
 
 def expand_file_refs(content: str, cwd: str | None = None) -> str:
