@@ -1,0 +1,59 @@
+README.md
+  s_72af05a5dabd4c::t_bef72f13a790a4 145
+docs/architecture.md
+  s_72af05a5dabd4c::t_0e828642f1ee23 113-120
+docs/distributed-execution-adr.md
+  s_72af05a5dabd4c::t_f545fa074ef6db 339-347
+docs/distributed-execution-quickstart.md
+  s_72af05a5dabd4c::t_583365e4edd386 77,99,108-109,124-130
+docs/durable-orchestration-fault-matrix.md
+  s_72af05a5dabd4c::t_0891c14566fda3 61
+docs/remote-execution-recovery.md
+  s_72af05a5dabd4c::t_ef75f7eef42eeb 1-139
+docs/remote-fleet-adversarial-review.md
+  s_72af05a5dabd4c::t_de41bbf1df5404 114-116
+docs/remote-fleet-data-plane.md
+  s_72af05a5dabd4c::t_d44f5686eb030a 161-163,166
+examples/distributed_execution_demo.py
+  s_72af05a5dabd4c::t_9863800b363092 46-48,543-545,811-813
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_3183c5396838aa 168-171,173
+src/orchestration/executor.py
+  s_72af05a5dabd4c::t_f0a319a3d3940e 986-1096
+src/orchestration/remote_control.py
+  s_72af05a5dabd4c::t_2dfbf8503270f5 35,37,94,102,113,118-133,379-397,572,1326,1381,1454-1457,1512-1514,1517-1534,1553-1558,1568-1578,1589
+src/orchestration/remote_execution.py
+  s_72af05a5dabd4c::t_f7ff9cfdc926bf 47,49,57-61,271,301,336-344,706,727-733,751-753,781-848,1294-1301,1386-1687,1808-1815,1918,2011,2067-2123,2165,2206,2226,2250,2510-2520,2639,2760,2855
+src/orchestration/remote_execution_journal.py
+  s_72af05a5dabd4c::t_5f1c9c236028d5 1-771
+src/orchestration/remote_protocol.py
+  s_72af05a5dabd4c::t_2e298063857066 400-447,1880,1882
+src/orchestration/worker_security.py
+  s_72af05a5dabd4c::t_ed3cd200739a9d 360-364,367-369,372,380
+tests/test_orchestration_distributed_demo.py
+  s_72af05a5dabd4c::t_6be9f198464987 40-44
+tests/test_orchestration_remote_execution.py
+  s_72af05a5dabd4c::t_f2c7773716f259 29-31,484-486,868-982,1426-1603
+tests/test_orchestration_remote_execution_journal.py
+  s_72af05a5dabd4c::t_bfaa8cebac5742 1-172
+tests/test_orchestration_worker_security.py
+  s_72af05a5dabd4c::t_0f17ab3d6dde01 367-412
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4e4781dcf51cab8409bd3fff9dc3c72a7643585f",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
