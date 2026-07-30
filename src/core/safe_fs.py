@@ -254,9 +254,25 @@ def atomic_write_bytes_beneath(
     *,
     create_parents: bool = True,
     default_mode: int = 0o644,
+    maximum_mode: int | None = None,
 ) -> None:
     if not isinstance(content, bytes):
         raise TypeError("content must be bytes")
+    if (
+        not isinstance(default_mode, int)
+        or isinstance(default_mode, bool)
+        or not 0 <= default_mode <= 0o777
+    ):
+        raise ValueError("default_mode must be an ordinary permission mode")
+    if (
+        maximum_mode is not None
+        and (
+            not isinstance(maximum_mode, int)
+            or isinstance(maximum_mode, bool)
+            or not 0 <= maximum_mode <= 0o777
+        )
+    ):
+        raise ValueError("maximum_mode must be an ordinary permission mode")
     parent_descriptor, target_name = _mutation_target(
         root,
         relative_path,
@@ -287,9 +303,13 @@ def atomic_write_bytes_beneath(
             # Preserve ordinary access bits, but never reproduce setuid/setgid
             # or sticky bits on Agent-generated replacement content.
             target_mode = stat_module.S_IMODE(target_stat.st_mode) & 0o777
+            if maximum_mode is not None:
+                target_mode &= maximum_mode & 0o777
             preserve_mode = True
         else:
             target_mode = default_mode
+            if maximum_mode is not None:
+                target_mode &= maximum_mode & 0o777
             preserve_mode = False
 
         flags = (
@@ -352,6 +372,8 @@ def atomic_write_text_beneath(
     *,
     encoding: str = "utf-8",
     create_parents: bool = True,
+    default_mode: int = 0o644,
+    maximum_mode: int | None = None,
 ) -> None:
     if not isinstance(content, str):
         raise TypeError("content must be text")
@@ -360,6 +382,8 @@ def atomic_write_text_beneath(
         relative_path,
         content.encode(encoding),
         create_parents=create_parents,
+        default_mode=default_mode,
+        maximum_mode=maximum_mode,
     )
 
 

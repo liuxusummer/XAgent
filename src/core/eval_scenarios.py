@@ -22,6 +22,7 @@ SCENARIO_PACK_V1_SCOPES = frozenset(
         "workspace.read",
         "workspace.write",
         "workspace.delete",
+        "memory.propose",
     }
 )
 SCENARIO_PACK_V1_TOOLS = frozenset(
@@ -31,6 +32,7 @@ SCENARIO_PACK_V1_TOOLS = frozenset(
         "file_write",
         "file_patch",
         "file_delete",
+        "memory_propose",
     }
 )
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")

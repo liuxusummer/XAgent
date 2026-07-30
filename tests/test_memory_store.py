@@ -11,6 +11,7 @@ from src.core.memory_store import (
     MEMORY_PROPOSE_SCOPE,
     MEMORY_READ_SCOPE,
     MEMORY_REVIEW_SCOPE,
+    MAX_MEMORY_STORE_BYTES,
     MEMORY_STORE_PATH,
     MemoryKind,
     MemoryReviewStatus,
@@ -111,6 +112,78 @@ class MemoryStoreTests(unittest.TestCase):
                     reason="self approval must fail",
                     now=12,
                 )
+
+    def test_review_requires_boolean_decision_and_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(tmp)
+            candidate = self._propose(store)
+            reviewer = self._principal(reviewer=True)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "approve must be boolean",
+            ):
+                store.review(
+                    candidate.candidate_id,
+                    reviewer=reviewer,
+                    approve="yes",  # type: ignore[arg-type]
+                    reason="verified",
+                    now=12,
+                )
+            with self.assertRaisesRegex(
+                ValueError,
+                "review_reason must not be empty",
+            ):
+                store.review(
+                    candidate.candidate_id,
+                    reviewer=reviewer,
+                    approve=True,
+                    reason="",
+                    now=12,
+                )
+            self.assertEqual(
+                store.get_candidate(
+                    candidate.candidate_id,
+                    principal=self._principal(),
+                ).review_status,
+                MemoryReviewStatus.PENDING,
+            )
+
+    def test_proposal_does_not_coerce_arbitrary_content_or_acl(self) -> None:
+        class Hostile:
+            def __str__(self) -> str:
+                raise AssertionError("__str__ must not run")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(tmp)
+            with self.assertRaisesRegex(
+                ValueError,
+                "memory content must be text",
+            ):
+                store.propose(
+                    principal=self._principal(),
+                    content=Hostile(),  # type: ignore[arg-type]
+                    namespace=("tenant-1",),
+                    kind=MemoryKind.SEMANTIC,
+                    source_refs=("event-1",),
+                    trust=TrustLevel.USER,
+                    confidence=1,
+                    sensitivity=DataSensitivity.INTERNAL,
+                    acl=("tenant:tenant-1",),
+                )
+            with self.assertRaisesRegex(ValueError, "acl must be an array"):
+                store.propose(
+                    principal=self._principal(),
+                    content="bounded",
+                    namespace=("tenant-1",),
+                    kind=MemoryKind.SEMANTIC,
+                    source_refs=("event-1",),
+                    trust=TrustLevel.USER,
+                    confidence=1,
+                    sensitivity=DataSensitivity.INTERNAL,
+                    acl="tenant:tenant-1",  # type: ignore[arg-type]
+                )
+            self.assertFalse(store.path.exists())
 
     def test_proposal_requires_explicit_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -345,6 +418,115 @@ class MemoryStoreTests(unittest.TestCase):
             path.write_text('{"schema_version":1,"candidates":[],"records":{}}', encoding="utf-8")
             with self.assertRaisesRegex(MemoryStoreError, "invalid"):
                 MemoryStore(tmp).active_records(principal=self._principal())
+
+    def test_active_record_must_match_its_reviewed_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(tmp)
+            candidate = self._propose(store)
+            store.review(
+                candidate.candidate_id,
+                reviewer=self._principal(reviewer=True),
+                approve=True,
+                reason="verified",
+                now=12,
+            )
+            payload = json.loads(store.path.read_text(encoding="utf-8"))
+            record = next(iter(payload["records"].values()))
+            record["content"] = "injected approved memory"
+            store.path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(MemoryStoreError, "does not match"):
+                store.active_records(principal=self._principal(), now=13)
+
+    def test_orphan_approved_record_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(tmp)
+            candidate = self._propose(store)
+            store.review(
+                candidate.candidate_id,
+                reviewer=self._principal(reviewer=True),
+                approve=True,
+                reason="verified",
+                now=12,
+            )
+            payload = json.loads(store.path.read_text(encoding="utf-8"))
+            payload["candidates"] = {}
+            store.path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                MemoryStoreError,
+                "lacks an approved candidate",
+            ):
+                store.active_records(principal=self._principal(), now=13)
+
+    def test_store_read_does_not_follow_replaced_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = MemoryStore(root)
+            candidate = self._propose(store)
+            store.review(
+                candidate.candidate_id,
+                reviewer=self._principal(reviewer=True),
+                approve=True,
+                reason="verified",
+                now=12,
+            )
+            outside = root / "outside-memory-store.json"
+            store.path.rename(outside)
+            store.path.symlink_to(outside)
+
+            with self.assertRaisesRegex(MemoryStoreError, "unreadable"):
+                store.active_records(principal=self._principal(), now=13)
+
+    def test_store_write_does_not_follow_runtime_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            outside.mkdir()
+            (root / "runtime").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+
+            with self.assertRaises(OSError):
+                self._propose(MemoryStore(root))
+
+            self.assertFalse((outside / ".workspace-write.lock").exists())
+            self.assertFalse(
+                (outside / "agent_kernel" / "memory-store.json").exists()
+            )
+
+    def test_store_is_private_and_rejects_oversized_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = MemoryStore(root)
+            self._propose(store)
+            self.assertEqual(store.path.stat().st_mode & 0o077, 0)
+
+            with store.path.open("wb") as file:
+                file.truncate(MAX_MEMORY_STORE_BYTES + 1)
+            with self.assertRaisesRegex(MemoryStoreError, "unreadable"):
+                store.active_records(principal=self._principal())
+
+    def test_candidate_identity_binds_review_relevant_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(tmp)
+            first = self._propose(store)
+            second = store.propose(
+                principal=self._principal(),
+                content=first.content,
+                namespace=first.namespace,
+                kind=first.kind,
+                source_refs=first.source_refs,
+                trust=first.trust,
+                confidence=0.1,
+                sensitivity=DataSensitivity.SECRET,
+                acl=("subject:user-1",),
+                ttl_seconds=60,
+                now=10,
+            )
+
+            self.assertNotEqual(first.candidate_id, second.candidate_id)
 
 
 if __name__ == "__main__":

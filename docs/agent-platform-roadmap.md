@@ -73,8 +73,12 @@ pack v1 now adds per-case workspaces, content-bound fixtures, Principal scope
 narrowing, and tool-selection, recovery, permission-denial, and retrieval
 grounding cases. Descriptor-relative no-follow reads now bind both file-index
 ingestion and file tools against concurrent link replacement. Memory modes also
-filter reviewed records by workspace/current-agent namespace. Memory-poisoning
-and context-pressure packs remain the next Phase 1 increments.
+filter reviewed records by workspace/current-agent namespace. Pack version 1.1
+adds memory-poisoning and context-pressure cases while granting only isolated
+`memory.propose`, never activation. The Memory Store now validates the complete
+candidate-to-record review chain, uses private bounded no-follow persistence,
+and context serialization applies explicit source, depth, item, and string
+pressure bounds with chunked token/hash accounting.
 
 ### Phase 2 — Retrieval and context quality
 

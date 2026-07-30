@@ -25,6 +25,9 @@ from src.core.agent_kernel import (
 DEFAULT_CONTEXT_TOKENS = 16_384
 DEFAULT_RESERVED_OUTPUT_TOKENS = 4_096
 MAX_CONTEXT_SOURCES = 240
+MAX_CONTEXT_SOURCE_CHARS = 2_000_000
+MAX_CONTEXT_TOTAL_CHARS = 8_000_000
+_TEXT_CHUNK_CHARS = 64 * 1024
 _BUDGET_WEIGHTS: dict[ContextKind, float] = {
     ContextKind.SYSTEM: 0.35,
     ContextKind.TASK_STATE: 0.20,
@@ -42,7 +45,20 @@ def estimate_tokens(text: str) -> int:
 
     if not text:
         return 0
-    return max(1, math.ceil(len(text.encode("utf-8")) / 3))
+    utf8_bytes = sum(
+        len(text[offset : offset + _TEXT_CHUNK_CHARS].encode("utf-8"))
+        for offset in range(0, len(text), _TEXT_CHUNK_CHARS)
+    )
+    return max(1, math.ceil(utf8_bytes / 3))
+
+
+def sha256_text(text: str) -> str:
+    digest = hashlib.sha256()
+    for offset in range(0, len(text), _TEXT_CHUNK_CHARS):
+        digest.update(
+            text[offset : offset + _TEXT_CHUNK_CHARS].encode("utf-8")
+        )
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +83,19 @@ class ContextSource:
             raise KernelValidationError("invalid ContextSource enum value") from exc
         if not isinstance(self.content, str):
             raise KernelValidationError("ContextSource content must be text")
+        if len(self.content) > MAX_CONTEXT_SOURCE_CHARS:
+            raise KernelValidationError(
+                "ContextSource content exceeds its pressure bound"
+            )
+        try:
+            for offset in range(0, len(self.content), _TEXT_CHUNK_CHARS):
+                self.content[
+                    offset : offset + _TEXT_CHUNK_CHARS
+                ].encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise KernelValidationError(
+                "ContextSource content must be valid UTF-8"
+            ) from exc
         if (
             not isinstance(self.priority, int)
             or isinstance(self.priority, bool)
@@ -119,16 +148,34 @@ class ContextBuilder:
         available = max_input_tokens - reserved_output_tokens
         if component_budgets is None:
             budgets = {
-                kind: max(1, math.floor(available * weight))
+                kind: math.floor(available * weight)
                 for kind, weight in _BUDGET_WEIGHTS.items()
             }
             difference = available - sum(budgets.values())
             budgets[ContextKind.SYSTEM] += difference
         else:
-            budgets = {
-                ContextKind(kind): int(value)
-                for kind, value in component_budgets.items()
-            }
+            budgets: dict[ContextKind, int] = {}
+            try:
+                budget_items = component_budgets.items()
+            except AttributeError as exc:
+                raise KernelValidationError(
+                    "component budgets must be a mapping"
+                ) from exc
+            for raw_kind, value in budget_items:
+                try:
+                    kind = ContextKind(raw_kind)
+                except ValueError as exc:
+                    raise KernelValidationError(
+                        "component budgets contain an unknown kind"
+                    ) from exc
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                ):
+                    raise KernelValidationError(
+                        "component budgets must contain integers"
+                    )
+                budgets[kind] = value
             for kind in ContextKind:
                 budgets.setdefault(kind, 0)
             if any(value < 0 for value in budgets.values()):
@@ -149,6 +196,14 @@ class ContextBuilder:
         source_items = tuple(sources)
         if len(source_items) > MAX_CONTEXT_SOURCES:
             raise KernelValidationError("context source count exceeds its bound")
+        if not all(isinstance(source, ContextSource) for source in source_items):
+            raise KernelValidationError(
+                "context sources must contain ContextSource values"
+            )
+        if sum(len(source.content) for source in source_items) > MAX_CONTEXT_TOTAL_CHARS:
+            raise KernelValidationError(
+                "combined context sources exceed their pressure bound"
+            )
         if len({source.ref_id for source in source_items}) != len(source_items):
             raise KernelValidationError("context source ref_id values must be unique")
 
@@ -160,9 +215,7 @@ class ContextBuilder:
         indexed = list(enumerate(source_items))
         indexed.sort(key=lambda item: (-item[1].priority, item[0]))
         for _index, source in indexed:
-            source_sha256 = hashlib.sha256(
-                source.content.encode("utf-8")
-            ).hexdigest()
+            source_sha256 = sha256_text(source.content)
             original_tokens = estimate_tokens(source.content)
             if not source.llm_visible:
                 manifest_items.append(
@@ -250,7 +303,7 @@ def _truncate_to_tokens(text: str, token_budget: int) -> str:
         return ""
     if estimate_tokens(text) <= token_budget:
         return text
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    digest = sha256_text(text)
     marker = f"\n...[context truncated sha256={digest}]...\n"
     if estimate_tokens(marker) >= token_budget:
         candidate = text[: max(1, token_budget * 3)]
@@ -276,6 +329,9 @@ __all__ = [
     "ContextSource",
     "DEFAULT_CONTEXT_TOKENS",
     "DEFAULT_RESERVED_OUTPUT_TOKENS",
+    "MAX_CONTEXT_SOURCE_CHARS",
     "MAX_CONTEXT_SOURCES",
+    "MAX_CONTEXT_TOTAL_CHARS",
     "estimate_tokens",
+    "sha256_text",
 ]

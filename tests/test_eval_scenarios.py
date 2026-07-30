@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -157,6 +158,63 @@ class ScenarioPackContractTests(unittest.TestCase):
                 "does not isolate tools",
             ):
                 load_scenario_pack_for_dataset(workspace, dataset)
+
+    def test_pack_v1_allows_proposals_but_not_memory_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            dataset, _fixture = _write_pack(workspace)
+            manifest_path = dataset.parent / "pack.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["default_scopes"].append("memory.propose")
+            manifest["tools_allowlist"].append("memory_propose")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            pack = load_scenario_pack_for_dataset(workspace, dataset)
+
+            self.assertIsNotNone(pack)
+            assert pack is not None
+            self.assertIn("memory.propose", pack.default_scopes)
+            self.assertIn("memory_propose", pack.tools_allowlist)
+
+            manifest["default_scopes"].append("memory.review")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ScenarioPackError,
+                "does not isolate scopes",
+            ):
+                load_scenario_pack_for_dataset(workspace, dataset)
+
+    def test_builtin_core_pack_is_importable(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "workspace"
+            / "default.ws"
+            / "system"
+            / "eval"
+            / "core-capabilities-v1"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            destination = (
+                workspace
+                / "system"
+                / "eval"
+                / "core-capabilities-v1"
+            )
+            shutil.copytree(source, destination)
+
+            metadata = import_dataset_path(
+                workspace,
+                rel_path=(
+                    "system/eval/core-capabilities-v1/cases.jsonl"
+                ),
+            )
+
+            self.assertEqual(metadata["case_count"], 6)
+            self.assertEqual(
+                metadata["scenario_pack"]["version"],
+                "1.1.0",
+            )
 
     def test_case_workspace_is_isolated_and_cleanup_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

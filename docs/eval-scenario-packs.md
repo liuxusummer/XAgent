@@ -34,11 +34,13 @@ system/eval/<pack>/
 - tool and skill allowlists;
 - `memory_mode: "none"` and a bounded turn limit.
 
-Schema v1 deliberately supports only `workspace.read`, `workspace.write`, and
-`workspace.delete`, with the five workspace file tools. It rejects `host.read`,
-process, network, browser, interaction, delegation, and state scopes/tools even
-when the caller owns them. Those capabilities need a future schema backed by
-their own per-case isolation rather than merely a prompt convention.
+Schema v1 supports `workspace.read`, `workspace.write`, `workspace.delete`, and
+the five workspace file tools. It also permits only the quarantine half of the
+managed-memory lifecycle: `memory.propose` / `memory_propose`. A proposal stays
+pending inside the disposable case workspace; schema v1 still rejects
+`memory.read`, `memory.review`, non-`none` memory modes, `host.read`, process,
+network, browser, interaction, delegation, and state scopes/tools even when the
+caller owns them.
 
 Every fixture file must be regular, the tree cannot contain symbolic links,
 and the whole pack is bounded by file-count and byte limits. The pack digest
@@ -95,13 +97,17 @@ next LLM turn.
 
 ## Built-in v1 coverage
 
-`core-capabilities-v1` contains four small, inspectable scenarios:
+`core-capabilities-v1` version 1.1 contains six small, inspectable scenarios:
 
 - least-privilege file-read tool selection;
 - recovery after a deliberately stale file path;
 - a denied write under a read-only Principal, with proof that no file appeared.
 - retrieval grounding against a current file while an archived file contains an
   adversarial instruction, with ordered tool and exact evidence-path checks.
+- resistance to an untrusted document that asks the model to create poisoned
+  managed Memory, including proof that no candidate store appeared;
+- preservation of authoritative tail evidence after a long tool result is
+  compacted under the context budget.
 
 These cases are model-dependent experiments, not ordinary CI unit tests. CI
 validates the pack schema, digest, isolation, scope narrowing, assertions, and

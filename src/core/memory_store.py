@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import time
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -27,13 +28,20 @@ from src.core.agent_kernel import (
     canonical_digest,
     namespace_tenant_id,
 )
-from src.core.workspace_storage import atomic_write_json, workspace_write_lock
+from src.core.safe_fs import (
+    FileSizeLimitExceededError,
+    atomic_write_text_beneath,
+    open_regular_file_beneath,
+    read_stable_text,
+)
+from src.core.workspace_storage import workspace_write_lock
 
 
 MEMORY_STORE_SCHEMA_VERSION = 1
 MEMORY_STORE_PATH = Path("runtime") / "agent_kernel" / "memory-store.json"
 MAX_MEMORY_CONTENT_CHARS = 8_000
 MAX_MEMORY_ITEMS = 2_000
+MAX_MEMORY_STORE_BYTES = 64 * 1024 * 1024
 MEMORY_PROPOSE_SCOPE = "memory.propose"
 MEMORY_READ_SCOPE = "memory.read"
 MEMORY_REVIEW_SCOPE = "memory.review"
@@ -56,6 +64,28 @@ class MemoryStoreError(RuntimeError):
     """Memory store state is unavailable or violates its trust contract."""
 
 
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise MemoryStoreError("memory store contains duplicate keys")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise MemoryStoreError("memory store contains a non-standard number")
+
+
+def _has_hex_id(value: str, prefix: str) -> bool:
+    suffix = value.removeprefix(prefix)
+    return (
+        value.startswith(prefix)
+        and len(suffix) == 32
+        and all(character in "0123456789abcdef" for character in suffix)
+    )
+
+
 def _text(value: Any, field_name: str, *, max_chars: int = 256) -> str:
     if not isinstance(value, str):
         raise KernelValidationError(f"{field_name} must be a string")
@@ -66,6 +96,10 @@ def _text(value: Any, field_name: str, *, max_chars: int = 256) -> str:
         raise KernelValidationError(f"{field_name} exceeds its bound")
     if any(ord(character) < 32 or ord(character) == 127 for character in text):
         raise KernelValidationError(f"{field_name} contains control characters")
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise KernelValidationError(f"{field_name} must be valid UTF-8") from exc
     return text
 
 
@@ -76,6 +110,8 @@ def _strings(
     max_items: int = 64,
     preserve_order: bool = False,
 ) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise KernelValidationError(f"{field_name} must be an array")
     try:
         normalized = tuple(_text(value, field_name) for value in values)
     except TypeError as exc:
@@ -88,6 +124,8 @@ def _strings(
 
 
 def _timestamp(value: Any, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise KernelValidationError(f"{field_name} must be a finite timestamp")
     try:
         result = float(value)
     except (TypeError, ValueError) as exc:
@@ -151,11 +189,19 @@ class MemoryCandidate:
             )
         except ValueError as exc:
             raise KernelValidationError("invalid memory enum value") from exc
-        content = str(self.content or "").strip()
+        if not isinstance(self.content, str):
+            raise KernelValidationError("memory content must be text")
+        content = self.content.strip()
         if not content:
             raise KernelValidationError("memory content must not be empty")
         if len(content) > MAX_MEMORY_CONTENT_CHARS:
             raise KernelValidationError("memory content exceeds its bound")
+        try:
+            content.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise KernelValidationError(
+                "memory content must be valid UTF-8"
+            ) from exc
         object.__setattr__(self, "content", content)
         object.__setattr__(
             self,
@@ -174,11 +220,15 @@ class MemoryCandidate:
         object.__setattr__(self, "acl", _strings(self.acl, "acl"))
         if not self.acl:
             raise KernelValidationError("acl must be explicit")
-        object.__setattr__(
-            self,
-            "proposed_by",
-            _text(self.proposed_by, "proposed_by"),
-        )
+        proposed_by = _text(self.proposed_by, "proposed_by")
+        if (
+            len(proposed_by) != 64
+            or any(character not in "0123456789abcdef" for character in proposed_by)
+        ):
+            raise KernelValidationError(
+                "proposed_by must be a lowercase SHA-256 digest"
+            )
+        object.__setattr__(self, "proposed_by", proposed_by)
         object.__setattr__(
             self,
             "created_at",
@@ -191,25 +241,40 @@ class MemoryCandidate:
             object.__setattr__(self, "expires_at", expires_at)
         if not isinstance(self.version, int) or isinstance(self.version, bool) or self.version < 1:
             raise KernelValidationError("version must be a positive integer")
+        if not isinstance(self.review_reason, str):
+            raise KernelValidationError("review_reason must be a string")
         if self.review_reason:
             object.__setattr__(
                 self,
                 "review_reason",
                 _text(self.review_reason, "review_reason", max_chars=1_000),
             )
+        if not isinstance(self.reviewed_by, str):
+            raise KernelValidationError("reviewed_by must be a string")
         if self.reviewed_by:
-            object.__setattr__(
-                self,
-                "reviewed_by",
-                _text(self.reviewed_by, "reviewed_by"),
-            )
+            reviewed_by = _text(self.reviewed_by, "reviewed_by")
+            if (
+                len(reviewed_by) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in reviewed_by
+                )
+            ):
+                raise KernelValidationError(
+                    "reviewed_by must be a lowercase SHA-256 digest"
+                )
+            object.__setattr__(self, "reviewed_by", reviewed_by)
         if self.reviewed_at is not None:
             object.__setattr__(
                 self,
                 "reviewed_at",
                 _timestamp(self.reviewed_at, "reviewed_at"),
             )
-        if self.schema_version != MEMORY_STORE_SCHEMA_VERSION:
+        if (
+            not isinstance(self.schema_version, int)
+            or isinstance(self.schema_version, bool)
+            or self.schema_version != MEMORY_STORE_SCHEMA_VERSION
+        ):
             raise KernelValidationError("unsupported MemoryCandidate schema_version")
 
     @property
@@ -422,26 +487,14 @@ class MemoryStore:
             raise PermissionError("memory propose scope is required")
         created_at = time.time() if now is None else _timestamp(now, "now")
         expires_at = None
+        ttl = None
         if ttl_seconds is not None:
             ttl = _timestamp(ttl_seconds, "ttl_seconds")
             if ttl <= 0:
                 raise KernelValidationError("ttl_seconds must be positive")
             expires_at = created_at + ttl
-        fingerprint = canonical_digest(
-            {
-                "namespace": list(namespace),
-                "kind": str(MemoryKind(kind).value),
-                "content_sha256": hashlib.sha256(
-                    str(content).encode("utf-8")
-                ).hexdigest(),
-                "source_refs": sorted(source_refs),
-                "trust": str(TrustLevel(trust).value),
-                "principal": principal.principal_digest,
-            },
-            "MemoryCandidate fingerprint",
-        )
         candidate = MemoryCandidate(
-            candidate_id=f"memcand-{fingerprint[:32]}",
+            candidate_id="pending",
             namespace=namespace,
             kind=kind,
             content=content,
@@ -453,6 +506,26 @@ class MemoryStore:
             proposed_by=principal.principal_digest,
             created_at=created_at,
             expires_at=expires_at,
+        )
+        fingerprint = canonical_digest(
+            {
+                "namespace": list(candidate.namespace),
+                "kind": candidate.kind.value,
+                "content_sha256": candidate.content_sha256,
+                "source_refs": list(candidate.source_refs),
+                "trust": candidate.trust.value,
+                "confidence": candidate.confidence,
+                "sensitivity": candidate.sensitivity.value,
+                "acl": list(candidate.acl),
+                "ttl_seconds": ttl,
+                "version": candidate.version,
+                "principal": principal.principal_digest,
+            },
+            "MemoryCandidate fingerprint",
+        )
+        candidate = replace(
+            candidate,
+            candidate_id=f"memcand-{fingerprint[:32]}",
         )
         allowed_acl = {
             f"subject:{principal.subject}",
@@ -466,7 +539,10 @@ class MemoryStore:
             raise PermissionError(
                 "memory candidate namespace must be bound to the principal tenant"
             )
-        with workspace_write_lock(self.workspace_root):
+        with workspace_write_lock(
+            self.workspace_root,
+            require_secure_path=True,
+        ):
             state = self._load()
             existing = state["candidates"].get(candidate.candidate_id)
             if existing is not None:
@@ -486,14 +562,28 @@ class MemoryStore:
         reason: str,
         now: float | None = None,
     ) -> MemoryCandidate:
-        if not isinstance(reviewer, Principal) or MEMORY_REVIEW_SCOPE not in reviewer.scopes:
+        if (
+            not isinstance(reviewer, Principal)
+            or MEMORY_REVIEW_SCOPE not in reviewer.scopes
+        ):
             raise PermissionError("memory review scope is required")
+        candidate_key = _text(candidate_id, "candidate_id")
+        if not isinstance(approve, bool):
+            raise KernelValidationError("approve must be boolean")
+        normalized_reason = _text(
+            reason,
+            "review_reason",
+            max_chars=1_000,
+        )
         reviewed_at = time.time() if now is None else _timestamp(now, "now")
-        with workspace_write_lock(self.workspace_root):
+        with workspace_write_lock(
+            self.workspace_root,
+            require_secure_path=True,
+        ):
             state = self._load()
-            raw = state["candidates"].get(candidate_id)
+            raw = state["candidates"].get(candidate_key)
             if raw is None:
-                raise KeyError(candidate_id)
+                raise KeyError(candidate_key)
             candidate = MemoryCandidate.from_dict(raw)
             if namespace_tenant_id(candidate.namespace) != reviewer.tenant_id:
                 raise PermissionError(
@@ -525,15 +615,15 @@ class MemoryStore:
                         if approve
                         else MemoryReviewStatus.REJECTED
                     ),
-                    review_reason=reason,
+                    review_reason=normalized_reason,
                     reviewed_by=reviewer.principal_digest,
                     reviewed_at=reviewed_at,
                 )
-            state["candidates"][candidate_id] = resolved.to_dict()
+            state["candidates"][candidate_key] = resolved.to_dict()
             if resolved.review_status is MemoryReviewStatus.APPROVED:
                 record = MemoryRecord(
-                    record_id=f"mem-{candidate_id.removeprefix('memcand-')}",
-                    candidate_id=candidate_id,
+                    record_id=f"mem-{candidate_key.removeprefix('memcand-')}",
+                    candidate_id=candidate_key,
                     namespace=resolved.namespace,
                     kind=resolved.kind,
                     content=resolved.content,
@@ -596,7 +686,8 @@ class MemoryStore:
             }.intersection(principal.scopes)
         ):
             raise PermissionError("memory candidate read scope is required")
-        raw = self._load()["candidates"].get(candidate_id)
+        candidate_key = _text(candidate_id, "candidate_id")
+        raw = self._load()["candidates"].get(candidate_key)
         if raw is None:
             return None
         candidate = MemoryCandidate.from_dict(raw)
@@ -611,32 +702,187 @@ class MemoryStore:
         return candidate
 
     def _load(self) -> dict[str, Any]:
-        if not self.path.is_file():
+        try:
+            file_descriptor, initial_stat = open_regular_file_beneath(
+                self.workspace_root,
+                MEMORY_STORE_PATH,
+            )
+        except FileNotFoundError:
             return {
                 "schema_version": MEMORY_STORE_SCHEMA_VERSION,
                 "candidates": {},
                 "records": {},
             }
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        except OSError as exc:
             raise MemoryStoreError("memory store is unreadable") from exc
+        try:
+            encoded = read_stable_text(
+                file_descriptor,
+                initial_stat,
+                max_bytes=MAX_MEMORY_STORE_BYTES,
+            )
+        except (
+            FileSizeLimitExceededError,
+            OSError,
+            UnicodeError,
+        ) as exc:
+            raise MemoryStoreError("memory store is unreadable") from exc
+        finally:
+            os.close(file_descriptor)
+        try:
+            payload = json.loads(
+                encoded,
+                object_pairs_hook=_strict_json_object,
+                parse_constant=_reject_json_constant,
+            )
+        except MemoryStoreError:
+            raise
+        except (
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            RecursionError,
+        ) as exc:
+            raise MemoryStoreError("memory store is unreadable") from exc
+        try:
+            self._validate_state(payload)
+        except MemoryStoreError:
+            raise
+        except (KernelValidationError, TypeError, ValueError) as exc:
+            raise MemoryStoreError("memory store is invalid") from exc
+        return payload
+
+    @staticmethod
+    def _validate_state(payload: Any) -> None:
         if (
             not isinstance(payload, dict)
+            or set(payload) != {"schema_version", "candidates", "records"}
+            or type(payload.get("schema_version")) is not int
             or payload.get("schema_version") != MEMORY_STORE_SCHEMA_VERSION
             or not isinstance(payload.get("candidates"), dict)
             or not isinstance(payload.get("records"), dict)
         ):
             raise MemoryStoreError("memory store is invalid")
-        return payload
+        raw_candidates = payload["candidates"]
+        raw_records = payload["records"]
+        if (
+            len(raw_candidates) > MAX_MEMORY_ITEMS
+            or len(raw_records) > MAX_MEMORY_ITEMS
+        ):
+            raise MemoryStoreError("memory store exceeds its capacity")
+
+        candidates: dict[str, MemoryCandidate] = {}
+        for candidate_id, raw_candidate in raw_candidates.items():
+            if not isinstance(candidate_id, str) or not isinstance(raw_candidate, dict):
+                raise MemoryStoreError("memory store candidate is invalid")
+            candidate = MemoryCandidate.from_dict(raw_candidate)
+            if (
+                not _has_hex_id(candidate_id, "memcand-")
+                or candidate_id != candidate.candidate_id
+                or candidate.to_dict() != raw_candidate
+            ):
+                raise MemoryStoreError("memory store candidate is non-canonical")
+            if candidate.review_status is MemoryReviewStatus.PENDING:
+                if (
+                    candidate.review_reason
+                    or candidate.reviewed_by
+                    or candidate.reviewed_at is not None
+                ):
+                    raise MemoryStoreError(
+                        "pending memory candidate has review metadata"
+                    )
+            elif (
+                not candidate.reviewed_by
+                or candidate.reviewed_at is None
+                or candidate.reviewed_at < candidate.created_at
+            ):
+                raise MemoryStoreError(
+                    "resolved memory candidate lacks review metadata"
+                )
+            candidates[candidate_id] = candidate
+
+        records: dict[str, MemoryRecord] = {}
+        for record_id, raw_record in raw_records.items():
+            if not isinstance(record_id, str) or not isinstance(raw_record, dict):
+                raise MemoryStoreError("memory store record is invalid")
+            record = MemoryRecord.from_dict(raw_record)
+            if (
+                not _has_hex_id(record_id, "mem-")
+                or record_id != record.record_id
+                or record.to_dict() != raw_record
+            ):
+                raise MemoryStoreError("memory store record is non-canonical")
+            candidate = candidates.get(record.candidate_id)
+            if (
+                candidate is None
+                or candidate.review_status is not MemoryReviewStatus.APPROVED
+                or record.record_id
+                != f"mem-{candidate.candidate_id.removeprefix('memcand-')}"
+            ):
+                raise MemoryStoreError(
+                    "active memory record lacks an approved candidate"
+                )
+            expected_record = MemoryRecord(
+                record_id=record.record_id,
+                candidate_id=candidate.candidate_id,
+                namespace=candidate.namespace,
+                kind=candidate.kind,
+                content=candidate.content,
+                source_refs=candidate.source_refs,
+                trust=candidate.trust,
+                confidence=candidate.confidence,
+                sensitivity=candidate.sensitivity,
+                acl=candidate.acl,
+                version=candidate.version,
+                created_at=candidate.created_at,
+                expires_at=candidate.expires_at,
+                reviewed_by=candidate.reviewed_by,
+                reviewed_at=candidate.reviewed_at,
+            )
+            if record != expected_record:
+                raise MemoryStoreError(
+                    "active memory record does not match its candidate"
+                )
+            records[record_id] = record
+
+        for candidate in candidates.values():
+            expected_record_id = (
+                f"mem-{candidate.candidate_id.removeprefix('memcand-')}"
+            )
+            has_record = expected_record_id in records
+            if (
+                candidate.review_status is MemoryReviewStatus.APPROVED
+            ) != has_record:
+                raise MemoryStoreError(
+                    "memory candidate and record state are inconsistent"
+                )
 
     def _write(self, state: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(self.path, state)
+        self._validate_state(state)
+        try:
+            content = json.dumps(
+                state,
+                ensure_ascii=False,
+                allow_nan=False,
+                indent=2,
+                sort_keys=True,
+            ) + "\n"
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+            raise MemoryStoreError("memory store is not serializable") from exc
+        if len(content.encode("utf-8")) > MAX_MEMORY_STORE_BYTES:
+            raise MemoryStoreError("memory store exceeds its size bound")
+        atomic_write_text_beneath(
+            self.workspace_root,
+            MEMORY_STORE_PATH,
+            content,
+            default_mode=0o600,
+            maximum_mode=0o600,
+        )
 
 
 __all__ = [
     "MAX_MEMORY_CONTENT_CHARS",
+    "MAX_MEMORY_STORE_BYTES",
     "MEMORY_PROPOSE_SCOPE",
     "MEMORY_READ_SCOPE",
     "MEMORY_REVIEW_SCOPE",

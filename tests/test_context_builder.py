@@ -5,17 +5,31 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.core.agent_kernel import ContextKind, Principal, TrustLevel
+from src.core.agent_kernel import (
+    ContextKind,
+    KernelValidationError,
+    Principal,
+    TrustLevel,
+)
 from src.core.agent_loop import (
+    MAX_CONTEXT_JSON_ITEMS,
+    MAX_CONTEXT_JSON_STRING_CHARS,
     ActionResult,
     AgentContext,
     BaseHandler,
     _prepare_context_messages,
+    _safe_context_json,
     exhaust,
     run_agent_loop,
 )
 from src.core.checkpoint import build_task_checkpoint, render_resume_prompt
-from src.core.context_builder import ContextBuilder, ContextSource, estimate_tokens
+from src.core.context_builder import (
+    MAX_CONTEXT_SOURCE_CHARS,
+    MAX_CONTEXT_TOTAL_CHARS,
+    ContextBuilder,
+    ContextSource,
+    estimate_tokens,
+)
 from src.core.llm import BaseSession, ChatResponse, ToolCall
 
 
@@ -130,6 +144,162 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertIn("high", result.visible_content)
         self.assertNotIn("low", result.visible_content)
         self.assertEqual(result.manifest.principal_digest, self.principal.principal_digest)
+
+    def test_tiny_default_budget_never_overallocates_components(self) -> None:
+        builder = ContextBuilder(
+            max_input_tokens=8,
+            reserved_output_tokens=7,
+        )
+        result = builder.build(
+            principal=self.principal,
+            manifest_id="manifest-tiny",
+            sources=tuple(
+                ContextSource(
+                    f"source-{kind.value}",
+                    kind,
+                    "x",
+                    TrustLevel.SYSTEM,
+                    100,
+                )
+                for kind in ContextKind
+            ),
+        )
+
+        self.assertEqual(sum(builder.component_budgets.values()), 1)
+        self.assertLessEqual(result.manifest.visible_token_count, 1)
+
+    def test_component_budgets_reject_coercible_non_integers(self) -> None:
+        with self.assertRaisesRegex(KernelValidationError, "integers"):
+            ContextBuilder(
+                max_input_tokens=100,
+                reserved_output_tokens=20,
+                component_budgets={ContextKind.SYSTEM: True},
+            )
+
+    def test_context_source_has_an_explicit_pressure_bound(self) -> None:
+        with self.assertRaisesRegex(KernelValidationError, "pressure bound"):
+            ContextSource(
+                "oversized",
+                ContextKind.TOOL_RESULT,
+                "x" * (MAX_CONTEXT_SOURCE_CHARS + 1),
+                TrustLevel.TOOL_UNTRUSTED,
+                50,
+            )
+
+    def test_combined_context_sources_have_a_pressure_bound(self) -> None:
+        repeated = "x" * (MAX_CONTEXT_TOTAL_CHARS // 4)
+        sources = tuple(
+            ContextSource(
+                f"oversized-{index}",
+                ContextKind.TOOL_RESULT,
+                repeated,
+                TrustLevel.TOOL_UNTRUSTED,
+                50,
+            )
+            for index in range(5)
+        )
+
+        with self.assertRaisesRegex(KernelValidationError, "combined"):
+            ContextBuilder().build(
+                principal=self.principal,
+                manifest_id="manifest-oversized",
+                sources=sources,
+            )
+
+    def test_large_tool_string_is_precompacted_before_context_build(self) -> None:
+        class Backend:
+            history = []
+            context_window_chars = 1_000_000
+            max_tokens = 4_096
+
+        class Client:
+            backend = Backend()
+
+        oversized = "x" * (MAX_CONTEXT_JSON_STRING_CHARS + 1)
+        ctx = AgentContext(principal=self.principal, session_id="session-1")
+        prepared = _prepare_context_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "continue",
+                    "tool_results": [
+                        {
+                            "tool_name": "external",
+                            "tool_call_id": "call-large",
+                            "data": {"content": oversized},
+                        }
+                    ],
+                }
+            ],
+            ctx=ctx,
+            client=Client(),
+            turn=2,
+        )
+
+        marker = prepared[0]["tool_results"][0]["data"]["content"]
+        self.assertEqual(marker["status"], "CONTEXT_STRING_LIMIT")
+        self.assertEqual(marker["original_chars"], len(oversized))
+        self.assertEqual(len(marker["source_sha256"]), 64)
+        self.assertLess(len(marker["preview"]), 5_000)
+        self.assertNotIn(oversized, str(prepared))
+
+    def test_context_serialization_never_calls_arbitrary_str(self) -> None:
+        class Hostile:
+            def __str__(self) -> str:
+                raise AssertionError("__str__ must not run")
+
+        rendered = json.loads(_safe_context_json({"value": Hostile()}))
+
+        self.assertEqual(rendered["status"], "CONTEXT_UNSERIALIZABLE")
+        self.assertEqual(rendered["value_type"], "dict")
+
+    def test_context_serialization_rejects_deep_and_invalid_unicode(
+        self,
+    ) -> None:
+        oversized_structure = {
+            "items": [0] * MAX_CONTEXT_JSON_ITEMS,
+        }
+        limited = json.loads(_safe_context_json(oversized_structure))
+        invalid_unicode = json.loads(
+            _safe_context_json({"content": "\ud800"})
+        )
+
+        self.assertEqual(limited["status"], "CONTEXT_STRUCTURE_LIMIT")
+        self.assertEqual(
+            invalid_unicode["status"],
+            "CONTEXT_UNSERIALIZABLE",
+        )
+
+    def test_precompacted_history_is_not_restored_from_raw_backend_state(
+        self,
+    ) -> None:
+        oversized = "h" * (MAX_CONTEXT_JSON_STRING_CHARS + 1)
+
+        class Backend:
+            history = [{"role": "assistant", "content": oversized}]
+            context_window_chars = 1_000_000
+            max_tokens = 4_096
+
+        class Client:
+            backend = Backend()
+
+        ctx = AgentContext(principal=self.principal, session_id="session-1")
+        _prepare_context_messages(
+            [{"role": "user", "content": "continue"}],
+            ctx=ctx,
+            client=Client(),
+            turn=2,
+        )
+
+        compacted = Client.backend.history[0]["content"]
+        self.assertIsInstance(compacted, str)
+        compacted_payload = json.loads(compacted)
+        self.assertEqual(
+            compacted_payload["status"],
+            "CONTEXT_STRING_LIMIT",
+        )
+        self.assertIn("context string truncated", compacted)
+        self.assertNotEqual(compacted, oversized)
 
     def test_agent_loop_compacts_large_tool_output_and_checkpoints_metadata(self) -> None:
         class Handler(BaseHandler):

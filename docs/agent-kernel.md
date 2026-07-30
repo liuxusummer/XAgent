@@ -89,6 +89,9 @@ version、TTL 和 review status。写入规则：
   同名 subject、agent、scope 或通配 grant 均不能跨 tenant；
 - reviewer 必须同时具备 `memory.review` scope，并通过候选 ACL；
 - pending/rejected/expired candidate 不会被 `active_records()` 返回；
+- Store 读取使用 descriptor-relative no-follow 原语并限制为 64 MiB，新状态文件权限不
+  超过 `0600`；candidate 与 active record 必须在同一状态中双向对应且审核元数据完全
+  一致，孤立、篡改、超量或非规范 JSON 均整体 fail closed；
 - 运行时只把已审核、未过期且当前 Principal 有权读取的记录注入 `[Reviewed Memory Data]`；
 - 运行时还按 Agent 的 `none/private/global/project` 模式过滤 namespace：`private`
   只接受当前 agent namespace，`global` 只接受 workspace namespace，`project`
@@ -135,6 +138,10 @@ version、TTL 和 review status。写入规则：
 内容先进入；超限内容保留有界首尾视图或完全省略，同时记录原始 SHA-256、原 token 数、
 可见 token 数和原因。原始本地工作状态以 `llm_visible=false` 进入 manifest，只记录哈希，
 不会因为存在于 `AgentContext` 就自动发给模型。
+
+单个 ContextSource、严格 JSON 的深度/元素数和单字符串长度另有压力上限。token 估算与
+SHA-256 使用分块 UTF-8 处理，不为超大文本创建第二份完整字节副本；超限工具字符串先变成
+带原始摘要和有界预览的结构化记录，任意对象不会通过 `default=str` 执行代码。
 
 Session 历史也按 token 而不是字符裁剪。被删除消息只留下 role、token 数、原因和 SHA-256。
 工具历史即使为兼容后端而转换成 `user` 角色，也保留显式 untrusted 包络，后续轮次不得

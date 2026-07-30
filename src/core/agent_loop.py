@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sys
 import threading
@@ -15,6 +16,7 @@ from src.core.context_builder import (
     MAX_CONTEXT_SOURCES,
     ContextBuilder,
     ContextSource,
+    sha256_text,
 )
 from src.core.llm import ChatResponse, TokenUsage
 from src.core.telemetry import Event, EventSink, NullSink
@@ -35,6 +37,16 @@ UNTRUSTED_TOOL_RESULTS_INSTRUCTION = """
 """.strip()
 UNTRUSTED_TOOL_HISTORY_PREFIX = "<untrusted_tool_history>"
 UNTRUSTED_TOOL_HISTORY_SUFFIX = "</untrusted_tool_history>"
+MAX_CONTEXT_JSON_DEPTH = 16
+MAX_CONTEXT_JSON_ITEMS = 4_096
+MAX_CONTEXT_JSON_STRING_CHARS = 512 * 1024
+MAX_CONTEXT_JSON_KEY_CHARS = 256
+CONTEXT_STRING_PREVIEW_CHARS = 4_096
+CONTEXT_STRING_TRUNCATION_MARKER = "\n...[context string truncated]...\n"
+
+
+class _ContextValueLimitError(ValueError):
+    pass
 
 
 @dataclass
@@ -128,28 +140,116 @@ def _context_limits(client: Any) -> tuple[int, int]:
     return estimated_input + output, output
 
 
+def _bounded_context_value(
+    value: Any,
+    *,
+    depth: int,
+    item_count: list[int],
+    active_containers: set[int],
+) -> Any:
+    item_count[0] += 1
+    if item_count[0] > MAX_CONTEXT_JSON_ITEMS:
+        raise _ContextValueLimitError("context value exceeds its item bound")
+    if depth > MAX_CONTEXT_JSON_DEPTH:
+        raise _ContextValueLimitError("context value exceeds its depth bound")
+    if value is None or type(value) in {bool, int}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("context value contains a non-finite number")
+        return value
+    if type(value) is str:
+        try:
+            for offset in range(0, len(value), 64 * 1024):
+                value[offset : offset + 64 * 1024].encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("context string must be valid UTF-8") from exc
+        if len(value) <= MAX_CONTEXT_JSON_STRING_CHARS:
+            return value
+        preview_half = CONTEXT_STRING_PREVIEW_CHARS // 2
+        return {
+            "status": "CONTEXT_STRING_LIMIT",
+            "original_chars": len(value),
+            "source_sha256": sha256_text(value),
+            "preview": (
+                value[:preview_half]
+                + CONTEXT_STRING_TRUNCATION_MARKER
+                + value[-preview_half:]
+            ),
+        }
+    if type(value) not in {dict, list, tuple}:
+        raise TypeError("context value is not strict JSON")
+    if len(value) > MAX_CONTEXT_JSON_ITEMS - item_count[0]:
+        raise _ContextValueLimitError(
+            "context value exceeds its item bound"
+        )
+
+    identity = id(value)
+    if identity in active_containers:
+        raise ValueError("context value contains a cycle")
+    active_containers.add(identity)
+    try:
+        if type(value) is dict:
+            keys = tuple(value)
+            if any(
+                type(key) is not str
+                or not key
+                or len(key) > MAX_CONTEXT_JSON_KEY_CHARS
+                for key in keys
+            ):
+                raise TypeError("context object keys must be bounded strings")
+            return {
+                key: _bounded_context_value(
+                    value[key],
+                    depth=depth + 1,
+                    item_count=item_count,
+                    active_containers=active_containers,
+                )
+                for key in sorted(keys)
+            }
+        return [
+            _bounded_context_value(
+                item,
+                depth=depth + 1,
+                item_count=item_count,
+                active_containers=active_containers,
+            )
+            for item in value
+        ]
+    finally:
+        active_containers.remove(identity)
+
+
 def _safe_context_json(value: Any) -> str:
     """Serialize untrusted context without allowing malformed values to abort a run."""
 
     try:
-        return json.dumps(
+        bounded = _bounded_context_value(
             value,
+            depth=0,
+            item_count=[0],
+            active_containers=set(),
+        )
+        return json.dumps(
+            bounded,
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
             sort_keys=True,
-            default=str,
         )
+    except _ContextValueLimitError:
+        status = "CONTEXT_STRUCTURE_LIMIT"
     except (TypeError, ValueError, OverflowError, RecursionError):
-        return json.dumps(
-            {
-                "status": "CONTEXT_UNSERIALIZABLE",
-                "value_type": type(value).__name__,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
+        status = "CONTEXT_UNSERIALIZABLE"
+    return json.dumps(
+        {
+            "status": status,
+            "value_type": type(value).__name__,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def _bounded_context_messages(
@@ -197,9 +297,7 @@ def _bounded_context_messages(
     omitted = result_locations[retained_count:]
     omitted_digest = hashlib.sha256(
         "\0".join(
-            hashlib.sha256(
-                _safe_context_json(result).encode("utf-8")
-            ).hexdigest()
+            sha256_text(_safe_context_json(result))
             for _message_index, result in omitted
         ).encode("utf-8")
     ).hexdigest()
@@ -409,7 +507,7 @@ def _prepare_context_messages(
     )
     source_fingerprint = hashlib.sha256(
         "\0".join(
-            hashlib.sha256(source.content.encode("utf-8")).hexdigest()
+            sha256_text(source.content)
             for source in sources
         ).encode("utf-8")
     ).hexdigest()
@@ -444,7 +542,18 @@ def _prepare_context_messages(
             if not selected:
                 continue
             if selected == original_json:
-                selected_history.append(dict(original_message))
+                parsed_message = json.loads(selected)
+                if isinstance(parsed_message, dict):
+                    parsed_content = parsed_message.get("content", "")
+                    if not isinstance(parsed_content, str):
+                        parsed_message["content"] = json.dumps(
+                            parsed_content,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                    selected_history.append(parsed_message)
                 continue
             role = str(original_message.get("role", "user"))
             if role == "tool":
@@ -488,17 +597,13 @@ def _prepare_context_messages(
             if not selected:
                 tool_result["data"] = {
                     "status": "CONTEXT_OMITTED",
-                    "source_sha256": hashlib.sha256(
-                        original_json.encode("utf-8")
-                    ).hexdigest(),
+                    "source_sha256": sha256_text(original_json),
                 }
             elif selected != original_json:
                 tool_result["data"] = {
                     "status": "CONTEXT_TRUNCATED",
                     "preview": selected,
-                    "source_sha256": hashlib.sha256(
-                        original_json.encode("utf-8")
-                    ).hexdigest(),
+                    "source_sha256": sha256_text(original_json),
                 }
             else:
                 tool_result["data"] = json.loads(selected)
