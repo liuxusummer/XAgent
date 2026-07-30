@@ -619,6 +619,7 @@ semantic-search = [
 ]
 web = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "pydantic" },
     { name = "selenium" },
     { name = "uvicorn" },
@@ -627,6 +628,7 @@ web = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.115.0" },
+    { name = "httpx", marker = "extra == 'web'", specifier = ">=0.28.0" },
     { name = "langfuse", marker = "extra == 'observability'", specifier = ">=3.0.0" },
     { name = "pydantic", marker = "extra == 'web'", specifier = ">=2.0.0" },
     { name = "selenium", marker = "extra == 'web'", specifier = ">=4.0.0" },
