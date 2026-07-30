@@ -41,18 +41,6 @@ def _truncate_inner(text: str, max_len: int) -> str:
     return text[:half] + "\n...[compressed]...\n" + text[-half:]
 
 
-def _message_content_len(message: dict[str, Any]) -> int:
-    content = message.get("content", "")
-    if isinstance(content, str):
-        return len(content)
-    if content is None:
-        return 0
-    try:
-        return len(json.dumps(content, ensure_ascii=False))
-    except (TypeError, ValueError):
-        return len(str(content))
-
-
 def _message_context_text(message: dict[str, Any]) -> str:
     content = message.get("content", "")
     if isinstance(content, str):

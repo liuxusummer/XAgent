@@ -79,7 +79,7 @@
   Artifact 边界。未启用时，现有 CLI、Web 单 Agent 和 Team Workflow 行为保持不变。完整协议见
   `docs/durable-orchestration-spec.md`
 - Durable Store、Artifact、GC 和锁必须放在 Agent workspace 外，由独立控制面
-  service/OS identity 持有，且不挂载给 legacy 文件、代码或浏览器工具。旧 Web UI 不会
+  service/OS identity 持有，且不挂载给 legacy 文件、代码或浏览器工具。默认 Web UI 不会
   自动发现数据库；投影服务必须显式注入受信 tenant→database 映射。同 UID 隐藏路径不构成
   隔离。
 - Orchestration Runtime 的进程内 Scheduler 仅是有界 LRU 加速层，默认最多缓存 64 个，

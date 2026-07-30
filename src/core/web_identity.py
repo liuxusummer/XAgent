@@ -48,13 +48,6 @@ def physical_directory_contains_path(
     return _directory_contains_path(Path(directory), Path(candidate))
 
 
-def _directories_physically_overlap(first: Path, second: Path) -> bool:
-    return _directory_contains_path(first, second) or _directory_contains_path(
-        second,
-        first,
-    )
-
-
 class WebIdentityError(PermissionError):
     """The request did not carry a valid server-recognized Web identity."""
 

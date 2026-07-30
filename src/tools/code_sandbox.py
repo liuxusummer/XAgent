@@ -599,10 +599,6 @@ def probe_code_sandbox(requested: str = "auto") -> SandboxCapability:
     )
 
 
-def clear_sandbox_probe_cache() -> None:
-    _probe_cached.cache_clear()
-
-
 @functools.lru_cache(maxsize=8)
 def _probe_cached(
     backend: str,

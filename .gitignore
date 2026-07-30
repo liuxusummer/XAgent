@@ -37,7 +37,6 @@ env/
 .ruff_cache/
 .coverage
 htmlcov/
-tests/
 
 ## uv / packaging
 .uv-cache/

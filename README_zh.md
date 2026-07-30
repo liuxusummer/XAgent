@@ -33,7 +33,7 @@ XAgent 面向那些**必须触碰真实环境**的任务：
 - 🧩 **多种模型协议**：既支持文本工具协议，也支持 OpenAI/Claude 的原生 tool-calling 客户端。
 - 🧵 **会话级历史管理**：历史裁剪、流式解析、failover 都收敛在 LLM layer 内。
 - 🛠️ **物理工具集**：文件读写、代码执行、浏览器 scan/JS、用户打断、checkpoint、长期记忆沉淀、skill 激活、计划跟踪。
-- 🖥️ **流式前端**：CLI、Gradio，以及 FastAPI + React（SSE 推送）。
+- 🖥️ **流式前端**：CLI，以及 FastAPI + React（SSE 推送）。
 - 📈 **可观测性**：结构化事件 sink、JSONL 日志、可选 Langfuse。
 - 🧯 **本地优先 workspace 模型**：相对路径默认落在 workspace 内，降低误改仓库与系统文件的概率。
 
@@ -53,7 +53,6 @@ XAgent 目前属于 **偏研究 + 工程探索的早期项目**：架构清晰�
 flowchart TB
   subgraph F[前端入口]
     CLI[CLI]
-    Gradio[Gradio UI]
     Web["FastAPI + React UI<br/>SSE"]
   end
 
@@ -148,7 +147,7 @@ sequenceDiagram
 ## 🧱 可选 Durable Orchestration 控制面
 
 `src.orchestration` 是包裹现有 Agent Core 的显式可选控制面。仅导入该包不会启动
-worker、创建存储，也不会改变默认 CLI、Gradio、FastAPI、React 或 Team Workflow
+worker、创建存储，也不会改变默认 CLI、FastAPI、React 或 Team Workflow
 行为。
 
 它的小型顶层 API 提供以下主要组合入口：
@@ -196,7 +195,7 @@ projection，因此核心 API 不要求安装 FastAPI。
   通过经过审查的 Artifact 引用跨越控制面。
 - Event Store、Artifact 根、GC 隔离区和锁必须位于所有 Agent 可写 workspace 之外，
   由独立控制面服务/OS identity 持有，且不得挂载给 legacy 文件、代码或浏览器工具。
-  旧 Web UI 不会自动挂载 Durable 数据库；GET-only Web adapter 只接受显式的受信
+  默认 Web UI 不会自动挂载 Durable 数据库；GET-only Web adapter 只接受显式的受信
   tenant→database resolver，用于独立部署的投影服务。隐藏路径或同 UID 权限不是安全
   边界。
 - 可信 Executor 会在 backend 执行前拒绝与 Store 或 Artifact 根重叠的 Sandbox
@@ -242,7 +241,6 @@ XAgent/
 │   ├── tools/                # 无状态工具实现
 │   ├── assets/               # system prompt、tool schema、code-run header
 │   ├── main.py               # CLI 入口
-│   ├── web_ui.py             # Gradio UI
 │   └── web_ui_new.py         # FastAPI 后端（服务 React UI）
 ├── frontends/web/            # React + Vite 前端
 ├── docs/                     # 设计文档
@@ -363,14 +361,6 @@ XAGENT_WEB_ALLOWED_ORIGINS=http://127.0.0.1:4173 \
 .venv/bin/python -m src.web_ui_new --host 127.0.0.1 --port 7861
 cd frontends/web
 VITE_API_BASE=http://127.0.0.1:7861 npm run dev -- --host 127.0.0.1 --port 5173
-```
-
----
-
-## 🎛️ Gradio 界面
-
-```bash
-.venv/bin/python -m src.web_ui --host 127.0.0.1 --port 7860
 ```
 
 ---

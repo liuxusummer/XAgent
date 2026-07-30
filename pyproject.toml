@@ -11,8 +11,10 @@ observability = [
     "langfuse>=3.0.0",
 ]
 web = [
-    "gradio>=5.0.0",
+    "fastapi>=0.115.0",
+    "pydantic>=2.0.0",
     "selenium>=4.0.0",
+    "uvicorn>=0.30.0",
 ]
 semantic-search = [
     "sqlite-vec>=0.1.9,<0.2",

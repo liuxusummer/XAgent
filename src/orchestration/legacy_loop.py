@@ -1058,16 +1058,6 @@ def _result_summary(
     }
 
 
-def _event_id(attempt_id: str, stage: str) -> str:
-    digest = hashlib.sha256(f"{attempt_id}:{stage}".encode("utf-8")).hexdigest()
-    return f"legacy_{digest}"
-
-
-def _callable_name(callback: Callable[..., Any]) -> str:
-    name = getattr(callback, "__qualname__", None) or getattr(callback, "__name__", None)
-    return _bounded(str(name or type(callback).__name__), 160)
-
-
 def _safe_turns(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 

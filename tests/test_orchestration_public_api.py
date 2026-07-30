@@ -178,6 +178,43 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             msg=completed.stderr or completed.stdout,
         )
 
+    def test_default_policy_import_does_not_eagerly_load_control_plane(self) -> None:
+        script = textwrap.dedent(
+            """
+            import sys
+
+            import src.core.local_policy
+
+            unexpected = {
+                "src.orchestration.legacy_loop",
+                "src.orchestration.mcp",
+                "src.orchestration.remote_control",
+                "src.orchestration.remote_execution",
+                "src.orchestration.remote_fleet",
+                "src.orchestration.runtime",
+                "src.orchestration.scheduler",
+                "src.orchestration.store",
+            }.intersection(sys.modules)
+
+            assert "src.orchestration.policy" in sys.modules
+            assert not unexpected, sorted(unexpected)
+            """
+        )
+
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=".",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=completed.stderr or completed.stdout,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

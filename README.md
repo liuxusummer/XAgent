@@ -33,7 +33,7 @@ It is intentionally **not** a generic chat wrapper. The core is a **tool-call lo
 - 🧩 **Multiple model protocols**: text-based tool protocol + native OpenAI/Claude tool-calling clients.
 - 🧵 **Session-managed history**: trimming, streaming parsing, failover handled in the LLM layer.
 - 🛠️ **Physical toolset**: file ops, code execution, browser scan/JS execution, user interruption, checkpoints, long-term memory settlement, skill activation, plan tracking.
-- 🖥️ **Streaming frontends**: CLI, Gradio UI, and FastAPI + React UI with SSE updates.
+- 🖥️ **Streaming frontends**: CLI and FastAPI + React UI with SSE updates.
 - 📈 **Observability hooks**: structured event sinks, JSONL logging, optional Langfuse.
 - 🧯 **Local-first workspace model**: relative paths resolve under an agent workspace to reduce accidental side effects.
 
@@ -53,7 +53,6 @@ XAgent is an **early-stage research + engineering project**. The architecture is
 flowchart TB
   subgraph F[Frontends]
     CLI[CLI]
-    Gradio[Gradio UI]
     Web["FastAPI + React UI<br/>SSE"]
   end
 
@@ -150,7 +149,7 @@ Design docs live in [`docs/`](docs/):
 
 `src.orchestration` is an opt-in control plane around the existing Agent Core.
 Importing it does not start a worker, create storage, or change the default CLI,
-Gradio, FastAPI, React, or Team Workflow behavior.
+FastAPI, React, or Team Workflow behavior.
 
 Its small top-level API exposes the main composition entries for:
 
@@ -214,7 +213,7 @@ imported by the top-level package, so the core API does not require FastAPI.
 - The Event Store, Artifact root, GC quarantine, and locks must live outside
   every Agent-writable workspace under a separate control-plane service/OS
   identity and must not be mounted into legacy file, code, or browser tools.
-  The legacy Web UI does not auto-mount a durable database. The GET-only Web
+  The default Web UI does not auto-mount a durable database. The GET-only Web
   adapter accepts an explicit trusted tenant-to-database resolver for a
   separately deployed projection service; path hiding or same-UID permissions
   are not a security boundary.
@@ -271,7 +270,6 @@ XAgent/
 │   ├── tools/                # stateless tool implementations
 │   ├── assets/               # system prompt, tool schema, code-run header
 │   ├── main.py               # CLI entry
-│   ├── web_ui.py             # Gradio UI
 │   └── web_ui_new.py         # FastAPI backend for React UI
 ├── frontends/web/            # React + Vite UI
 ├── docs/                     # design documents
@@ -448,14 +446,6 @@ responses redact host paths and backend exception details.
 .venv/bin/python -m src.web_ui_new --host 127.0.0.1 --port 7861
 cd frontends/web
 VITE_API_BASE=http://127.0.0.1:7861 npm run dev -- --host 127.0.0.1 --port 5173
-```
-
----
-
-## 🎛️ Gradio UI
-
-```bash
-.venv/bin/python -m src.web_ui --host 127.0.0.1 --port 7860
 ```
 
 ---

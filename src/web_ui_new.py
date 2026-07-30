@@ -34,7 +34,12 @@ from pydantic import BaseModel
 from src.config import load_config
 from src.core.XAgent import XAgent
 from src.core.agent_kernel import Principal
-from src.core.agent_profiles import load_agent_runtime_config
+from src.core.agent_profiles import (
+    load_agent_runtime_config,
+    parse_agent_markdown,
+    read_agent_profile as load_agent_profile_document,
+    serialize_agent_markdown,
+)
 from src.core.web_identity import (
     WebIdentity,
     WebIdentityConfigurationError,
@@ -3479,17 +3484,6 @@ async def read_trace_session_detail(
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _WORKSPACE_ROOT = os.path.join(_PROJECT_ROOT, "workspace")
 _DEFAULT_WORKSPACE_ROOT = _WORKSPACE_ROOT
-_AGENT_PROFILE_FIELDS = (
-    "name",
-    "description",
-    "tools",
-    "model",
-    "maxTurns",
-    "memory",
-    "skills",
-    "project_agents",
-)
-_AGENT_LIST_FIELDS = {"tools", "skills", "project_agents"}
 
 
 def _is_workspace_name(ws: str) -> bool:
@@ -3716,210 +3710,6 @@ def _agent_dir(ws: str, agent: str) -> tuple[str | None, str | None]:
     if not os.path.isdir(agent_dir):
         return None, "Agent not found"
     return agent_dir, None
-
-
-def _default_agent_profile(agent_name: str) -> dict[str, Any]:
-    return {
-        "name": agent_name,
-        "description": "",
-        "tools": [],
-        "model": "",
-        "maxTurns": 300,
-        "memory": "",
-        "skills": [],
-        "project_agents": [],
-    }
-
-
-def _split_agent_frontmatter(content: str) -> tuple[str, str] | None:
-    lines = content.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return None
-    for index, line in enumerate(lines[1:], start=1):
-        if line.strip() == "---":
-            frontmatter = "\n".join(lines[1:index])
-            body = "\n".join(lines[index + 1 :]).lstrip("\n")
-            if content.endswith("\n"):
-                body += "\n"
-            return frontmatter, body
-    return None
-
-
-def _strip_yaml_comment(value: str) -> str:
-    in_single = False
-    in_double = False
-    escaped = False
-    for index, char in enumerate(value):
-        if escaped:
-            escaped = False
-            continue
-        if char == "\\" and in_double:
-            escaped = True
-            continue
-        if char == "'" and not in_double:
-            in_single = not in_single
-            continue
-        if char == '"' and not in_single:
-            in_double = not in_double
-            continue
-        if char == "#" and not in_single and not in_double:
-            return value[:index].rstrip()
-    return value.strip()
-
-
-def _parse_scalar(value: str) -> Any:
-    value = _strip_yaml_comment(value)
-    if value == "":
-        return ""
-    if value == "[]":
-        return []
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-        return value[1:-1]
-    try:
-        return int(value)
-    except ValueError:
-        return value
-
-
-def _parse_inline_list(value: str) -> list[str]:
-    value = _strip_yaml_comment(value)
-    if value == "[]":
-        return []
-    if not (value.startswith("[") and value.endswith("]")):
-        parsed = _parse_scalar(value)
-        return parsed if isinstance(parsed, list) else []
-    inner = value[1:-1].strip()
-    if not inner:
-        return []
-    return [str(_parse_scalar(item.strip())) for item in inner.split(",") if item.strip()]
-
-
-def parse_agent_markdown(content: str, agent_name: str) -> dict[str, Any]:
-    profile = _default_agent_profile(agent_name)
-    split = _split_agent_frontmatter(content)
-    if split is None:
-        return {"profile": profile, "body": content}
-
-    frontmatter, body = split
-    current_list_key: str | None = None
-    for raw_line in frontmatter.splitlines():
-        if not raw_line.strip():
-            continue
-        stripped = raw_line.strip()
-        if stripped.startswith("- ") and current_list_key:
-            profile[current_list_key].append(str(_parse_scalar(stripped[2:].strip())))
-            continue
-        if ":" not in raw_line:
-            current_list_key = None
-            continue
-        key, raw_value = raw_line.split(":", 1)
-        key = key.strip()
-        if key not in _AGENT_PROFILE_FIELDS:
-            current_list_key = None
-            continue
-        value = raw_value.strip()
-        if key in _AGENT_LIST_FIELDS:
-            if value:
-                profile[key] = _parse_inline_list(value)
-                current_list_key = None
-            else:
-                profile[key] = []
-                current_list_key = key
-        else:
-            profile[key] = _parse_scalar(value)
-            current_list_key = None
-    if not isinstance(profile.get("name"), str) or not profile["name"]:
-        profile["name"] = agent_name
-    return {"profile": profile, "body": body}
-
-
-def _yaml_string(value: Any) -> str:
-    return json.dumps(str(value), ensure_ascii=False)
-
-
-def serialize_agent_markdown(profile: dict[str, Any], body: str) -> str:
-    normalized = _default_agent_profile(str(profile.get("name") or "agent"))
-    for key in _AGENT_PROFILE_FIELDS:
-        if key in profile:
-            normalized[key] = profile[key]
-
-    lines = ["---"]
-    for key in _AGENT_PROFILE_FIELDS:
-        value = normalized[key]
-        if key in _AGENT_LIST_FIELDS:
-            items = value if isinstance(value, list) else []
-            if not items:
-                lines.append(f"{key}: []")
-            else:
-                lines.append(f"{key}:")
-                lines.extend(f"  - {_yaml_string(item)}" for item in items)
-        elif isinstance(value, int):
-            lines.append(f"{key}: {value}")
-        else:
-            lines.append(f"{key}: {_yaml_string(value)}")
-    lines.append("---")
-    normalized_body = body.lstrip("\n")
-    return "\n".join(lines) + "\n\n" + normalized_body
-
-
-def _read_agent_profile(agent_dir: str, agent_name: str) -> dict[str, Any]:
-    agent_file = os.path.join(agent_dir, "AGENT.md")
-    if not os.path.isfile(agent_file):
-        parsed = {"profile": _default_agent_profile(agent_name), "body": ""}
-        content = serialize_agent_markdown(parsed["profile"], parsed["body"])
-    else:
-        with open(agent_file, "r", encoding="utf-8") as f:
-            content = f.read()
-        parsed = parse_agent_markdown(content, agent_name)
-    return {
-        "agent": agent_name,
-        "path": f"system/agents/{agent_name}/AGENT.md",
-        "profile": parsed["profile"],
-        "body": parsed["body"],
-        "content": content,
-    }
-
-
-def _agent_dir_from_workspace_input(workspace_dir: str, agent_name: str) -> tuple[str | None, str | None]:
-    if not agent_name:
-        return None, None
-    if not _is_child_name(agent_name):
-        return None, "Invalid agent name"
-    workspace_input = _normalize_path_input(workspace_dir) or "default.ws"
-    if _is_workspace_name(workspace_input):
-        return _agent_dir(workspace_input, agent_name)
-
-    ws_root = os.path.realpath(workspace_input)
-    if not os.path.isdir(ws_root):
-        return None, "Workspace not found"
-    agents_root = os.path.realpath(os.path.join(ws_root, "system", "agents"))
-    agent_dir = os.path.realpath(os.path.join(agents_root, agent_name))
-    if os.path.commonpath([agents_root, agent_dir]) != agents_root:
-        return None, "Path traversal not allowed"
-    if not os.path.isdir(agent_dir):
-        return None, "Agent not found"
-    return agent_dir, None
-
-
-def _read_optional_text(path: str) -> str:
-    if not os.path.isfile(path):
-        return ""
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def _positive_int(value: Any) -> int | None:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
-
-
-def _string_list(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _agent_runtime_config(workspace_dir: str, agent_name: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -4416,14 +4206,6 @@ def _record_scheduled_task_dispatch_result(
     task["last_error"] = ""
 
 
-def _run_scheduled_task_record(task: dict[str, Any], now_ts: float | None = None) -> dict[str, Any]:
-    now_ts = time.time() if now_ts is None else now_ts
-    _claim_scheduled_task_record(task, now_ts)
-    session_id, error = _dispatch_scheduled_task(task)
-    _record_scheduled_task_dispatch_result(task, session_id, error)
-    return task
-
-
 def _debug_scheduled_task_record(task: dict[str, Any], now_ts: float | None = None) -> dict[str, Any]:
     now_ts = time.time() if now_ts is None else now_ts
     session_id, error = _dispatch_scheduled_task(task)
@@ -4768,7 +4550,7 @@ async def list_agents(ws: str = "default.ws"):
         for name in sorted(os.listdir(agents_dir)):
             agent_path = os.path.join(agents_dir, name)
             if os.path.isdir(agent_path):
-                profile_data = _read_agent_profile(agent_path, name)
+                profile_data = load_agent_profile_document(agent_path, name)
                 profile = profile_data["profile"]
                 agent_info: dict[str, Any] = {
                     "name": name,
@@ -4790,7 +4572,10 @@ async def read_agent_profile(ws: str = "default.ws", agent: str = ""):
     if error or agent_path is None:
         return {"success": False, "error": error}
     try:
-        return {"success": True, "data": _read_agent_profile(agent_path, agent)}
+        return {
+            "success": True,
+            "data": load_agent_profile_document(agent_path, agent),
+        }
     except (OSError, UnicodeDecodeError) as exc:
         return {"success": False, "error": _web_error_message(exc)}
 

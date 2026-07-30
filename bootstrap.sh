@@ -8,7 +8,6 @@ API_HOST="${API_HOST:-127.0.0.1}"
 API_PORT="${API_PORT:-7861}"
 WEB_HOST="${WEB_HOST:-127.0.0.1}"
 WEB_PORT="${WEB_PORT:-5173}"
-GRADIO_PORT="${GRADIO_PORT:-7860}"
 
 PYTHON_CMD=()
 
@@ -23,7 +22,6 @@ Commands:
   dev         Start FastAPI backend and Vite frontend together
   build-web   Build the React frontend
   serve       Build frontend, then serve it from FastAPI
-  gradio      Start Gradio UI on ${API_HOST}:${GRADIO_PORT}
   help        Show this help
 
 Environment:
@@ -31,7 +29,6 @@ Environment:
   API_PORT=${API_PORT}
   WEB_HOST=${WEB_HOST}
   WEB_PORT=${WEB_PORT}
-  GRADIO_PORT=${GRADIO_PORT}
 EOF
 }
 
@@ -138,12 +135,6 @@ serve_built_web() {
   start_api
 }
 
-start_gradio() {
-  detect_python
-  free_port "$GRADIO_PORT" "Gradio UI"
-  (cd "$ROOT_DIR" && "${PYTHON_CMD[@]}" -m src.web_ui --host "$API_HOST" --port "$GRADIO_PORT")
-}
-
 start_dev() {
   detect_python
   require_npm
@@ -200,9 +191,6 @@ case "$command" in
     ;;
   serve)
     serve_built_web
-    ;;
-  gradio)
-    start_gradio
     ;;
   help|-h|--help)
     usage

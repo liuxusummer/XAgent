@@ -221,27 +221,6 @@ class WebIdentityProviderTests(unittest.TestCase):
             ):
                 WebIdentityProvider.from_trusted_config(payload)
 
-    def test_physical_overlap_follows_inode_ancestry_not_path_case(self) -> None:
-        identities = {
-            Path("/srv/tenant.ws"): (1, 10),
-            Path("/srv/TENANT.WS/child.ws"): (1, 20),
-            Path("/srv/TENANT.WS"): (1, 10),
-            Path("/srv"): (1, 2),
-            Path("/"): (1, 1),
-        }
-
-        with patch.object(
-            web_identity_module,
-            "_path_identity",
-            side_effect=lambda path: identities[path],
-        ):
-            self.assertTrue(
-                web_identity_module._directories_physically_overlap(
-                    Path("/srv/tenant.ws"),
-                    Path("/srv/TENANT.WS/child.ws"),
-                )
-            )
-
     def test_registry_file_must_be_physically_outside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             workspace = Path(tmp_dir) / "default.ws"
