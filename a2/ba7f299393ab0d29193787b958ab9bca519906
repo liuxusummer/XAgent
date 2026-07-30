@@ -1,0 +1,25 @@
+src/orchestration/remote_journal.py
+  s_72af05a5dabd4c::t_aa6cc46dcfa79a 121
+src/orchestration/remote_protocol.py
+  s_72af05a5dabd4c::t_c12ff937bafb3d 59,1262-1264,1376-1379
+src/orchestration/remote_worker.py
+  s_72af05a5dabd4c::t_258b2f8464c4d9 220-228
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a2ba7f299393ab0d29193787b958ab9bca519906",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
