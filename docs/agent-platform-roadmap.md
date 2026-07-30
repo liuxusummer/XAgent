@@ -70,9 +70,11 @@ tagged capability metrics, tool recovery, policy decisions, and token coverage.
 `python -m src.eval_report` compares completed runs against an explicit,
 versioned regression budget without emitting prompts or tool payloads. Scenario
 pack v1 now adds per-case workspaces, content-bound fixtures, Principal scope
-narrowing, and initial tool-selection, recovery, and permission-denial cases.
-Retrieval grounding, memory-poisoning resistance, and context-pressure packs
-remain the next Phase 1 increments.
+narrowing, and tool-selection, recovery, permission-denial, and retrieval
+grounding cases. Descriptor-relative no-follow reads now bind both file-index
+ingestion and file tools against concurrent link replacement. Memory modes also
+filter reviewed records by workspace/current-agent namespace. Memory-poisoning
+and context-pressure packs remain the next Phase 1 increments.
 
 ### Phase 2 — Retrieval and context quality
 

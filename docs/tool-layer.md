@@ -54,6 +54,10 @@ class AgentContext:
 - **代码执行**：先生成并验证不可变隔离计划，再启动独立进程组；超时、取消或输出超限均终止整个进程组
 - **浏览器操作**：独立 WebDriver session，不共享主进程的浏览器状态；导航只允许解析到公网地址的 HTTP(S) URL
 - **文件操作**：路径必须转换为绝对路径；相对路径一律基于 `ctx.cwd`（当前 Agent 工作区）解析。工作区外读取需要本地 operator 专用的 `host.read`，并默认逐次确认；安全 Web 注册表不能授予该 scope
+- **稳定读取**：普通读取、文件引用展开及读改写阶段均通过逐路径组件的
+  descriptor-relative no-follow 原语完成；读取对象必须在开始/结束时保持相同
+  device/inode/size/mtime/ctime，单文件原始读取上限为 20MB。能力缺失、符号链接替换或
+  并发改写均 fail closed，不退回 `Path.read_text()`
 
 `code_run` 默认要求真实 OS 隔离，独立策略门禁不能替代隔离：
 

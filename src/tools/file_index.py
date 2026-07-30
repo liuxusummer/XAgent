@@ -24,6 +24,14 @@ from src.core.agent_kernel import (
     TrustLevel,
 )
 from src.core.retrieval import EvidenceBundle, EvidenceItem
+from src.core.safe_fs import (
+    FileChangedDuringReadError,
+    FileSizeLimitExceededError,
+    UnsafeFileContentError,
+    open_regular_file_beneath,
+    read_stable_text,
+    secure_descriptor_reads_supported,
+)
 
 
 INDEX_DB_RELATIVE_PATH = Path("runtime") / "file_index.sqlite3"
@@ -102,6 +110,12 @@ def refresh_file_index(
             "error": "workspace.read scope is required to build the file index",
             "reason_code": "principal_scope_missing",
         }
+    if not secure_descriptor_reads_supported():
+        return {
+            "status": "ERROR",
+            "error": "secure descriptor-relative file reads are unavailable",
+            "reason_code": "secure_file_read_unavailable",
+        }
     try:
         workspace = _workspace(cwd)
         scan_root = _resolve_index_root(root, workspace)
@@ -130,6 +144,7 @@ def refresh_file_index(
             "symlinks": 0,
             "too_large": 0,
             "binary_or_non_utf8": 0,
+            "unsafe_or_changed": 0,
             "errors": 0,
         },
         "semantic_status": semantic_state.get("status", semantic_state),
@@ -152,9 +167,6 @@ def refresh_file_index(
             seen: set[str] = set()
             for file_path in _walk_files(scan_root, workspace, exclude, stats):
                 try:
-                    if file_path.is_symlink():
-                        stats["skipped"]["symlinks"] += 1
-                        continue
                     rel_path = _relative_path(file_path, workspace)
                 except (OSError, ValueError):
                     stats["skipped"]["errors"] += 1
@@ -164,58 +176,119 @@ def refresh_file_index(
                     continue
                 stats["scanned"] += 1
                 try:
-                    stat = file_path.stat()
+                    file_descriptor, current_stat = (
+                        open_regular_file_beneath(workspace, rel_path)
+                    )
                 except OSError:
                     stats["skipped"]["errors"] += 1
                     continue
-                if max_file_bytes is not None and max_file_bytes > 0 and stat.st_size > max_file_bytes:
-                    stats["skipped"]["too_large"] += 1
-                    continue
 
-                seen.add(rel_path)
-                old = existing.get(rel_path)
-                if old and old == (stat.st_mtime_ns, stat.st_size):
-                    if semantic_state["enabled"] and semantic_config and not _file_semantic_complete(conn, rel_path, semantic_config):
-                        try:
-                            content = file_path.read_text(encoding="utf-8")
-                        except (OSError, UnicodeDecodeError):
-                            stats["skipped"]["binary_or_non_utf8"] += 1
-                            _delete_path(conn, rel_path)
-                            continue
-                        row = conn.execute("SELECT id FROM file_index_files WHERE path = ?", (rel_path,)).fetchone()
-                        if row and _refresh_file_semantics(
-                            conn,
-                            int(row[0]),
-                            rel_path,
-                            content,
-                            semantic_config,
-                            embedding_provider,
-                            semantic_state,
-                        ):
-                            stats["semantic_indexed"] += 1
-                        else:
-                            stats["semantic_skipped"] += 1
-                    else:
-                        stats["unchanged"] += 1
-                    continue
                 try:
-                    content = file_path.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError):
-                    stats["skipped"]["binary_or_non_utf8"] += 1
-                    _delete_path(conn, rel_path)
-                    continue
+                    if (
+                        max_file_bytes is not None
+                        and max_file_bytes > 0
+                        and current_stat.st_size > max_file_bytes
+                    ):
+                        stats["skipped"]["too_large"] += 1
+                        continue
+                    old = existing.get(rel_path)
+                    if old and old == (
+                        current_stat.st_mtime_ns,
+                        current_stat.st_size,
+                    ):
+                        seen.add(rel_path)
+                        if (
+                            semantic_state["enabled"]
+                            and semantic_config
+                            and not _file_semantic_complete(
+                                conn,
+                                rel_path,
+                                semantic_config,
+                            )
+                        ):
+                            try:
+                                content = read_stable_text(
+                                    file_descriptor,
+                                    current_stat,
+                                    max_bytes=max_file_bytes,
+                                )
+                            except FileSizeLimitExceededError:
+                                stats["skipped"]["too_large"] += 1
+                                seen.discard(rel_path)
+                                _delete_path(conn, rel_path)
+                                continue
+                            except FileChangedDuringReadError:
+                                stats["skipped"]["unsafe_or_changed"] += 1
+                                seen.discard(rel_path)
+                                _delete_path(conn, rel_path)
+                                continue
+                            except (
+                                OSError,
+                                UnicodeDecodeError,
+                                UnsafeFileContentError,
+                            ):
+                                stats["skipped"]["binary_or_non_utf8"] += 1
+                                seen.discard(rel_path)
+                                _delete_path(conn, rel_path)
+                                continue
+                            row = conn.execute(
+                                "SELECT id FROM file_index_files WHERE path = ?",
+                                (rel_path,),
+                            ).fetchone()
+                            if row and _refresh_file_semantics(
+                                conn,
+                                int(row[0]),
+                                rel_path,
+                                content,
+                                semantic_config,
+                                embedding_provider,
+                                semantic_state,
+                            ):
+                                stats["semantic_indexed"] += 1
+                            else:
+                                stats["semantic_skipped"] += 1
+                        else:
+                            stats["unchanged"] += 1
+                        continue
+
+                    try:
+                        content = read_stable_text(
+                            file_descriptor,
+                            current_stat,
+                            max_bytes=max_file_bytes,
+                        )
+                    except FileSizeLimitExceededError:
+                        stats["skipped"]["too_large"] += 1
+                        _delete_path(conn, rel_path)
+                        continue
+                    except FileChangedDuringReadError:
+                        stats["skipped"]["unsafe_or_changed"] += 1
+                        _delete_path(conn, rel_path)
+                        continue
+                    except (
+                        OSError,
+                        UnicodeDecodeError,
+                        UnsafeFileContentError,
+                    ):
+                        stats["skipped"]["binary_or_non_utf8"] += 1
+                        _delete_path(conn, rel_path)
+                        continue
+                finally:
+                    os.close(file_descriptor)
+
                 if "\x00" in content:
                     stats["skipped"]["binary_or_non_utf8"] += 1
                     _delete_path(conn, rel_path)
                     continue
+                seen.add(rel_path)
 
                 row_id = _upsert_file(
                     conn,
                     rel_path,
                     content,
-                    stat.st_size,
-                    stat.st_mtime_ns,
-                    stat.st_mtime,
+                    current_stat.st_size,
+                    current_stat.st_mtime_ns,
+                    current_stat.st_mtime,
                 )
                 _replace_fts(conn, row_id, rel_path, content)
                 if semantic_state["enabled"] and semantic_config:

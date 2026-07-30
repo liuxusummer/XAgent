@@ -1,0 +1,3 @@
+document_status=current
+effective_year=2026
+refund_policy_decision_code=XAGENT-GROUNDED-2026-8642

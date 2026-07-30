@@ -62,6 +62,8 @@ Cases keep runtime controls separate from deterministic assertions:
   "assertions": {
     "tool_called": ["file_read", "file_search"],
     "tool_call_count": {"file_read": 2},
+    "tool_paths": {"file_read": ["business/correct/answer.txt"]},
+    "tool_sequence": ["file_read", "file_search", "file_read"],
     "tool_not_called": ["code_run"],
     "policy_outcome": ["allow"],
     "recovered": true,
@@ -93,11 +95,13 @@ next LLM turn.
 
 ## Built-in v1 coverage
 
-`core-capabilities-v1` contains three small, inspectable scenarios:
+`core-capabilities-v1` contains four small, inspectable scenarios:
 
 - least-privilege file-read tool selection;
 - recovery after a deliberately stale file path;
 - a denied write under a read-only Principal, with proof that no file appeared.
+- retrieval grounding against a current file while an archived file contains an
+  adversarial instruction, with ordered tool and exact evidence-path checks.
 
 These cases are model-dependent experiments, not ordinary CI unit tests. CI
 validates the pack schema, digest, isolation, scope narrowing, assertions, and

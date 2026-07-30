@@ -325,7 +325,7 @@ def _prepare_context_messages(
                 (ContextKind.SYSTEM, TrustLevel.SYSTEM, 100, system_content),
                 (
                     ContextKind.MEMORY,
-                    TrustLevel.WORKSPACE,
+                    TrustLevel.TOOL_UNTRUSTED,
                     80,
                     marker + memory_content,
                 ),

@@ -90,6 +90,9 @@ version、TTL 和 review status。写入规则：
 - reviewer 必须同时具备 `memory.review` scope，并通过候选 ACL；
 - pending/rejected/expired candidate 不会被 `active_records()` 返回；
 - 运行时只把已审核、未过期且当前 Principal 有权读取的记录注入 `[Reviewed Memory Data]`；
+- 运行时还按 Agent 的 `none/private/global/project` 模式过滤 namespace：`private`
+  只接受当前 agent namespace，`global` 只接受 workspace namespace，`project`
+  接受两者；其他 agent 的记录不能因 subject ACL 相同而串入当前上下文；
 - 记录即使已审核仍保留原始 trust，内容始终被声明为 data，不获得系统指令权限。
 
 旧的文件型 Memory Provider 保留为管理员配置兼容层，但生产 Agent 的自我进化 Hook 和长期
@@ -108,6 +111,10 @@ version、TTL 和 review status。写入规则：
 6. 每个结果绑定完整索引内容的 SHA-256、snippet SHA-256 和 `schema:revision`；
 7. 返回 `EvidenceBundle`，其中的 `KnowledgeItem` 再次执行 caller ACL 校验；
 8. bundle 只在权限过滤后生成，拒绝响应不包含 match、snippet 或源内容。
+
+索引刷新通过逐路径组件的 descriptor-relative `open` 与 `O_NOFOLLOW` 读取，最终文件
+必须是常规文件，读取前后的 device/inode/size/mtime/ctime 必须一致。不支持该安全原语的
+平台显式返回 `secure_file_read_unavailable`，不能降级为跟随符号链接的普通读取。
 
 索引中的哈希绑定“被索引的内容”，而不是未经刷新后的当前文件。依赖结果执行修改前仍需
 `file_read` 读取当前状态，这是防止陈旧证据变成写入依据的第二道边界。

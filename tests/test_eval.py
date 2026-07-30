@@ -125,6 +125,9 @@ class EvalDatasetTests(unittest.TestCase):
             '[{"task":"bad","unexpected":true}]',
             '[{"task":"bad","assertions":{"tool_callled":["file_read"]}}]',
             '[{"task":"bad","assertions":{"tool_call_count":{"file_read":-1}}}]',
+            '[{"task":"bad","assertions":{"tool_paths":{"file_read":"../escape"}}}]',
+            '[{"task":"bad","assertions":{"tool_paths":{"file_read":7}}}]',
+            '[{"task":"bad","assertions":{"tool_sequence":[]}}]',
             '{"task":"bad","task":"overridden"}\n',
             '{"task":"bad","assertions":{"max_duration_sec":NaN}}\n',
         ]
@@ -280,6 +283,10 @@ class EvalAssertionTests(unittest.TestCase):
                     "tool_called": ["file_read"],
                     "tool_call_count": {"file_read": 1},
                     "tool_not_called": ["file_write"],
+                    "tool_sequence": ["file_read"],
+                    "tool_paths": {
+                        "file_read": ["business/answer.txt"],
+                    },
                     "file_exists": ["business/answer.txt"],
                     "file_contains": {"business/answer.txt": "saved"},
                     "max_turns": 5,
@@ -289,7 +296,14 @@ class EvalAssertionTests(unittest.TestCase):
             result = {
                 "response": "hello world",
                 "exit_reason": "CURRENT_TASK_DONE",
-                "tool_results": [{"tool_name": "file_read"}],
+                "tool_results": [
+                    {
+                        "tool_name": "file_read",
+                        "data": {
+                            "path": str(root / "business" / "answer.txt"),
+                        },
+                    }
+                ],
                 "turns": 2,
             }
 
@@ -310,6 +324,65 @@ class EvalAssertionTests(unittest.TestCase):
                 "tool file_read called 2 times, expected 1",
                 failures,
             )
+            self.assertFalse(
+                any("unexpected paths" in failure for failure in failures)
+            )
+
+            result["tool_results"].append(
+                {
+                    "tool_name": "file_read",
+                    "data": {"path": str(root / "business" / "other.txt")},
+                }
+            )
+            _status, failures = evaluate_assertions(
+                case,
+                result,
+                workspace_root=root,
+                duration_sec=0.1,
+            )
+            self.assertTrue(
+                any("unexpected paths" in failure for failure in failures)
+            )
+
+    def test_tool_sequence_requires_order_but_allows_other_calls(self) -> None:
+        case = {
+            "assertions": {
+                "tool_sequence": ["file_search", "file_read"],
+            }
+        }
+        ordered = {
+            "tool_results": [
+                {"tool_name": "plan_update"},
+                {"tool_name": "file_search"},
+                {"tool_name": "file_read"},
+            ]
+        }
+        reversed_order = {
+            "tool_results": [
+                {"tool_name": "file_read"},
+                {"tool_name": "file_search"},
+            ]
+        }
+
+        status, failures = evaluate_assertions(
+            case,
+            ordered,
+            workspace_root=".",
+            duration_sec=0.1,
+        )
+        self.assertEqual(status, "passed")
+        self.assertEqual(failures, [])
+
+        status, failures = evaluate_assertions(
+            case,
+            reversed_order,
+            workspace_root=".",
+            duration_sec=0.1,
+        )
+        self.assertEqual(status, "failed")
+        self.assertTrue(
+            any("required ordered calls" in failure for failure in failures)
+        )
 
     def test_assertions_report_failures(self) -> None:
         case = {

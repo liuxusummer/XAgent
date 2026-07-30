@@ -15,6 +15,12 @@ from src.core.agent_loop import AgentContext, run_agent_loop
 from src.core.checkpoint import build_task_checkpoint, load_task_checkpoint, render_resume_prompt, write_task_checkpoint
 from src.core.llm import MixinSession, NativeToolClient, OpenAITextSession, ToolClient
 from src.core.local_policy import LOCAL_PRINCIPAL_SCOPES
+from src.core.memory import (
+    MEMORY_MODE_GLOBAL,
+    MEMORY_MODE_NONE,
+    MEMORY_MODE_PRIVATE,
+    MEMORY_MODE_PROJECT,
+)
 from src.core.memory_store import MEMORY_READ_SCOPE, MemoryStore, MemoryStoreError
 from src.core.runbook import distill_runbook_from_task
 from src.core.skills import SkillRegistry, dedupe_skill_names, select_skills
@@ -58,6 +64,46 @@ class _RunbookEventCollector:
 
 class CheckpointResumeDenied(RuntimeError):
     """An explicit resume request could not be authorized or verified."""
+
+
+def _normalized_memory_mode(value: str) -> str:
+    normalized = str(value or MEMORY_MODE_PROJECT).strip().lower()
+    if normalized not in {
+        MEMORY_MODE_PROJECT,
+        MEMORY_MODE_PRIVATE,
+        MEMORY_MODE_GLOBAL,
+        MEMORY_MODE_NONE,
+    }:
+        return MEMORY_MODE_PROJECT
+    return normalized
+
+
+def _managed_memory_visible(
+    namespace: tuple[str, ...],
+    *,
+    principal: Principal,
+    memory_mode: str,
+) -> bool:
+    agent_prefix = (
+        "tenant",
+        principal.tenant_id,
+        "agent",
+        principal.agent_id,
+    )
+    workspace_prefix = (
+        "tenant",
+        principal.tenant_id,
+        "workspace",
+    )
+    is_private = namespace[: len(agent_prefix)] == agent_prefix
+    is_global = namespace[: len(workspace_prefix)] == workspace_prefix
+    if memory_mode == MEMORY_MODE_PRIVATE:
+        return is_private
+    if memory_mode == MEMORY_MODE_GLOBAL:
+        return is_global
+    if memory_mode == MEMORY_MODE_PROJECT:
+        return is_private or is_global
+    return False
 
 
 def ensure_workspace_layout(workspace_dir: str | Path) -> None:
@@ -355,6 +401,21 @@ class XAgent:
         principal = self.handler.ctx.principal
         if not isinstance(principal, Principal):
             return self.system_prompt
+        memory_mode = _normalized_memory_mode(self.memory_mode)
+        if memory_mode == MEMORY_MODE_NONE:
+            self.handler.ctx.sink.emit(
+                Event(
+                    session_id=self.handler.ctx.session_id,
+                    turn=0,
+                    kind="reviewed_memory_loaded",
+                    name="SKIP",
+                    data={
+                        "record_count": 0,
+                        "reason_code": "memory_mode_none",
+                    },
+                )
+            )
+            return self.system_prompt
         if MEMORY_READ_SCOPE not in principal.scopes:
             self.handler.ctx.sink.emit(
                 Event(
@@ -367,7 +428,25 @@ class XAgent:
             )
             return self.system_prompt
         try:
-            records = MemoryStore(self.cwd).active_records(principal=principal)
+            records = tuple(
+                sorted(
+                    (
+                        record
+                        for record in MemoryStore(self.cwd).active_records(
+                            principal=principal
+                        )
+                        if _managed_memory_visible(
+                            record.namespace,
+                            principal=principal,
+                            memory_mode=memory_mode,
+                        )
+                    ),
+                    key=lambda record: (
+                        record.created_at,
+                        record.record_id,
+                    ),
+                )
+            )
         except (MemoryStoreError, OSError, PermissionError, ValueError):
             self.handler.ctx.sink.emit(
                 Event(

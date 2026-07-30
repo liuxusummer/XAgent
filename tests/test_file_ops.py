@@ -4,7 +4,9 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
+from src.core.safe_fs import open_path_beneath
 from src.tools.file_ops import delete_file, patch_file, read_file, write_file
 
 
@@ -105,6 +107,18 @@ class FilePatchTests(unittest.TestCase):
             self.assertEqual(result["status"], "OK")
             self.assertEqual(result["content"], "line2\nline3\n")
 
+    def test_missing_file_result_keeps_the_resolved_evidence_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+
+            result = read_file(path="missing.txt", cwd=str(root))
+
+            self.assertEqual(result["status"], "ERROR")
+            self.assertEqual(
+                result["path"],
+                str((root / "missing.txt").resolve()),
+            )
+
     def test_write_file_expands_file_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -194,6 +208,41 @@ class FilePatchTests(unittest.TestCase):
             (outside / "item.txt").write_text("ok", encoding="utf-8")
 
             result = read_file(path=str(outside), cwd=str(root), allow_outside=True)
+
+            self.assertEqual(result["status"], "OK")
+            self.assertTrue(result["is_directory"])
+            self.assertIn("item.txt", result["content"])
+
+    def test_read_file_rejects_symlink_replacement_after_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            container = Path(tmp_dir)
+            root = container / "workspace"
+            root.mkdir()
+            target = root / "target.txt"
+            target.write_text("safe", encoding="utf-8")
+            outside = container / "outside.txt"
+            outside.write_text("OUTSIDE_RACE_SECRET", encoding="utf-8")
+
+            def replace_then_open(read_root, relative_path):
+                target.unlink()
+                target.symlink_to(outside)
+                return open_path_beneath(read_root, relative_path)
+
+            with patch(
+                "src.tools.file_ops.open_path_beneath",
+                side_effect=replace_then_open,
+            ):
+                result = read_file(path="target.txt", cwd=str(root))
+
+            self.assertEqual(result["status"], "ERROR")
+            self.assertNotIn("OUTSIDE_RACE_SECRET", str(result))
+
+    def test_read_file_can_list_workspace_root_via_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "item.txt").write_text("ok", encoding="utf-8")
+
+            result = read_file(path=".", cwd=str(root))
 
             self.assertEqual(result["status"], "OK")
             self.assertTrue(result["is_directory"])

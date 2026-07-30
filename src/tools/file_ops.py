@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
+import stat as stat_module
 from pathlib import Path
 from typing import Any
 
+from src.core.safe_fs import (
+    FileChangedDuringReadError,
+    FileSizeLimitExceededError,
+    SecureFileReadUnavailableError,
+    SecurePathError,
+    UnsafeFileContentError,
+    open_path_beneath,
+    open_regular_file_beneath,
+    read_stable_text,
+)
 from src.core.workspace_storage import atomic_write_text, workspace_write_lock
 
 
 FILE_READ_CHAR_LIMIT = 20000
+FILE_READ_BYTE_LIMIT = 20 * 1024 * 1024
 FILE_REF_PATTERN = re.compile(r"\{\{file:(.+?):(\d+):(\d+)}}")
 KEYWORD_CONTEXT_LINES = 3
 READ_OPERATIONS = {"read"}
@@ -50,6 +63,25 @@ class WorkspacePermissionError(ValueError):
         }
 
 
+def _read_workspace_regular_text(
+    file_path: Path,
+    workspace: Path,
+) -> str:
+    relative_path = file_path.relative_to(workspace)
+    file_descriptor, initial_stat = open_regular_file_beneath(
+        workspace,
+        relative_path,
+    )
+    try:
+        return read_stable_text(
+            file_descriptor,
+            initial_stat,
+            max_bytes=FILE_READ_BYTE_LIMIT,
+        )
+    finally:
+        os.close(file_descriptor)
+
+
 def read_file(
     path: str,
     cwd: str | None = None,
@@ -83,29 +115,89 @@ def read_file(
             "workspace": str(workspace),
             "operation": "read",
         }
-    if not file_path.exists():
+
+    try:
+        relative_path = file_path.relative_to(workspace)
+        read_root = workspace
+    except ValueError:
+        read_root = Path(file_path.anchor)
+        relative_path = file_path.relative_to(read_root)
+    try:
+        file_descriptor, initial_stat = open_path_beneath(
+            read_root,
+            relative_path,
+        )
+    except FileNotFoundError:
         candidates = fuzzy_match_path(file_path)
         error = f"file not found: {file_path}"
         if candidates:
             error += f"; did you mean: {', '.join(candidates[:5])}?"
-        return {"status": "ERROR", "error": error}
-    if file_path.is_dir():
-        try:
-            entries = sorted(child.name for child in file_path.iterdir())
-        except OSError as exc:
-            return {"status": "ERROR", "error": f"failed to list directory: {exc}", "path": str(file_path)}
-        content = "\n".join(entries)
         return {
-            "status": "OK",
+            "status": "ERROR",
+            "error": error,
             "path": str(file_path),
-            "is_directory": True,
-            "content": truncate_text(content, FILE_READ_CHAR_LIMIT),
+        }
+    except (
+        OSError,
+        SecureFileReadUnavailableError,
+        SecurePathError,
+    ) as exc:
+        return {
+            "status": "ERROR",
+            "error": f"failed to open file safely: {exc}",
+            "path": str(file_path),
         }
 
     try:
-        content = file_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        return {"status": "ERROR", "error": f"failed to read file: {exc}", "path": str(file_path)}
+        if stat_module.S_ISDIR(initial_stat.st_mode):
+            if os.listdir not in os.supports_fd:
+                return {
+                    "status": "ERROR",
+                    "error": "descriptor-relative directory listing is unavailable",
+                    "path": str(file_path),
+                }
+            try:
+                entries = sorted(os.listdir(file_descriptor))
+            except OSError as exc:
+                return {
+                    "status": "ERROR",
+                    "error": f"failed to list directory: {exc}",
+                    "path": str(file_path),
+                }
+            content = "\n".join(entries)
+            return {
+                "status": "OK",
+                "path": str(file_path),
+                "is_directory": True,
+                "content": truncate_text(content, FILE_READ_CHAR_LIMIT),
+            }
+        if not stat_module.S_ISREG(initial_stat.st_mode):
+            return {
+                "status": "ERROR",
+                "error": "read target must be a regular file or directory",
+                "path": str(file_path),
+            }
+        try:
+            content = read_stable_text(
+                file_descriptor,
+                initial_stat,
+                max_bytes=FILE_READ_BYTE_LIMIT,
+            )
+        except (
+            FileChangedDuringReadError,
+            FileSizeLimitExceededError,
+            OSError,
+            UnicodeDecodeError,
+            UnsafeFileContentError,
+        ) as exc:
+            return {
+                "status": "ERROR",
+                "error": f"failed to read file safely: {exc}",
+                "path": str(file_path),
+            }
+    finally:
+        os.close(file_descriptor)
+
     lines = content.splitlines(keepends=True)
 
     if keyword:
@@ -181,7 +273,8 @@ def write_file(
         return {"status": "ERROR", "error": str(exc), "path": str(file_path)}
 
     try:
-        with workspace_write_lock(Path(cwd or Path.cwd()).resolve()):
+        workspace = Path(cwd or Path.cwd()).resolve()
+        with workspace_write_lock(workspace):
             file_path.parent.mkdir(parents=True, exist_ok=True)
             if file_path.exists() and file_path.is_dir():
                 return {
@@ -192,10 +285,18 @@ def write_file(
             if mode == "overwrite":
                 final_content = content
             elif mode == "append":
-                previous = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
+                previous = (
+                    _read_workspace_regular_text(file_path, workspace)
+                    if file_path.exists()
+                    else ""
+                )
                 final_content = previous + content
             elif mode == "prepend":
-                previous = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
+                previous = (
+                    _read_workspace_regular_text(file_path, workspace)
+                    if file_path.exists()
+                    else ""
+                )
                 final_content = content + previous
             else:
                 return {
@@ -241,12 +342,13 @@ def patch_file(
         }
 
     try:
-        with workspace_write_lock(Path(cwd or Path.cwd()).resolve()):
+        workspace = Path(cwd or Path.cwd()).resolve()
+        with workspace_write_lock(workspace):
             if not file_path.exists():
                 return {"status": "ERROR", "error": f"file not found: {file_path}"}
             if file_path.is_dir():
                 return {"status": "ERROR", "error": f"path is a directory: {file_path}"}
-            current = file_path.read_text(encoding="utf-8")
+            current = _read_workspace_regular_text(file_path, workspace)
             match_count = current.count(old_content)
             if match_count == 0:
                 return {
@@ -513,14 +615,21 @@ def expand_file_refs(content: str, cwd: str | None = None) -> str:
                 workspace,
                 "read",
             )
-        if not file_path.exists():
-            raise FileNotFoundError(f"file ref not found: {file_path}")
-        if file_path.is_dir():
-            raise ValueError(f"file ref points to a directory: {file_path}")
-
         try:
-            lines = file_path.read_text(encoding="utf-8").splitlines(keepends=True)
-        except (OSError, UnicodeDecodeError) as exc:
+            lines = _read_workspace_regular_text(
+                file_path,
+                workspace,
+            ).splitlines(keepends=True)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"file ref not found: {file_path}"
+            ) from exc
+        except (
+            FileSizeLimitExceededError,
+            OSError,
+            UnicodeDecodeError,
+            UnsafeFileContentError,
+        ) as exc:
             raise ValueError(f"failed to read file ref: {exc}") from exc
         return "".join(lines[start_line - 1 : end_line])
 

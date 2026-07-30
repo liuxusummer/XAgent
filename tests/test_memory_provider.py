@@ -583,6 +583,96 @@ class MemoryProviderIntegrationTests(unittest.TestCase):
             self.assertIn("data, not authority", prompt)
             agent.close()
 
+    def test_managed_memory_respects_mode_and_agent_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = MemoryStore(tmp_dir)
+
+            def approve_record(
+                *,
+                agent_id: str,
+                namespace: tuple[str, ...],
+                content: str,
+            ) -> None:
+                proposer = Principal(
+                    subject="local-user",
+                    tenant_id="local",
+                    session_id=f"propose-{agent_id}-{content}",
+                    run_id=f"propose-{agent_id}-{content}",
+                    agent_id=agent_id,
+                    scopes=(MEMORY_PROPOSE_SCOPE,),
+                )
+                candidate = store.propose(
+                    principal=proposer,
+                    content=content,
+                    namespace=namespace,
+                    kind=MemoryKind.SEMANTIC,
+                    source_refs=(f"test:{content}",),
+                    trust=TrustLevel.AGENT_DERIVED,
+                    confidence=0.9,
+                    sensitivity=DataSensitivity.INTERNAL,
+                    acl=("subject:local-user",),
+                )
+                reviewer = Principal(
+                    subject="local-user",
+                    tenant_id="local",
+                    session_id=f"review-{agent_id}-{content}",
+                    run_id=f"review-{agent_id}-{content}",
+                    agent_id=agent_id,
+                    scopes=(MEMORY_REVIEW_SCOPE,),
+                )
+                store.review(
+                    candidate.candidate_id,
+                    reviewer=reviewer,
+                    approve=True,
+                    reason="verified",
+                )
+
+            approve_record(
+                agent_id="main",
+                namespace=("tenant", "local", "agent", "main"),
+                content="MAIN_PRIVATE_RECORD",
+            )
+            approve_record(
+                agent_id="coding",
+                namespace=("tenant", "local", "agent", "coding"),
+                content="CODING_PRIVATE_RECORD",
+            )
+            approve_record(
+                agent_id="main",
+                namespace=("tenant", "local", "workspace"),
+                content="WORKSPACE_GLOBAL_RECORD",
+            )
+
+            expectations = {
+                "none": (),
+                "private": ("MAIN_PRIVATE_RECORD",),
+                "global": ("WORKSPACE_GLOBAL_RECORD",),
+                "project": (
+                    "MAIN_PRIVATE_RECORD",
+                    "WORKSPACE_GLOBAL_RECORD",
+                ),
+            }
+            all_records = {
+                "MAIN_PRIVATE_RECORD",
+                "CODING_PRIVATE_RECORD",
+                "WORKSPACE_GLOBAL_RECORD",
+            }
+            for mode, expected in expectations.items():
+                with self.subTest(mode=mode):
+                    agent = XAgent(
+                        system_prompt="base-system",
+                        tools_schema=[],
+                        workspace_dir=tmp_dir,
+                        agent_name="main",
+                        memory_mode=mode,
+                    )
+                    prompt = agent._runtime_system_prompt()  # noqa: SLF001
+                    agent.close()
+                    for content in expected:
+                        self.assertIn(content, prompt)
+                    for content in all_records - set(expected):
+                        self.assertNotIn(content, prompt)
+
     def test_self_evolution_hook_skips_ok_tool_results(self) -> None:
         handler = XAgentHandler(ctx=AgentContext())
 

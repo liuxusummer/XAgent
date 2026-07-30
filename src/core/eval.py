@@ -65,6 +65,8 @@ ASSERTION_LIST_KEYS = {
 ASSERTION_KEYS = ASSERTION_LIST_KEYS | {
     "file_contains",
     "tool_call_count",
+    "tool_paths",
+    "tool_sequence",
     "recovered",
     "max_turns",
     "max_duration_sec",
@@ -304,6 +306,67 @@ def normalize_assertions(raw: Any, *, strict: bool = False) -> dict[str, Any]:
                     )
                 counts[name] = raw_count
             assertions[key] = counts
+        elif key == "tool_paths":
+            if not isinstance(value, dict) or len(value) > 64:
+                raise EvalError(
+                    "tool_paths must be an object with at most 64 tools"
+                )
+            paths: dict[str, list[str]] = {}
+            for raw_name, raw_paths in value.items():
+                name = validate_safe_id(str(raw_name), "tool name")
+                if len(name) > 80:
+                    raise EvalError("tool name exceeds 80 characters")
+                if not isinstance(raw_paths, (str, list)) or (
+                    isinstance(raw_paths, list)
+                    and not all(isinstance(path, str) for path in raw_paths)
+                ):
+                    raise EvalError(
+                        "tool_paths values must be a path or array of paths"
+                    )
+                expected_paths = list(dict.fromkeys(_string_list(raw_paths)))
+                if (
+                    not expected_paths
+                    or len(expected_paths) > 64
+                    or any(
+                        len(path) > 1_024
+                        or any(
+                            ord(character) < 32
+                            or ord(character) == 127
+                            for character in path
+                        )
+                        for path in expected_paths
+                    )
+                ):
+                    raise EvalError(
+                        "tool_paths values must contain 1..64 bounded paths"
+                    )
+                for path in expected_paths:
+                    normalized = path.replace("\\", "/")
+                    candidate = Path(normalized)
+                    if (
+                        candidate.is_absolute()
+                        or re.match(r"^[A-Za-z]:/", normalized)
+                        or any(part in {"", ".", ".."} for part in candidate.parts)
+                    ):
+                        raise EvalError(
+                            "tool_paths entries must be safe relative paths"
+                        )
+                paths[name] = expected_paths
+            assertions[key] = paths
+        elif key == "tool_sequence":
+            if not isinstance(value, list) or not 1 <= len(value) <= 64:
+                raise EvalError(
+                    "tool_sequence must contain 1..64 tool names"
+                )
+            sequence: list[str] = []
+            for raw_name in value:
+                if not isinstance(raw_name, str):
+                    raise EvalError("tool_sequence values must be strings")
+                name = validate_safe_id(raw_name, "tool name")
+                if len(name) > 80:
+                    raise EvalError("tool name exceeds 80 characters")
+                sequence.append(name)
+            assertions[key] = sequence
         elif key == "recovered":
             if not isinstance(value, bool):
                 raise EvalError("recovered must be a boolean")
@@ -945,6 +1008,37 @@ def _tool_call_counts(result: dict[str, Any]) -> dict[str, int]:
     return counts
 
 
+def _tool_call_sequence(result: dict[str, Any]) -> list[str]:
+    sequence: list[str] = []
+    for item in result.get("tool_results", []) or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("tool_name") or item.get("name") or "").strip()
+        if name:
+            sequence.append(name)
+    return sequence
+
+
+def _tool_result_paths(
+    result: dict[str, Any],
+    tool_name: str,
+) -> list[str]:
+    paths: list[str] = []
+    for item in result.get("tool_results", []) or []:
+        if not isinstance(item, dict):
+            continue
+        item_name = str(
+            item.get("tool_name") or item.get("name") or ""
+        ).strip()
+        data = item.get("data")
+        if item_name != tool_name or not isinstance(data, dict):
+            continue
+        path = str(data.get("path") or "").strip()
+        if path:
+            paths.append(path)
+    return paths
+
+
 def _nonnegative_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
@@ -1084,6 +1178,65 @@ def evaluate_assertions(
             failures.append(
                 f"tool {tool_name} called {actual_count} times, "
                 f"expected {expected_count}"
+            )
+    expected_sequence = assertions.get("tool_sequence", [])
+    if expected_sequence:
+        actual_sequence = _tool_call_sequence(result)
+        expected_index = 0
+        for tool_name in actual_sequence:
+            if tool_name == expected_sequence[expected_index]:
+                expected_index += 1
+                if expected_index == len(expected_sequence):
+                    break
+        if expected_index != len(expected_sequence):
+            failures.append(
+                "tool sequence did not contain required ordered calls: "
+                f"{expected_sequence}"
+            )
+    workspace = Path(workspace_root).resolve()
+    for tool_name, expected_paths in assertions.get("tool_paths", {}).items():
+        try:
+            expected = {
+                _resolve_workspace_file(workspace, path).resolve()
+                for path in expected_paths
+            }
+        except EvalError as exc:
+            failures.append(str(exc))
+            continue
+        actual: set[Path] = set()
+        escaped = False
+        for raw_path in _tool_result_paths(result, tool_name):
+            try:
+                candidate = Path(raw_path)
+                resolved = (
+                    candidate.resolve()
+                    if candidate.is_absolute()
+                    else (workspace / candidate).resolve()
+                )
+            except (OSError, RuntimeError):
+                escaped = True
+                continue
+            try:
+                resolved.relative_to(workspace)
+            except ValueError:
+                escaped = True
+                continue
+            actual.add(resolved)
+        if escaped:
+            failures.append(
+                f"tool {tool_name} returned a path outside the case workspace"
+            )
+        missing = expected - actual
+        unexpected = actual - expected
+        if missing:
+            failures.append(
+                f"tool {tool_name} did not return required paths: "
+                f"{sorted(path.relative_to(workspace).as_posix() for path in missing)}"
+            )
+        if unexpected:
+            failures.append(
+                f"tool {tool_name} returned unexpected paths: "
+                f"{sorted(path.relative_to(workspace).as_posix() for path in unexpected)}"
             )
 
     tool_metrics = _tool_attempt_metrics(result)

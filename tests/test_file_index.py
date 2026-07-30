@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.core.agent_kernel import Principal
+from src.core.safe_fs import (
+    FileChangedDuringReadError,
+    open_regular_file_beneath,
+    read_stable_text,
+)
 from src.tools.file_index import (
     DEFAULT_MAX_FILE_BYTES,
     refresh_file_index as _refresh_file_index,
@@ -216,6 +223,110 @@ class FileIndexTests(unittest.TestCase):
             self.assertEqual(refresh["skipped"]["symlinks"], 2)
             self.assertEqual(outside_result["matches"], [])
             self.assertEqual(visible_result["matches"][0]["path"], "visible.txt")
+
+    def test_descriptor_relative_open_rejects_intermediate_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            container = Path(tmp)
+            root = container / "workspace"
+            outside = container / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (outside / "secret.txt").write_text(
+                "OUTSIDE_INDEX_SECRET",
+                encoding="utf-8",
+            )
+            (root / "redirect").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+
+            with self.assertRaises(OSError):
+                open_regular_file_beneath(
+                    root,
+                    "redirect/secret.txt",
+                )
+
+    def test_refresh_fails_explicitly_without_secure_open_support(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "visible.txt").write_text("token", encoding="utf-8")
+
+            with patch.object(os, "supports_dir_fd", set()):
+                result = refresh_file_index(cwd=str(root))
+
+            self.assertEqual(result["status"], "ERROR")
+            self.assertEqual(
+                result["reason_code"],
+                "secure_file_read_unavailable",
+            )
+            self.assertFalse(
+                (root / "runtime" / "file_index.sqlite3").exists()
+            )
+
+    def test_descriptor_read_detects_in_place_file_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "changing.txt"
+            target.write_text("A" * (128 * 1024), encoding="utf-8")
+            descriptor, initial_stat = open_regular_file_beneath(
+                root,
+                "changing.txt",
+            )
+            original_read = os.read
+            read_count = 0
+
+            def mutate_after_first_read(fd: int, size: int) -> bytes:
+                nonlocal read_count
+                chunk = original_read(fd, size)
+                read_count += 1
+                if read_count == 1:
+                    target.write_text(
+                        "B" * (128 * 1024),
+                        encoding="utf-8",
+                    )
+                return chunk
+
+            try:
+                with (
+                    patch(
+                        "src.core.safe_fs.os.read",
+                        side_effect=mutate_after_first_read,
+                    ),
+                    self.assertRaises(FileChangedDuringReadError),
+                ):
+                    read_stable_text(
+                        descriptor,
+                        initial_stat,
+                        max_bytes=DEFAULT_MAX_FILE_BYTES,
+                    )
+            finally:
+                os.close(descriptor)
+
+    def test_file_that_grows_past_limit_is_removed_from_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "growing.txt"
+            target.write_text("OLD_INDEX_TOKEN", encoding="utf-8")
+            self.assertTrue(
+                search_file_index(
+                    query="OLD_INDEX_TOKEN",
+                    cwd=str(root),
+                )["matches"]
+            )
+            target.write_text("OLD_INDEX_TOKEN" + ("x" * 100), encoding="utf-8")
+
+            refresh = refresh_file_index(
+                cwd=str(root),
+                max_file_bytes=20,
+            )
+            stale = search_file_index(
+                query="OLD_INDEX_TOKEN",
+                cwd=str(root),
+            )
+
+            self.assertEqual(refresh["status"], "OK")
+            self.assertEqual(refresh["skipped"]["too_large"], 1)
+            self.assertEqual(stale["matches"], [])
 
     def test_refresh_applies_default_file_size_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
