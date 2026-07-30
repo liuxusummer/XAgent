@@ -1199,8 +1199,10 @@ Phase 1–5 稳定后已交付独立
 [故障矩阵](distributed-execution-fault-matrix.md)和
 [runnable quickstart](distributed-execution-quickstart.md)。该参考面验证会话身份、
 fencing、Artifact grant、runtime proof、取消与 replay；不得把它解释为生产
-server/pull、真实 mTLS/gVisor、持久 broker registry 或异构 fleet 集成。生产化仍需
-独立 transport、持久化准入/暂存状态，并在 fleet claim 失败后从 Store 重新投影。
+gVisor、持久 broker registry 或异构 fleet 集成。其后新增了严格、有界的
+[HTTPS/ASGI transport](remote-worker-https-transport.md)、证书 pin identity 和 TLS
+客户端，但生产化仍需验证 TLS-extension server/PKI 部署、持久化准入/暂存状态，并在
+fleet claim 失败后从 Store 重新投影。
 
 ## 18. 故障注入矩阵
 

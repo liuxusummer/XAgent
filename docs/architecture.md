@@ -248,9 +248,9 @@ XAgent/
 - **不做 ORM / 业务数据库**：记忆系统和业务工作区仍基于文件；仅 Durable
   Orchestration 控制面使用 Python 标准库 SQLite 保存编排元数据
 - **不做插件热加载**：工具集编译期确定，运行期不动态增删
-- **默认不要求分布式基础设施**：默认仍是单机进程，不引入消息中间件；可选远程参考面
-  用于验证协议、授权与恢复边界，但不声称已经提供生产 server/pull、真实 mTLS/gVisor
-  或异构 fleet
+- **默认不要求分布式基础设施**：默认仍是单机进程，不引入消息中间件；可选远程面
+  提供持久协议、授权/恢复边界和严格 HTTPS/ASGI transport，但不捆绑或声称已经验证
+  ASGI TLS-extension server、SPIFFE/PKI、真实 gVisor 或异构 fleet 部署
 - **不做无边界的通用 Agent 框架**：编排抽象只覆盖物理执行所需的确定性控制面
 - **不做前端渲染引擎**：前端只负责消息展示，不做 Markdown/Rich 渲染
 

@@ -60,14 +60,19 @@ claim=reference_workload_not_production_slo
 
 ```python
 from src.orchestration import (
+    AsgiTlsPeerAuthenticator,
     ArtifactGrantBroker,
     AuthenticatedWorker,
     BoundedRemoteObservability,
     DeterministicRemoteScheduler,
+    HttpsRemoteTransport,
     OciGvisorSandboxBackend,
+    PinnedCertificateIdentityVerifier,
+    PinnedWorkerCertificate,
     RemoteControlJournal,
     RemoteControlPlane,
     RemoteFleetCoordinator,
+    RemoteHttpASGIApp,
     RemoteWorkerClient,
     RemoteWorkerDaemon,
     SecureRemoteAssignmentAdmitter,
@@ -90,7 +95,7 @@ from src.orchestration import (
 
 | 能力 | reference implementation 已证明 | 尚未证明/部署 |
 |---|---|---|
-| 协议 | 严格、有界、版本化 wire model；持久 request digest identity 与有界 response LRU 分离 | HTTP/gRPC/queue server、pull loop、mTLS、SPIFFE |
+| 协议 | 严格、有界、版本化 wire model；持久 request digest identity 与有界 response LRU 分离；严格 HTTPS/ASGI adapter、固定证书 pin identity 和 TLS 客户端 | 已验证的 TLS-extension server 部署、gRPC/queue、SPIFFE |
 | Session | 持久单调 epoch；当前 identity + instance 可跨重启恢复；被替换 instance 的 tombstone 防 A→B→A；启动时校验完整 schema/FK/integrity，首次建库原子发布 | journal 备份、跨服务认证会话续期与证书轮换运维 |
 | Artifact | path-free grant、单次读取、受绑定的 staging/finalize、完整性复验、跨 Attempt 常驻字节硬上限、过期不可逆 | 远程对象服务、传输加密、持久 staging registry |
 | Sandbox | 限制性 OCI spec、精确 attestation/proof binding、缺证据 fail closed | 本机真实 gVisor/Kubernetes 部署与部署 attestation |
@@ -113,7 +118,9 @@ from src.orchestration import (
 - `OciGvisorSandboxBackend` 只在注入 verifier 对当前 adapter、runtime class 和有效期
   返回精确 attestation 时暴露 `SecurityLevel.CONTAINER`。示例中的 HMAC proof 只证明
   绑定代码，不证明进程真的在 gVisor 中运行。
-- `RemoteControlPlane` 仍是 run-scoped reference poll；它与
+- `RemoteControlPlane` 仍是 run-scoped poll；新增的
+  [HTTPS transport](remote-worker-https-transport.md) 可将它安全暴露给实现 ASGI TLS
+  extension 的受信 server，但仓库没有捆绑或证明该 server/PKI 部署。它与
   `RemoteFleetCoordinator` / `DeterministicRemoteScheduler` 尚未组成真实
   server/pull 数据面。fleet 层证明多工具 Worker 的逐节点匹配，但 control poll 当前只
   对整个 Workflow 的 activity kinds/capabilities 做粗预检。因此不能声称已经端到端
@@ -123,6 +130,9 @@ from src.orchestration import (
   re-admit ready work。
 - 外部副作用仍是 at-least-once Attempt；reference protocol 的幂等 response 不等于
   任意工具 exactly-once。
+
+HTTPS 传输的三轮专项审查见
+[remote-worker-https-adversarial-review.md](remote-worker-https-adversarial-review.md)。
 
 ## 验证
 

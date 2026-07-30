@@ -307,6 +307,19 @@ class RemoteControlPlane:
         self._inflight: dict[tuple[str, str, str], _Inflight] = {}
         self._worker_session_guards: dict[str, _WorkerSessionGuard] = {}
 
+    @property
+    def production_security_ready(self) -> bool:
+        """Whether a network transport may expose this control composition."""
+
+        adapter = self._assignment_admitter
+        return (
+            self._journal.durable
+            and adapter is not None
+            and getattr(adapter, "production_security_ready", None) is True
+            and getattr(adapter, "secure_two_phase_admission", None) is True
+            and not self._allow_reference_admission
+        )
+
     def handle(
         self,
         identity: AuthenticatedWorker,

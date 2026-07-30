@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import secrets
+import ssl
 import tempfile
 import threading
 import unittest
@@ -20,6 +22,12 @@ from src.orchestration.models import AttemptStatus, RunStatus
 from src.orchestration.remote_control import (
     RemoteAdmissionAuthorization,
     RemoteControlPlane,
+)
+from src.orchestration.remote_http import (
+    AsgiTlsPeerAuthenticator,
+    PinnedCertificateIdentityVerifier,
+    PinnedWorkerCertificate,
+    RemoteHttpASGIApp,
 )
 from src.orchestration.remote_journal import RemoteControlJournal
 from src.orchestration.remote_protocol import (
@@ -1040,12 +1048,99 @@ class RemoteProtocolTests(unittest.TestCase):
         self.assertEqual(len(seen), 1)
         self.assertEqual(self.store.get_run("run-remote").status, RunStatus.COMPLETED)
 
+    def test_https_asgi_transport_composes_with_real_control_plane(self) -> None:
+        certificate = (
+            "-----BEGIN CERTIFICATE-----\n"
+            "VEVTVA==\n"
+            "-----END CERTIFICATE-----"
+        )
+        fingerprint = hashlib.sha256(
+            ssl.PEM_cert_to_DER_cert(certificate)
+        ).hexdigest()
+        verifier = PinnedCertificateIdentityVerifier(
+            [
+                PinnedWorkerCertificate(
+                    fingerprint,
+                    "worker-1",
+                    "tenant-1",
+                )
+            ]
+        )
+
+        app = RemoteHttpASGIApp(
+            self.control,
+            AsgiTlsPeerAuthenticator(verifier),
+        )
+
+        async def exchange(wire_request):
+            body = json.dumps(
+                wire_request,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "https",
+                "path": "/v1/remote-worker",
+                "query_string": b"",
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+                "extensions": {
+                    "tls": {
+                        "server_cert": None,
+                        "client_cert_chain": [certificate],
+                        "client_cert_name": "CN=worker-1",
+                        "client_cert_error": None,
+                        "tls_version": 0x0304,
+                        "cipher_suite": 0x1301,
+                    }
+                },
+            }
+            messages = [
+                {
+                    "type": "http.request",
+                    "body": body,
+                    "more_body": False,
+                }
+            ]
+            sent = []
+
+            async def receive():
+                return messages.pop()
+
+            async def send(message):
+                sent.append(message)
+
+            await app(scope, receive, send)
+            self.assertEqual(sent[0]["status"], 200)
+            return json.loads(sent[1]["body"])
+
+        client = RemoteWorkerClient(
+            lambda request: asyncio.run(exchange(request)),
+            worker_id="worker-1",
+            instance_id="https-instance",
+        )
+
+        self._register(client)
+        assignment = client.poll("run-remote")
+
+        self.assertIsNotNone(assignment)
+        self.assertEqual(assignment.worker_id, "worker-1")
+        self.assertEqual(len(self.store.list_attempts("run-remote")), 1)
+
     def test_security_adapters_are_required_and_arbitrary_callable_is_rejected(self) -> None:
+        self.assertTrue(self.control.production_security_ready)
         memory_journal_control = RemoteControlPlane(
             lambda _run_id: self.scheduler,
             authorize_run=lambda _identity, _run_id: True,
             assignment_admitter=self.admitter,
         )
+        self.assertFalse(memory_journal_control.production_security_ready)
         memory_client = self._client(
             memory_journal_control,
             instance_id="memory-journal-instance",
@@ -1060,6 +1155,7 @@ class RemoteProtocolTests(unittest.TestCase):
             authorize_run=lambda _identity, _run_id: True,
             journal=RemoteControlJournal(self.journal_path),
         )
+        self.assertFalse(unguarded_control.production_security_ready)
         unguarded_client = self._client(unguarded_control)
         self._register(unguarded_client)
         with self.assertRaisesRegex(RemoteWorkerError, "security_not_ready"):
@@ -1127,6 +1223,7 @@ class RemoteProtocolTests(unittest.TestCase):
                 self.control_root / "legacy-marked-enabled.sqlite3"
             ),
         )
+        self.assertFalse(marked_enabled.production_security_ready)
         marked_enabled_client = self._client(
             marked_enabled,
             instance_id="legacy-marked-enabled-instance",

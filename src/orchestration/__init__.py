@@ -170,6 +170,16 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "SecureRemoteExecutionAdapter",
     ),
     ".remote_fleet": ("RemoteFleetCoordinator",),
+    ".remote_http": (
+        "AsgiTlsPeerAuthenticator",
+        "HttpsRemoteTransport",
+        "PinnedCertificateIdentityVerifier",
+        "PinnedWorkerCertificate",
+        "RemoteHttpASGIApp",
+        "RemoteHttpConfigurationError",
+        "RemotePeerAuthenticationError",
+        "TlsPeerEvidence",
+    ),
     ".remote_observability": ("BoundedRemoteObservability",),
     ".remote_protocol": ("AuthenticatedWorker",),
     ".remote_scheduling": (

@@ -6,8 +6,10 @@ R01–R20 的可执行证据索引。所有 R 编号均直接映射到
 不计作本矩阵证据。
 
 矩阵使用逻辑时钟、固定并发 barrier、内存 transport、受控 fake 外部 ledger 和 fake
-runtime adapter。它不等待真实时间窗口，不发起真实网络请求，也不宣称 reference
-transport 提供 mTLS，或 fake runtime 提供真实 gVisor 隔离。
+runtime adapter。它不等待真实时间窗口，不发起真实网络请求；独立的
+[HTTPS transport](remote-worker-https-transport.md) 测试验证网络 framing 与 TLS
+identity 组合，但本矩阵仍不宣称已部署真实 PKI/SPIFFE，或 fake runtime 提供真实
+gVisor 隔离。
 
 状态含义：
 
@@ -50,7 +52,7 @@ transport 提供 mTLS，或 fake runtime 提供真实 gVisor 隔离。
 - `OciGvisorSandboxBackend` 只有在注入 verifier 返回当前、精确绑定的 attestation 时才暴露
   `SecurityLevel.CONTAINER`；本矩阵的 fake verifier 只测试绑定逻辑，不证明本机实际运行
   gVisor。
-- 真实部署仍须单独提供并验证 transport mTLS/SPIFFE adapter、Artifact 服务传输加密、
+- 真实部署仍须单独提供并验证 TLS-extension server/PKI 或 SPIFFE adapter、Artifact 服务传输加密、
   OCI runtime/Kubernetes 配置与部署 attestation。缺少这些部署证据时，不得将 reference
   transport 或 fake runtime 描述为生产安全平面。
 

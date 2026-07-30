@@ -56,10 +56,14 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             "AuthenticatedWorker",
             "BoundedRemoteObservability",
             "DeterministicRemoteScheduler",
+            "HttpsRemoteTransport",
             "OciGvisorSandboxBackend",
+            "PinnedCertificateIdentityVerifier",
+            "PinnedWorkerCertificate",
             "RemoteControlJournal",
             "RemoteControlPlane",
             "RemoteFleetCoordinator",
+            "RemoteHttpASGIApp",
             "RemoteWorkerClient",
             "RemoteWorkerDaemon",
             "SecureRemoteAssignmentAdmitter",
@@ -94,6 +98,11 @@ class OrchestrationPublicApiTests(unittest.TestCase):
         from src.orchestration.executor import TrustedActivityExecutor
         from src.orchestration.remote_control import RemoteControlPlane
         from src.orchestration.remote_journal import RemoteControlJournal
+        from src.orchestration.remote_http import (
+            HttpsRemoteTransport,
+            PinnedCertificateIdentityVerifier,
+            RemoteHttpASGIApp,
+        )
         from src.orchestration.remote_execution import (
             SecureRemoteAssignmentAdmitter,
         )
@@ -121,6 +130,12 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             ("TrustedActivityExecutor", TrustedActivityExecutor),
             ("RemoteControlPlane", RemoteControlPlane),
             ("RemoteControlJournal", RemoteControlJournal),
+            ("HttpsRemoteTransport", HttpsRemoteTransport),
+            (
+                "PinnedCertificateIdentityVerifier",
+                PinnedCertificateIdentityVerifier,
+            ),
+            ("RemoteHttpASGIApp", RemoteHttpASGIApp),
             ("RemoteWorkerDaemon", RemoteWorkerDaemon),
             (
                 "SecureRemoteAssignmentAdmitter",
