@@ -1,0 +1,37 @@
+docs/agent-platform-roadmap.md
+  s_72af05a5dabd4c::t_6b7194678cd553 94-101
+docs/eval-regression-gates.md
+  s_72af05a5dabd4c::t_ac3db6cada7450 73-75,84-93
+docs/eval-scenario-packs.md
+  s_72af05a5dabd4c::t_9eff780c8ec162 68-71,104,110-111
+docs/file-index-semantic-search-spec.md
+  s_72af05a5dabd4c::t_c55c495bff2cf9 14-16,30-32,34-42,44-46,81-85
+tests/test_eval_scenarios.py
+  s_72af05a5dabd4c::t_71a5bb0902b6c8 214-217
+tests/test_file_index.py
+  s_72af05a5dabd4c::t_fe8a72c3c7fcaf 365-419,477-481,670-767
+tests/test_handler_tools.py
+  s_72af05a5dabd4c::t_a1e593c5177f79 220
+workspace/default.ws/system/eval/core-capabilities-v1/cases.jsonl
+  s_72af05a5dabd4c::t_0d017354f7c798 4
+workspace/default.ws/system/eval/core-capabilities-v1/pack.json
+  s_72af05a5dabd4c::t_314531a6af2f8e 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7646879c3583a6a135650cbae0c243c4aa657691",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
