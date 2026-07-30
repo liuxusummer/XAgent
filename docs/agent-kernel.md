@@ -74,9 +74,10 @@ scope 会在加载时被拒绝；工作区外 `file_read` 同时在 Policy prefl
 `MemoryStore` 在同一原子 JSON 状态中维护：
 
 ```text
-MemoryCandidate(pending/rejected/expired)
-    -- memory.review scope + ACL + TTL -->
-MemoryRecord(approved)
+MemoryCandidate(pending/rejected/expired + logical memory_key)
+    -- memory.review scope + ACL + TTL + conflict check -->
+MemoryRecord(approved/active)
+    -- explicit atomic supersession --> MemoryRecord(superseded)
 ```
 
 候选和记录均包含 namespace、kind、source refs、trust、confidence、sensitivity、ACL、
@@ -88,7 +89,21 @@ version、TTL 和 review status。写入规则：
 - namespace 必须规范绑定当前 tenant；ACL 命中仍需先通过独立 tenant 边界校验，
   同名 subject、agent、scope 或通配 grant 均不能跨 tenant；
 - reviewer 必须同时具备 `memory.review` scope，并通过候选 ACL；
+- `memory_key` 只声明同一 namespace/kind 内的逻辑事实身份，不赋予覆盖权；默认 key
+  由内容摘要生成，因此不提供 key 的旧调用仍能检测精确重复；
+- reviewer 可用 `assess_candidate()` 查看自己有权审核的重复与冲突。批准时必须通过
+  `supersede_record_ids` 精确替代当前全部重复/冲突记录，检查、旧记录失活和新记录
+  生效在同一工作区锁与原子写中完成；
+- 若候选与 reviewer 无权读取、但读者范围存在交集的记录冲突，审批 fail closed，
+  不泄露对方记录 ID；
 - pending/rejected/expired candidate 不会被 `active_records()` 返回；
+- superseded record 保留在 `provenance_records()` 的来源链中，但不会再进入
+  `active_records()`；具备 `memory.review` 的同租户主体可按保留期 `compact()`，
+  清除已拒绝、已过期或已替代的正文，并累计有界清理摘要；
+- `quality_metrics()` 只返回计数、字符成本，以及针对评测提供的 key→content digest
+  真值计算出的 precision/recall，用于门禁 active duplicate/conflict、观察 stale
+  suppression 和上下文体积，不暴露记忆正文；
+- schema v1 状态在读取时严格校验并映射为 v2，只有下一次真实变更才原子写回 v2；
 - Store 读取使用 descriptor-relative no-follow 原语并限制为 64 MiB，新状态文件权限不
   超过 `0600`；candidate 与 active record 必须在同一状态中双向对应且审核元数据完全
   一致，孤立、篡改、超量或非规范 JSON 均整体 fail closed；

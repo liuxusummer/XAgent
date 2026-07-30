@@ -365,6 +365,7 @@ BaseSession
 
 #### 4.2.11 memory_propose
 - 提交带来源、trust、confidence、sensitivity、ACL、TTL 的待审核候选
+- 可选 `memory_key` 声明同一逻辑事实，供独立 reviewer 检测重复/冲突并显式替代
 - candidate 在单独 reviewer 批准前不属于 active memory
 
 ### 4.3 中英文 Schema 切换

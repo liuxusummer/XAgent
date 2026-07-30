@@ -482,6 +482,9 @@ class XAgent:
                 name="OK",
                 data={
                     "record_count": len(selected),
+                    "available_record_count": len(records),
+                    "omitted_record_count": len(records) - len(selected),
+                    "selected_chars": rendered_chars,
                     "record_ids": [item["record_id"] for item in selected],
                 },
             )

@@ -476,6 +476,7 @@ class MemoryProviderIntegrationTests(unittest.TestCase):
                     "memory_propose",
                     {
                         "content": "Use atomic writes for shared JSON state.",
+                        "memory_key": "workspace.shared_state_write",
                         "kind": "procedural",
                         "confidence": 0.8,
                         "source_refs": ["test:atomic-write"],
@@ -491,6 +492,10 @@ class MemoryProviderIntegrationTests(unittest.TestCase):
             self.assertIsNotNone(candidate)
             assert candidate is not None
             self.assertEqual(candidate.review_status, MemoryReviewStatus.PENDING)
+            self.assertEqual(
+                candidate.memory_key,
+                "workspace.shared_state_write",
+            )
             self.assertEqual(
                 MemoryStore(tmp_dir).active_records(
                     principal=handler.ctx.principal

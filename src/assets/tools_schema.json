@@ -331,6 +331,12 @@
             "type": "string",
             "description": "Concise candidate fact, decision, or reusable procedure."
           },
+          "memory_key": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*$",
+            "description": "Optional stable logical key, such as repository.state_backend. Reusing a key lets a reviewer detect and explicitly supersede conflicting facts; it does not grant replacement authority."
+          },
           "kind": {
             "type": "string",
             "enum": ["semantic", "episodic", "procedural"],

@@ -18,7 +18,12 @@ from src.core.local_policy import (
     LocalPolicyGate,
 )
 from src.core.memory import load_effective_memory, load_global_memory
-from src.core.memory_store import MEMORY_READ_SCOPE, MemoryKind, MemoryStore
+from src.core.memory_store import (
+    MEMORY_READ_SCOPE,
+    MemoryKind,
+    MemoryReviewStatus,
+    MemoryStore,
+)
 from src.core.skills import SkillRegistry, dedupe_skill_names, render_active_skills
 from src.core.telemetry import Event
 from src.tools import ask_user, create_browser_driver, delete_file, patch_file, plan_update, read_file, search_file_index, start_long_term_update, update_working_checkpoint, web_execute_js, web_scan, write_file
@@ -1513,6 +1518,7 @@ class XAgentHandler(BaseHandler):
         if not isinstance(raw_refs, (list, tuple)):
             raw_refs = ()
         source_refs = tuple(str(item).strip() for item in raw_refs if str(item).strip())
+        memory_key = args.get("memory_key", "")
         try:
             confidence = float(args.get("confidence", 0.5))
             candidate = MemoryStore(Path(memory_root)).propose(
@@ -1533,6 +1539,7 @@ class XAgentHandler(BaseHandler):
                 confidence=confidence,
                 sensitivity=DataSensitivity.SENSITIVE,
                 acl=(f"subject:{principal.subject}",),
+                memory_key=memory_key,
                 ttl_seconds=7 * 24 * 60 * 60,
             )
         except (OSError, RuntimeError, ValueError, PermissionError) as exc:
@@ -1555,6 +1562,9 @@ class XAgentHandler(BaseHandler):
                 name=candidate.kind.value,
                 data={
                     "candidate_id": candidate.candidate_id,
+                    "memory_key_sha256": hashlib.sha256(
+                        candidate.memory_key.encode("utf-8")
+                    ).hexdigest(),
                     "content_sha256": candidate.content_sha256,
                     "review_status": candidate.review_status.value,
                     "trust": candidate.trust.value,
@@ -1571,18 +1581,30 @@ class XAgentHandler(BaseHandler):
                 },
             )
         )
+        if candidate.review_status is MemoryReviewStatus.APPROVED:
+            next_prompt = (
+                "等价候选已存在且已通过独立审核，无需重复沉淀；继续任务即可。"
+            )
+        elif candidate.review_status is MemoryReviewStatus.PENDING:
+            next_prompt = (
+                "记忆候选已隔离保存，尚未生效。继续任务即可；"
+                "不得声称它已成为长期记忆。"
+            )
+        else:
+            next_prompt = (
+                "等价候选已被独立 reviewer 处理，当前调用不会将它重新激活；"
+                "只有新增可验证来源后才能提出新的候选。"
+            )
         return ActionResult(
             data={
                 "status": "OK",
                 "candidate_id": candidate.candidate_id,
+                "memory_key": candidate.memory_key,
                 "content_sha256": candidate.content_sha256,
                 "review_status": candidate.review_status.value,
                 "trust": candidate.trust.value,
             },
-            next_prompt=(
-                "记忆候选已隔离保存，尚未生效。继续任务即可；"
-                "不得声称它已成为长期记忆。"
-            ),
+            next_prompt=next_prompt,
         )
 
     def exec_plan_update(self, args: dict[str, Any]) -> ActionResult:

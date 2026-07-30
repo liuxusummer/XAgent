@@ -111,6 +111,16 @@ rejection; core capability pack 1.2 gates its grounding case on these metrics.
 Exit evidence: approved memory improves repeat-task success without allowing
 unreviewed or cross-tenant content into model-visible context.
 
+Foundation delivered: Memory Store schema v2 adds bounded logical keys,
+reviewer-visible duplicate/conflict assessment, and atomic explicit
+supersession. Overlapping ACL audiences fail closed when one reviewer cannot
+authorize every affected record. Runtime reads suppress superseded records,
+while provenance views retain the review chain and scoped compaction removes
+retired payload after a retention window with a cumulative purge digest. Strict
+v1 validation and lazy migration preserve existing workspaces.
+The three-round threat/concurrency/upgrade review is recorded in
+[`memory-lifecycle-adversarial-review.md`](memory-lifecycle-adversarial-review.md).
+
 ### Phase 4 — Policy operations
 
 - Add policy simulation and explainability for operators before execution.

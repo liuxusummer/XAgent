@@ -200,8 +200,11 @@ Memory 行为应该能在事件流里解释清楚。建议在已有 telemetry �
 ### Phase 4：长期记忆结算护栏
 
 - `start_long_term_update` 已收敛为结算提案入口，真正持久提交走 `memory_propose`。
-- 增加重复检测、长度检测、主题段检测。
-- 写后强制验证，失败时把诊断信息返回给 Agent。
+- `MemoryStore` schema v2 使用有界 `memory_key` 检测同一事实的重复与冲突；审批者必须
+  显式、原子地替代所有重叠的 active record，不能静默覆盖或留下并行真相。
+- `provenance_records()` 保留替代链；`compact()` 按 ACL、tenant 和保留期清除过期正文，
+  同时维护累计 purge digest。
+- 写后继续做完整状态、候选—记录双向关系和 supersession 图校验，失败时整体拒绝写入。
 
 验收：长期记忆更新 diff 更小，重复条目下降，错误更新可诊断。
 
