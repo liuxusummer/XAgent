@@ -1,0 +1,69 @@
+docs/agent-kernel.md
+  s_72af05a5dabd4c::t_a5565d4210a11f 52-57,62-64
+docs/agent-platform-roadmap.md
+  s_72af05a5dabd4c::t_e0f56cfff19a0a 134-144
+docs/architecture.md
+  s_72af05a5dabd4c::t_65748b0fed6f41 85-88
+docs/durable-orchestration-spec.md
+  s_72af05a5dabd4c::t_6d6cc4b5514ce8 864-874
+docs/policy-operations-adversarial-review.md
+  s_72af05a5dabd4c::t_b8fc70d8c77d27 1-90
+src/core/local_policy.py
+  s_72af05a5dabd4c::t_c54190c3c6deea 13,29,32,37-41,263-298,328,337-393,402-408,513-517,554-594,601-602,604-611,786
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_36b5b4596dcaad 96-102,108,112,114,118-123,128-132
+src/orchestration/mcp.py
+  s_72af05a5dabd4c::t_9759ea1a80f358 95,98-100,766-789,807-830,1238-1269,1378-1389
+src/orchestration/operator_diagnostics.py
+  s_72af05a5dabd4c::t_fc56e0c02f402e 1-233
+src/orchestration/policy.py
+  s_72af05a5dabd4c::t_efe3deb6b661c5 19,35-39,64-70,115-146,179-183,186-199,201-210,218-219,221-234,236,238-241,244-247,250,257-266,268,285-287,295-296,402,407-411,449-458,589-593,595,719-885,1018,1027,1049-1054,1076-1082,1085,1088-1096,1100-1108,1110-1118,1121-1129,1131-1132,1134-1141,1143,1148-1149,1151-1158,1160-1161,1164-1165,1167-1174,1176,1178-1179,1181-1188,1190,1193-1194,1196-1203,1205,1207-1208,1210-1217,1219,1224-1225,1227-1234,1236-1237,1242-1243,1245-1252,1254-1255,1258,1260,1277-1278,1282,1286-1287,1294-1296,1298-1309,1391-1428
+src/orchestration/policy_conformance.py
+  s_72af05a5dabd4c::t_2e749da5215f94 1-203
+src/orchestration/protocol.py
+  s_72af05a5dabd4c::t_d772035ea53245 22-26,50,61,110-118,125-127,273-305,449
+src/orchestration/recovery.py
+  s_72af05a5dabd4c::t_53b385bcc64bca 1-129
+src/orchestration/runtime.py
+  s_72af05a5dabd4c::t_f504c116e500d9 37,48,55,97-99,303-324,460-462,599-600,602,605,619-623,663-697,954-958,971-979,991-993,1007-1009
+src/orchestration/store.py
+  s_72af05a5dabd4c::t_01ab115ac2229b 51,144,198,610-649,2016-2022,2029,3660-3816,6308-6314
+src/orchestration/web_api.py
+  s_72af05a5dabd4c::t_89a63bf9f48f4c 19,580,593-595,600,613-615,620,636-638
+tests/test_local_policy.py
+  s_72af05a5dabd4c::t_9a79da760e5260 3,5,53-137,263-276
+tests/test_operator_diagnostics.py
+  s_72af05a5dabd4c::t_c5296f10b30e68 1-140
+tests/test_orchestration_mcp.py
+  s_72af05a5dabd4c::t_24f212a26b99ba 199,294-302,320,323-332
+tests/test_orchestration_policy.py
+  s_72af05a5dabd4c::t_1435afd95ade02 4,18,23,122-274
+tests/test_orchestration_protocol.py
+  s_72af05a5dabd4c::t_31014aaaada10b 14,143-151,161-182
+tests/test_orchestration_runtime.py
+  s_72af05a5dabd4c::t_a222193b624fe6 11,685-762
+tests/test_orchestration_store.py
+  s_72af05a5dabd4c::t_c1afea9d341c8b 31-32,734-742,1346-1647
+tests/test_orchestration_web_api.py
+  s_72af05a5dabd4c::t_10db1e90597f26 37,549-604
+tests/test_policy_conformance.py
+  s_72af05a5dabd4c::t_15ba3de3b904f8 1-138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "841e86810d6b70e38ac9011759928238fcb71d74",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
