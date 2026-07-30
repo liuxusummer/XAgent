@@ -22,6 +22,16 @@ from src.core.network_guard import (
     UnsafeNetworkTargetError,
     resolve_public_endpoint,
 )
+from src.core.eval_scenarios import (
+    EvalCaseRuntime,
+    ScenarioPack,
+    ScenarioPackError,
+    cleanup_case_workspace,
+    load_scenario_pack_for_dataset,
+    prepare_case_workspace,
+    validate_scenario_dataset_bytes,
+    validate_scenario_cases,
+)
 
 
 MAX_DATASET_BYTES = 20 * 1024 * 1024
@@ -41,8 +51,25 @@ TOKEN_USAGE_KEYS = (
     "reasoning_tokens",
 )
 
-ASSERTION_LIST_KEYS = {"contains", "contains_any", "not_contains", "exit_reason", "tool_called", "file_exists"}
-ASSERTION_KEYS = ASSERTION_LIST_KEYS | {"file_contains", "max_turns", "max_duration_sec"}
+ASSERTION_LIST_KEYS = {
+    "contains",
+    "contains_any",
+    "not_contains",
+    "exit_reason",
+    "tool_called",
+    "tool_not_called",
+    "policy_outcome",
+    "file_exists",
+    "file_not_exists",
+}
+ASSERTION_KEYS = ASSERTION_LIST_KEYS | {
+    "file_contains",
+    "tool_call_count",
+    "recovered",
+    "max_turns",
+    "max_duration_sec",
+    "max_total_tokens",
+}
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -57,15 +84,22 @@ class EvalCase:
     task: str
     tags: list[str]
     assertions: dict[str, Any]
+    runtime: dict[str, Any]
+    grader: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "id": self.id,
             "name": self.name,
             "task": self.task,
             "tags": list(self.tags),
             "assertions": dict(self.assertions),
         }
+        if self.runtime:
+            value["runtime"] = dict(self.runtime)
+        if self.grader:
+            value["grader"] = dict(self.grader)
+        return value
 
 
 def utc_timestamp() -> float:
@@ -173,7 +207,51 @@ def _parse_assertion_cell(value: Any) -> Any:
     return stripped
 
 
-def normalize_assertions(raw: Any) -> dict[str, Any]:
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise EvalError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def _reject_nonstandard_json_number(value: str) -> None:
+    raise EvalError(f"non-standard JSON number is not allowed: {value}")
+
+
+def _json_loads(value: str, *, strict: bool) -> Any:
+    if not strict:
+        return json.loads(value)
+    return json.loads(
+        value,
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_reject_nonstandard_json_number,
+    )
+
+
+def _read_text_file_limited(
+    path: Path,
+    *,
+    size_limit: int = MAX_DATASET_BYTES,
+) -> str:
+    try:
+        with path.open("rb") as file:
+            encoded = file.read(size_limit + 1)
+        if len(encoded) > size_limit:
+            raise EvalError("Dataset exceeds 20MB limit")
+        return encoded.decode("utf-8")
+    except EvalError:
+        raise
+    except UnicodeDecodeError as exc:
+        raise EvalError("Dataset file is not valid UTF-8 text") from exc
+    except OSError as exc:
+        raise EvalError(
+            f"Dataset file could not be read: {type(exc).__name__}"
+        ) from exc
+
+
+def normalize_assertions(raw: Any, *, strict: bool = False) -> dict[str, Any]:
     if raw in (None, ""):
         return {}
     if isinstance(raw, str):
@@ -183,6 +261,10 @@ def normalize_assertions(raw: Any) -> dict[str, Any]:
             raise EvalError(f"Invalid assertions JSON: {exc}") from exc
     if not isinstance(raw, dict):
         raise EvalError("assertions must be an object")
+    if strict:
+        unknown = set(raw) - ASSERTION_KEYS
+        if unknown:
+            raise EvalError(f"unsupported assertion fields: {sorted(unknown)}")
 
     assertions: dict[str, Any] = {}
     for key, value in raw.items():
@@ -191,8 +273,40 @@ def normalize_assertions(raw: Any) -> dict[str, Any]:
         if value in (None, ""):
             continue
         if key in ASSERTION_LIST_KEYS:
-            assertions[key] = _string_list(value)
+            normalized = _string_list(value)
+            if key == "policy_outcome" and any(
+                item not in {"allow", "deny", "require_approval"}
+                for item in normalized
+            ):
+                raise EvalError(
+                    "policy_outcome values must be allow, deny, or require_approval"
+                )
+            assertions[key] = normalized
         elif key == "file_contains":
+            assertions[key] = value
+        elif key == "tool_call_count":
+            if not isinstance(value, dict) or len(value) > 64:
+                raise EvalError(
+                    "tool_call_count must be an object with at most 64 tools"
+                )
+            counts: dict[str, int] = {}
+            for raw_name, raw_count in value.items():
+                name = validate_safe_id(str(raw_name), "tool name")
+                if len(name) > 80:
+                    raise EvalError("tool name exceeds 80 characters")
+                if (
+                    isinstance(raw_count, bool)
+                    or not isinstance(raw_count, int)
+                    or raw_count < 0
+                ):
+                    raise EvalError(
+                        "tool_call_count values must be non-negative integers"
+                    )
+                counts[name] = raw_count
+            assertions[key] = counts
+        elif key == "recovered":
+            if not isinstance(value, bool):
+                raise EvalError("recovered must be a boolean")
             assertions[key] = value
         elif key == "max_turns":
             try:
@@ -211,12 +325,74 @@ def normalize_assertions(raw: Any) -> dict[str, Any]:
                 or assertions[key] <= 0
             ):
                 raise EvalError("max_duration_sec must be a positive finite number")
+        elif key == "max_total_tokens":
+            if isinstance(value, bool):
+                raise EvalError("max_total_tokens must be an integer")
+            try:
+                assertions[key] = int(value)
+            except (TypeError, ValueError) as exc:
+                raise EvalError("max_total_tokens must be an integer") from exc
+            if assertions[key] <= 0:
+                raise EvalError("max_total_tokens must be positive")
     return assertions
 
 
-def normalize_case(raw: dict[str, Any], index: int) -> EvalCase:
+def _normalize_case_runtime(raw: Any, index: int) -> dict[str, Any]:
+    if raw in (None, {}):
+        return {}
+    if not isinstance(raw, dict):
+        raise EvalError(f"case #{index + 1} runtime must be an object")
+    unknown = set(raw) - {"fixture", "scopes"}
+    if unknown:
+        raise EvalError(
+            f"case #{index + 1} runtime has unsupported fields: {sorted(unknown)}"
+        )
+    runtime: dict[str, Any] = {}
+    if raw.get("fixture") not in (None, ""):
+        fixture = str(raw["fixture"]).strip()
+        runtime["fixture"] = validate_safe_id(fixture, "fixture")
+    if "scopes" in raw:
+        scopes = list(dict.fromkeys(_string_list(raw["scopes"])))
+        if len(scopes) > 64 or any(len(scope) > 80 for scope in scopes):
+            raise EvalError(f"case #{index + 1} runtime scopes exceed bounds")
+        runtime["scopes"] = scopes
+    return runtime
+
+
+def _normalize_case_grader(raw: Any, index: int) -> dict[str, Any]:
+    if raw in (None, {}):
+        return {}
+    if not isinstance(raw, dict):
+        raise EvalError(f"case #{index + 1} grader must be an object")
+    if set(raw) != {"type"} or raw.get("type") != "deterministic":
+        raise EvalError(
+            f"case #{index + 1} only supports the deterministic grader"
+        )
+    return {"type": "deterministic"}
+
+
+def normalize_case(
+    raw: dict[str, Any],
+    index: int,
+    *,
+    strict: bool = False,
+) -> EvalCase:
     if not isinstance(raw, dict):
         raise EvalError(f"case #{index + 1} must be an object")
+    if strict:
+        unknown = set(raw) - {
+            "id",
+            "name",
+            "task",
+            "tags",
+            "assertions",
+            "runtime",
+            "grader",
+        }
+        if unknown:
+            raise EvalError(
+                f"case #{index + 1} has unsupported fields: {sorted(unknown)}"
+            )
     task = str(raw.get("task") or "").strip()
     if not task:
         raise EvalError(f"case #{index + 1} missing required task")
@@ -233,11 +409,26 @@ def normalize_case(raw: dict[str, Any], index: int) -> EvalCase:
         for tag in tags
     ):
         raise EvalError(f"case #{index + 1} tag contains control characters")
-    assertions = normalize_assertions(raw.get("assertions", {}))
-    return EvalCase(id=case_id, name=name, task=task, tags=tags, assertions=assertions)
+    assertions = normalize_assertions(raw.get("assertions", {}), strict=strict)
+    runtime = _normalize_case_runtime(raw.get("runtime"), index)
+    grader = _normalize_case_grader(raw.get("grader"), index)
+    return EvalCase(
+        id=case_id,
+        name=name,
+        task=task,
+        tags=tags,
+        assertions=assertions,
+        runtime=runtime,
+        grader=grader,
+    )
 
 
-def parse_dataset(content: str, fmt: str) -> list[EvalCase]:
+def parse_dataset(
+    content: str,
+    fmt: str,
+    *,
+    strict: bool = False,
+) -> list[EvalCase]:
     fmt = infer_format("", fmt)
     if len(content.encode("utf-8")) > MAX_DATASET_BYTES:
         raise EvalError("Dataset exceeds 20MB limit")
@@ -249,17 +440,23 @@ def parse_dataset(content: str, fmt: str) -> list[EvalCase]:
             if not stripped:
                 continue
             try:
-                value = json.loads(stripped)
+                value = _json_loads(stripped, strict=strict)
             except json.JSONDecodeError as exc:
                 raise EvalError(f"Invalid JSONL at line {line_no}: {exc}") from exc
+            except RecursionError as exc:
+                raise EvalError(
+                    f"JSONL nesting is too deep at line {line_no}"
+                ) from exc
             if not isinstance(value, dict):
                 raise EvalError(f"JSONL line {line_no} must be an object")
             raw_cases.append(value)
     elif fmt == "json":
         try:
-            value = json.loads(content)
+            value = _json_loads(content, strict=strict)
         except json.JSONDecodeError as exc:
             raise EvalError(f"Invalid JSON dataset: {exc}") from exc
+        except RecursionError as exc:
+            raise EvalError("JSON dataset nesting is too deep") from exc
         if isinstance(value, dict) and isinstance(value.get("cases"), list):
             raw_cases = value["cases"]
         elif isinstance(value, list):
@@ -290,7 +487,10 @@ def parse_dataset(content: str, fmt: str) -> list[EvalCase]:
                 }
             )
 
-    cases = [normalize_case(item, index) for index, item in enumerate(raw_cases)]
+    cases = [
+        normalize_case(item, index, strict=strict)
+        for index, item in enumerate(raw_cases)
+    ]
     if not cases:
         raise EvalError("Dataset contains no cases")
     if len(cases) > MAX_CASES:
@@ -328,6 +528,19 @@ def _dataset_digest(cases: list[dict[str, Any]] | list[EvalCase]) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _evaluation_digest(dataset_digest: str, pack_digest: str) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "dataset_digest": dataset_digest,
+                "scenario_pack_digest": pack_digest,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def read_dataset_cases(
@@ -385,6 +598,7 @@ def import_dataset_content(
     source: dict[str, Any] | None = None,
     storage_root: str | Path | None = None,
     owner_digest: str = "",
+    scenario_pack: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     fmt = infer_format(name, fmt)
     cases = parse_dataset(content, fmt)
@@ -408,6 +622,7 @@ def import_dataset_content(
         "size_bytes": dataset_path.stat().st_size,
         "dataset_path": str(dataset_path),
         **({"owner_digest": owner_digest} if owner_digest else {}),
+        **({"scenario_pack": scenario_pack} if scenario_pack else {}),
     }
     _write_json(target_dir / "metadata.json", metadata)
     return metadata
@@ -433,12 +648,28 @@ def import_dataset_path(
         raise EvalError("Path traversal not allowed")
     if not real_path.is_file():
         raise EvalError("Dataset file not found")
-    if real_path.stat().st_size > MAX_DATASET_BYTES:
-        raise EvalError("Dataset exceeds 20MB limit")
+    content = _read_text_file_limited(real_path)
     try:
-        content = real_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        raise EvalError("Dataset file is not valid UTF-8 text") from exc
+        scenario_pack = load_scenario_pack_for_dataset(workspace, real_path)
+    except ScenarioPackError as exc:
+        raise EvalError(str(exc)) from exc
+    if scenario_pack is not None:
+        try:
+            validate_scenario_dataset_bytes(
+                scenario_pack,
+                content.encode("utf-8"),
+            )
+            strict_cases = parse_dataset(
+                content,
+                fmt or infer_format(real_path.name),
+                strict=True,
+            )
+            validate_scenario_cases(
+                scenario_pack,
+                [case.to_dict() for case in strict_cases],
+            )
+        except ScenarioPackError as exc:
+            raise EvalError(str(exc)) from exc
     return import_dataset_content(
         workspace_root,
         name=name or real_path.name,
@@ -447,6 +678,11 @@ def import_dataset_path(
         source={"type": "path", "path": rel_path},
         storage_root=storage_root,
         owner_digest=owner_digest,
+        scenario_pack=(
+            scenario_pack.public_metadata(workspace)
+            if scenario_pack is not None
+            else None
+        ),
     )
 
 
@@ -487,10 +723,24 @@ def list_workspace_eval_datasets(workspace_root: str | Path) -> list[dict[str, A
             continue
         try:
             fmt = infer_format(path.name)
-            content = path.read_text(encoding="utf-8")
-            cases = parse_dataset(content, fmt)
+            content = _read_text_file_limited(path)
+            scenario_pack = load_scenario_pack_for_dataset(workspace_root, path)
+            cases = parse_dataset(
+                content,
+                fmt,
+                strict=scenario_pack is not None,
+            )
+            if scenario_pack is not None:
+                validate_scenario_dataset_bytes(
+                    scenario_pack,
+                    content.encode("utf-8"),
+                )
+                validate_scenario_cases(
+                    scenario_pack,
+                    [case.to_dict() for case in cases],
+                )
             stat = path.stat()
-        except (EvalError, OSError, UnicodeError):
+        except (EvalError, ScenarioPackError, OSError, UnicodeError):
             continue
         datasets.append(
             {
@@ -503,6 +753,15 @@ def list_workspace_eval_datasets(workspace_root: str | Path) -> list[dict[str, A
                 "size_bytes": stat.st_size,
                 "dataset_path": rel_path,
                 "imported": False,
+                **(
+                    {
+                        "scenario_pack": scenario_pack.public_metadata(
+                            workspace_root
+                        )
+                    }
+                    if scenario_pack is not None
+                    else {}
+                ),
             }
         )
     return datasets
@@ -670,15 +929,20 @@ def _resolve_workspace_file(workspace_root: str | Path, rel_path: str) -> Path:
 
 
 def _tool_names(result: dict[str, Any]) -> set[str]:
-    names: set[str] = set()
+    return set(_tool_call_counts(result))
+
+
+def _tool_call_counts(result: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
     for item in result.get("tool_results", []) or []:
         if not isinstance(item, dict):
             continue
         for key in ("tool_name", "name"):
             value = str(item.get(key) or "").strip()
             if value:
-                names.add(value)
-    return names
+                counts[value] = counts.get(value, 0) + 1
+                break
+    return counts
 
 
 def _nonnegative_int(value: Any) -> int | None:
@@ -702,6 +966,7 @@ def _tool_attempt_metrics(result: dict[str, Any]) -> dict[str, Any]:
     attempts = 0
     successes = 0
     failures = 0
+    recoverable_failures = 0
     unknown = 0
     policy_outcomes = {"allow": 0, "deny": 0, "require_approval": 0}
     for item in result.get("tool_results", []) or []:
@@ -714,10 +979,12 @@ def _tool_attempt_metrics(result: dict[str, Any]) -> dict[str, Any]:
             if isinstance(data, dict)
             else ""
         )
+        failed = False
         if status in {"OK", "SUCCESS"}:
             successes += 1
         elif status:
             failures += 1
+            failed = True
         else:
             unknown += 1
 
@@ -732,11 +999,21 @@ def _tool_attempt_metrics(result: dict[str, Any]) -> dict[str, Any]:
             outcome = str(raw_outcome or "").strip().lower()
             if outcome in policy_outcomes:
                 policy_outcomes[outcome] += 1
+        if (
+            failed
+            and status not in {"SKIP", "INTERRUPTED"}
+            and "deny" not in {
+                str(item or "").strip().lower()
+                for item in outcomes
+            }
+        ):
+            recoverable_failures += 1
 
     return {
         "tool_attempts": attempts,
         "successful_tool_attempts": successes,
         "failed_tool_attempts": failures,
+        "recoverable_tool_failures": recoverable_failures,
         "unknown_tool_attempts": unknown,
         "policy_outcomes": policy_outcomes,
     }
@@ -794,11 +1071,46 @@ def evaluate_assertions(
     for expected_tool in assertions.get("tool_called", []):
         if expected_tool not in called:
             failures.append(f"tool not called: {expected_tool}")
+    for forbidden_tool in assertions.get("tool_not_called", []):
+        if forbidden_tool in called:
+            failures.append(f"forbidden tool called: {forbidden_tool}")
+    call_counts = _tool_call_counts(result)
+    for tool_name, expected_count in assertions.get(
+        "tool_call_count",
+        {},
+    ).items():
+        actual_count = call_counts.get(tool_name, 0)
+        if actual_count != expected_count:
+            failures.append(
+                f"tool {tool_name} called {actual_count} times, "
+                f"expected {expected_count}"
+            )
+
+    tool_metrics = _tool_attempt_metrics(result)
+    policy_outcomes = tool_metrics["policy_outcomes"]
+    for expected_outcome in assertions.get("policy_outcome", []):
+        if int(policy_outcomes.get(expected_outcome, 0)) <= 0:
+            failures.append(f"policy outcome not observed: {expected_outcome}")
+
+    if "recovered" in assertions:
+        actual_recovery = int(tool_metrics["recoverable_tool_failures"]) > 0
+        if actual_recovery is not bool(assertions["recovered"]):
+            failures.append(
+                f"recovered {actual_recovery} does not match "
+                f"{assertions['recovered']}"
+            )
 
     for rel_path in assertions.get("file_exists", []):
         try:
             if not _resolve_workspace_file(workspace_root, rel_path).is_file():
                 failures.append(f"file does not exist: {rel_path}")
+        except EvalError as exc:
+            failures.append(str(exc))
+
+    for rel_path in assertions.get("file_not_exists", []):
+        try:
+            if _resolve_workspace_file(workspace_root, rel_path).exists():
+                failures.append(f"file unexpectedly exists: {rel_path}")
         except EvalError as exc:
             failures.append(str(exc))
 
@@ -828,6 +1140,16 @@ def evaluate_assertions(
         failures.append(
             f"duration {duration_sec:.2f}s exceeds max_duration_sec {assertions['max_duration_sec']}"
         )
+
+    if "max_total_tokens" in assertions:
+        usage = _token_usage(result)
+        if "total_tokens" not in usage:
+            failures.append("total token usage was not reported")
+        elif usage["total_tokens"] > int(assertions["max_total_tokens"]):
+            failures.append(
+                f"total tokens {usage['total_tokens']} exceeds "
+                f"max_total_tokens {assertions['max_total_tokens']}"
+            )
 
     return ("failed" if failures else "passed"), failures
 
@@ -865,18 +1187,44 @@ def _summarize_case_group(
         int(item.get("failed_tool_attempts") or 0)
         for item in case_results
     )
+    recoverable_tool_failures = sum(
+        int(
+            item.get(
+                "recoverable_tool_failures",
+                item.get("failed_tool_attempts", 0),
+            )
+            or 0
+        )
+        for item in case_results
+    )
     unknown_tool_attempts = sum(
         int(item.get("unknown_tool_attempts") or 0)
         for item in case_results
     )
     known_tool_attempts = successful_tool_attempts + failed_tool_attempts
     recovery_opportunities = sum(
-        1 for item in case_results if int(item.get("failed_tool_attempts") or 0) > 0
+        1
+        for item in case_results
+        if int(
+            item.get(
+                "recoverable_tool_failures",
+                item.get("failed_tool_attempts", 0),
+            )
+            or 0
+        )
+        > 0
     )
     recovered = sum(
         1
         for item in case_results
-        if int(item.get("failed_tool_attempts") or 0) > 0
+        if int(
+            item.get(
+                "recoverable_tool_failures",
+                item.get("failed_tool_attempts", 0),
+            )
+            or 0
+        )
+        > 0
         and item.get("status") == "passed"
     )
     policy_outcomes = {"allow": 0, "deny": 0, "require_approval": 0}
@@ -918,6 +1266,7 @@ def _summarize_case_group(
         ),
         "successful_tool_attempts": successful_tool_attempts,
         "failed_tool_attempts": failed_tool_attempts,
+        "recoverable_tool_failures": recoverable_tool_failures,
         "unknown_tool_attempts": unknown_tool_attempts,
         "recovery_opportunities": recovery_opportunities,
         "recovered": recovered,
@@ -995,13 +1344,22 @@ def create_eval_run(
         cases = cases[:case_limit]
     now = utc_timestamp()
     run_id = f"run-{int(now)}-{uuid.uuid4().hex[:8]}"
+    dataset_digest = _dataset_digest(cases)
+    raw_pack = metadata.get("scenario_pack")
+    scenario_pack = dict(raw_pack) if isinstance(raw_pack, dict) else {}
+    pack_digest = str(scenario_pack.get("pack_digest") or "")
+    if pack_digest and (
+        len(pack_digest) != 64
+        or any(character not in "0123456789abcdef" for character in pack_digest)
+    ):
+        raise EvalError("Scenario pack digest is invalid")
     result = {
         "version": RUN_RESULT_VERSION,
         "id": run_id,
         "workspace": workspace,
         "dataset_id": dataset_id,
         "dataset_name": metadata.get("name", dataset_id),
-        "dataset_digest": _dataset_digest(cases),
+        "dataset_digest": dataset_digest,
         "dataset_source_digest": str(metadata.get("content_sha256") or ""),
         "dataset_case_count": len(cases),
         "dataset_schema_version": int(
@@ -1016,6 +1374,17 @@ def create_eval_run(
         "summary": summarize_cases([], total=len(cases)),
         "cases": [],
         "error": "",
+        **(
+            {
+                "scenario_pack": scenario_pack,
+                "evaluation_digest": _evaluation_digest(
+                    dataset_digest,
+                    pack_digest,
+                ),
+            }
+            if scenario_pack
+            else {}
+        ),
         **({"owner_digest": owner_digest} if owner_digest else {}),
     }
     _write_json(
@@ -1088,6 +1457,8 @@ def list_eval_runs(
                         "dataset_source_digest",
                         "dataset_schema_version",
                         "dataset_case_count",
+                        "scenario_pack",
+                        "evaluation_digest",
                         "agent",
                         "status",
                         "created_at",
@@ -1106,6 +1477,34 @@ def list_eval_runs(
 
 
 AgentFactory = Callable[[], Any]
+CaseAgentFactory = Callable[[EvalCaseRuntime], Any]
+
+
+def _scenario_pack_for_run(
+    workspace_root: str | Path,
+    metadata: dict[str, Any],
+) -> ScenarioPack | None:
+    raw_pack = metadata.get("scenario_pack")
+    if not isinstance(raw_pack, dict):
+        return None
+    source = metadata.get("source")
+    source_path = (
+        str(source.get("path") or "").strip()
+        if isinstance(source, dict)
+        else ""
+    )
+    if not source_path:
+        raise EvalError("Scenario pack source path is missing")
+    try:
+        dataset_path = _resolve_workspace_file(workspace_root, source_path)
+        pack = load_scenario_pack_for_dataset(workspace_root, dataset_path)
+    except ScenarioPackError as exc:
+        raise EvalError(str(exc)) from exc
+    if pack is None:
+        raise EvalError("Scenario pack manifest is missing")
+    if pack.pack_digest != str(raw_pack.get("pack_digest") or ""):
+        raise EvalError("Scenario pack changed after dataset import")
+    return pack
 
 
 def _stop_eval_agent_on_cancel(
@@ -1130,6 +1529,7 @@ def execute_eval_run(
     run_id: str,
     *,
     agent_factory: AgentFactory,
+    case_agent_factory: CaseAgentFactory | None = None,
     cancel_event: threading.Event | None = None,
     storage_root: str | Path | None = None,
     redact_errors: bool = False,
@@ -1141,6 +1541,11 @@ def execute_eval_run(
         storage_root=storage_root,
     )
     dataset_id = str(result.get("dataset_id") or "")
+    metadata = read_dataset_metadata(
+        workspace_root,
+        dataset_id,
+        storage_root=storage_root,
+    )
     cases = read_dataset_cases(
         workspace_root,
         dataset_id,
@@ -1157,6 +1562,9 @@ def execute_eval_run(
 
     case_results: list[dict[str, Any]] = []
     try:
+        scenario_pack = _scenario_pack_for_run(workspace_root, metadata)
+        if scenario_pack is not None and case_agent_factory is None:
+            raise EvalError("Scenario pack requires an isolated case agent factory")
         for case in cases:
             if cancel_event.is_set():
                 result["status"] = "canceled"
@@ -1165,9 +1573,25 @@ def execute_eval_run(
             agent = None
             cancel_watcher: threading.Thread | None = None
             case_finished = threading.Event()
+            case_runtime: EvalCaseRuntime | None = None
+            assertion_workspace = str(workspace_root)
+            cleanup_failure = ""
             raw_result: dict[str, Any]
             try:
-                agent = agent_factory()
+                if scenario_pack is not None:
+                    case_runtime = prepare_case_workspace(
+                        scenario_pack,
+                        case,
+                        runs_root(
+                            workspace_root,
+                            storage_root=storage_root,
+                        )
+                        / run_id,
+                    )
+                    assertion_workspace = case_runtime.workspace_root
+                    agent = case_agent_factory(case_runtime)
+                else:
+                    agent = agent_factory()
                 cancel_watcher = threading.Thread(
                     target=_stop_eval_agent_on_cancel,
                     args=(cancel_event, case_finished, agent),
@@ -1181,7 +1605,7 @@ def execute_eval_run(
                 status, failures = evaluate_assertions(
                     case,
                     raw_result,
-                    workspace_root=workspace_root,
+                    workspace_root=assertion_workspace,
                     duration_sec=duration_sec,
                 )
             except Exception as exc:  # noqa: BLE001 - eval records per-case errors without killing the server.
@@ -1201,6 +1625,19 @@ def execute_eval_run(
                         agent.close()
                     except Exception:
                         pass
+                if case_runtime is not None:
+                    try:
+                        cleanup_case_workspace(case_runtime)
+                    except (OSError, ScenarioPackError) as exc:
+                        cleanup_failure = (
+                            "scenario workspace cleanup failed"
+                            if redact_errors
+                            else str(exc)
+                        )
+
+            if cleanup_failure:
+                status = "error"
+                failures.append(cleanup_failure)
 
             response = str(raw_result.get("response") or "")
             tool_metrics = _tool_attempt_metrics(raw_result)
@@ -1217,7 +1654,7 @@ def execute_eval_run(
                 **tool_metrics,
                 "recovered": (
                     status == "passed"
-                    and int(tool_metrics["failed_tool_attempts"]) > 0
+                    and int(tool_metrics["recoverable_tool_failures"]) > 0
                 ),
                 "token_usage": _token_usage(raw_result),
                 "failures": failures,

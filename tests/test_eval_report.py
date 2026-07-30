@@ -25,8 +25,9 @@ def _run(
     pass_rate: float = 0.9,
     error_rate: float = 0.0,
     p95_duration: float = 10.0,
+    evaluation_digest: str = "",
 ) -> dict:
-    return {
+    result = {
         "version": 2,
         "id": run_id,
         "dataset_id": dataset_id,
@@ -48,6 +49,9 @@ def _run(
             }
         ],
     }
+    if evaluation_digest:
+        result["evaluation_digest"] = evaluation_digest
+    return result
 
 
 def _budget() -> dict:
@@ -120,6 +124,20 @@ class EvalRegressionReportTests(unittest.TestCase):
                 "dataset_compatibility"
             ]["passed"]
         )
+
+    def test_scenario_pack_digest_takes_precedence_over_dataset_digest(self) -> None:
+        current = _run("current", evaluation_digest="b" * 64)
+        baseline = _run("baseline", evaluation_digest="c" * 64)
+        report = build_regression_report(current, baseline, _budget())
+        self.assertFalse(report["dataset_compatibility"]["passed"])
+        self.assertEqual(
+            report["dataset_compatibility"]["mode"],
+            "evaluation_digest",
+        )
+
+        baseline["evaluation_digest"] = "b" * 64
+        report = build_regression_report(current, baseline, _budget())
+        self.assertTrue(report["dataset_compatibility"]["passed"])
         baseline = _run("baseline", digest="a" * 64)
         self.assertFalse(
             build_regression_report(current, baseline, _budget())[

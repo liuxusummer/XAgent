@@ -89,6 +89,10 @@ def _run_identity(run: dict[str, Any]) -> dict[str, str]:
             run.get("dataset_digest"),
             "dataset digest",
         ),
+        "evaluation_digest": _optional_digest(
+            run.get("evaluation_digest"),
+            "evaluation digest",
+        ),
         "agent": _optional_bounded_text(run.get("agent"), "agent"),
     }
 
@@ -97,6 +101,15 @@ def _dataset_compatibility(
     current: dict[str, Any],
     baseline: dict[str, Any],
 ) -> tuple[bool, str]:
+    current_evaluation = str(current.get("evaluation_digest") or "")
+    baseline_evaluation = str(baseline.get("evaluation_digest") or "")
+    if current_evaluation and baseline_evaluation:
+        return (
+            current_evaluation == baseline_evaluation,
+            "evaluation_digest",
+        )
+    if current_evaluation or baseline_evaluation:
+        return False, "mixed_evaluation_identity_unverifiable"
     current_digest = str(current.get("dataset_digest") or "")
     baseline_digest = str(baseline.get("dataset_digest") or "")
     if current_digest and baseline_digest:

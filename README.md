@@ -544,7 +544,8 @@ npm run lint
 - 📦 reproducible packaging, upgrades, and showcase workflows
 
 See the evidence-driven [Agent Platform Roadmap](docs/agent-platform-roadmap.md)
-and the offline [Eval regression gate contract](docs/eval-regression-gates.md).
+along with the [versioned scenario-pack contract](docs/eval-scenario-packs.md)
+and offline [Eval regression gate contract](docs/eval-regression-gates.md).
 
 ---
 

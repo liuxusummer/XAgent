@@ -390,7 +390,21 @@ export interface EvalDataset {
   size_bytes: number;
   dataset_path: string;
   imported?: boolean;
+  scenario_pack?: EvalScenarioPack;
   cases?: EvalCase[];
+}
+
+export interface EvalScenarioPack {
+  schema_version: number;
+  id: string;
+  name: string;
+  version: string;
+  source_dir: string;
+  dataset_file: string;
+  pack_digest: string;
+  fixture_files: number;
+  fixture_bytes: number;
+  isolation: 'case_workspace' | string;
 }
 
 export interface EvalCase {
@@ -399,6 +413,13 @@ export interface EvalCase {
   task: string;
   tags: string[];
   assertions: Record<string, unknown>;
+  runtime?: {
+    fixture?: string;
+    scopes?: string[];
+  };
+  grader?: {
+    type: 'deterministic' | string;
+  };
 }
 
 export interface EvalRunSummary {
@@ -417,6 +438,7 @@ export interface EvalRunSummary {
   avg_tool_attempts?: number;
   successful_tool_attempts?: number;
   failed_tool_attempts?: number;
+  recoverable_tool_failures?: number;
   unknown_tool_attempts?: number;
   tool_success_rate?: number;
   recovery_opportunities?: number;
@@ -443,6 +465,7 @@ export interface EvalCaseResult {
   tool_attempts?: number;
   successful_tool_attempts?: number;
   failed_tool_attempts?: number;
+  recoverable_tool_failures?: number;
   unknown_tool_attempts?: number;
   recovered?: boolean;
   policy_outcomes?: Record<'allow' | 'deny' | 'require_approval', number>;
@@ -461,6 +484,8 @@ export interface EvalRunResult {
   dataset_source_digest?: string;
   dataset_schema_version?: number;
   dataset_case_count?: number;
+  scenario_pack?: EvalScenarioPack;
+  evaluation_digest?: string;
   agent: string;
   status: 'pending' | 'running' | 'canceling' | 'canceled' | 'completed' | 'error' | string;
   created_at: number;

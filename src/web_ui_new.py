@@ -20,7 +20,7 @@ import time
 import urllib.parse
 import uuid
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -75,6 +75,11 @@ from src.core.eval import (
     list_eval_runs,
     read_eval_run,
     write_eval_run,
+)
+from src.core.eval_scenarios import (
+    SCENARIO_PACK_V1_SCOPES,
+    SCENARIO_PACK_V1_TOOLS,
+    EvalCaseRuntime,
 )
 from src.main import build_agent, build_team_step_runner, load_observability_config
 from src.tools.file_index import get_file_index_stats, refresh_file_index, search_file_index
@@ -5052,20 +5057,80 @@ def _eval_agent_factory(
 ):
     runtime_config = runtime_config or {}
 
-    def _factory():
+    def _intersect_allowlist(
+        configured: Any,
+        requested: tuple[str, ...],
+    ) -> list[str]:
+        if configured is None:
+            return list(requested)
+        configured_names = {
+            str(item).strip()
+            for item in configured
+            if str(item).strip()
+        }
+        return [name for name in requested if name in configured_names]
+
+    def _factory(case_runtime: EvalCaseRuntime | None = None):
+        effective_workspace = ws_root
+        effective_principal = principal_template
+        effective_tools = runtime_config.get("tools_allowlist")
+        effective_skills = runtime_config.get("skill_allowlist")
+        effective_memory_mode = str(runtime_config.get("memory_mode", "project"))
+        effective_max_turns = runtime_config.get("max_turns")
+        if case_runtime is not None:
+            if not set(case_runtime.scopes).issubset(
+                SCENARIO_PACK_V1_SCOPES
+            ):
+                raise EvalError("Scenario pack contains a non-isolated scope")
+            if not set(case_runtime.tools_allowlist).issubset(
+                SCENARIO_PACK_V1_TOOLS
+            ):
+                raise EvalError("Scenario pack contains a non-isolated tool")
+            if not isinstance(principal_template, Principal):
+                raise EvalError(
+                    "Scenario pack execution requires an authenticated principal"
+                )
+            if not set(case_runtime.scopes).issubset(
+                set(principal_template.scopes)
+            ):
+                raise EvalError(
+                    "Scenario pack scopes exceed the caller principal"
+                )
+            effective_workspace = case_runtime.workspace_root
+            effective_principal = replace(
+                principal_template,
+                scopes=case_runtime.scopes,
+            )
+            effective_tools = _intersect_allowlist(
+                effective_tools,
+                case_runtime.tools_allowlist,
+            )
+            effective_skills = _intersect_allowlist(
+                effective_skills,
+                case_runtime.skill_allowlist,
+            )
+            effective_memory_mode = case_runtime.memory_mode
+            configured_max_turns = runtime_config.get("max_turns")
+            effective_max_turns = (
+                min(case_runtime.max_turns, int(configured_max_turns))
+                if isinstance(configured_max_turns, int)
+                and not isinstance(configured_max_turns, bool)
+                and configured_max_turns > 0
+                else case_runtime.max_turns
+            )
         agent = build_agent(
             config_path=config_path or None,
             observability_config_path=observability_config_path or None,
-            workspace_dir=ws_root,
+            workspace_dir=effective_workspace,
             agent_name=agent_name,
             agent_prompt=str(runtime_config.get("agent_prompt", "")),
             agent_soul=str(runtime_config.get("agent_soul", "")),
-            tools_allowlist=runtime_config.get("tools_allowlist"),
-            skill_allowlist=runtime_config.get("skill_allowlist"),
+            tools_allowlist=effective_tools,
+            skill_allowlist=effective_skills,
             model_override=str(runtime_config.get("model_override", "")),
-            max_turns=runtime_config.get("max_turns"),
-            memory_mode=str(runtime_config.get("memory_mode", "project")),
-            principal=principal_template,
+            max_turns=effective_max_turns,
+            memory_mode=effective_memory_mode,
+            principal=effective_principal,
         )
         if hasattr(agent, "handler") and hasattr(agent.handler, "ctx"):
             agent.handler.ctx.verbose = True
@@ -5089,7 +5154,8 @@ def _run_eval_background(
         execute_eval_run(
             ws_root,
             run_id,
-            agent_factory=agent_factory,
+            agent_factory=lambda: agent_factory(None),
+            case_agent_factory=agent_factory,
             cancel_event=cancel_event,
             storage_root=storage_root,
             redact_errors=redact_errors,

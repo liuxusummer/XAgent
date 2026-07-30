@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "id": "core-capabilities",
+  "name": "XAgent Core Capability Scenarios",
+  "version": "1.0.0",
+  "dataset_file": "cases.jsonl",
+  "fixtures_dir": "fixtures",
+  "default_scopes": [
+    "workspace.read"
+  ],
+  "tools_allowlist": [
+    "file_read",
+    "file_search",
+    "file_write"
+  ],
+  "skill_allowlist": [],
+  "memory_mode": "none",
+  "max_turns": 8
+}

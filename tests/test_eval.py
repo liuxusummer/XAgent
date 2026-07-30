@@ -120,6 +120,22 @@ class EvalDatasetTests(unittest.TestCase):
         )
         self.assertEqual(cases[0].tags, ["recovery"])
 
+    def test_strict_pack_parsing_rejects_unknown_case_and_assertion_fields(self) -> None:
+        invalid_cases = [
+            '[{"task":"bad","unexpected":true}]',
+            '[{"task":"bad","assertions":{"tool_callled":["file_read"]}}]',
+            '[{"task":"bad","assertions":{"tool_call_count":{"file_read":-1}}}]',
+            '{"task":"bad","task":"overridden"}\n',
+            '{"task":"bad","assertions":{"max_duration_sec":NaN}}\n',
+        ]
+        for content in invalid_cases:
+            with self.subTest(content=content), self.assertRaises(EvalError):
+                parse_dataset(
+                    content,
+                    "jsonl" if content.endswith("\n") else "json",
+                    strict=True,
+                )
+
     def test_import_path_stays_inside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -262,6 +278,8 @@ class EvalAssertionTests(unittest.TestCase):
                     "not_contains": ["forbidden"],
                     "exit_reason": ["CURRENT_TASK_DONE"],
                     "tool_called": ["file_read"],
+                    "tool_call_count": {"file_read": 1},
+                    "tool_not_called": ["file_write"],
                     "file_exists": ["business/answer.txt"],
                     "file_contains": {"business/answer.txt": "saved"},
                     "max_turns": 5,
@@ -279,6 +297,19 @@ class EvalAssertionTests(unittest.TestCase):
 
             self.assertEqual(status, "passed")
             self.assertEqual(failures, [])
+
+            result["tool_results"].append({"tool_name": "file_read"})
+            status, failures = evaluate_assertions(
+                case,
+                result,
+                workspace_root=root,
+                duration_sec=0.1,
+            )
+            self.assertEqual(status, "failed")
+            self.assertIn(
+                "tool file_read called 2 times, expected 1",
+                failures,
+            )
 
     def test_assertions_report_failures(self) -> None:
         case = {
@@ -590,7 +621,8 @@ class EvalRunTests(unittest.TestCase):
             self.assertTrue(result["cases"][0]["recovered"])
             self.assertEqual(result["summary"]["tool_attempts"], 3)
             self.assertAlmostEqual(result["summary"]["tool_success_rate"], 1 / 3)
-            self.assertEqual(result["summary"]["recovery_rate"], 0.5)
+            self.assertEqual(result["summary"]["recovery_opportunities"], 1)
+            self.assertEqual(result["summary"]["recovery_rate"], 1)
             self.assertEqual(
                 result["summary"]["policy_outcomes"],
                 {"allow": 2, "deny": 1, "require_approval": 1},

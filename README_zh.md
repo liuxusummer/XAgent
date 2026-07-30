@@ -481,6 +481,7 @@ npm run lint
 - 📦 可复现的打包、升级与 showcase 流程
 
 详见证据驱动的 [Agent Platform Roadmap](docs/agent-platform-roadmap.md)
+、[版本化场景包契约](docs/eval-scenario-packs.md)
 与离线 [Eval 回归门禁契约](docs/eval-regression-gates.md)。
 
 ---

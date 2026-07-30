@@ -69,7 +69,10 @@ Foundation delivered: Eval result schema v2 records dataset-subset digests,
 tagged capability metrics, tool recovery, policy decisions, and token coverage.
 `python -m src.eval_report` compares completed runs against an explicit,
 versioned regression budget without emitting prompts or tool payloads. Scenario
-pack coverage remains the next Phase 1 increment.
+pack v1 now adds per-case workspaces, content-bound fixtures, Principal scope
+narrowing, and initial tool-selection, recovery, and permission-denial cases.
+Retrieval grounding, memory-poisoning resistance, and context-pressure packs
+remain the next Phase 1 increments.
 
 ### Phase 2 — Retrieval and context quality
 

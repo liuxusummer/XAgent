@@ -574,6 +574,11 @@ export function EvalPanel({ workspace, configPath = '', observabilityConfigPath 
                             }`}>
                               {isWorkspaceDataset(dataset) ? 'workspace' : 'imported'}
                             </span>
+                            {dataset.scenario_pack && (
+                              <span className="rounded-full bg-status-warning/10 px-1.5 py-0.5 text-[10px] text-status-warning">
+                                pack v{dataset.scenario_pack.version}
+                              </span>
+                            )}
                             <span className="text-[11px] text-text-muted bg-bg-tertiary px-2 py-0.5 rounded-full">
                               {dataset.case_count} cases
                             </span>
@@ -739,6 +744,14 @@ export function EvalPanel({ workspace, configPath = '', observabilityConfigPath 
                           <>
                             <span>·</span>
                             <span className="truncate">{workspaceDatasetPath(selectedDataset)}</span>
+                          </>
+                        )}
+                        {selectedDataset.scenario_pack && (
+                          <>
+                            <span>·</span>
+                            <span>
+                              isolated pack v{selectedDataset.scenario_pack.version}
+                            </span>
                           </>
                         )}
                       </div>

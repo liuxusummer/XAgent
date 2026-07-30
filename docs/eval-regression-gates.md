@@ -72,9 +72,11 @@ turns, and add:
   tokens over cases that reported a total;
 - the same metrics grouped by scenario tag.
 
-A recovery opportunity is a case with at least one non-success tool result. It
-counts as recovered only when the case ultimately passes. Token coverage makes
-missing provider usage data visible instead of treating it as measured zero.
+A recovery opportunity is a case with at least one recoverable tool failure.
+Policy denial, user rejection (`SKIP`), and interruption are excluded because
+successfully respecting a boundary is not error recovery. An opportunity counts
+as recovered only when the case ultimately passes. Token coverage makes missing
+provider usage data visible instead of treating it as measured zero.
 
 The gate is deterministic and offline. Running the agent remains a separate,
 potentially model-dependent step; the comparison command never calls an LLM or
