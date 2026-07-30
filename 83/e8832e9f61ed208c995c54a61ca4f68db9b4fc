@@ -1,0 +1,29 @@
+docs/tool-layer.md
+  s_72af05a5dabd4c::t_43695b3e25926e 61-64
+src/core/safe_fs.py
+  s_72af05a5dabd4c::t_1b0052b5335949 1,11,44-101,123,131-135,139,147-148,222-467,469-470,476,479,483
+src/core/workspace_storage.py
+  s_72af05a5dabd4c::t_90be9df29514f3 12-13,48-55,57-61,68,71-74,84-97,101-102,106
+src/tools/file_ops.py
+  s_72af05a5dabd4c::t_705b556fdf4893 15,19,21,276-277,281-287,290-296,305-310,347-348,366-372,390-411,414-419
+tests/test_file_ops.py
+  s_72af05a5dabd4c::t_33b8a05940ead1 3,10-15,195-406,628-696
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "83e8832e9f61ed208c995c54a61ca4f68db9b4fc",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
