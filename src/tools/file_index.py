@@ -23,7 +23,15 @@ from src.core.agent_kernel import (
     Principal,
     TrustLevel,
 )
-from src.core.retrieval import EvidenceBundle, EvidenceItem
+from src.core.retrieval import (
+    QUERY_TOKEN_PATTERN,
+    RERANK_VERSION,
+    EvidenceBundle,
+    EvidenceItem,
+    QueryPlan,
+    build_query_plan,
+    deterministic_rerank,
+)
 from src.core.safe_fs import (
     FileChangedDuringReadError,
     FileSizeLimitExceededError,
@@ -52,7 +60,6 @@ DEFAULT_EXCLUDE_GLOBS = (
 )
 DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024
 SNIPPET_CONTEXT_CHARS = 80
-QUERY_TOKEN_PATTERN = re.compile(r"[\w\u4e00-\u9fff]+", re.UNICODE)
 SYMBOL_QUERY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:[.:/][A-Za-z0-9_]+)*")
 SCHEMA_VERSION = "4"
 MIGRATABLE_SCHEMA_VERSIONS = {"1", "2", "3", SCHEMA_VERSION}
@@ -357,9 +364,16 @@ def search_file_index(
             "reason_code": "principal_scope_missing",
             "matches": [],
         }
-    query = str(query or "").strip()
-    if not query:
-        return {"status": "ERROR", "error": "query is required"}
+    try:
+        query_plan = build_query_plan(query)
+    except (TypeError, ValueError) as exc:
+        return {
+            "status": "ERROR",
+            "error": str(exc),
+            "reason_code": "invalid_query",
+            "matches": [],
+        }
+    query = query_plan.normalized_query
     mode = str(mode or "hybrid").strip().lower()
     if mode not in SUPPORTED_SEARCH_MODES:
         return {"status": "ERROR", "error": f"invalid search mode: {mode}"}
@@ -412,8 +426,13 @@ def search_file_index(
             keyword_matches: list[dict[str, Any]] = []
             semantic_matches: list[dict[str, Any]] = []
             if mode in {"keyword", "hybrid"}:
-                keyword_matches = _path_matches(conn, query, root_prefix, limit)
-                keyword_matches.extend(_content_matches(conn, query, root_prefix, limit))
+                keyword_matches = _keyword_matches(
+                    conn,
+                    query_plan,
+                    root_prefix,
+                    limit,
+                    path_only=path_only,
+                )
             if mode in {"semantic", "hybrid"}:
                 semantic_matches, semantic_status = _semantic_matches(
                     conn,
@@ -424,18 +443,39 @@ def search_file_index(
                     embedding_provider,
                 )
             if mode == "semantic":
-                deduped = _dedupe_chunk_matches(semantic_matches, query, limit)
+                candidates = _dedupe_chunk_matches(
+                    semantic_matches,
+                    query,
+                    limit * DEFAULT_SEMANTIC_OVERFETCH,
+                )
             elif mode == "hybrid":
-                deduped = _hybrid_matches(keyword_matches, semantic_matches, query, limit)
+                candidates = _hybrid_matches(
+                    keyword_matches,
+                    semantic_matches,
+                    query,
+                    limit * DEFAULT_SEMANTIC_OVERFETCH,
+                )
             else:
-                deduped = _dedupe_matches(keyword_matches, query, limit)
-            deduped, evidence_bundle = _attach_evidence(
+                candidates = _dedupe_matches(
+                    keyword_matches,
+                    query,
+                    limit * DEFAULT_SEMANTIC_OVERFETCH,
+                )
+            reranked = deterministic_rerank(
+                candidates,
+                query_plan,
+                mode=mode,
+                limit=min(limit * DEFAULT_SEMANTIC_OVERFETCH, 500),
+            )
+            deduped, evidence_bundle, stale_rejected = _attach_evidence(
                 conn,
-                deduped,
+                reranked,
                 query=query,
                 principal=principal,
                 acl=acl,
                 index_version=index_version,
+                workspace=workspace,
+                limit=limit,
             )
             index_stats = _index_stats(conn, root_prefix)
     except (PermissionError, ValueError) as exc:
@@ -449,9 +489,35 @@ def search_file_index(
     except sqlite3.Error as exc:
         return {"status": "ERROR", "error": f"index database error: {exc}", "index_path": str(db_path)}
 
+    covered_terms = {
+        term.casefold()
+        for match in deduped
+        for term in match.get("ranking_signals", {}).get("matched_terms", [])
+        if isinstance(term, str)
+    }
+    query_term_count = len(query_plan.terms)
+    retrieval_diagnostics = {
+        "version": 1,
+        "query_plan_digest": query_plan.digest,
+        "rerank_version": RERANK_VERSION,
+        "keyword_candidates": len(keyword_matches),
+        "semantic_candidates": len(semantic_matches),
+        "fused_candidates": len(candidates),
+        "returned_matches": len(deduped),
+        "stale_rejected": stale_rejected,
+        "query_terms": query_term_count,
+        "covered_query_terms": len(covered_terms),
+        "query_term_coverage": (
+            len(covered_terms) / query_term_count
+            if query_term_count
+            else 0.0
+        ),
+        "evidence_binding_coverage": 1.0 if deduped else 0.0,
+    }
     return {
         "status": "OK",
         "query": query,
+        "query_plan": query_plan.to_dict(),
         "root": root_prefix,
         "mode": mode,
         "refreshed": refreshed,
@@ -461,6 +527,7 @@ def search_file_index(
         "index_version": index_version,
         "evidence_bundle": evidence_bundle.to_dict(),
         "evidence_bundle_digest": evidence_bundle.bundle_digest,
+        "retrieval_diagnostics": retrieval_diagnostics,
         "matches": deduped,
     }
 
@@ -872,6 +939,41 @@ def _delete_chunks(conn: sqlite3.Connection, path: str) -> None:
     conn.execute("DELETE FROM file_index_chunks WHERE path = ?", (path,))
 
 
+def _keyword_matches(
+    conn: sqlite3.Connection,
+    query_plan: QueryPlan,
+    root: str,
+    limit: int,
+    *,
+    path_only: bool,
+) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    component_limit = max(1, limit * DEFAULT_SEMANTIC_OVERFETCH)
+    for component_index, component in enumerate(query_plan.components):
+        component_matches = _path_matches(
+            conn,
+            component,
+            root,
+            component_limit,
+        )
+        if not path_only:
+            component_matches.extend(
+                _content_matches(
+                    conn,
+                    component,
+                    root,
+                    component_limit,
+                )
+            )
+        for component_rank, match in enumerate(component_matches, start=1):
+            annotated = dict(match)
+            annotated["query_component"] = component
+            annotated["query_component_index"] = component_index
+            annotated["query_component_rank"] = component_rank
+            matches.append(annotated)
+    return matches
+
+
 def _path_matches(conn: sqlite3.Connection, query: str, root: str, limit: int) -> list[dict[str, Any]]:
     like = f"%{_escape_like(query.lower())}%"
     root_sql, root_params = _root_sql_filter(root, "path")
@@ -981,14 +1083,16 @@ def _attach_evidence(
     principal: Principal,
     acl: tuple[str, ...],
     index_version: str,
-) -> tuple[list[dict[str, Any]], EvidenceBundle]:
+    workspace: Path,
+    limit: int,
+) -> tuple[list[dict[str, Any]], EvidenceBundle, int]:
     paths = tuple(sorted({str(match.get("path", "")) for match in matches if match.get("path")}))
-    metadata: dict[str, tuple[str, float, str]] = {}
+    metadata: dict[str, tuple[str, float, str, int]] = {}
     if paths:
         placeholders = ",".join("?" for _ in paths)
         rows = conn.execute(
             (
-                "SELECT path, content_sha256, indexed_at, content "
+                "SELECT path, content_sha256, indexed_at, content, size_bytes "
                 f"FROM file_index_files WHERE path IN ({placeholders})"
             ),
             paths,
@@ -998,18 +1102,21 @@ def _attach_evidence(
                 str(content_sha256),
                 float(indexed_at),
                 str(content),
+                int(size_bytes),
             )
-            for path, content_sha256, indexed_at, content in rows
+            for path, content_sha256, indexed_at, content, size_bytes in rows
         }
 
     authorized_matches: list[dict[str, Any]] = []
     evidence_items: list[EvidenceItem] = []
+    live_content: dict[str, bool] = {}
+    stale_rejected = 0
     for match in matches:
         path = str(match.get("path", ""))
         file_metadata = metadata.get(path)
         if file_metadata is None:
             continue
-        content_sha256, indexed_at, indexed_content = file_metadata
+        content_sha256, indexed_at, indexed_content, indexed_size = file_metadata
         if (
             len(content_sha256) != 64
             or any(character not in "0123456789abcdef" for character in content_sha256)
@@ -1020,6 +1127,18 @@ def _attach_evidence(
             != content_sha256
         ):
             raise PermissionError("file index content integrity check failed")
+        is_current = live_content.get(path)
+        if is_current is None:
+            is_current = _live_file_matches_index(
+                workspace,
+                path,
+                content_sha256=content_sha256,
+                indexed_size=indexed_size,
+            )
+            live_content[path] = is_current
+        if not is_current:
+            stale_rejected += 1
+            continue
         path_sha256 = hashlib.sha256(path.encode("utf-8")).hexdigest()
         knowledge = KnowledgeItem(
             item_id=f"file-{path_sha256[:24]}-{content_sha256[:24]}",
@@ -1063,13 +1182,51 @@ def _attach_evidence(
         )
         authorized_matches.append(enriched)
         evidence_items.append(evidence)
+        if len(authorized_matches) >= limit:
+            break
     bundle = EvidenceBundle.build(
         query=query,
         principal=principal,
         index_version=index_version,
         items=evidence_items,
     )
-    return authorized_matches, bundle
+    return authorized_matches, bundle, stale_rejected
+
+
+def _live_file_matches_index(
+    workspace: Path,
+    relative_path: str,
+    *,
+    content_sha256: str,
+    indexed_size: int,
+) -> bool:
+    file_descriptor: int | None = None
+    try:
+        file_descriptor, initial_stat = open_regular_file_beneath(
+            workspace,
+            relative_path,
+        )
+        if initial_stat.st_size != indexed_size:
+            return False
+        content = read_stable_text(
+            file_descriptor,
+            initial_stat,
+            max_bytes=max(1, indexed_size),
+        )
+        return hashlib.sha256(content.encode("utf-8")).hexdigest() == content_sha256
+    except (
+        FileChangedDuringReadError,
+        FileNotFoundError,
+        FileSizeLimitExceededError,
+        OSError,
+        UnicodeDecodeError,
+        UnsafeFileContentError,
+        ValueError,
+    ):
+        return False
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
 
 
 def _match_priority(match: dict[str, Any], query: str) -> tuple[float, int]:

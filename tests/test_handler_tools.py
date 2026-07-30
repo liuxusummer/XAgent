@@ -217,6 +217,7 @@ class HandlerToolStreamingTests(unittest.TestCase):
             self.assertEqual(result.data["status"], "OK")
             self.assertEqual(result.data["matches"][0]["path"], "target.txt")
             self.assertIn("file_read", result.next_prompt or "")
+            self.assertIn("evidence_id", result.next_prompt or "")
 
     def test_exec_skill_activate_updates_active_skills(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

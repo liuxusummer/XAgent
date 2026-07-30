@@ -211,10 +211,10 @@ class ScenarioPackContractTests(unittest.TestCase):
             )
 
             self.assertEqual(metadata["case_count"], 6)
-            self.assertEqual(
-                metadata["scenario_pack"]["version"],
-                "1.1.0",
-            )
+        self.assertEqual(
+            metadata["scenario_pack"]["version"],
+            "1.2.0",
+        )
 
     def test_case_workspace_is_isolated_and_cleanup_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

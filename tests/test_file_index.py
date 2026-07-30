@@ -362,6 +362,61 @@ class FileIndexTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "OK")
 
+    def test_query_plan_is_bounded_and_rejects_invalid_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sample.txt").write_text("alpha beta\n", encoding="utf-8")
+
+            results = (
+                search_file_index(query="a" * 4097, cwd=str(root)),
+                search_file_index(query="\ud800", cwd=str(root)),
+                _search_file_index(
+                    query=object(),
+                    cwd=str(root),
+                    principal=_TEST_PRINCIPAL,
+                ),
+            )
+
+            for result in results:
+                self.assertEqual(result["status"], "ERROR")
+                self.assertEqual(result["reason_code"], "invalid_query")
+                self.assertEqual(result["matches"], [])
+            self.assertFalse(
+                (root / "runtime" / "file_index.sqlite3").exists()
+            )
+
+    def test_path_only_query_decomposition_does_not_search_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "authentication-guide.md").write_text(
+                "unrelated prose\n",
+                encoding="utf-8",
+            )
+            (root / "notes.md").write_text(
+                "authentication flow\n",
+                encoding="utf-8",
+            )
+
+            result = search_file_index(
+                query="authentication flow",
+                cwd=str(root),
+                path_only=True,
+            )
+
+            self.assertEqual(result["status"], "OK")
+            self.assertEqual(
+                [match["path"] for match in result["matches"]],
+                ["authentication-guide.md"],
+            )
+            self.assertEqual(
+                result["query_plan"]["components"],
+                ["authentication flow", "authentication", "flow"],
+            )
+            self.assertEqual(
+                result["retrieval_diagnostics"]["query_plan_digest"],
+                result["query_plan"]["digest"],
+            )
+
     def test_search_root_filters_results_before_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -419,7 +474,11 @@ class FileIndexTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "OK")
             self.assertEqual([match["path"] for match in result["matches"]], ["auth.md", "auth.md"])
-            self.assertEqual([match["start_line"] for match in result["matches"]], [1, 3])
+            self.assertEqual([match["start_line"] for match in result["matches"]], [3, 1])
+            self.assertGreater(
+                result["matches"][0]["ranking_signals"]["term_coverage"],
+                result["matches"][1]["ranking_signals"]["term_coverage"],
+            )
 
     def test_hybrid_search_merges_keyword_and_semantic_matches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -607,6 +666,104 @@ class FileIndexTests(unittest.TestCase):
             self.assertEqual(
                 bundle["items"][0]["knowledge"]["acl"],
                 ["tenant:tenant-test"],
+            )
+            diagnostics = result["retrieval_diagnostics"]
+            self.assertEqual(diagnostics["returned_matches"], 1)
+            self.assertEqual(diagnostics["stale_rejected"], 0)
+            self.assertEqual(
+                diagnostics["evidence_binding_coverage"],
+                1.0,
+            )
+            self.assertEqual(diagnostics["query_term_coverage"], 1.0)
+            self.assertEqual(
+                match["ranking_signals"]["matched_terms"],
+                ["needle"],
+            )
+
+    def test_stale_index_content_is_never_returned_as_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "evidence.txt"
+            target.write_text("trusted needle\n", encoding="utf-8")
+            initial = search_file_index(
+                query="needle",
+                cwd=str(root),
+                mode="keyword",
+            )
+            self.assertEqual(initial["status"], "OK")
+            self.assertTrue(initial["matches"])
+
+            target.write_text("changed secret\n", encoding="utf-8")
+            stale = search_file_index(
+                query="needle",
+                cwd=str(root),
+                mode="keyword",
+            )
+
+            self.assertEqual(stale["status"], "OK")
+            self.assertEqual(stale["matches"], [])
+            self.assertEqual(stale["evidence_bundle"]["items"], [])
+            self.assertEqual(
+                stale["retrieval_diagnostics"]["stale_rejected"],
+                1,
+            )
+            self.assertNotIn("trusted needle", str(stale))
+            self.assertNotIn("changed secret", str(stale))
+
+    def test_deleted_index_content_is_reported_as_stale_without_leaking_snippet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "evidence.txt"
+            target.write_text("deleted needle\n", encoding="utf-8")
+            self.assertTrue(
+                search_file_index(
+                    query="needle",
+                    cwd=str(root),
+                    mode="keyword",
+                )["matches"]
+            )
+            target.unlink()
+
+            stale = search_file_index(
+                query="needle",
+                cwd=str(root),
+                mode="keyword",
+            )
+
+            self.assertEqual(stale["matches"], [])
+            self.assertEqual(
+                stale["retrieval_diagnostics"]["stale_rejected"],
+                1,
+            )
+            self.assertNotIn("deleted needle", str(stale))
+
+    def test_stale_top_candidate_is_backfilled_by_current_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stale_target = root / "needle-primary.txt"
+            fresh_target = root / "fallback.txt"
+            stale_target.write_text("needle primary\n", encoding="utf-8")
+            fresh_target.write_text("needle fallback\n", encoding="utf-8")
+            self.assertEqual(
+                refresh_file_index(cwd=str(root))["status"],
+                "OK",
+            )
+            stale_target.write_text("changed primary\n", encoding="utf-8")
+
+            result = search_file_index(
+                query="needle",
+                cwd=str(root),
+                mode="keyword",
+                limit=1,
+            )
+
+            self.assertEqual(
+                [match["path"] for match in result["matches"]],
+                ["fallback.txt"],
+            )
+            self.assertEqual(
+                result["retrieval_diagnostics"]["stale_rejected"],
+                1,
             )
 
     def test_missing_principal_fails_closed_without_matches(self) -> None:

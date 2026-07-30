@@ -128,6 +128,13 @@ class EvalDatasetTests(unittest.TestCase):
             '[{"task":"bad","assertions":{"tool_paths":{"file_read":"../escape"}}}]',
             '[{"task":"bad","assertions":{"tool_paths":{"file_read":7}}}]',
             '[{"task":"bad","assertions":{"tool_sequence":[]}}]',
+            '[{"task":"bad","assertions":{"retrieval_expected_paths":["../escape"]}}]',
+            '[{"task":"bad","assertions":{"retrieval_expected_paths":[7]}}]',
+            '[{"task":"bad","assertions":{"min_citation_coverage":1.1}}]',
+            '[{"task":"bad","assertions":{"min_citation_coverage":"0.5"}}]',
+            '[{"task":"bad","assertions":{"min_query_term_coverage":NaN}}]',
+            '[{"task":"bad","assertions":{"max_stale_evidence":-1}}]',
+            '[{"task":"bad","assertions":{"max_stale_evidence":0.5}}]',
             '{"task":"bad","task":"overridden"}\n',
             '{"task":"bad","assertions":{"max_duration_sec":NaN}}\n',
         ]
@@ -384,6 +391,116 @@ class EvalAssertionTests(unittest.TestCase):
             any("required ordered calls" in failure for failure in failures)
         )
 
+    def test_retrieval_assertions_use_content_bound_evidence_metrics(self) -> None:
+        evidence_one = "ev-" + "1" * 32
+        evidence_two = "ev-" + "2" * 32
+        case = {
+            "assertions": {
+                "retrieval_expected_paths": ["business/reference.txt"],
+                "min_citation_coverage": 1.0,
+                "min_query_term_coverage": 0.5,
+                "max_stale_evidence": 0,
+            }
+        }
+        result = {
+            "response": "Answer without a citation",
+            "tool_results": [
+                {
+                    "tool_name": "file_search",
+                    "data": {
+                        "status": "OK",
+                        "matches": [
+                            {
+                                "path": "business/reference.txt",
+                                "evidence_id": evidence_one,
+                            },
+                            {
+                                "path": "business/uncited.txt",
+                                "evidence_id": evidence_two,
+                            },
+                        ],
+                        "evidence_bundle": {
+                            "items": [
+                                {"evidence_id": evidence_one},
+                                {"evidence_id": evidence_two},
+                            ],
+                        },
+                        "retrieval_diagnostics": {
+                            "query_terms": 4,
+                            "covered_query_terms": 3,
+                            "stale_rejected": 0,
+                        },
+                    },
+                }
+            ]
+        }
+
+        status, failures = evaluate_assertions(
+            case,
+            result,
+            workspace_root=".",
+            duration_sec=0.1,
+        )
+
+        self.assertEqual(status, "failed")
+        self.assertEqual(
+            failures,
+            [
+                "citation_coverage 0 is below "
+                "min_citation_coverage 1"
+            ],
+        )
+        result["response"] += f" {evidence_one}"
+        status, failures = evaluate_assertions(
+            case,
+            result,
+            workspace_root=".",
+            duration_sec=0.1,
+        )
+        self.assertEqual(status, "passed")
+        self.assertEqual(failures, [])
+
+        result["tool_results"][0]["data"]["evidence_bundle"]["items"] = [
+            {"evidence_id": evidence_two}
+        ]
+        status, failures = evaluate_assertions(
+            case,
+            result,
+            workspace_root=".",
+            duration_sec=0.1,
+        )
+        self.assertEqual(status, "failed")
+        self.assertTrue(
+            any(
+                "retrieval missing expected evidence paths" in failure
+                for failure in failures
+            )
+        )
+        result["tool_results"][0]["data"]["evidence_bundle"]["items"] = [
+            {"evidence_id": evidence_one},
+            {"evidence_id": evidence_two},
+        ]
+        result["tool_results"][0]["data"]["retrieval_diagnostics"][
+            "stale_rejected"
+        ] = 1
+        result["tool_results"][0]["data"]["matches"] = []
+        status, failures = evaluate_assertions(
+            case,
+            result,
+            workspace_root=".",
+            duration_sec=0.1,
+        )
+        self.assertEqual(status, "failed")
+        self.assertTrue(
+            any(
+                "retrieval missing expected evidence paths" in failure
+                for failure in failures
+            )
+        )
+        self.assertTrue(
+            any("stale evidence 1 exceeds" in failure for failure in failures)
+        )
+
     def test_assertions_report_failures(self) -> None:
         case = {
             "assertions": {
@@ -476,6 +593,59 @@ class EvalAssertionTests(unittest.TestCase):
         self.assertEqual(summary["token_coverage"], 1)
         self.assertEqual(summary["total_token_coverage"], 0.5)
         self.assertEqual(summary["avg_total_tokens"], 7)
+
+    def test_summary_aggregates_retrieval_quality_without_payloads(self) -> None:
+        summary = summarize_cases(
+            [
+                {
+                    "status": "passed",
+                    "retrieval": {
+                        "search_attempts": 1,
+                        "successful_searches": 1,
+                        "returned_matches": 2,
+                        "evidence_items": 2,
+                        "bound_matches": 2,
+                        "citation_candidates": 2,
+                        "cited_evidence": 1,
+                        "query_terms": 3,
+                        "covered_query_terms": 2,
+                        "stale_rejected": 0,
+                        "expected_evidence": 2,
+                        "recalled_evidence": 1,
+                    },
+                },
+                {
+                    "status": "failed",
+                    "retrieval": {
+                        "search_attempts": 1,
+                        "successful_searches": 1,
+                        "returned_matches": 1,
+                        "evidence_items": 0,
+                        "bound_matches": 0,
+                        "citation_candidates": 0,
+                        "cited_evidence": 0,
+                        "query_terms": 1,
+                        "covered_query_terms": 1,
+                        "stale_rejected": 1,
+                        "expected_evidence": 1,
+                        "recalled_evidence": 1,
+                    },
+                },
+            ]
+        )
+
+        retrieval = summary["retrieval"]
+        self.assertEqual(retrieval["search_attempts"], 2)
+        self.assertEqual(retrieval["stale_rejected"], 1)
+        self.assertAlmostEqual(
+            retrieval["evidence_binding_coverage"],
+            2 / 3,
+        )
+        self.assertEqual(retrieval["citation_coverage"], 0.5)
+        self.assertEqual(retrieval["query_term_coverage"], 0.75)
+        self.assertAlmostEqual(retrieval["evidence_recall"], 2 / 3)
+        self.assertEqual(retrieval["case_coverage"], 1.0)
+        self.assertEqual(retrieval["recall_case_coverage"], 1.0)
 
 
 class EvalRunTests(unittest.TestCase):

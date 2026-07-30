@@ -42,6 +42,7 @@ RUN_RESULT_VERSION = 2
 MAX_TAGS_PER_CASE = 20
 MAX_TAG_LENGTH = 80
 MAX_SUMMARY_TAGS = 100
+MAX_RETRIEVAL_METRIC_ITEMS = 100
 TOKEN_USAGE_KEYS = (
     "input_tokens",
     "output_tokens",
@@ -61,6 +62,7 @@ ASSERTION_LIST_KEYS = {
     "policy_outcome",
     "file_exists",
     "file_not_exists",
+    "retrieval_expected_paths",
 }
 ASSERTION_KEYS = ASSERTION_LIST_KEYS | {
     "file_contains",
@@ -71,8 +73,12 @@ ASSERTION_KEYS = ASSERTION_LIST_KEYS | {
     "max_turns",
     "max_duration_sec",
     "max_total_tokens",
+    "min_citation_coverage",
+    "min_query_term_coverage",
+    "max_stale_evidence",
 }
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+EVIDENCE_ID_RE = re.compile(r"^ev-[0-9a-f]{32}$")
 
 
 class EvalError(ValueError):
@@ -275,6 +281,16 @@ def normalize_assertions(raw: Any, *, strict: bool = False) -> dict[str, Any]:
         if value in (None, ""):
             continue
         if key in ASSERTION_LIST_KEYS:
+            if key == "retrieval_expected_paths" and (
+                not isinstance(value, (str, list))
+                or (
+                    isinstance(value, list)
+                    and not all(isinstance(path, str) for path in value)
+                )
+            ):
+                raise EvalError(
+                    "retrieval_expected_paths must be a path or array of paths"
+                )
             normalized = _string_list(value)
             if key == "policy_outcome" and any(
                 item not in {"allow", "deny", "require_approval"}
@@ -283,6 +299,32 @@ def normalize_assertions(raw: Any, *, strict: bool = False) -> dict[str, Any]:
                 raise EvalError(
                     "policy_outcome values must be allow, deny, or require_approval"
                 )
+            if key == "retrieval_expected_paths":
+                normalized = list(dict.fromkeys(normalized))
+                if not 1 <= len(normalized) <= MAX_RETRIEVAL_METRIC_ITEMS:
+                    raise EvalError(
+                        "retrieval_expected_paths must contain 1..100 paths"
+                    )
+                for path in normalized:
+                    normalized_path = path.replace("\\", "/")
+                    candidate = Path(normalized_path)
+                    if (
+                        len(path) > 1_024
+                        or candidate.is_absolute()
+                        or re.match(r"^[A-Za-z]:/", normalized_path)
+                        or any(
+                            part in {"", ".", ".."}
+                            for part in candidate.parts
+                        )
+                    ):
+                        raise EvalError(
+                            "retrieval_expected_paths entries must be safe relative paths"
+                        )
+                normalized = [
+                    Path(path.replace("\\", "/")).as_posix()
+                    for path in normalized
+                ]
+                normalized = list(dict.fromkeys(normalized))
             assertions[key] = normalized
         elif key == "file_contains":
             assertions[key] = value
@@ -397,6 +439,27 @@ def normalize_assertions(raw: Any, *, strict: bool = False) -> dict[str, Any]:
                 raise EvalError("max_total_tokens must be an integer") from exc
             if assertions[key] <= 0:
                 raise EvalError("max_total_tokens must be positive")
+        elif key in {
+            "min_citation_coverage",
+            "min_query_term_coverage",
+        }:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+            ):
+                raise EvalError(f"{key} must be a number")
+            assertions[key] = float(value)
+            if (
+                not math.isfinite(assertions[key])
+                or not 0.0 <= assertions[key] <= 1.0
+            ):
+                raise EvalError(f"{key} must be between 0 and 1")
+        elif key == "max_stale_evidence":
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise EvalError("max_stale_evidence must be an integer")
+            assertions[key] = value
+            if assertions[key] < 0:
+                raise EvalError("max_stale_evidence must be non-negative")
     return assertions
 
 
@@ -1113,6 +1176,184 @@ def _tool_attempt_metrics(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _bounded_metric_count(
+    value: Any,
+    *,
+    maximum: int = MAX_RETRIEVAL_METRIC_ITEMS,
+) -> int:
+    normalized = _nonnegative_int(value)
+    if normalized is None:
+        return 0
+    return min(normalized, maximum)
+
+
+def _retrieval_metrics(
+    result: dict[str, Any],
+    *,
+    expected_paths: list[str] | None = None,
+) -> tuple[dict[str, Any], set[str]]:
+    expected = {
+        Path(path.replace("\\", "/")).as_posix()
+        for path in (expected_paths or [])
+    }
+    search_attempts = 0
+    successful_searches = 0
+    returned_matches = 0
+    bound_matches = 0
+    stale_rejected = 0
+    query_terms = 0
+    covered_query_terms = 0
+    returned_paths: set[str] = set()
+    available_evidence_ids: set[str] = set()
+    expected_evidence_ids: set[str] = set()
+
+    raw_tool_results = result.get("tool_results")
+    tool_results = (
+        raw_tool_results[:1_000]
+        if isinstance(raw_tool_results, list)
+        else []
+    )
+    for tool_result in tool_results:
+        if not isinstance(tool_result, dict):
+            continue
+        tool_name = str(
+            tool_result.get("tool_name")
+            or tool_result.get("name")
+            or ""
+        ).strip()
+        if tool_name != "file_search":
+            continue
+        search_attempts += 1
+        data = tool_result.get("data")
+        if not isinstance(data, dict) or data.get("status") != "OK":
+            continue
+        successful_searches += 1
+        raw_matches = data.get("matches")
+        matches = (
+            raw_matches[:MAX_RETRIEVAL_METRIC_ITEMS]
+            if isinstance(raw_matches, list)
+            else []
+        )
+        bundle = data.get("evidence_bundle")
+        raw_items = bundle.get("items") if isinstance(bundle, dict) else None
+        items = (
+            raw_items[:MAX_RETRIEVAL_METRIC_ITEMS]
+            if isinstance(raw_items, list)
+            else []
+        )
+        evidence_ids = {
+            str(item.get("evidence_id") or "")
+            for item in items
+            if (
+                isinstance(item, dict)
+                and EVIDENCE_ID_RE.fullmatch(
+                    str(item.get("evidence_id") or "")
+                )
+            )
+        }
+        available_evidence_ids.update(evidence_ids)
+        for match in matches:
+            if not isinstance(match, dict):
+                continue
+            returned_matches += 1
+            path = str(match.get("path") or "").replace("\\", "/").strip()
+            candidate = Path(path)
+            if (
+                path
+                and len(path) <= 1_024
+                and not candidate.is_absolute()
+                and not re.match(r"^[A-Za-z]:/", path)
+                and all(part not in {"", ".", ".."} for part in candidate.parts)
+            ):
+                normalized_path = candidate.as_posix()
+            else:
+                normalized_path = ""
+            evidence_id = str(match.get("evidence_id") or "")
+            if EVIDENCE_ID_RE.fullmatch(evidence_id) and evidence_id in evidence_ids:
+                bound_matches += 1
+                if normalized_path:
+                    returned_paths.add(normalized_path)
+                if normalized_path in expected:
+                    expected_evidence_ids.add(evidence_id)
+
+        diagnostics = data.get("retrieval_diagnostics")
+        if not isinstance(diagnostics, dict):
+            continue
+        stale_rejected += _bounded_metric_count(
+            diagnostics.get("stale_rejected")
+        )
+        term_count = _bounded_metric_count(
+            diagnostics.get("query_terms"),
+        )
+        covered_count = min(
+            term_count,
+            _bounded_metric_count(
+                diagnostics.get("covered_query_terms"),
+            ),
+        )
+        query_terms += term_count
+        covered_query_terms += covered_count
+
+    recalled = len(expected & returned_paths)
+    response = str(result.get("response") or "")
+    raw_citations = result.get("citations")
+    structured_citations = (
+        {
+            citation
+            for citation in raw_citations[:MAX_RETRIEVAL_METRIC_ITEMS]
+            if isinstance(citation, str)
+            and EVIDENCE_ID_RE.fullmatch(citation)
+        }
+        if isinstance(raw_citations, list)
+        else set()
+    )
+    citation_candidates = (
+        expected_evidence_ids
+        if expected
+        else available_evidence_ids
+    )
+    cited_evidence_ids = {
+        evidence_id
+        for evidence_id in citation_candidates
+        if evidence_id in response or evidence_id in structured_citations
+    }
+    metrics = {
+        "search_attempts": search_attempts,
+        "successful_searches": successful_searches,
+        "returned_matches": returned_matches,
+        "evidence_items": len(available_evidence_ids),
+        "bound_matches": bound_matches,
+        "evidence_binding_coverage": (
+            bound_matches / returned_matches
+            if returned_matches
+            else 0.0
+        ),
+        "citation_candidates": len(citation_candidates),
+        "cited_evidence": len(cited_evidence_ids),
+        "citation_coverage": (
+            len(cited_evidence_ids) / len(citation_candidates)
+            if citation_candidates
+            else 0.0
+        ),
+        "query_terms": query_terms,
+        "covered_query_terms": covered_query_terms,
+        "query_term_coverage": (
+            covered_query_terms / query_terms
+            if query_terms
+            else 0.0
+        ),
+        "stale_rejected": stale_rejected,
+        "expected_evidence": len(expected),
+        "recalled_evidence": recalled,
+        "evidence_recall": (
+            recalled / len(expected)
+            if expected
+            else 0.0
+        ),
+    }
+    return metrics, returned_paths
+
+
 def _file_contains_items(value: Any) -> list[tuple[str, list[str]]]:
     items: list[tuple[str, list[str]]] = []
     if isinstance(value, dict):
@@ -1253,6 +1494,44 @@ def evaluate_assertions(
                 f"{assertions['recovered']}"
             )
 
+    retrieval_metrics, returned_retrieval_paths = _retrieval_metrics(
+        result,
+        expected_paths=assertions.get("retrieval_expected_paths", []),
+    )
+    expected_retrieval_paths = set(
+        assertions.get("retrieval_expected_paths", [])
+    )
+    missing_retrieval_paths = (
+        expected_retrieval_paths - returned_retrieval_paths
+    )
+    if missing_retrieval_paths:
+        failures.append(
+            "retrieval missing expected evidence paths: "
+            f"{sorted(missing_retrieval_paths)}"
+        )
+    for assertion_key, metric_key in (
+        ("min_citation_coverage", "citation_coverage"),
+        ("min_query_term_coverage", "query_term_coverage"),
+    ):
+        if assertion_key not in assertions:
+            continue
+        actual = float(retrieval_metrics[metric_key])
+        expected = float(assertions[assertion_key])
+        if actual < expected:
+            failures.append(
+                f"{metric_key} {actual:.6g} is below {assertion_key} "
+                f"{expected:.6g}"
+            )
+    if (
+        "max_stale_evidence" in assertions
+        and int(retrieval_metrics["stale_rejected"])
+        > int(assertions["max_stale_evidence"])
+    ):
+        failures.append(
+            f"stale evidence {retrieval_metrics['stale_rejected']} exceeds "
+            f"max_stale_evidence {assertions['max_stale_evidence']}"
+        )
+
     for rel_path in assertions.get("file_exists", []):
         try:
             if not _resolve_workspace_file(workspace_root, rel_path).is_file():
@@ -1384,6 +1663,22 @@ def _summarize_case_group(
     token_usage = {key: 0 for key in TOKEN_USAGE_KEYS}
     token_cases = 0
     total_token_cases = 0
+    retrieval_totals = {
+        "search_attempts": 0,
+        "successful_searches": 0,
+        "returned_matches": 0,
+        "evidence_items": 0,
+        "bound_matches": 0,
+        "citation_candidates": 0,
+        "cited_evidence": 0,
+        "query_terms": 0,
+        "covered_query_terms": 0,
+        "stale_rejected": 0,
+        "expected_evidence": 0,
+        "recalled_evidence": 0,
+    }
+    retrieval_cases = 0
+    retrieval_recall_cases = 0
     for item in case_results:
         raw_policy = item.get("policy_outcomes")
         if isinstance(raw_policy, dict):
@@ -1396,8 +1691,55 @@ def _summarize_case_group(
                 token_usage[key] += int(raw_usage.get(key) or 0)
             if "total_tokens" in raw_usage:
                 total_token_cases += 1
+        raw_retrieval = item.get("retrieval")
+        if isinstance(raw_retrieval, dict):
+            for key in retrieval_totals:
+                retrieval_totals[key] += (
+                    _nonnegative_int(raw_retrieval.get(key)) or 0
+                )
+            if (_nonnegative_int(raw_retrieval.get("search_attempts")) or 0) > 0:
+                retrieval_cases += 1
+            if (_nonnegative_int(raw_retrieval.get("expected_evidence")) or 0) > 0:
+                retrieval_recall_cases += 1
 
     completed = passed + failed + error
+    returned_matches = retrieval_totals["returned_matches"]
+    query_terms = retrieval_totals["query_terms"]
+    expected_evidence = retrieval_totals["expected_evidence"]
+    retrieval_summary = {
+        **retrieval_totals,
+        "evidence_binding_coverage": (
+            retrieval_totals["bound_matches"] / returned_matches
+            if returned_matches
+            else 0.0
+        ),
+        "citation_coverage": (
+            retrieval_totals["cited_evidence"]
+            / retrieval_totals["citation_candidates"]
+            if retrieval_totals["citation_candidates"]
+            else 0.0
+        ),
+        "query_term_coverage": (
+            retrieval_totals["covered_query_terms"] / query_terms
+            if query_terms
+            else 0.0
+        ),
+        "evidence_recall": (
+            retrieval_totals["recalled_evidence"] / expected_evidence
+            if expected_evidence
+            else 0.0
+        ),
+        "case_coverage": (
+            retrieval_cases / completed
+            if completed
+            else 0.0
+        ),
+        "recall_case_coverage": (
+            retrieval_recall_cases / completed
+            if completed
+            else 0.0
+        ),
+    }
     return {
         "total": total_count,
         "completed": completed,
@@ -1443,6 +1785,7 @@ def _summarize_case_group(
             if total_token_cases
             else 0.0
         ),
+        "retrieval": retrieval_summary,
     }
 
 
@@ -1794,6 +2137,16 @@ def execute_eval_run(
 
             response = str(raw_result.get("response") or "")
             tool_metrics = _tool_attempt_metrics(raw_result)
+            normalized_assertions = normalize_assertions(
+                case.get("assertions", {})
+            )
+            retrieval_metrics, _returned_retrieval_paths = _retrieval_metrics(
+                raw_result,
+                expected_paths=normalized_assertions.get(
+                    "retrieval_expected_paths",
+                    [],
+                ),
+            )
             case_result = {
                 "id": case.get("id", ""),
                 "name": case.get("name", case.get("id", "")),
@@ -1810,6 +2163,7 @@ def execute_eval_run(
                     and int(tool_metrics["recoverable_tool_failures"]) > 0
                 ),
                 "token_usage": _token_usage(raw_result),
+                "retrieval": retrieval_metrics,
                 "failures": failures,
                 "response_excerpt": response[:1200],
             }

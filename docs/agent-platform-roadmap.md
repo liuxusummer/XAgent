@@ -91,6 +91,14 @@ pressure bounds with chunked token/hash accounting.
 Exit evidence: versioned retrieval benchmarks improve grounding metrics while
 all cross-tenant and stale-evidence adversarial cases remain denied.
 
+Foundation delivered: file search now produces a bounded, content-digested
+query plan, deterministic ranking signals, and payload-safe diagnostics.
+Descriptor-relative live-content verification rejects changed, deleted, or
+link-replaced index entries before their snippets become evidence, while
+overfetch preserves fresh backfill candidates. Eval measures expected-path
+recall, evidence binding, final-answer citation, query-term coverage, and stale
+rejection; core capability pack 1.2 gates its grounding case on these metrics.
+
 ### Phase 3 — Memory lifecycle
 
 - Add duplicate/conflict detection, supersession, retention, and provenance

@@ -195,6 +195,8 @@ Telemetry 只保存长度、计数、ID 和 digest，不保存脚本、完整参
 - policy allow / deny / require approval 及 reason code；
 - approval rejection、expiry、replay；
 - EvidenceBundle 数量、ACL deny、索引版本；
+- query plan / rerank 版本、expected-path recall、evidence binding、answer
+  citation coverage、query-term coverage 和 stale evidence rejection；
 - 每组件 visible token、compaction 数；
 - Memory candidate 的 pending/approved/rejected/expired；
 - checkpoint resume deny 和 unknown-outcome 恢复。
@@ -203,6 +205,11 @@ Telemetry 只保存长度、计数、ID 和 digest，不保存脚本、完整参
 
 Telemetry 是审计线索，不是执行事实源。工具是否已完成仍以工具结果、当前物理状态和 durable
 store/checkpoint 的相应契约为准。
+
+EvidenceBundle 内的 evidence ID 必须唯一，所有 EvidenceItem 必须来自
+`KnowledgeKind.RETRIEVAL`、属于同一 index version，并在构造时重新通过 Principal
+授权。文件检索在绑定 EvidenceItem 前还会以 descriptor-relative no-follow 方式读取当前
+文件并核对内容摘要；索引中的旧片段本身不能作为“当前文件未变化”的证明。
 
 ## 8. 测试门槛
 

@@ -70,6 +70,9 @@ turns, and add:
 - policy decision outcome counts, including approval-required transitions;
 - token totals, any-usage coverage, total-token coverage, and average total
   tokens over cases that reported a total;
+- retrieval search coverage, expected-path recall, result-to-bundle evidence
+  binding, answer citation coverage, query-term coverage, and stale evidence
+  rejection counts;
 - the same metrics grouped by scenario tag.
 
 A recovery opportunity is a case with at least one recoverable tool failure.
@@ -77,6 +80,16 @@ Policy denial, user rejection (`SKIP`), and interruption are excluded because
 successfully respecting a boundary is not error recovery. An opportunity counts
 as recovered only when the case ultimately passes. Token coverage makes missing
 provider usage data visible instead of treating it as measured zero.
+
+Retrieval metrics are derived from bounded `file_search` results and contain
+only counts and ratios. `evidence_binding_coverage` verifies that returned
+matches have a corresponding content-bound evidence item.
+`citation_coverage` checks whether the final response (or a structured
+`citations` list) includes the cryptographic IDs for expected evidence paths;
+when a case has no expected paths, all available evidence items form the
+denominator. `retrieval_expected_paths`, `min_citation_coverage`,
+`min_query_term_coverage`, and `max_stale_evidence` provide deterministic
+per-case gates without persisting queries, snippets, or tool payloads.
 
 The gate is deterministic and offline. Running the agent remains a separate,
 potentially model-dependent step; the comparison command never calls an LLM or

@@ -136,6 +136,13 @@ class AgentKernelEndToEndTests(unittest.TestCase):
             retrieval = next(
                 event for event in sink.events if event.kind == "retrieval_evidence"
             )
+            self.assertEqual(len(retrieval.data["query_plan_digest"]), 64)
+            self.assertEqual(retrieval.data["rerank_version"], 1)
+            self.assertEqual(retrieval.data["stale_rejected"], 0)
+            self.assertGreaterEqual(
+                retrieval.data["covered_query_terms"],
+                1,
+            )
             context = next(
                 event
                 for event in sink.events

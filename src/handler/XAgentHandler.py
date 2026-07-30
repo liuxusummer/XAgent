@@ -1140,6 +1140,10 @@ class XAgentHandler(BaseHandler):
         if result.get("status") == "OK":
             bundle = result.get("evidence_bundle")
             bundle_data = bundle if isinstance(bundle, dict) else {}
+            diagnostics = result.get("retrieval_diagnostics")
+            diagnostics_data = (
+                diagnostics if isinstance(diagnostics, dict) else {}
+            )
             self.ctx.sink.emit(
                 Event(
                     session_id=self.ctx.session_id,
@@ -1155,6 +1159,25 @@ class XAgentHandler(BaseHandler):
                             bundle_data.get("items", [])
                             if isinstance(bundle_data.get("items"), list)
                             else []
+                        ),
+                        "query_plan_digest": str(
+                            diagnostics_data.get("query_plan_digest", "")
+                        ),
+                        "rerank_version": int(
+                            diagnostics_data.get("rerank_version", 0) or 0
+                        ),
+                        "stale_rejected": int(
+                            diagnostics_data.get("stale_rejected", 0) or 0
+                        ),
+                        "query_terms": int(
+                            diagnostics_data.get("query_terms", 0) or 0
+                        ),
+                        "covered_query_terms": int(
+                            diagnostics_data.get(
+                                "covered_query_terms",
+                                0,
+                            )
+                            or 0
                         ),
                         "principal_digest": str(
                             bundle_data.get("principal_digest", "")
@@ -1173,7 +1196,11 @@ class XAgentHandler(BaseHandler):
             )
         return ActionResult(
             data=result,
-            next_prompt="文件索引检索完成。搜索结果只用于定位；修改或依赖具体内容前，必须用 file_read 精读候选文件。",
+            next_prompt=(
+                "文件索引检索完成。搜索结果只用于定位；修改或依赖具体内容前，"
+                "必须用 file_read 精读候选文件。最终回答若使用检索证据，"
+                "请保留对应 evidence_id 作为引用。"
+            ),
         )
 
     @staticmethod
