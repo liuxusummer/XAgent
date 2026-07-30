@@ -1,0 +1,39 @@
+docs/architecture.md
+  s_72af05a5dabd4c::t_05555394e656d3 251-253
+docs/distributed-execution-fault-matrix.md
+  s_72af05a5dabd4c::t_29741d621c9b63 9-12,55
+docs/durable-orchestration-spec.md
+  s_72af05a5dabd4c::t_fe86a474d5c596 1202-1205
+docs/remote-worker-https-adversarial-review.md
+  s_72af05a5dabd4c::t_a483417506f41c 1-108
+docs/remote-worker-https-transport.md
+  s_72af05a5dabd4c::t_35b7287ba23b9f 1-170
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_a453f2dc10fb99 173-182
+src/orchestration/remote_control.py
+  s_72af05a5dabd4c::t_4540818c979a96 310-322
+src/orchestration/remote_http.py
+  s_72af05a5dabd4c::t_f94933baa7c620 1-938
+tests/test_orchestration_remote_http.py
+  s_72af05a5dabd4c::t_f4424033ff1bbc 1-809
+tests/test_orchestration_remote_protocol.py
+  s_72af05a5dabd4c::t_8fd6d6d8b5b3e9 3,7,26-31,1051-1135,1137,1143,1158,1226
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c04a5c7af0cc85adcd670d29b9fa3b63551d9fd7",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
