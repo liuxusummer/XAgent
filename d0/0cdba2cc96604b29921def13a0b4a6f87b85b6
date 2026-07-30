@@ -1,0 +1,49 @@
+docs/architecture.md
+  s_72af05a5dabd4c::t_ffc059d82c6c61 119-124
+docs/distributed-execution-adr.md
+  s_72af05a5dabd4c::t_d06117da66e197 329-341
+docs/distributed-execution-quickstart.md
+  s_72af05a5dabd4c::t_029796bd644f01 113,151
+docs/durable-orchestration-spec.md
+  s_72af05a5dabd4c::t_d1657d53cf5d4e 1205-1208
+docs/remote-fleet-adversarial-review.md
+  s_72af05a5dabd4c::t_ebbbce042a113c 1,106-151,154-158
+docs/remote-fleet-data-plane.md
+  s_72af05a5dabd4c::t_59db515862097a 5-7,134-136,142-156,178-179,185-188,199-200
+src/orchestration/remote_control.py
+  s_72af05a5dabd4c::t_7e6d4beb2f3003 945,973-977,985,1017,1054-1055,1171
+src/orchestration/remote_fleet.py
+  s_72af05a5dabd4c::t_2221775fb5bea7 26,201-206,357-366,384-401,406
+src/orchestration/remote_fleet_control.py
+  s_72af05a5dabd4c::t_99352f7e4e429f 34,515-516,548,555-560,572
+src/orchestration/remote_scheduling.py
+  s_72af05a5dabd4c::t_e0c4fabea8902a 27-28,45,58,384-455,620-641,1149-1171,1246-1247
+src/orchestration/scheduler.py
+  s_72af05a5dabd4c::t_bda526134247e4 833,911
+src/orchestration/store.py
+  s_72af05a5dabd4c::t_16f8a8920b3e66 67,447-515,4382,4386-4412,4451-4483,4485-4488,4490-4504,4507-4577,4715,4807-4809,5022,5071-5074
+tests/test_orchestration_remote_fleet_control.py
+  s_72af05a5dabd4c::t_46ab830d2f5f0a 84-87,206-217,608-613,624,630-662,940-945,955,987-996
+tests/test_orchestration_remote_scheduling.py
+  s_72af05a5dabd4c::t_ce66c20d892c3e 362-397
+tests/test_orchestration_scheduler.py
+  s_72af05a5dabd4c::t_e8ac1e94a2b2af 20-23,34,170-229,488-804
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d00cdba2cc96604b29921def13a0b4a6f87b85b6",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
