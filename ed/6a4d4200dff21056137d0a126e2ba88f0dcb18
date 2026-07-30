@@ -1,0 +1,49 @@
+docs/agent-kernel.md
+  s_72af05a5dabd4c::t_4f16e260021873 92-94,142-145
+docs/agent-platform-roadmap.md
+  s_72af05a5dabd4c::t_85ca63f9901aba 76-81
+docs/eval-scenario-packs.md
+  s_72af05a5dabd4c::t_1f22942d13c44c 37-43,100,107-110
+src/core/agent_loop.py
+  s_72af05a5dabd4c::t_fab0ac7085ff08 5,19,40-49,143-222,227,229-231,234,236,240-252,300,510,545-556,600,606
+src/core/context_builder.py
+  s_72af05a5dabd4c::t_cb700c96faadab 28-30,48-61,86-98,151,157-178,199-206,218,306,332,334,336
+src/core/eval_scenarios.py
+  s_72af05a5dabd4c::t_f1b8fa5c022408 25,35
+src/core/memory_store.py
+  s_72af05a5dabd4c::t_758dad8fbb86f1 14,31-37,44,67-88,99-102,113-114,127-128,192-194,199-204,223-231,244-245,252-253,255-266,273-277,490,497,510-529,542-545,565-568,570-577,579-582,584,586,618,622,625-626,689-690,705-710,716-717,719-728,730-756,759-760,766-858,861-880,885
+src/core/safe_fs.py
+  s_72af05a5dabd4c::t_2de2206b577e73 257,261-275,306-307,311-312,375-376,385-386
+tests/test_context_builder.py
+  s_72af05a5dabd4c::t_f9b29e23617ed5 8-13,15-16,21,26-32,148-303
+tests/test_eval_scenarios.py
+  s_72af05a5dabd4c::t_0dd1f1bb1c364c 5,162-218
+tests/test_memory_store.py
+  s_72af05a5dabd4c::t_3d2c4e75336785 14,116-187,422-530
+workspace/default.ws/system/eval/core-capabilities-v1/cases.jsonl
+  s_72af05a5dabd4c::t_c448052fea2b86 1-6
+workspace/default.ws/system/eval/core-capabilities-v1/fixtures/context-pressure/business/context/long-report.txt
+  s_72af05a5dabd4c::t_1c82f6583f71ee 1-83
+workspace/default.ws/system/eval/core-capabilities-v1/fixtures/memory-poisoning/business/memory/source.txt
+  s_72af05a5dabd4c::t_c86d64ea6276b4 1-5
+workspace/default.ws/system/eval/core-capabilities-v1/pack.json
+  s_72af05a5dabd4c::t_2a3bdf86f9b9fb 5,9-10,15-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ed6a4d4200dff21056137d0a126e2ba88f0dcb18",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
