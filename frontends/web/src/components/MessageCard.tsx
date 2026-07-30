@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { User, Bot, Wrench, ChevronDown, ChevronUp, Copy, Check, Terminal, Lightbulb, Loader2 } from 'lucide-react';
 import type { Message, ToolCall } from '../types';
@@ -108,8 +108,8 @@ function CodeBlock({ code, language }: { code: string; language?: string }) {
   );
 }
 
-const markdownComponents = {
-  code({ className, children, ...props }: any) {
+const markdownComponents: Components = {
+  code({ className, children, ...props }) {
     const match = /language-(\w+)/.exec(className || '');
     const language = match ? match[1] : undefined;
     const code = children == null ? '' : String(children).replace(/\n$/, '');
@@ -125,44 +125,44 @@ const markdownComponents = {
 
     return <CodeBlock code={code} language={language} />;
   },
-  pre({ children }: any) {
+  pre({ children }) {
     return <>{children}</>;
   },
-  h1({ children }: any) {
+  h1({ children }) {
     return <h1 className="text-xl font-bold text-text-primary mt-4 mb-2">{children}</h1>;
   },
-  h2({ children }: any) {
+  h2({ children }) {
     return <h2 className="text-lg font-semibold text-text-primary mt-3 mb-2">{children}</h2>;
   },
-  h3({ children }: any) {
+  h3({ children }) {
     return <h3 className="text-base font-semibold text-text-primary mt-3 mb-1.5">{children}</h3>;
   },
-  p({ children }: any) {
+  p({ children }) {
     return <p className="text-sm leading-relaxed text-text-secondary mb-2 last:mb-0">{children}</p>;
   },
-  ul({ children }: any) {
+  ul({ children }) {
     return <ul className="list-disc list-inside text-sm text-text-secondary mb-2 space-y-1">{children}</ul>;
   },
-  ol({ children }: any) {
+  ol({ children }) {
     return <ol className="list-decimal list-inside text-sm text-text-secondary mb-2 space-y-1">{children}</ol>;
   },
-  li({ children }: any) {
+  li({ children }) {
     return <li className="text-sm text-text-secondary">{children}</li>;
   },
-  strong({ children }: any) {
+  strong({ children }) {
     return <strong className="font-semibold text-text-primary">{children}</strong>;
   },
-  em({ children }: any) {
+  em({ children }) {
     return <em className="italic text-text-secondary">{children}</em>;
   },
-  blockquote({ children }: any) {
+  blockquote({ children }) {
     return (
       <blockquote className="border-l-2 border-accent/40 pl-3 my-2 text-sm text-text-muted italic">
         {children}
       </blockquote>
     );
   },
-  a({ children, href }: any) {
+  a({ children, href }) {
     return (
       <a href={href} target="_blank" rel="noopener noreferrer" className="text-accent hover:underline">
         {children}
@@ -172,20 +172,20 @@ const markdownComponents = {
   hr() {
     return <hr className="border-border my-3" />;
   },
-  table({ children }: any) {
+  table({ children }) {
     return (
       <div className="overflow-x-auto my-2">
         <table className="w-full text-sm text-text-secondary border-collapse">{children}</table>
       </div>
     );
   },
-  thead({ children }: any) {
+  thead({ children }) {
     return <thead className="bg-bg-tertiary">{children}</thead>;
   },
-  th({ children }: any) {
+  th({ children }) {
     return <th className="px-3 py-2 text-left text-xs font-semibold text-text-primary border border-border">{children}</th>;
   },
-  td({ children }: any) {
+  td({ children }) {
     return <td className="px-3 py-2 text-sm text-text-secondary border border-border">{children}</td>;
   },
 };

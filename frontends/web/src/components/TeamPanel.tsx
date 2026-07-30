@@ -55,7 +55,8 @@ export function TeamPanel({ workspace, onSelectTeam, onCreateTeam, onChatWithTea
   }, [workspace]);
 
   useEffect(() => {
-    loadTeams();
+    const timer = window.setTimeout(loadTeams, 0);
+    return () => window.clearTimeout(timer);
   }, [loadTeams]);
 
   const filteredTeams = useMemo(() => {
@@ -214,7 +215,8 @@ export function TeamDetail({ workspace, teamName, onBack, onChatWithTeam }: Team
   }, [teamName, workspace]);
 
   useEffect(() => {
-    loadDetail();
+    const timer = window.setTimeout(loadDetail, 0);
+    return () => window.clearTimeout(timer);
   }, [loadDetail]);
 
   const updateTeam = (patch: Partial<AgentTeam>) => {

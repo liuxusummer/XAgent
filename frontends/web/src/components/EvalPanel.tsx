@@ -359,14 +359,18 @@ export function EvalPanel({ workspace, configPath = '', observabilityConfigPath 
   }, [workspace, selectedRunId]);
 
   useEffect(() => {
-    setSelectedDatasetId('');
-    setSelectedRunId('');
-    setSelectedRun(null);
-    loadLists();
+    const timer = window.setTimeout(() => {
+      setSelectedDatasetId('');
+      setSelectedRunId('');
+      setSelectedRun(null);
+      loadLists();
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [workspace, loadLists]);
 
   useEffect(() => {
-    loadRun();
+    const timer = window.setTimeout(loadRun, 0);
+    return () => window.clearTimeout(timer);
   }, [loadRun]);
 
   useEffect(() => {

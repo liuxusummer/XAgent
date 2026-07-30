@@ -1,5 +1,11 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import { X, Save, RotateCcw, FileJson, Folder, Eye, EyeOff } from 'lucide-react';
+import {
+  DEFAULT_CONFIG,
+  loadConfig,
+  saveConfigToStorage,
+  type AgentConfig,
+} from '../config/agentConfig';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -8,47 +14,9 @@ interface SettingsModalProps {
   initialConfig?: AgentConfig;
 }
 
-export interface AgentConfig {
-  configPath: string;
-  observabilityConfigPath: string;
-  workspaceDir: string;
-}
-
-const DEFAULT_CONFIG: AgentConfig = {
-  configPath: 'config.json',
-  observabilityConfigPath: '',
-  workspaceDir: '',
-};
-
-const STORAGE_KEY = 'xagent-config';
-
-function loadStoredConfig(): AgentConfig | undefined {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch {
-    // ignore
-  }
-  return undefined;
-}
-
-export function saveConfigToStorage(config: AgentConfig) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
-}
-
-export function loadConfig(): AgentConfig {
-  return loadStoredConfig() || DEFAULT_CONFIG;
-}
-
 export function SettingsModal({ isOpen, onClose, onSave, initialConfig }: SettingsModalProps) {
-  const [config, setConfig] = useState<AgentConfig>(initialConfig || DEFAULT_CONFIG);
+  const [config, setConfig] = useState<AgentConfig>(() => initialConfig || loadConfig());
   const [showKey, setShowKey] = useState(false);
-
-  useEffect(() => {
-    if (isOpen) {
-      setConfig(initialConfig || loadConfig());
-    }
-  }, [isOpen, initialConfig]);
 
   const handleChange = useCallback((field: keyof AgentConfig, value: string) => {
     setConfig(prev => ({ ...prev, [field]: value }));

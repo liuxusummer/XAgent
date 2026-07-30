@@ -39,29 +39,33 @@ export function MemoryPanel({ workspace, agentName }: MemoryPanelProps) {
   // Update selectedAgent when agentName prop changes
   useEffect(() => {
     if (agentName) {
-      setSelectedAgent(agentName);
+      const timer = window.setTimeout(() => setSelectedAgent(agentName), 0);
+      return () => window.clearTimeout(timer);
     }
   }, [agentName]);
 
   // Load files based on selected agent
   useEffect(() => {
-    if (selectedAgent === 'global') {
-      setFiles(['project.md']);
-      setSelectedFile('project.md');
-    } else {
-      api.listAgents(workspace).then((res) => {
-        if (res.success && res.data) {
-          const agent = res.data.find((a) => a.name === selectedAgent);
-          if (agent) {
-            const memoryFiles = agent.files.filter((f) =>
-              f.toLowerCase().includes('memory')
-            );
-            setFiles(memoryFiles.length > 0 ? memoryFiles : ['MEMORY.md']);
-            setSelectedFile(memoryFiles.length > 0 ? memoryFiles[0] : 'MEMORY.md');
+    const timer = window.setTimeout(() => {
+      if (selectedAgent === 'global') {
+        setFiles(['project.md']);
+        setSelectedFile('project.md');
+      } else {
+        api.listAgents(workspace).then((res) => {
+          if (res.success && res.data) {
+            const agent = res.data.find((a) => a.name === selectedAgent);
+            if (agent) {
+              const memoryFiles = agent.files.filter((f) =>
+                f.toLowerCase().includes('memory')
+              );
+              setFiles(memoryFiles.length > 0 ? memoryFiles : ['MEMORY.md']);
+              setSelectedFile(memoryFiles.length > 0 ? memoryFiles[0] : 'MEMORY.md');
+            }
           }
-        }
-      });
-    }
+        });
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [selectedAgent, workspace]);
 
   // Load file content
@@ -85,7 +89,8 @@ export function MemoryPanel({ workspace, agentName }: MemoryPanelProps) {
   }, [workspace, selectedAgent, selectedFile]);
 
   useEffect(() => {
-    loadContent();
+    const timer = window.setTimeout(loadContent, 0);
+    return () => window.clearTimeout(timer);
   }, [loadContent]);
 
   const handleSave = async () => {

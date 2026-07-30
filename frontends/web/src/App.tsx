@@ -9,7 +9,8 @@ import { SystemPanel } from './components/SystemPanel';
 import { EvalPanel } from './components/EvalPanel';
 import { UsagePanel } from './components/UsagePanel';
 import { CronPanel } from './components/CronPanel';
-import { SettingsModal, loadConfig, type AgentConfig } from './components/SettingsModal';
+import { SettingsModal } from './components/SettingsModal';
+import { loadConfig, type AgentConfig } from './config/agentConfig';
 import { useChat } from './hooks/useChat';
 import { ThemeProvider } from './hooks/useTheme.tsx';
 import { api } from './api/client';
@@ -73,7 +74,8 @@ function App() {
   } = useChat({ onPersistentChatUpdated: refreshAgentChats });
 
   useEffect(() => {
-    refreshAgentChats();
+    const timer = window.setTimeout(refreshAgentChats, 0);
+    return () => window.clearTimeout(timer);
   }, [refreshAgentChats]);
 
   const handleSaveConfig = (config: AgentConfig) => {
@@ -148,6 +150,7 @@ function App() {
     setSelectedTeam(null);
     setSelectedTeamName(null);
     setChatDeleteError('');
+    setMainView('chat');
   };
 
   const handleSelectAgent = (agentName: string) => {
@@ -287,6 +290,7 @@ function App() {
     if (mainView === 'agent-detail' && selectedAgent) {
       return (
         <AgentDetail
+          key={`${currentWorkspace}:${selectedAgent}`}
           workspace={currentWorkspace}
           agentName={selectedAgent}
           onBack={handleBackFromDetail}
@@ -308,7 +312,11 @@ function App() {
     if (mainView === 'memory') {
       return (
         <div className="flex-1 flex flex-col min-w-0 bg-bg-primary">
-          <MemoryPanel workspace={currentWorkspace} agentName={selectedAgent} />
+          <MemoryPanel
+            key={`${currentWorkspace}:${selectedAgent || 'global'}`}
+            workspace={currentWorkspace}
+            agentName={selectedAgent}
+          />
         </div>
       );
     }
@@ -338,6 +346,7 @@ function App() {
       return (
         <div className="flex-1 flex flex-col min-w-0 bg-bg-primary">
           <EvalPanel
+            key={`${currentWorkspace}:${agentConfig.configPath}:${agentConfig.observabilityConfigPath}`}
             workspace={currentWorkspace}
             configPath={agentConfig.configPath}
             observabilityConfigPath={agentConfig.observabilityConfigPath}
@@ -350,6 +359,7 @@ function App() {
       return (
         <div className="flex-1 flex flex-col min-w-0 bg-bg-primary">
           <UsagePanel
+            key={`${currentWorkspace}:${agentConfig.observabilityConfigPath}`}
             workspace={currentWorkspace}
             observabilityConfigPath={agentConfig.observabilityConfigPath}
             liveUsage={liveTokenUsage}
@@ -374,6 +384,7 @@ function App() {
     return (
       <div className="flex-1 flex flex-col min-w-0 bg-bg-primary">
         <WorkspacePanel
+          key={`${currentWorkspace}:${mainView}`}
           isOpen={true}
           workspace={currentWorkspace}
           defaultTab={mainView === 'skills' ? 'skills' : 'agents'}
@@ -407,6 +418,7 @@ function App() {
         />
         {renderMainContent()}
         <SettingsModal
+          key={settingsOpen ? 'settings-open' : 'settings-closed'}
           isOpen={settingsOpen}
           onClose={() => setSettingsOpen(false)}
           onSave={handleSaveConfig}

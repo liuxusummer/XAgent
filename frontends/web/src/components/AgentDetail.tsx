@@ -130,29 +130,35 @@ export function AgentDetail({ workspace, agentName, onBack }: AgentDetailProps) 
   }, [workspace, agentName]);
 
   useEffect(() => {
-    setProfile(defaultProfile(agentName));
-    setAgentBody('');
-    setProjectAgentsDraft('');
-    setSelectedFile(null);
-    setFileContent('');
-    setEditedContent('');
-    setHasChanges(false);
-    loadFiles();
-    loadAgentProfile();
+    const timer = window.setTimeout(() => {
+      setProfile(defaultProfile(agentName));
+      setAgentBody('');
+      setProjectAgentsDraft('');
+      setSelectedFile(null);
+      setFileContent('');
+      setEditedContent('');
+      setHasChanges(false);
+      loadFiles();
+      loadAgentProfile();
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [agentName, loadFiles, loadAgentProfile]);
 
   useEffect(() => {
     if (!selectedFile) return;
-    setLoading(true);
-    const path = `system/agents/${agentName}/${selectedFile}`;
-    api.readWorkspaceFile(workspace, path).then((res) => {
-      if (res.success && res.data) {
-        setFileContent(res.data.content);
-        setEditedContent(res.data.content);
-        setHasChanges(false);
-      }
-      setLoading(false);
-    });
+    const timer = window.setTimeout(() => {
+      setLoading(true);
+      const path = `system/agents/${agentName}/${selectedFile}`;
+      api.readWorkspaceFile(workspace, path).then((res) => {
+        if (res.success && res.data) {
+          setFileContent(res.data.content);
+          setEditedContent(res.data.content);
+          setHasChanges(false);
+        }
+        setLoading(false);
+      });
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [workspace, agentName, selectedFile]);
 
   const saveProfile = useCallback(
@@ -216,7 +222,8 @@ export function AgentDetail({ workspace, agentName, onBack }: AgentDetailProps) 
 
   useEffect(() => {
     if (activeTab === 'skills') {
-      loadSkills();
+      const timer = window.setTimeout(loadSkills, 0);
+      return () => window.clearTimeout(timer);
     }
   }, [activeTab, loadSkills]);
 
@@ -248,7 +255,8 @@ export function AgentDetail({ workspace, agentName, onBack }: AgentDetailProps) 
 
   useEffect(() => {
     if (activeTab === 'tools') {
-      loadTools();
+      const timer = window.setTimeout(loadTools, 0);
+      return () => window.clearTimeout(timer);
     }
   }, [activeTab, loadTools]);
 

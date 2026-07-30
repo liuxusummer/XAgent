@@ -536,11 +536,14 @@ npm run lint
 
 ## 🗓️ Roadmap
 
-- 🔐 stronger permission model for high-risk tools
-- 🧪 more complete frontend testing
-- 🧰 CI for Python + frontend checks
-- 📦 packaged release workflows
-- 🧾 more complete configuration examples
+- ✅ reproducible Python and frontend quality gates
+- 🧪 versioned Agent capability benchmarks and regression budgets
+- 🧠 measurable retrieval, context, and reviewed-memory quality
+- 🛡️ operator-facing policy simulation and approval evidence
+- 🌐 deployable durable worker transport beyond reference adapters
+- 📦 reproducible packaging, upgrades, and showcase workflows
+
+See the evidence-driven [Agent Platform Roadmap](docs/agent-platform-roadmap.md).
 
 ---
 

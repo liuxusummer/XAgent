@@ -152,8 +152,11 @@ export function UsagePanel({ workspace, observabilityConfigPath = '', liveUsage 
   const [traceError, setTraceError] = useState('');
 
   useEffect(() => {
-    setSelectedSessionId('');
-    setTraceDetail(null);
+    const timer = window.setTimeout(() => {
+      setSelectedSessionId('');
+      setTraceDetail(null);
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [workspace, observabilityConfigPath]);
 
   const loadSummary = useCallback(() => {
@@ -175,32 +178,36 @@ export function UsagePanel({ workspace, observabilityConfigPath = '', liveUsage 
   }, [workspace, observabilityConfigPath]);
 
   useEffect(() => {
-    loadSummary();
+    const timer = window.setTimeout(loadSummary, 0);
+    return () => window.clearTimeout(timer);
   }, [loadSummary]);
 
   useEffect(() => {
-    if (!selectedSessionId) {
-      setTraceDetail(null);
+    const timer = window.setTimeout(() => {
+      if (!selectedSessionId) {
+        setTraceDetail(null);
+        setTraceError('');
+        return;
+      }
+      setTraceLoading(true);
       setTraceError('');
-      return;
-    }
-    setTraceLoading(true);
-    setTraceError('');
-    api.getTraceSession(selectedSessionId, { ws: workspace, observabilityConfigPath })
-      .then((res) => {
-        if (res.success && res.data) {
-          setTraceDetail(res.data);
-        } else {
-          setTraceDetail(null);
-          setTraceError(res.error || 'Failed to load trace session');
-        }
-      })
-      .finally(() => setTraceLoading(false));
+      api.getTraceSession(selectedSessionId, { ws: workspace, observabilityConfigPath })
+        .then((res) => {
+          if (res.success && res.data) {
+            setTraceDetail(res.data);
+          } else {
+            setTraceDetail(null);
+            setTraceError(res.error || 'Failed to load trace session');
+          }
+        })
+        .finally(() => setTraceLoading(false));
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [selectedSessionId, workspace, observabilityConfigPath]);
 
   const totals = mergeUsage(summary?.totals);
   const liveTotals = mergeUsage(liveUsage?.totals);
-  const sessions = summary?.sessions || [];
+  const sessions = useMemo(() => summary?.sessions || [], [summary?.sessions]);
   const latestSession = sessions[0];
 
   const tableRows = useMemo(() => sessions.slice(0, 12), [sessions]);

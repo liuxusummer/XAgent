@@ -56,11 +56,14 @@ export function WorkspacePanel({
 
   useEffect(() => {
     if (!isOpen) return;
-    loadData();
+    const timer = window.setTimeout(loadData, 0);
+    return () => window.clearTimeout(timer);
   }, [isOpen, loadData]);
 
   useEffect(() => {
-    if (isOpen && defaultTab) setActiveTab(defaultTab);
+    if (!isOpen || !defaultTab) return;
+    const timer = window.setTimeout(() => setActiveTab(defaultTab), 0);
+    return () => window.clearTimeout(timer);
   }, [isOpen, defaultTab]);
 
   const filteredAgents = useMemo(() => {

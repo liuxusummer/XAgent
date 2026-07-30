@@ -1,6 +1,6 @@
 import { Bot, Loader2, AlertCircle, Pause, Radio, Sun, Moon, Sparkles } from 'lucide-react';
 import type { AgentStatus } from '../types';
-import { useTheme } from '../hooks/useTheme.tsx';
+import { useTheme } from '../hooks/themeContext';
 
 interface StatusBarProps {
   status: AgentStatus;

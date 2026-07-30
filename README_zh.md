@@ -473,11 +473,14 @@ npm run lint
 
 ## 🗓️ Roadmap（方向清单）
 
-- 🔐 为高风险工具引入更强的权限模型
-- 🧪 更完整的前端测试体系
-- 🧰 增加 CI（Python unittest + 前端 build/lint）
-- 📦 增加可发布的 release workflow
-- 🧾 提供更完善的配置示例与最佳实践
+- ✅ 可复现的 Python 与前端质量门禁
+- 🧪 版本化 Agent 能力基准与回归预算
+- 🧠 可量化的检索、上下文与审核后记忆质量
+- 🛡️ 面向 operator 的策略模拟与审批证据
+- 🌐 超越 reference adapter 的可部署持久 Worker 传输
+- 📦 可复现的打包、升级与 showcase 流程
+
+详见证据驱动的 [Agent Platform Roadmap](docs/agent-platform-roadmap.md)。
 
 ---
 

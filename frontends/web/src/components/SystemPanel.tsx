@@ -160,7 +160,8 @@ export function SystemPanel({ workspace }: SystemPanelProps) {
   }, [workspace]);
 
   useEffect(() => {
-    loadTree();
+    const timer = window.setTimeout(loadTree, 0);
+    return () => window.clearTimeout(timer);
   }, [loadTree]);
 
   const loadIndexStats = useCallback(() => {
@@ -179,7 +180,8 @@ export function SystemPanel({ workspace }: SystemPanelProps) {
 
   useEffect(() => {
     if (activeTab === 'index') {
-      loadIndexStats();
+      const timer = window.setTimeout(loadIndexStats, 0);
+      return () => window.clearTimeout(timer);
     }
   }, [activeTab, loadIndexStats]);
 
