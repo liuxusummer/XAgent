@@ -118,6 +118,7 @@ _OPERATIONS = frozenset(
     {
         "register",
         "poll",
+        "poll_fleet",
         "start",
         "heartbeat",
         "cancellation_status",

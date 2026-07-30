@@ -646,6 +646,7 @@ class DurableScheduler:
         worker_id: str,
         *,
         resource_keys: Sequence[str] | None = None,
+        target_node_id: str | None = None,
     ) -> ActivityAdmissionCandidate | None:
         """Build a read-only exact candidate before worker authorization.
 
@@ -664,13 +665,28 @@ class DurableScheduler:
             if resource_keys is None
             else frozenset(str(key) for key in resource_keys)
         )
-        nodes = {node.node_id: node for node in self.store.list_nodes(run_id)}
-        attempts = self.store.list_attempts(run_id)
+        if target_node_id is None:
+            nodes = {
+                node.node_id: node
+                for node in self.store.list_nodes(run_id)
+            }
+            attempts = self.store.list_attempts(run_id)
+        else:
+            target_node = self.store.get_node(run_id, target_node_id)
+            if target_node is None:
+                return None
+            nodes = {target_node_id: target_node}
+            attempts = self.store.list_attempts(
+                run_id,
+                node_id=target_node_id,
+            )
         by_node: dict[str, list[AttemptRecord]] = {}
         for attempt in attempts:
             by_node.setdefault(attempt.node_id, []).append(attempt)
 
         for node_id in self.workflow.topological_order:
+            if target_node_id is not None and node_id != target_node_id:
+                continue
             node = nodes[node_id]
             definition = self.workflow.get_node(node_id)
             if (

@@ -217,6 +217,15 @@ class RemoteWorkerClient:
             return None
         return WorkAssignment.from_wire(assignment)
 
+    def poll_fleet(self) -> WorkAssignment | None:
+        """Claim the next server-selected compatible Run, if one is ready."""
+
+        body = self._call(RemoteOperation.POLL_FLEET, {})
+        assignment = body.get("assignment")
+        if assignment is None:
+            return None
+        return WorkAssignment.from_wire(assignment)
+
     def start(self, claim: ClaimBinding) -> Mapping[str, Any]:
         return self._call(RemoteOperation.START, claim_body(claim))
 

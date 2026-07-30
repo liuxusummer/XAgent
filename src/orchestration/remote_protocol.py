@@ -56,6 +56,7 @@ _BASE64URL_RE = re.compile(r"[A-Za-z0-9_-]+")
 class RemoteOperation(StrEnum):
     REGISTER = "register"
     POLL = "poll"
+    POLL_FLEET = "poll_fleet"
     START = "start"
     HEARTBEAT = "heartbeat"
     CANCELLATION_STATUS = "cancellation_status"
@@ -1258,6 +1259,9 @@ def _validated_body(
             "run_id": _identifier(payload["run_id"], "run_id"),
             "lease_seconds": _lease_seconds(payload["lease_seconds"]),
         }
+    if operation is RemoteOperation.POLL_FLEET:
+        _exact_object(body, "body", set())
+        return {}
     if operation is RemoteOperation.HEARTBEAT:
         payload = _exact_object(body, "body", {"claim", "lease_seconds"})
         return {
@@ -1369,7 +1373,10 @@ def _validated_response_body(
                 "registration_digest",
             ),
         }
-    if operation is RemoteOperation.POLL:
+    if operation in {
+        RemoteOperation.POLL,
+        RemoteOperation.POLL_FLEET,
+    }:
         payload = _exact_object(body, "response", {"assignment"})
         assignment = payload["assignment"]
         return {

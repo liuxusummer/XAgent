@@ -38,8 +38,9 @@ MAX_FLEET_TASK_BINDINGS = 1_000_000
 MAX_FLEET_WORKERS = 4096
 MAX_RUN_ID_CHARS = 255
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,254}$")
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
-ClaimRun = Callable[[str, str], WorkAssignment]
+ClaimRun = Callable[..., WorkAssignment]
 SchedulerFactory = Callable[[], DeterministicRemoteScheduler]
 
 
@@ -69,11 +70,47 @@ class FleetTaskBinding:
 
     run_id: str
     task: RemoteTask
+    node_id: str | None = None
+    activity_config_digest: str | None = None
+    routing_policy_digest: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_id", _run_id(self.run_id))
         if not isinstance(self.task, RemoteTask):
             raise RemoteFleetValidationError("task must be a RemoteTask")
+        if (self.node_id is None) != (
+            self.activity_config_digest is None
+        ):
+            raise RemoteFleetValidationError(
+                "exact Fleet binding requires node_id and config digest"
+            )
+        if self.node_id is not None:
+            object.__setattr__(self, "node_id", _run_id(self.node_id))
+            if (
+                not isinstance(self.activity_config_digest, str)
+                or _DIGEST.fullmatch(self.activity_config_digest) is None
+            ):
+                raise RemoteFleetValidationError(
+                    "activity_config_digest must be a SHA-256 digest"
+                )
+        if (
+            self.routing_policy_digest is not None
+            and (
+                not isinstance(self.routing_policy_digest, str)
+                or _DIGEST.fullmatch(self.routing_policy_digest) is None
+            )
+        ):
+            raise RemoteFleetValidationError(
+                "routing_policy_digest must be a SHA-256 digest"
+            )
+
+    @property
+    def exact_for_production(self) -> bool:
+        return (
+            self.node_id is not None
+            and self.activity_config_digest is not None
+            and self.routing_policy_digest is not None
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,8 +182,32 @@ class RemoteFleetCoordinator:
         self._observability = observability
         self._lock = threading.RLock()
         self._scheduler = scheduler
-        self._task_runs: dict[str, str] = {}
+        self._task_bindings: dict[str, FleetTaskBinding] = {}
         self._inflight_durable_claims = 0
+
+    @property
+    def production_security_ready(self) -> bool:
+        """Whether the durable claim callback is explicitly trusted."""
+
+        try:
+            callback_ready = (
+                getattr(
+                    self._claim_run,
+                    "production_security_ready",
+                    None,
+                )
+                is True
+            )
+            with self._lock:
+                bindings_ready = all(
+                    binding.exact_for_production
+                    for binding in self._task_bindings.values()
+                )
+            return callback_ready and bindings_ready
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            return False
 
     def register_worker(self, descriptor: WorkerDescriptor) -> WorkerSnapshot:
         with self._lock:
@@ -224,21 +285,26 @@ class RemoteFleetCoordinator:
                 "binding must be a FleetTaskBinding"
             )
         with self._lock:
-            existing = self._task_runs.get(binding.task.task_id)
-            if existing is not None and existing != binding.run_id:
-                raise RemoteFleetConflict("task_id is bound to another Run")
-            if existing is None and len(self._task_runs) >= self.max_task_bindings:
+            existing = self._task_bindings.get(binding.task.task_id)
+            if existing is not None and existing != binding:
+                raise RemoteFleetConflict(
+                    "task_id is bound to another Run or durable candidate"
+                )
+            if (
+                existing is None
+                and len(self._task_bindings) >= self.max_task_bindings
+            ):
                 raise RemoteFleetConflict("fleet task binding registry is full")
             decision = self._scheduler.admit(binding.task)
             if decision.outcome is AdmissionOutcome.ADMITTED:
-                self._task_runs[binding.task.task_id] = binding.run_id
+                self._task_bindings[binding.task.task_id] = binding
             elif decision.outcome is AdmissionOutcome.DUPLICATE:
                 if existing is None:
                     raise RemoteFleetConflict(
                         "routing task exists without a trusted Run binding"
                     )
             elif existing is None:
-                self._task_runs.pop(binding.task.task_id, None)
+                self._task_bindings.pop(binding.task.task_id, None)
             queue_depth = self._scheduler.queue_depth(
                 pool_id=binding.task.pool_id
             )
@@ -275,12 +341,13 @@ class RemoteFleetCoordinator:
             else:
                 routing = decision.assignment
                 assert routing is not None
-                run_id = self._task_runs.get(routing.task.task_id)
-                if run_id is None:
+                binding = self._task_bindings.get(routing.task.task_id)
+                if binding is None:
                     self._rollback_routing(scheduler, routing)
                     raise RemoteFleetConflict(
                         "routing assignment has no trusted Run binding"
                     )
+                run_id = binding.run_id
                 self._inflight_durable_claims += 1
         self._observe("record_poll", pool_id, decision.outcome)
         if routing is None:
@@ -289,14 +356,28 @@ class RemoteFleetCoordinator:
 
         try:
             try:
-                durable = self._claim_run(run_id, worker_id)
+                if (
+                    getattr(
+                        self._claim_run,
+                        "production_security_ready",
+                        None,
+                    )
+                    is True
+                ):
+                    durable = self._claim_run(
+                        binding,
+                        worker_id,
+                        routing.worker_session_id,
+                    )
+                else:
+                    durable = self._claim_run(run_id, worker_id)
             except BaseException as exc:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
                 self._claim_failed(scheduler, routing, expected_run_id=run_id)
                 raise RemoteFleetClaimError() from exc
 
-            if not self._durable_matches(routing, durable, run_id):
+            if not self._durable_matches(routing, durable, binding):
                 self._claim_failed(scheduler, routing, expected_run_id=run_id)
                 raise RemoteFleetConflict(
                     "durable assignment conflicts with routing projection"
@@ -355,7 +436,7 @@ class RemoteFleetCoordinator:
             raise RemoteFleetValidationError(
                 "scheduler_factory must return DeterministicRemoteScheduler"
             )
-        task_runs: dict[str, str] = {}
+        task_bindings: dict[str, FleetTaskBinding] = {}
         worker_ids: set[str] = set()
         for descriptor in workers:
             if not isinstance(descriptor, WorkerDescriptor):
@@ -372,7 +453,7 @@ class RemoteFleetCoordinator:
                     "tasks must contain FleetTaskBinding values"
                 )
             task_id = binding.task.task_id
-            existing = task_runs.get(task_id)
+            existing = task_bindings.get(task_id)
             if existing is not None:
                 raise RemoteFleetConflict("duplicate task in rebuild projection")
             decision = candidate.admit(binding.task)
@@ -380,7 +461,7 @@ class RemoteFleetCoordinator:
                 raise RemoteFleetConflict(
                     "rebuild projection exceeds scheduler admission bounds"
                 )
-            task_runs[task_id] = binding.run_id
+            task_bindings[task_id] = binding
 
         with self._lock:
             if self._inflight_durable_claims:
@@ -392,7 +473,7 @@ class RemoteFleetCoordinator:
                     "cannot rebuild over active routing assignments"
                 )
             self._scheduler = candidate
-            self._task_runs = task_runs
+            self._task_bindings = task_bindings
         for descriptor in workers:
             self._observe(
                 "record_worker_registration",
@@ -408,7 +489,7 @@ class RemoteFleetCoordinator:
                 worker_count=len(routing.workers),
                 queued_tasks=routing.queued_tasks,
                 active_assignments=routing.active_assignments,
-                task_bindings=len(self._task_runs),
+                task_bindings=len(self._task_bindings),
                 inflight_durable_claims=self._inflight_durable_claims,
             )
 
@@ -422,13 +503,13 @@ class RemoteFleetCoordinator:
             )
         routing = assignment.routing
         with self._lock:
-            run_id = self._task_runs.get(routing.task.task_id)
+            binding = self._task_bindings.get(routing.task.task_id)
             if (
-                run_id is None
+                binding is None
                 or not self._durable_matches(
                     routing,
                     assignment.durable,
-                    run_id,
+                    binding,
                 )
             ):
                 raise RemoteFleetConflict(
@@ -441,7 +522,7 @@ class RemoteFleetCoordinator:
                 session_id=routing.worker_session_id,
             )
             if outcome is ReleaseOutcome.RELEASED:
-                self._task_runs.pop(routing.task.task_id, None)
+                self._task_bindings.pop(routing.task.task_id, None)
             queue_depth = self._scheduler.queue_depth(
                 pool_id=routing.task.pool_id
             )
@@ -463,12 +544,13 @@ class RemoteFleetCoordinator:
     ) -> None:
         self._rollback_routing(scheduler, routing)
         with self._lock:
+            binding = self._task_bindings.get(routing.task.task_id)
             if (
                 self._scheduler is scheduler
-                and self._task_runs.get(routing.task.task_id)
-                == expected_run_id
+                and binding is not None
+                and binding.run_id == expected_run_id
             ):
-                self._task_runs.pop(routing.task.task_id, None)
+                self._task_bindings.pop(routing.task.task_id, None)
         self._observe("record_stale_commit", routing.task.pool_id)
         self._observe(
             "observe_queue_depth",
@@ -496,15 +578,30 @@ class RemoteFleetCoordinator:
     def _durable_matches(
         routing: RemoteAssignment,
         durable: object,
-        run_id: str,
+        binding: FleetTaskBinding,
     ) -> bool:
         return (
             isinstance(durable, WorkAssignment)
-            and durable.claim.run_id == run_id
+            and durable.claim.run_id == binding.run_id
             and durable.worker_id == routing.worker_id
             and durable.activity_kind == "tool"
             and durable.activity_descriptor.activity_name
             == routing.task.tool_name
+            and (
+                not binding.exact_for_production
+                or (
+                    durable.claim.node_id == binding.node_id
+                    and durable.activity_descriptor.config_digest
+                    == binding.activity_config_digest
+                    and frozenset(
+                        durable.execution_plan.capabilities
+                    ).issubset(
+                        routing.task.required_capabilities
+                    )
+                    and frozenset(durable.resource_keys)
+                    == routing.task.required_resource_keys
+                )
+            )
         )
 
     def _observe(self, method_name: str, *args, **kwargs) -> None:

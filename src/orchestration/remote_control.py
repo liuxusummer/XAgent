@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 import time
 from collections import OrderedDict
@@ -27,6 +28,8 @@ from .remote_journal import (
     RemoteJournalSessionSuperseded,
 )
 from .remote_protocol import (
+    MAX_LEASE_SECONDS,
+    MIN_LEASE_SECONDS,
     AuthenticatedWorker,
     ClaimBinding,
     ExecutionAuthorization,
@@ -153,6 +156,26 @@ class WorkerRegistration:
     session_epoch: int
     session_owner_id: str
     session_binding_digest: str
+
+
+@runtime_checkable
+class RemoteFleetPoller(Protocol):
+    """Trusted cross-Run selector; durable claims remain in this control."""
+
+    production_security_ready: bool
+
+    def poll(
+        self,
+        identity: AuthenticatedWorker,
+        registration: WorkerRegistration,
+    ) -> WorkAssignment | None: ...
+
+    def release_terminal(
+        self,
+        identity: AuthenticatedWorker,
+        registration: WorkerRegistration,
+        claim: ClaimBinding,
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +329,7 @@ class RemoteControlPlane:
         ] = OrderedDict()
         self._inflight: dict[tuple[str, str, str], _Inflight] = {}
         self._worker_session_guards: dict[str, _WorkerSessionGuard] = {}
+        self._fleet_poller: RemoteFleetPoller | None = None
 
     @property
     def production_security_ready(self) -> bool:
@@ -319,6 +343,38 @@ class RemoteControlPlane:
             and getattr(adapter, "secure_two_phase_admission", None) is True
             and not self._allow_reference_admission
         )
+
+    @property
+    def production_fleet_ready(self) -> bool:
+        poller = self._fleet_poller
+        try:
+            return (
+                self.production_security_ready
+                and poller is not None
+                and poller.production_security_ready is True
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            return False
+
+    def bind_fleet_poller(self, poller: RemoteFleetPoller) -> None:
+        """Bind one production fleet selector before serving fleet polls."""
+
+        if not isinstance(poller, RemoteFleetPoller):
+            raise TypeError("poller must implement RemoteFleetPoller")
+        try:
+            ready = poller.production_security_ready
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            raise RemoteControlError("security_not_ready") from exc
+        if ready is not True:
+            raise RemoteControlError("security_not_ready")
+        with self._lock:
+            if self._fleet_poller is not None:
+                raise RemoteControlError("already_registered")
+            self._fleet_poller = poller
 
     def handle(
         self,
@@ -442,6 +498,8 @@ class RemoteControlPlane:
         registration = self._require_registration(identity, request)
         if request.operation is RemoteOperation.POLL:
             return self._poll(identity, registration, request)
+        if request.operation is RemoteOperation.POLL_FLEET:
+            return self._poll_fleet(identity, registration, request)
 
         claim = ClaimBinding.from_wire(request.body["claim"])
         if not self._authorize_run(identity, claim.run_id):
@@ -655,6 +713,10 @@ class RemoteControlPlane:
             or not error_fields_match
         ):
             raise RemoteControlError("authorization_conflict")
+        self._release_fleet_terminal(
+            registration,
+            ClaimBinding.from_wire(request.body["claim"]),
+        )
         return make_response(
             request,
             ok=True,
@@ -776,13 +838,153 @@ class RemoteControlPlane:
         registration: WorkerRegistration,
         request: RemoteRequest,
     ) -> dict[str, Any]:
-        run_id = str(request.body["run_id"])
+        assignment = self._claim_assignment(
+            identity,
+            registration,
+            run_id=str(request.body["run_id"]),
+            lease_seconds=float(request.body["lease_seconds"]),
+        )
+        return make_response(
+            request,
+            ok=True,
+            body={
+                "assignment": (
+                    None if assignment is None else assignment.to_wire()
+                )
+            },
+        ).to_wire()
+
+    def _poll_fleet(
+        self,
+        identity: AuthenticatedWorker,
+        registration: WorkerRegistration,
+        request: RemoteRequest,
+    ) -> dict[str, Any]:
+        poller = self._fleet_poller
+        try:
+            ready = (
+                poller is not None
+                and poller.production_security_ready is True
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            raise RemoteControlError("security_not_ready") from exc
+        if not ready:
+            raise RemoteControlError("security_not_ready")
+        try:
+            assignment = poller.poll(identity, registration)
+        except RemoteControlError:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            raise RemoteControlError("control_unavailable") from exc
+        if assignment is not None and (
+            not isinstance(assignment, WorkAssignment)
+            or assignment.worker_id != registration.worker_id
+        ):
+            raise RemoteControlError("authorization_conflict")
+        return make_response(
+            request,
+            ok=True,
+            body={
+                "assignment": (
+                    None if assignment is None else assignment.to_wire()
+                )
+            },
+        ).to_wire()
+
+    def claim_for_fleet(
+        self,
+        run_id: str,
+        worker_id: str,
+        *,
+        lease_seconds: float,
+        node_id: str,
+        activity_config_digest: str,
+        expected_session_binding_digest: str,
+    ) -> WorkAssignment:
+        """Trusted Fleet callback that preserves current session authority."""
+
+        if not self.production_security_ready:
+            raise RemoteControlError("security_not_ready")
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, (int, float))
+            or not math.isfinite(float(lease_seconds))
+            or not MIN_LEASE_SECONDS
+            <= float(lease_seconds)
+            <= MAX_LEASE_SECONDS
+        ):
+            raise RemoteControlError("claim_conflict")
+        registration = self.get_registration(worker_id)
+        if registration is None:
+            raise RemoteControlError("not_registered")
+        if (
+            registration.session_binding_digest
+            != expected_session_binding_digest
+        ):
+            raise RemoteControlError("worker_identity_mismatch")
+        identity = AuthenticatedWorker(
+            worker_id=registration.worker_id,
+            tenant_id=registration.tenant_id,
+            identity_digest=registration.identity_digest,
+        )
+        assignment = self._claim_assignment(
+            identity,
+            registration,
+            run_id=run_id,
+            lease_seconds=lease_seconds,
+            expected_node_id=node_id,
+            expected_config_digest=activity_config_digest,
+        )
+        if assignment is None:
+            raise RemoteControlError("claim_conflict")
+        return assignment
+
+    def fleet_claim_is_terminal(self, claim: ClaimBinding) -> bool:
+        """Probe durable truth for one previously issued Fleet assignment."""
+
+        if not isinstance(claim, ClaimBinding):
+            raise TypeError("claim must be a ClaimBinding")
+        scheduler = self._scheduler(claim.run_id)
+        attempt = scheduler.store.get_attempt(claim.attempt_id)
+        if (
+            attempt is None
+            or attempt.run_id != claim.run_id
+            or attempt.node_id != claim.node_id
+            or attempt.metadata.get("request_hash")
+            != claim.activity_request_digest
+        ):
+            raise RemoteControlError("claim_conflict")
+        return attempt.status.is_terminal
+
+    def _claim_assignment(
+        self,
+        identity: AuthenticatedWorker,
+        registration: WorkerRegistration,
+        *,
+        run_id: str,
+        lease_seconds: float,
+        expected_node_id: str | None = None,
+        expected_config_digest: str | None = None,
+    ) -> WorkAssignment | None:
         if not self._authorize_run(identity, run_id):
             raise RemoteControlError("forbidden")
         scheduler = self._scheduler(run_id)
+        if expected_node_id is None:
+            candidate_nodes = tuple(scheduler.workflow.nodes)
+        else:
+            try:
+                candidate_nodes = (
+                    scheduler.workflow.get_node(expected_node_id),
+                )
+            except KeyError:
+                return None
         required_kinds = {
             node.kind
-            for node in scheduler.workflow.nodes
+            for node in candidate_nodes
             if node.kind in ACTIVITY_KINDS
         }
         required_capabilities = {
@@ -793,7 +995,7 @@ class RemoteControlPlane:
             or not required_capabilities.issubset(registration.capabilities)
         ):
             raise RemoteControlError("unsupported_activity")
-        for node in scheduler.workflow.nodes:
+        for node in candidate_nodes:
             if node.kind in ACTIVITY_KINDS and contains_sensitive_key(
                 node.config.to_dict()
             ):
@@ -825,24 +1027,25 @@ class RemoteControlPlane:
             run_id,
             registration.session_owner_id,
             resource_keys=registration.resource_keys,
+            target_node_id=expected_node_id,
         )
         if candidate is None:
-            return make_response(
-                request,
-                ok=True,
-                body={"assignment": None},
-            ).to_wire()
+            return None
+        candidate_config_digest = canonical_digest(
+            dict(candidate.claim.config)
+        )
+        if (
+            expected_config_digest is not None
+            and candidate_config_digest != expected_config_digest
+        ):
+            return None
         activity = scheduler.workflow.get_node(candidate.claim.node_id)
         compatibility = activity.runtime_compatibility
         if (
             compatibility is not None
             and not compatibility.accepts(registration.runtime_version)
         ):
-            return make_response(
-                request,
-                ok=True,
-                body={"assignment": None},
-            ).to_wire()
+            return None
         try:
             adapter.preflight(identity, registration, scheduler)
         except RemoteControlError:
@@ -866,7 +1069,7 @@ class RemoteControlPlane:
                 registration.session_owner_id,
                 capacity=registration.max_concurrency,
                 resource_keys=registration.resource_keys,
-                lease_seconds=float(request.body["lease_seconds"]),
+                lease_seconds=lease_seconds,
             )
             authorization = (
                 None
@@ -913,7 +1116,7 @@ class RemoteControlPlane:
             try:
                 claim, policy_event = scheduler.claim_admitted(
                     candidate,
-                    lease_seconds=float(request.body["lease_seconds"]),
+                    lease_seconds=lease_seconds,
                     capacity=registration.max_concurrency,
                     admission_expires_at=admission_expires_at,
                     policy_binding=admission.policy_binding,
@@ -954,11 +1157,7 @@ class RemoteControlPlane:
                     cancel(admission)
                     authorization = None
                     policy_event = None
-                    return make_response(
-                        request,
-                        ok=True,
-                        body={"assignment": None},
-                    ).to_wire()
+                    return None
                 with self._worker_session_guard(identity.worker_id):
                     if not self._registration_is_current(registration):
                         cancel(admission)
@@ -992,16 +1191,13 @@ class RemoteControlPlane:
                         authorization,
                     )
         if claim is None:
-            body: dict[str, Any] = {"assignment": None}
-        else:
-            assert authorization is not None
-            assignment = self._assignment(
-                claim,
-                authorization,
-                registration,
-            )
-            body = {"assignment": assignment.to_wire()}
-        return make_response(request, ok=True, body=body).to_wire()
+            return None
+        assert authorization is not None
+        return self._assignment(
+            claim,
+            authorization,
+            registration,
+        )
 
     def _start(
         self,
@@ -1120,6 +1316,10 @@ class RemoteControlPlane:
         committed = scheduler.store.get_attempt(claim.attempt_id)
         if committed is None or committed.status is not outcome:
             raise RemoteControlError("authorization_conflict")
+        self._release_fleet_terminal(
+            registration,
+            ClaimBinding.from_wire(request.body["claim"]),
+        )
         return make_response(
             request,
             ok=True,
@@ -1165,6 +1365,10 @@ class RemoteControlPlane:
         committed = scheduler.store.get_attempt(claim.attempt_id)
         if committed is None or committed.status is not AttemptStatus.CANCELLED:
             raise RemoteControlError("authorization_conflict")
+        self._release_fleet_terminal(
+            registration,
+            ClaimBinding.from_wire(request.body["claim"]),
+        )
         return make_response(
             request,
             ok=True,
@@ -1177,6 +1381,31 @@ class RemoteControlPlane:
                 "outcome": "cancelled",
             },
         ).to_wire()
+
+    def _release_fleet_terminal(
+        self,
+        registration: WorkerRegistration,
+        claim: ClaimBinding,
+    ) -> None:
+        """Release non-authoritative capacity after durable terminal proof."""
+
+        poller = self._fleet_poller
+        if poller is None:
+            return
+        identity = AuthenticatedWorker(
+            worker_id=registration.worker_id,
+            tenant_id=registration.tenant_id,
+            identity_digest=registration.identity_digest,
+        )
+        try:
+            poller.release_terminal(identity, registration, claim)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            # Durable terminal state is execution truth. A projection release
+            # failure must be repaired by fleet reconciliation, never by
+            # rolling back or falsifying the committed terminal response.
+            return
 
     def _assignment(
         self,

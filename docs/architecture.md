@@ -95,9 +95,11 @@
   限制可持久 Run 数量。
 - 可选的 Phase 2 远程参考面保持 Store/Scheduler 为唯一执行事实：worker 只接收无宿主
   路径的 execution plan、会话绑定 Artifact grant，并回传 output handle 与签名 runtime
-  proof。`RemoteControlPlane` 是按 Run 轮询的参考协议，尚未与 fleet scheduler 的
-  server/pull transport 集成。可信 reconciler 必须先把 Run/Node 推进到
-  `RUNNING/READY`；poll 随后只读生成不含 lease authority 的精确 Attempt candidate，
+  proof。`RemoteControlPlane` 同时提供按 Run `poll` 和跨 Run `poll_fleet`；
+  后者通过可信 Fleet 组合接入 server/pull transport。可信 reconciler 必须先把
+  Run/Node 推进到
+  `RUNNING/READY`；run-scoped `poll` 或空 body 的跨 Run `poll_fleet` 随后只读生成
+  不含 lease authority 的精确 Attempt candidate，
   在 Store mutation 前完成节点级 policy、Worker session、Action、profile、Artifact
   与 runtime attestation 绑定，再以短期单次 ticket 做原子 candidate CAS + claim。
   旧的 claim-then-authorize reference adapter 默认禁用，只有控制面显式开启且 adapter
@@ -106,9 +108,11 @@
   journal；journal 路径不得挂载给 Worker，内存 journal 的 secure path fail closed。
   durable journal 首次建库经临时库完整提交后原子发布；既有库必须通过 schema/FK/
   integrity 校验，禁止缺表时自动重建。
-  prepared/staging registry 仍为进程内状态，fleet claim 准入后失败必须从 Store
-  重新投影，不能把内存队列或 journal 当作 Domain 事实源。完整边界见
-  `docs/distributed-execution-adr.md`。
+  Fleet routing 使用服务端版本化 Tool/Worker policy，并把 capabilities、resource
+  keys、runtime 和精确节点/config 纳入匹配；Worker register 声明只能缩小权限。
+  prepared/staging registry 与 Fleet queue 仍为进程内状态，fleet claim 准入后失败
+  必须从 Store 重新投影，不能把内存队列或 journal 当作 Domain 事实源。完整边界见
+  `docs/distributed-execution-adr.md` 和 `docs/remote-fleet-data-plane.md`。
 
 ## 3. 核心数据流
 

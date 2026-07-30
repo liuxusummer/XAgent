@@ -56,14 +56,20 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             "AuthenticatedWorker",
             "BoundedRemoteObservability",
             "DeterministicRemoteScheduler",
+            "DurableFleetProjector",
+            "FleetToolRoutingPolicy",
+            "FleetWorkerPolicy",
             "HttpsRemoteTransport",
             "OciGvisorSandboxBackend",
             "PinnedCertificateIdentityVerifier",
             "PinnedWorkerCertificate",
             "RemoteControlJournal",
+            "RemoteControlFleetClaimer",
             "RemoteControlPlane",
             "RemoteFleetCoordinator",
             "RemoteHttpASGIApp",
+            "SecureRemoteFleetPoller",
+            "StaticFleetToolPolicyResolver",
             "RemoteWorkerClient",
             "RemoteWorkerDaemon",
             "SecureRemoteAssignmentAdmitter",
@@ -103,6 +109,13 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             PinnedCertificateIdentityVerifier,
             RemoteHttpASGIApp,
         )
+        from src.orchestration.remote_fleet_control import (
+            DurableFleetProjector,
+            FleetToolRoutingPolicy,
+            RemoteControlFleetClaimer,
+            SecureRemoteFleetPoller,
+            StaticFleetToolPolicyResolver,
+        )
         from src.orchestration.remote_execution import (
             SecureRemoteAssignmentAdmitter,
         )
@@ -130,6 +143,14 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             ("TrustedActivityExecutor", TrustedActivityExecutor),
             ("RemoteControlPlane", RemoteControlPlane),
             ("RemoteControlJournal", RemoteControlJournal),
+            ("DurableFleetProjector", DurableFleetProjector),
+            ("FleetToolRoutingPolicy", FleetToolRoutingPolicy),
+            ("RemoteControlFleetClaimer", RemoteControlFleetClaimer),
+            ("SecureRemoteFleetPoller", SecureRemoteFleetPoller),
+            (
+                "StaticFleetToolPolicyResolver",
+                StaticFleetToolPolicyResolver,
+            ),
             ("HttpsRemoteTransport", HttpsRemoteTransport),
             (
                 "PinnedCertificateIdentityVerifier",

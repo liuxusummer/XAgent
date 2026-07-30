@@ -65,6 +65,9 @@ from src.orchestration import (
     AuthenticatedWorker,
     BoundedRemoteObservability,
     DeterministicRemoteScheduler,
+    DurableFleetProjector,
+    FleetToolRoutingPolicy,
+    FleetWorkerPolicy,
     HttpsRemoteTransport,
     OciGvisorSandboxBackend,
     PinnedCertificateIdentityVerifier,
@@ -77,6 +80,9 @@ from src.orchestration import (
     RemoteWorkerDaemon,
     SecureRemoteAssignmentAdmitter,
     SecureRemoteExecutionAdapter,
+    SecureRemoteFleetPoller,
+    StaticFleetToolPolicyResolver,
+    StaticFleetWorkerResolver,
     WorkerAuthorizationGate,
 )
 ```
@@ -99,7 +105,7 @@ from src.orchestration import (
 | Session | 持久单调 epoch；当前 identity + instance 可跨重启恢复；被替换 instance 的 tombstone 防 A→B→A；启动时校验完整 schema/FK/integrity，首次建库原子发布 | journal 备份、跨服务认证会话续期与证书轮换运维 |
 | Artifact | path-free grant、单次读取、受绑定的 staging/finalize、完整性复验、跨 Attempt 常驻字节硬上限、过期不可逆 | 远程对象服务、传输加密、持久 staging registry |
 | Sandbox | 限制性 OCI spec、精确 attestation/proof binding、缺证据 fail closed | 本机真实 gVisor/Kubernetes 部署与部署 attestation |
-| 调度 | 有界、确定性 tenant round-robin、quota、drain、session/generation 防 ABA；Activity runtime 范围在 claim 前强制 | fleet server 与 Run-scoped control poll 的端到端生产集成 |
+| 调度 | 有界、确定性 tenant round-robin、quota、drain、session/generation 防 ABA；`poll_fleet` 端到端绑定服务端 Tool/Worker policy、资源、精确节点和 durable claim | 跨控制面共享 broker/共识队列、自动 Run discovery/rebuild 控制循环 |
 | 观测 | 低基数、best-effort、明确 `execution_truth=false` | 生产 exporter、告警与容量规划 |
 
 还必须保留以下残余边界：
@@ -118,13 +124,12 @@ from src.orchestration import (
 - `OciGvisorSandboxBackend` 只在注入 verifier 对当前 adapter、runtime class 和有效期
   返回精确 attestation 时暴露 `SecurityLevel.CONTAINER`。示例中的 HMAC proof 只证明
   绑定代码，不证明进程真的在 gVisor 中运行。
-- `RemoteControlPlane` 仍是 run-scoped poll；新增的
+- `RemoteControlPlane` 同时保留 run-scoped `poll`，并提供空 body 的
+  `poll_fleet` server/pull 路径。后者已端到端组合 Fleet 公平选择、服务端 Tool/Worker
+  policy、精确节点 candidate 和 durable two-phase claim。新增的
   [HTTPS transport](remote-worker-https-transport.md) 可将它安全暴露给实现 ASGI TLS
-  extension 的受信 server，但仓库没有捆绑或证明该 server/PKI 部署。它与
-  `RemoteFleetCoordinator` / `DeterministicRemoteScheduler` 尚未组成真实
-  server/pull 数据面。fleet 层证明多工具 Worker 的逐节点匹配，但 control poll 当前只
-  对整个 Workflow 的 activity kinds/capabilities 做粗预检。因此不能声称已经端到端
-  支持生产异构 fleet。
+  extension 的受信 server，但仓库仍没有捆绑或证明该 server/PKI 部署。完整组合见
+  [remote-fleet-data-plane.md](remote-fleet-data-plane.md)。
 - `RemoteFleetCoordinator` 的 routing 是 projection，不是执行事实。durable claim
   callback 失败后会回滚 routing 并移除绑定；Store reconciler/投影器必须重新投影并
   re-admit ready work。
@@ -133,6 +138,8 @@ from src.orchestration import (
 
 HTTPS 传输的三轮专项审查见
 [remote-worker-https-adversarial-review.md](remote-worker-https-adversarial-review.md)。
+Fleet 数据面的四轮专项审查见
+[remote-fleet-adversarial-review.md](remote-fleet-adversarial-review.md)。
 
 ## 验证
 

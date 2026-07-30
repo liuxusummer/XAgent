@@ -50,6 +50,7 @@ def worker(
     capabilities: frozenset[str] = frozenset({"workspace.read", "workspace.write"}),
     tools: frozenset[str] = frozenset({"file.read", "file.write"}),
     authorized_tenants: frozenset[str] = _TEST_TENANTS,
+    resource_keys: frozenset[str] = frozenset(),
     capacity: int = 1,
 ) -> WorkerDescriptor:
     return WorkerDescriptor(
@@ -60,6 +61,7 @@ def worker(
         capabilities=capabilities,
         tools=tools,
         authorized_tenants=authorized_tenants,
+        resource_keys=resource_keys,
         capacity=capacity,
     )
 
@@ -99,6 +101,7 @@ def task(
     pool_id: str = "pool-a",
     tool_name: str = "file.read",
     required_capabilities: frozenset[str] = frozenset({"workspace.read"}),
+    required_resource_keys: frozenset[str] = frozenset(),
     min_runtime_version: str = "2",
     max_runtime_version: str | None = "2.9",
 ) -> RemoteTask:
@@ -108,6 +111,7 @@ def task(
         pool_id=pool_id,
         tool_name=tool_name,
         required_capabilities=required_capabilities,
+        required_resource_keys=required_resource_keys,
         min_runtime_version=min_runtime_version,
         max_runtime_version=max_runtime_version,
     )
@@ -176,6 +180,7 @@ class RemoteSchedulingTests(unittest.TestCase):
                 "pool_id",
                 "tool_name",
                 "required_capabilities",
+                "required_resource_keys",
                 "min_runtime_version",
                 "max_runtime_version",
                 "schema_version",
@@ -183,6 +188,52 @@ class RemoteSchedulingTests(unittest.TestCase):
         )
         self.assertNotIn("metadata", WorkerDescriptor.__dataclass_fields__)
         self.assertNotIn("arguments", RemoteTask.__dataclass_fields__)
+
+    def test_resource_requirements_are_part_of_worker_compatibility(self) -> None:
+        requirement = task(
+            "task-resource",
+            required_resource_keys=frozenset({"workspace:/project"}),
+        )
+        self.assertFalse(
+            is_worker_compatible(worker("worker-no-resource"), requirement)
+        )
+        self.assertTrue(
+            is_worker_compatible(
+                worker(
+                    "worker-resource",
+                    resource_keys=frozenset(
+                        {"workspace:/project", "workspace:/other"}
+                    ),
+                ),
+                requirement,
+            )
+        )
+        legacy_worker = WorkerDescriptor(
+            "legacy-worker",
+            "legacy-session",
+            "pool-a",
+            "2.1",
+            frozenset({"workspace.read"}),
+            frozenset({"file.read"}),
+            frozenset({"tenant-a"}),
+            3,
+        )
+        legacy_task = RemoteTask(
+            "legacy-task",
+            "tenant-a",
+            "pool-a",
+            "file.read",
+            frozenset({"workspace.read"}),
+            "2",
+            "2.9",
+        )
+        self.assertEqual(legacy_worker.capacity, 3)
+        self.assertEqual(legacy_worker.resource_keys, frozenset())
+        self.assertEqual(
+            legacy_task.required_resource_keys,
+            frozenset(),
+        )
+        self.assertTrue(is_worker_compatible(legacy_worker, legacy_task))
 
     def test_fifo_with_tenant_round_robin_resists_starvation(self) -> None:
         scheduler = DeterministicRemoteScheduler(clock=_FakeClock())

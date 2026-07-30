@@ -44,12 +44,14 @@ MAX_IDENTIFIER_CHARS = 64
 MAX_CAPABILITIES = 64
 MAX_TOOLS = 256
 MAX_AUTHORIZED_TENANTS = 64
+MAX_RESOURCE_KEYS = 128
 MAX_WORKER_CAPACITY = 256
 MAX_QUOTA_ENTRIES = 4096
 MAX_SEQUENCE = (1 << 63) - 1
 MAX_WORKER_IDLE_TTL_SECONDS = 7 * 24 * 60 * 60
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+_RESOURCE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
 
 
 class RemoteSchedulingError(RuntimeError):
@@ -200,6 +202,40 @@ def _names(
     return normalized
 
 
+def _resource_keys(
+    values: object,
+    field_name: str,
+) -> frozenset[str]:
+    if not isinstance(values, (tuple, list, set, frozenset)):
+        raise RemoteSchedulingValidationError(
+            f"{field_name} must be a collection"
+        )
+    if len(values) > MAX_RESOURCE_KEYS:
+        raise RemoteSchedulingValidationError(
+            f"{field_name} exceeds the {MAX_RESOURCE_KEYS}-item limit"
+        )
+    normalized: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise RemoteSchedulingValidationError(
+                f"{field_name} must contain strings"
+            )
+        text = value.strip()
+        if (
+            not text
+            or _RESOURCE_KEY.fullmatch(text) is None
+        ):
+            raise RemoteSchedulingValidationError(
+                f"{field_name} contains an invalid resource key"
+            )
+        normalized.add(text)
+    if len(normalized) != len(values):
+        raise RemoteSchedulingValidationError(
+            f"{field_name} contains duplicates"
+        )
+    return frozenset(normalized)
+
+
 def _canonical_runtime_version(value: object, field_name: str) -> str:
     try:
         return canonical_runtime_version(value, field_name)
@@ -220,6 +256,7 @@ class WorkerDescriptor:
     authorized_tenants: frozenset[str]
     capacity: int = 1
     schema_version: int = REMOTE_SCHEDULING_SCHEMA_VERSION
+    resource_keys: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if self.schema_version != REMOTE_SCHEDULING_SCHEMA_VERSION:
@@ -266,6 +303,11 @@ class WorkerDescriptor:
         )
         object.__setattr__(
             self,
+            "resource_keys",
+            _resource_keys(self.resource_keys, "resource_keys"),
+        )
+        object.__setattr__(
+            self,
             "capacity",
             _positive_int(
                 self.capacity,
@@ -287,6 +329,7 @@ class RemoteTask:
     min_runtime_version: str = "0"
     max_runtime_version: str | None = None
     schema_version: int = REMOTE_SCHEDULING_SCHEMA_VERSION
+    required_resource_keys: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if self.schema_version != REMOTE_SCHEDULING_SCHEMA_VERSION:
@@ -305,6 +348,14 @@ class RemoteTask:
                 "required_capabilities",
                 maximum=MAX_CAPABILITIES,
                 allow_empty=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "required_resource_keys",
+            _resource_keys(
+                self.required_resource_keys,
+                "required_resource_keys",
             ),
         )
         try:
@@ -417,6 +468,8 @@ def is_worker_compatible(worker: WorkerDescriptor, task: RemoteTask) -> bool:
     ):
         return False
     if not task.required_capabilities.issubset(worker.capabilities):
+        return False
+    if not task.required_resource_keys.issubset(worker.resource_keys):
         return False
     return RuntimeCompatibility(
         min_runtime_version=task.min_runtime_version,

@@ -118,7 +118,7 @@ no-clobber 原子发布到最终路径；崩溃或多进程并发初始化不能
 {
   "protocol_version": 1,
   "request_id": "bounded-id",
-  "operation": "register|poll|heartbeat|start|complete|cancel_status",
+  "operation": "register|poll|poll_fleet|heartbeat|start|complete|cancel_status",
   "body": {}
 }
 ```
@@ -137,6 +137,7 @@ no-clobber 原子发布到最终路径；崩溃或多进程并发初始化不能
 |---|---|---|
 | `register` | 建立短期 Worker session | transport identity、pool、tenant、capabilities、runtime |
 | `poll` | 获取一个匹配的 durable claim | session、capacity、兼容版本 |
+| `poll_fleet` | 由服务端跨 Run 选择兼容工作 | session、服务端 routing policy、精确节点 |
 | `heartbeat` | 延长当前 lease | exact Attempt、lease、fencing、claim token |
 | `start` | 提交越过副作用门禁的意图 | action/execution digest、policy authorization |
 | `complete` | 提交候选 ToolReceipt | exact terminal outcome、Artifact refs、receipt digest |
@@ -308,14 +309,30 @@ Worker drain 后：
   transport binding 或 `instance_id` 的注册创建新 session，不能接管旧 claim
   authority。
 
-### 7.4 Reference 组合边界
+### 7.4 Fleet server/pull 组合
 
-当前 `RemoteControlPlane` 是按 Run 轮询的 reference protocol，尚未与
-`RemoteFleetCoordinator` / `DeterministicRemoteScheduler` 组成生产 server/pull
-数据面。control poll 已按精确节点 candidate 做两阶段准入，但 fleet projection 的
-跨 Run 公平选择和 reference control 的按 Run poll 仍是两条边界，不能声称已端到端
-支持生产异构 fleet。fleet claim callback 失败后必须丢弃 routing binding，并由 Store
-reconciler 重新投影、重新准入。旧单阶段 adapter 只有在控制面显式设置
+`poll_fleet` 已把 `RemoteControlPlane` 与
+`RemoteFleetCoordinator` / `DeterministicRemoteScheduler` 组成显式 server/pull
+数据面。Worker 请求体为空，不能选择 Run、节点或 lease；服务端从当前认证 session、
+精确 Worker policy 和跨 tenant 公平队列选择。`DurableFleetProjector` 从已 reconcile
+的 READY Tool 节点生成无密 binding，包含 Run/节点/config、版本化 Tool routing
+policy、capabilities、resource keys 和 runtime 范围。routing 预留后仍必须通过原有
+two-phase admission 和 Store candidate CAS，Fleet projection 不能推进 Domain 状态。
+
+Worker 注册声明只缩小服务端 policy：effective capabilities/resources 取交集，
+capacity 取最小值，tenant/pool/tools 使用服务端精确值。Tool policy 缺失、策略
+digest 漂移、节点/config 不一致、session supersession 或 durable assignment 与
+routing 不一致均 fail closed。terminal projection 由 completion/replay/cancel
+释放；lease reaper 等带外终态通过 exact Store probe 的有界 reconciler 收敛。
+
+Fleet queue/active registry 仍是单进程、可重建 projection，不是共享消息 broker 或
+跨控制面共识。ready Run 发现、周期投影、策略变更后的 rebuild 和 terminal reconcile
+由部署控制循环显式驱动。claim callback 失败后 binding 可丢弃，并由 Store reconciler
+重新投影、重新准入。完整组合与审查证据见
+[remote-fleet-data-plane.md](remote-fleet-data-plane.md) 和
+[remote-fleet-adversarial-review.md](remote-fleet-adversarial-review.md)。
+
+旧单阶段 adapter 只有在控制面显式设置
 `allow_reference_admission=true` 且 adapter 同时声明 `reference_admission_only=true`
 时才可进入开发兼容路径；任一条件缺失均在 Store mutation 前 fail closed。
 

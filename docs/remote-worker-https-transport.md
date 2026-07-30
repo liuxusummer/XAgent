@@ -32,6 +32,9 @@ Worker request
   `CERT_REQUIRED + check_hostname + TLS 1.2+` 的 context。
 - 连接丢失重试复用完全相同的 canonical request id/digest。确定性 4xx、认证失败和
   非法响应不重试。
+- 同一端点承载 run-scoped `poll` 和空 body 的 `poll_fleet`；后者只有在控制面显式
+  绑定 production-ready Fleet poller 后才可领取跨 Run 工作，完整边界见
+  [remote-fleet-data-plane.md](remote-fleet-data-plane.md)。
 
 ASGI TLS extension 定义 `client_cert_chain` 为 PEM Unicode 字符串序列，并规定第一个
 元素是叶证书；`tls_version` 和 `cipher_suite` 是整数。实现按该契约严格解析：
