@@ -353,15 +353,35 @@ class WebToolTests(unittest.TestCase):
             self.assertEqual(result["operation"], "write")
             self.assertFalse((root / "system" / "output.json").exists())
 
-    def test_save_result_allows_runtime_target(self) -> None:
+    def test_save_result_allows_business_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
 
-            result = save_result("payload", "runtime/output.json", str(root))
+            result = save_result(
+                "payload",
+                "business/output.json",
+                str(root),
+            )
 
-            target = root / "runtime" / "output.json"
+            target = root / "business" / "output.json"
             self.assertEqual(result["saved_to"], str(target.resolve()))
             self.assertEqual(target.read_text(encoding="utf-8"), "payload")
+
+    def test_save_result_denies_runtime_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+
+            result = save_result(
+                "payload",
+                "runtime/chats/state.json",
+                str(root),
+            )
+
+            self.assertEqual(result["status"], "ERROR")
+            self.assertEqual(result["operation"], "write")
+            self.assertFalse(
+                (root / "runtime" / "chats" / "state.json").exists()
+            )
 
 
 if __name__ == "__main__":

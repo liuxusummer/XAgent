@@ -59,20 +59,40 @@ def utc_timestamp() -> float:
     return time.time()
 
 
-def eval_root(workspace_root: str | Path) -> Path:
-    return Path(workspace_root) / "runtime" / "eval"
+def eval_root(
+    workspace_root: str | Path,
+    *,
+    storage_root: str | Path | None = None,
+) -> Path:
+    return (
+        Path(storage_root)
+        if storage_root is not None
+        else Path(workspace_root) / "runtime" / "eval"
+    )
 
 
-def datasets_root(workspace_root: str | Path) -> Path:
-    return eval_root(workspace_root) / "datasets"
+def datasets_root(
+    workspace_root: str | Path,
+    *,
+    storage_root: str | Path | None = None,
+) -> Path:
+    return eval_root(workspace_root, storage_root=storage_root) / "datasets"
 
 
-def runs_root(workspace_root: str | Path) -> Path:
-    return eval_root(workspace_root) / "runs"
+def runs_root(
+    workspace_root: str | Path,
+    *,
+    storage_root: str | Path | None = None,
+) -> Path:
+    return eval_root(workspace_root, storage_root=storage_root) / "runs"
 
 
-def downloads_root(workspace_root: str | Path) -> Path:
-    return eval_root(workspace_root) / "downloads"
+def downloads_root(
+    workspace_root: str | Path,
+    *,
+    storage_root: str | Path | None = None,
+) -> Path:
+    return eval_root(workspace_root, storage_root=storage_root) / "downloads"
 
 
 def validate_safe_id(value: str, kind: str = "id") -> str:
@@ -263,9 +283,18 @@ def _write_dataset_jsonl(path: Path, cases: list[EvalCase]) -> None:
             f.write(json.dumps(case.to_dict(), ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def read_dataset_cases(workspace_root: str | Path, dataset_id: str) -> list[dict[str, Any]]:
+def read_dataset_cases(
+    workspace_root: str | Path,
+    dataset_id: str,
+    *,
+    storage_root: str | Path | None = None,
+) -> list[dict[str, Any]]:
     dataset_id = validate_safe_id(dataset_id, "dataset_id")
-    path = datasets_root(workspace_root) / dataset_id / "dataset.jsonl"
+    path = (
+        datasets_root(workspace_root, storage_root=storage_root)
+        / dataset_id
+        / "dataset.jsonl"
+    )
     if not path.is_file():
         raise EvalError("Dataset not found")
     cases: list[dict[str, Any]] = []
@@ -283,9 +312,18 @@ def read_dataset_cases(workspace_root: str | Path, dataset_id: str) -> list[dict
     return cases
 
 
-def read_dataset_metadata(workspace_root: str | Path, dataset_id: str) -> dict[str, Any]:
+def read_dataset_metadata(
+    workspace_root: str | Path,
+    dataset_id: str,
+    *,
+    storage_root: str | Path | None = None,
+) -> dict[str, Any]:
     dataset_id = validate_safe_id(dataset_id, "dataset_id")
-    path = datasets_root(workspace_root) / dataset_id / "metadata.json"
+    path = (
+        datasets_root(workspace_root, storage_root=storage_root)
+        / dataset_id
+        / "metadata.json"
+    )
     if not path.is_file():
         raise EvalError("Dataset not found")
     return json.loads(path.read_text(encoding="utf-8"))
@@ -298,13 +336,17 @@ def import_dataset_content(
     content: str,
     fmt: str = "",
     source: dict[str, Any] | None = None,
+    storage_root: str | Path | None = None,
+    owner_digest: str = "",
 ) -> dict[str, Any]:
     fmt = infer_format(name, fmt)
     cases = parse_dataset(content, fmt)
     now = utc_timestamp()
     base = sanitize_name(Path(name).stem or name, "dataset")
     dataset_id = f"{base}-{int(now)}-{uuid.uuid4().hex[:8]}"
-    target_dir = datasets_root(workspace_root) / dataset_id
+    target_dir = (
+        datasets_root(workspace_root, storage_root=storage_root) / dataset_id
+    )
     dataset_path = target_dir / "dataset.jsonl"
     _write_dataset_jsonl(dataset_path, cases)
     metadata = {
@@ -316,6 +358,7 @@ def import_dataset_content(
         "case_count": len(cases),
         "size_bytes": dataset_path.stat().st_size,
         "dataset_path": str(dataset_path),
+        **({"owner_digest": owner_digest} if owner_digest else {}),
     }
     _write_json(target_dir / "metadata.json", metadata)
     return metadata
@@ -327,6 +370,8 @@ def import_dataset_path(
     rel_path: str,
     name: str = "",
     fmt: str = "",
+    storage_root: str | Path | None = None,
+    owner_digest: str = "",
 ) -> dict[str, Any]:
     rel_path = str(rel_path or "").strip().replace("\\", "/")
     if not rel_path:
@@ -351,11 +396,17 @@ def import_dataset_path(
         content=content,
         fmt=fmt or infer_format(real_path.name),
         source={"type": "path", "path": rel_path},
+        storage_root=storage_root,
+        owner_digest=owner_digest,
     )
 
 
-def list_datasets(workspace_root: str | Path) -> list[dict[str, Any]]:
-    root = datasets_root(workspace_root)
+def list_datasets(
+    workspace_root: str | Path,
+    *,
+    storage_root: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    root = datasets_root(workspace_root, storage_root=storage_root)
     if not root.is_dir():
         return []
     datasets: list[dict[str, Any]] = []
@@ -408,9 +459,25 @@ def list_workspace_eval_datasets(workspace_root: str | Path) -> list[dict[str, A
     return datasets
 
 
-def get_dataset_detail(workspace_root: str | Path, dataset_id: str) -> dict[str, Any]:
-    metadata = read_dataset_metadata(workspace_root, dataset_id)
-    return {**metadata, "cases": read_dataset_cases(workspace_root, dataset_id)}
+def get_dataset_detail(
+    workspace_root: str | Path,
+    dataset_id: str,
+    *,
+    storage_root: str | Path | None = None,
+) -> dict[str, Any]:
+    metadata = read_dataset_metadata(
+        workspace_root,
+        dataset_id,
+        storage_root=storage_root,
+    )
+    return {
+        **metadata,
+        "cases": read_dataset_cases(
+            workspace_root,
+            dataset_id,
+            storage_root=storage_root,
+        ),
+    }
 
 
 def _validate_dataset_url(url: str) -> str:
@@ -514,11 +581,16 @@ def download_dataset(
     name: str = "",
     fmt: str = "",
     timeout: float = DOWNLOAD_TIMEOUT_SEC,
+    storage_root: str | Path | None = None,
+    owner_digest: str = "",
 ) -> dict[str, Any]:
     data, final_url = _read_url_limited(url, timeout=timeout)
     parsed = urllib.parse.urlparse(final_url)
     filename = sanitize_name(Path(parsed.path).name or name or "dataset")
-    target = downloads_root(workspace_root) / f"{int(utc_timestamp())}-{uuid.uuid4().hex[:8]}-{filename}"
+    target = (
+        downloads_root(workspace_root, storage_root=storage_root)
+        / f"{int(utc_timestamp())}-{uuid.uuid4().hex[:8]}-{filename}"
+    )
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
     try:
@@ -531,6 +603,8 @@ def download_dataset(
         content=content,
         fmt=fmt or infer_format(filename),
         source={"type": "url", "url": url, "final_url": final_url, "download_path": str(target)},
+        storage_root=storage_root,
+        owner_digest=owner_digest,
     )
     return metadata
 
@@ -675,9 +749,19 @@ def create_eval_run(
     dataset_id: str,
     agent: str,
     case_limit: int | None = None,
+    storage_root: str | Path | None = None,
+    owner_digest: str = "",
 ) -> dict[str, Any]:
-    metadata = read_dataset_metadata(workspace_root, dataset_id)
-    cases = read_dataset_cases(workspace_root, dataset_id)
+    metadata = read_dataset_metadata(
+        workspace_root,
+        dataset_id,
+        storage_root=storage_root,
+    )
+    cases = read_dataset_cases(
+        workspace_root,
+        dataset_id,
+        storage_root=storage_root,
+    )
     if case_limit is not None and case_limit > 0:
         cases = cases[:case_limit]
     now = utc_timestamp()
@@ -697,26 +781,55 @@ def create_eval_run(
         "summary": summarize_cases([], total=len(cases)),
         "cases": [],
         "error": "",
+        **({"owner_digest": owner_digest} if owner_digest else {}),
     }
-    _write_json(runs_root(workspace_root) / run_id / "result.json", result)
+    _write_json(
+        runs_root(workspace_root, storage_root=storage_root)
+        / run_id
+        / "result.json",
+        result,
+    )
     return result
 
 
-def read_eval_run(workspace_root: str | Path, run_id: str) -> dict[str, Any]:
+def read_eval_run(
+    workspace_root: str | Path,
+    run_id: str,
+    *,
+    storage_root: str | Path | None = None,
+) -> dict[str, Any]:
     run_id = validate_safe_id(run_id, "run_id")
-    path = runs_root(workspace_root) / run_id / "result.json"
+    path = (
+        runs_root(workspace_root, storage_root=storage_root)
+        / run_id
+        / "result.json"
+    )
     if not path.is_file():
         raise EvalError("Run not found")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def write_eval_run(workspace_root: str | Path, result: dict[str, Any]) -> None:
+def write_eval_run(
+    workspace_root: str | Path,
+    result: dict[str, Any],
+    *,
+    storage_root: str | Path | None = None,
+) -> None:
     run_id = validate_safe_id(str(result.get("id") or ""), "run_id")
-    _write_json(runs_root(workspace_root) / run_id / "result.json", result)
+    _write_json(
+        runs_root(workspace_root, storage_root=storage_root)
+        / run_id
+        / "result.json",
+        result,
+    )
 
 
-def list_eval_runs(workspace_root: str | Path) -> list[dict[str, Any]]:
-    root = runs_root(workspace_root)
+def list_eval_runs(
+    workspace_root: str | Path,
+    *,
+    storage_root: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    root = runs_root(workspace_root, storage_root=storage_root)
     if not root.is_dir():
         return []
     runs: list[dict[str, Any]] = []
@@ -744,6 +857,7 @@ def list_eval_runs(workspace_root: str | Path) -> list[dict[str, Any]]:
                         "case_limit",
                         "summary",
                         "error",
+                        "owner_digest",
                     )
                 }
             )
@@ -755,17 +869,44 @@ def list_eval_runs(workspace_root: str | Path) -> list[dict[str, Any]]:
 AgentFactory = Callable[[], Any]
 
 
+def _stop_eval_agent_on_cancel(
+    cancel_event: threading.Event,
+    case_finished: threading.Event,
+    agent: Any,
+) -> None:
+    while not case_finished.wait(0.05):
+        if not cancel_event.is_set():
+            continue
+        stop = getattr(agent, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception:
+                pass
+        return
+
+
 def execute_eval_run(
     workspace_root: str | Path,
     run_id: str,
     *,
     agent_factory: AgentFactory,
     cancel_event: threading.Event | None = None,
+    storage_root: str | Path | None = None,
+    redact_errors: bool = False,
 ) -> dict[str, Any]:
     cancel_event = cancel_event or threading.Event()
-    result = read_eval_run(workspace_root, run_id)
+    result = read_eval_run(
+        workspace_root,
+        run_id,
+        storage_root=storage_root,
+    )
     dataset_id = str(result.get("dataset_id") or "")
-    cases = read_dataset_cases(workspace_root, dataset_id)
+    cases = read_dataset_cases(
+        workspace_root,
+        dataset_id,
+        storage_root=storage_root,
+    )
     case_limit = int(result.get("case_limit") or 0)
     if case_limit > 0:
         cases = cases[:case_limit]
@@ -773,7 +914,7 @@ def execute_eval_run(
     result["status"] = "running"
     result["started_at"] = result.get("started_at") or utc_timestamp()
     result["summary"] = summarize_cases(result.get("cases", []), total=len(cases))
-    write_eval_run(workspace_root, result)
+    write_eval_run(workspace_root, result, storage_root=storage_root)
 
     case_results: list[dict[str, Any]] = []
     try:
@@ -783,9 +924,17 @@ def execute_eval_run(
                 break
             start = time.monotonic()
             agent = None
+            cancel_watcher: threading.Thread | None = None
+            case_finished = threading.Event()
             raw_result: dict[str, Any]
             try:
                 agent = agent_factory()
+                cancel_watcher = threading.Thread(
+                    target=_stop_eval_agent_on_cancel,
+                    args=(cancel_event, case_finished, agent),
+                    daemon=True,
+                )
+                cancel_watcher.start()
                 raw_result = agent.run_task(str(case.get("task") or ""))
                 if not isinstance(raw_result, dict):
                     raw_result = {"response": str(raw_result), "exit_reason": "", "tool_results": [], "turns": 0}
@@ -798,10 +947,16 @@ def execute_eval_run(
                 )
             except Exception as exc:  # noqa: BLE001 - eval records per-case errors without killing the server.
                 duration_sec = time.monotonic() - start
-                raw_result = {"response": f"[error] {exc}", "exit_reason": "ERROR", "tool_results": [], "turns": 0}
+                error_detail = (
+                    "evaluation case failed" if redact_errors else str(exc)
+                )
+                raw_result = {"response": f"[error] {error_detail}", "exit_reason": "ERROR", "tool_results": [], "turns": 0}
                 status = "error"
-                failures = [str(exc)]
+                failures = [error_detail]
             finally:
+                case_finished.set()
+                if cancel_watcher is not None:
+                    cancel_watcher.join(timeout=0.2)
                 if agent is not None and hasattr(agent, "close"):
                     try:
                         agent.close()
@@ -825,15 +980,20 @@ def execute_eval_run(
             case_results.append(case_result)
             result["cases"] = case_results
             result["summary"] = summarize_cases(case_results, total=len(cases))
-            write_eval_run(workspace_root, result)
+            write_eval_run(workspace_root, result, storage_root=storage_root)
+            if cancel_event.is_set():
+                result["status"] = "canceled"
+                break
 
         if result.get("status") != "canceled":
             result["status"] = "completed"
     except Exception as exc:  # noqa: BLE001
         result["status"] = "error"
-        result["error"] = str(exc)
+        result["error"] = (
+            "evaluation run failed" if redact_errors else str(exc)
+        )
     finally:
         result["finished_at"] = utc_timestamp()
         result["summary"] = summarize_cases(case_results, total=len(cases))
-        write_eval_run(workspace_root, result)
+        write_eval_run(workspace_root, result, storage_root=storage_root)
     return result

@@ -1,15 +1,36 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
+from src.core.agent_kernel import Principal
 from src.tools.file_index import (
     DEFAULT_MAX_FILE_BYTES,
-    refresh_file_index,
-    search_file_index,
+    refresh_file_index as _refresh_file_index,
+    search_file_index as _search_file_index,
 )
+
+
+_TEST_PRINCIPAL = Principal(
+    subject="file-index-test",
+    tenant_id="tenant-test",
+    session_id="session-test",
+    run_id="run-test",
+    scopes=("workspace.read",),
+)
+
+
+def refresh_file_index(*args, **kwargs):
+    kwargs.setdefault("principal", _TEST_PRINCIPAL)
+    return _refresh_file_index(*args, **kwargs)
+
+
+def search_file_index(*args, **kwargs):
+    kwargs.setdefault("principal", _TEST_PRINCIPAL)
+    return _search_file_index(*args, **kwargs)
 
 
 class FakeEmbeddingProvider:
@@ -111,6 +132,70 @@ class FileIndexTests(unittest.TestCase):
             self.assertGreaterEqual(refresh["skipped"]["directories"], 1)
             self.assertEqual(refresh["skipped"]["too_large"], 1)
             self.assertEqual([match["path"] for match in result["matches"]], ["visible.txt"])
+
+    def test_index_excludes_all_managed_memory_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "memory").mkdir()
+            (root / "system" / "memory").mkdir(parents=True)
+            (root / "system" / "agents" / "main").mkdir(parents=True)
+            (root / "memory" / "global_mem.txt").write_text(
+                "LEGACY_MEMORY_SECRET",
+                encoding="utf-8",
+            )
+            (root / "system" / "memory" / "project.md").write_text(
+                "PROJECT_MEMORY_SECRET",
+                encoding="utf-8",
+            )
+            (
+                root / "system" / "agents" / "main" / "MEMORY.md"
+            ).write_text(
+                "AGENT_MEMORY_SECRET",
+                encoding="utf-8",
+            )
+            (root / "public.txt").write_text(
+                "PUBLIC_INDEX_TOKEN",
+                encoding="utf-8",
+            )
+
+            refresh = refresh_file_index(cwd=str(root))
+            secret = search_file_index(
+                query="MEMORY_SECRET",
+                cwd=str(root),
+            )
+            public = search_file_index(
+                query="PUBLIC_INDEX_TOKEN",
+                cwd=str(root),
+            )
+
+            self.assertEqual(refresh["status"], "OK")
+            self.assertEqual(secret["matches"], [])
+            self.assertEqual(
+                public["matches"][0]["path"],
+                "public.txt",
+            )
+
+    def test_mixed_case_memory_paths_are_never_indexed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            secret = root / "SYSTEM" / "MEMORY" / "secret.md"
+            secret.parent.mkdir(parents=True)
+            secret.write_text("MEMORY-INDEX-SECRET", encoding="utf-8")
+
+            refresh = refresh_file_index(cwd=str(root))
+            result = search_file_index(
+                query="MEMORY-INDEX-SECRET",
+                cwd=str(root),
+            )
+            protected_root = refresh_file_index(
+                cwd=str(root),
+                root="SYSTEM/MEMORY",
+            )
+
+            self.assertEqual(refresh["status"], "OK")
+            self.assertEqual(result["matches"], [])
+            self.assertEqual(protected_root["status"], "ERROR")
+            self.assertIn("protected", protected_root["error"])
 
     def test_refresh_skips_external_and_recursive_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -382,6 +467,242 @@ class FileIndexTests(unittest.TestCase):
             self.assertEqual(result["matches"][0]["path"], "target.txt")
             self.assertEqual(result["refresh_stats"]["semantic_status"]["status"], "ERROR")
             self.assertEqual(result["semantic_status"]["status"], "EMPTY")
+
+    def test_search_returns_content_bound_evidence_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            content = "evidence needle\n"
+            (root / "evidence.txt").write_text(content, encoding="utf-8")
+
+            result = search_file_index(
+                query="needle",
+                cwd=str(root),
+                mode="keyword",
+            )
+
+            self.assertEqual(result["status"], "OK")
+            match = result["matches"][0]
+            bundle = result["evidence_bundle"]
+            self.assertEqual(match["evidence_id"], bundle["items"][0]["evidence_id"])
+            self.assertEqual(
+                match["content_sha256"],
+                hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            )
+            self.assertEqual(match["index_version"], result["index_version"])
+            self.assertEqual(
+                bundle["principal_digest"],
+                _TEST_PRINCIPAL.principal_digest,
+            )
+            self.assertEqual(
+                bundle["items"][0]["knowledge"]["acl"],
+                ["tenant:tenant-test"],
+            )
+
+    def test_missing_principal_fails_closed_without_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "secret.txt").write_text("tenant secret", encoding="utf-8")
+
+            result = _search_file_index(query="secret", cwd=str(root))
+
+            self.assertEqual(result["status"], "ERROR")
+            self.assertEqual(result["reason_code"], "principal_required")
+            self.assertEqual(result["matches"], [])
+            self.assertFalse((root / "runtime" / "file_index.sqlite3").exists())
+
+    def test_missing_workspace_read_scope_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "secret.txt").write_text("tenant secret", encoding="utf-8")
+            principal = Principal(
+                subject="user",
+                tenant_id="tenant-test",
+                session_id="session",
+                run_id="run",
+                scopes=(),
+            )
+
+            result = _search_file_index(
+                query="secret",
+                cwd=str(root),
+                principal=principal,
+            )
+
+            self.assertEqual(result["status"], "ERROR")
+            self.assertEqual(result["reason_code"], "principal_scope_missing")
+            self.assertEqual(result["matches"], [])
+            self.assertFalse((root / "runtime" / "file_index.sqlite3").exists())
+
+    def test_different_tenant_cannot_search_existing_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "secret.txt").write_text("tenant secret", encoding="utf-8")
+            self.assertEqual(
+                search_file_index(query="secret", cwd=str(root))["status"],
+                "OK",
+            )
+            other = Principal(
+                subject="other-user",
+                tenant_id="other-tenant",
+                session_id="other-session",
+                run_id="other-run",
+                scopes=("workspace.read",),
+            )
+
+            denied = _search_file_index(
+                query="secret",
+                cwd=str(root),
+                principal=other,
+            )
+
+            self.assertEqual(denied["status"], "ERROR")
+            self.assertEqual(denied["reason_code"], "index_acl_denied")
+            self.assertEqual(denied["matches"], [])
+            self.assertNotIn("tenant secret", str(denied))
+
+    def test_missing_acl_metadata_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "secret.txt").write_text("tenant secret", encoding="utf-8")
+            self.assertEqual(
+                search_file_index(query="secret", cwd=str(root))["status"],
+                "OK",
+            )
+            with sqlite3.connect(root / "runtime" / "file_index.sqlite3") as conn:
+                conn.execute(
+                    "DELETE FROM file_index_meta WHERE key = 'owner_acl'"
+                )
+                conn.commit()
+
+            denied = search_file_index(query="secret", cwd=str(root))
+
+            self.assertEqual(denied["status"], "ERROR")
+            self.assertEqual(denied["reason_code"], "index_acl_denied")
+            self.assertEqual(denied["matches"], [])
+
+    def test_unknown_schema_version_fails_closed_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "secret.txt").write_text("tenant secret", encoding="utf-8")
+            self.assertEqual(
+                search_file_index(query="secret", cwd=str(root))["status"],
+                "OK",
+            )
+            db_path = root / "runtime" / "file_index.sqlite3"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE file_index_meta SET value = '999' "
+                    "WHERE key = 'schema_version'"
+                )
+                conn.commit()
+
+            denied = search_file_index(query="secret", cwd=str(root))
+
+            self.assertEqual(denied["status"], "ERROR")
+            self.assertEqual(denied["reason_code"], "index_acl_denied")
+            self.assertEqual(denied["matches"], [])
+            with sqlite3.connect(db_path) as conn:
+                stored = conn.execute(
+                    "SELECT value FROM file_index_meta "
+                    "WHERE key = 'schema_version'"
+                ).fetchone()[0]
+            self.assertEqual(stored, "999")
+
+    def test_schema_v4_rebuild_drops_content_now_classified_as_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy.txt"
+            legacy.write_text("MIGRATED_MEMORY_SECRET", encoding="utf-8")
+            self.assertTrue(
+                search_file_index(
+                    query="MIGRATED_MEMORY_SECRET",
+                    cwd=str(root),
+                )["matches"]
+            )
+            legacy.unlink()
+            memory = root / "system" / "memory"
+            memory.mkdir(parents=True)
+            (memory / "project.md").write_text(
+                "MIGRATED_MEMORY_SECRET",
+                encoding="utf-8",
+            )
+            db_path = root / "runtime" / "file_index.sqlite3"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE file_index_meta SET value = '3' "
+                    "WHERE key = 'schema_version'"
+                )
+                conn.commit()
+
+            result = search_file_index(
+                query="MIGRATED_MEMORY_SECRET",
+                cwd=str(root),
+            )
+
+            self.assertEqual(result["status"], "OK")
+            self.assertTrue(result["refreshed"])
+            self.assertEqual(result["matches"], [])
+            with sqlite3.connect(db_path) as conn:
+                stored = conn.execute(
+                    "SELECT value FROM file_index_meta "
+                    "WHERE key = 'schema_version'"
+                ).fetchone()[0]
+            self.assertEqual(stored, "4")
+
+    def test_missing_schema_metadata_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "secret.txt").write_text(
+                "tenant secret",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                search_file_index(query="secret", cwd=str(root))["status"],
+                "OK",
+            )
+            db_path = root / "runtime" / "file_index.sqlite3"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "DELETE FROM file_index_meta "
+                    "WHERE key = 'schema_version'"
+                )
+                conn.commit()
+
+            denied = search_file_index(query="secret", cwd=str(root))
+
+            self.assertEqual(denied["status"], "ERROR")
+            self.assertEqual(denied["reason_code"], "index_acl_denied")
+            self.assertEqual(denied["matches"], [])
+
+    def test_content_digest_mismatch_fails_closed_without_snippet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "evidence.txt").write_text(
+                "trusted evidence\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                search_file_index(query="evidence", cwd=str(root))["status"],
+                "OK",
+            )
+            with sqlite3.connect(root / "runtime" / "file_index.sqlite3") as conn:
+                conn.execute(
+                    "UPDATE file_index_files SET content = ? "
+                    "WHERE path = 'evidence.txt'",
+                    ("tampered secret",),
+                )
+                conn.commit()
+
+            denied = search_file_index(
+                query="evidence.txt",
+                cwd=str(root),
+                path_only=True,
+            )
+
+            self.assertEqual(denied["status"], "ERROR")
+            self.assertEqual(denied["reason_code"], "index_acl_denied")
+            self.assertEqual(denied["matches"], [])
+            self.assertNotIn("tampered secret", str(denied))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from src.core.eval import (
     get_dataset_detail,
     import_dataset_content,
     import_dataset_path,
+    list_datasets,
     parse_dataset,
     read_eval_run,
 )
@@ -279,6 +280,80 @@ class EvalAssertionTests(unittest.TestCase):
 
 
 class EvalRunTests(unittest.TestCase):
+    def test_explicit_storage_root_physically_partitions_owner_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            storage_root = Path(tmp_dir) / "private-owner"
+            owner_digest = "a" * 64
+            metadata = import_dataset_content(
+                tmp_dir,
+                name="private.jsonl",
+                fmt="jsonl",
+                content='{"task":"private"}\n',
+                storage_root=storage_root,
+                owner_digest=owner_digest,
+            )
+            run = create_eval_run(
+                tmp_dir,
+                workspace="default.ws",
+                dataset_id=metadata["id"],
+                agent="main",
+                storage_root=storage_root,
+                owner_digest=owner_digest,
+            )
+
+            self.assertEqual(list_datasets(tmp_dir), [])
+            self.assertEqual(
+                get_dataset_detail(
+                    tmp_dir,
+                    metadata["id"],
+                    storage_root=storage_root,
+                )["owner_digest"],
+                owner_digest,
+            )
+            self.assertEqual(
+                read_eval_run(
+                    tmp_dir,
+                    run["id"],
+                    storage_root=storage_root,
+                )["owner_digest"],
+                owner_digest,
+            )
+            with self.assertRaises(EvalError):
+                read_eval_run(tmp_dir, run["id"])
+
+    def test_secure_eval_error_redaction_omits_exception_details(self) -> None:
+        class _FailingAgent:
+            def run_task(self, _task: str) -> dict:
+                raise RuntimeError("/private/host/credential.txt")
+
+            def close(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            metadata = import_dataset_content(
+                tmp_dir,
+                name="suite.jsonl",
+                fmt="jsonl",
+                content='{"task":"fail"}\n',
+            )
+            run = create_eval_run(
+                tmp_dir,
+                workspace="default.ws",
+                dataset_id=metadata["id"],
+                agent="main",
+            )
+
+            result = execute_eval_run(
+                tmp_dir,
+                run["id"],
+                agent_factory=_FailingAgent,
+                redact_errors=True,
+            )
+
+            rendered = json.dumps(result)
+            self.assertNotIn("/private/host", rendered)
+            self.assertIn("evaluation case failed", rendered)
+
     def test_execute_eval_run_serially_with_fresh_agents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             metadata = import_dataset_content(
@@ -337,6 +412,68 @@ class EvalRunTests(unittest.TestCase):
             self.assertEqual(result["status"], "canceled")
             self.assertEqual(calls, 1)
             self.assertEqual(result["summary"]["completed"], 1)
+
+    def test_cancel_stops_the_current_long_running_agent(self) -> None:
+        class _BlockingAgent:
+            def __init__(self) -> None:
+                self.started = threading.Event()
+                self.released = threading.Event()
+                self.stopped = False
+                self.closed = False
+
+            def run_task(self, _task: str) -> dict:
+                self.started.set()
+                if not self.released.wait(2):
+                    raise RuntimeError("agent was not stopped")
+                return {
+                    "response": "",
+                    "exit_reason": "EXITED",
+                    "tool_results": [],
+                    "turns": 1,
+                }
+
+            def stop(self) -> None:
+                self.stopped = True
+                self.released.set()
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            metadata = import_dataset_content(
+                tmp_dir,
+                name="suite.jsonl",
+                fmt="jsonl",
+                content='{"task":"long"}\n',
+            )
+            run = create_eval_run(
+                tmp_dir,
+                workspace="default.ws",
+                dataset_id=metadata["id"],
+                agent="main",
+            )
+            cancel_event = threading.Event()
+            agent = _BlockingAgent()
+            outcome: list[dict] = []
+            worker = threading.Thread(
+                target=lambda: outcome.append(
+                    execute_eval_run(
+                        tmp_dir,
+                        run["id"],
+                        agent_factory=lambda: agent,
+                        cancel_event=cancel_event,
+                    )
+                )
+            )
+            worker.start()
+            self.assertTrue(agent.started.wait(1))
+            cancel_event.set()
+            worker.join(timeout=2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(agent.stopped)
+            self.assertTrue(agent.closed)
+            self.assertEqual(outcome[0]["status"], "canceled")
 
 
 if __name__ == "__main__":

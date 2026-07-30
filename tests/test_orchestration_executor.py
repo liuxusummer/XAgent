@@ -1158,7 +1158,7 @@ class TrustedActivityExecutorTests(unittest.TestCase):
             ("ＰＡＳＳＷＯＲＤ", "fullwidth-password-canary"),
             ("api.key", "api-key-canary"),
             ("zero\u200bwidth_token", "zero-width-token-canary"),
-            ("pin", 1234),
+            ("pin", 123412341234123412),
         )
         for index, (key, canary) in enumerate(attacks):
             with self.subTest(key=key):

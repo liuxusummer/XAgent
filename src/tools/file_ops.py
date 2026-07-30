@@ -16,11 +16,19 @@ WRITE_OPERATIONS = {"create", "update", "write", "patch", "delete"}
 SUPPORTED_OPERATIONS = READ_OPERATIONS | WRITE_OPERATIONS
 WORKSPACE_SYSTEM_DIR = "system"
 WORKSPACE_RUNTIME_DIR = "runtime"
+AGENT_KERNEL_DIR = "agent_kernel"
 _LEGACY_ORCHESTRATION_NAMES = frozenset(
     {
         "orchestration.sqlite3",
         "orchestration.sqlite3-shm",
         "orchestration.sqlite3-wal",
+    }
+)
+_WORKSPACE_ROOT_CONTROL_NAMES = frozenset(
+    {
+        "_intervene",
+        "_keyinfo",
+        "plan.md",
     }
 )
 
@@ -50,6 +58,7 @@ def read_file(
     keyword: str | None = None,
     *,
     allow_outside: bool = False,
+    allow_managed_memory: bool = False,
 ) -> dict[str, Any]:
     try:
         file_path = resolve_path_for_operation(
@@ -62,6 +71,18 @@ def read_file(
         return exc.to_result()
     except (OSError, ValueError) as exc:
         return {"status": "ERROR", "error": str(exc)}
+    workspace = Path(cwd or Path.cwd()).resolve()
+    if (
+        _is_managed_memory_path(file_path, workspace)
+        and not allow_managed_memory
+    ):
+        return {
+            "status": "ERROR",
+            "error": "managed memory requires explicit memory read authorization",
+            "path": str(file_path),
+            "workspace": str(workspace),
+            "operation": "read",
+        }
     if not file_path.exists():
         candidates = fuzzy_match_path(file_path)
         error = f"file not found: {file_path}"
@@ -324,20 +345,55 @@ def resolve_path_for_operation(
                 base,
                 operation,
             ) from exc
+    protected_root_control = _is_workspace_root_control_path(resolved, base)
+    if protected_root_control:
+        raise WorkspacePermissionError(
+            (
+                "workspace root control-plane files are unavailable to agent "
+                f"file tools: {resolved} (workspace: {base}, operation: {operation})"
+            ),
+            resolved,
+            base,
+            operation,
+        )
     protected_control_plane = _is_legacy_orchestration_path(resolved, base)
+    protected_control_plane = (
+        protected_control_plane
+    )
+    protected_agent_kernel = _is_agent_kernel_path(resolved, base)
+    if protected_agent_kernel:
+        raise WorkspacePermissionError(
+            (
+                "agent control-plane files are unavailable to agent file tools: "
+                f"{resolved} (workspace: {base}, operation: {operation})"
+            ),
+            resolved,
+            base,
+            operation,
+        )
+    protected_system = _is_workspace_system_path(resolved, base)
+    protected_runtime = _is_workspace_runtime_path(resolved, base)
+    protected_memory = _is_managed_memory_path(resolved, base)
     if operation in WRITE_OPERATIONS and (
-        _is_workspace_system_path(resolved, base) or protected_control_plane
+        protected_system
+        or protected_runtime
+        or protected_memory
+        or protected_control_plane
     ):
-        if operation == "delete":
+        if protected_memory:
+            message = "managed memory requires the memory candidate workflow"
+        elif protected_runtime:
+            message = "workspace runtime files are read-only for agent file tools"
+        elif protected_control_plane:
             message = (
                 "control-plane files cannot be deleted by agent file tools"
-                if protected_control_plane
-                else "workspace system files cannot be deleted by agent file tools"
+                if operation == "delete"
+                else "control-plane files are read-only for agent file tools"
             )
         else:
             message = (
-                "control-plane files are read-only for agent file tools"
-                if protected_control_plane
+                "workspace system files cannot be deleted by agent file tools"
+                if operation == "delete"
                 else "workspace system files are read-only for agent file tools"
             )
         raise WorkspacePermissionError(
@@ -350,12 +406,50 @@ def resolve_path_for_operation(
 
 
 def _is_workspace_system_path(path: Path, workspace: Path) -> bool:
-    system_root = workspace / WORKSPACE_SYSTEM_DIR
     try:
-        path.relative_to(system_root)
+        relative = path.relative_to(workspace)
     except ValueError:
         return False
-    return True
+    return bool(relative.parts) and relative.parts[0].casefold() == WORKSPACE_SYSTEM_DIR
+
+
+def _is_workspace_runtime_path(path: Path, workspace: Path) -> bool:
+    try:
+        relative = path.relative_to(workspace)
+    except ValueError:
+        return False
+    return bool(relative.parts) and relative.parts[0].casefold() == WORKSPACE_RUNTIME_DIR
+
+
+def _is_workspace_root_control_path(path: Path, workspace: Path) -> bool:
+    try:
+        relative = path.relative_to(workspace)
+    except ValueError:
+        return False
+    return (
+        len(relative.parts) == 1
+        and relative.parts[0].casefold() in _WORKSPACE_ROOT_CONTROL_NAMES
+    )
+
+
+def _is_managed_memory_path(path: Path, workspace: Path) -> bool:
+    try:
+        relative = path.relative_to(workspace)
+    except ValueError:
+        return False
+    parts = tuple(part.casefold() for part in relative.parts)
+    return (
+        bool(parts)
+        and (
+            parts[0] == "memory"
+            or parts[:2] == ("system", "memory")
+            or (
+                len(parts) >= 4
+                and parts[:2] == ("system", "agents")
+                and parts[-1].casefold() == "memory.md"
+            )
+        )
+    )
 
 
 def _is_legacy_orchestration_path(path: Path, workspace: Path) -> bool:
@@ -367,18 +461,33 @@ def _is_legacy_orchestration_path(path: Path, workspace: Path) -> bool:
     cannot be corrupted through ordinary file tools while it is migrated.
     """
 
-    runtime_root = workspace / WORKSPACE_RUNTIME_DIR
     try:
-        relative = path.relative_to(runtime_root)
+        relative = path.relative_to(workspace)
     except ValueError:
         return False
-    if not relative.parts:
+    parts = tuple(part.casefold() for part in relative.parts)
+    if len(parts) < 2 or parts[0] != WORKSPACE_RUNTIME_DIR:
         return False
-    name = relative.parts[0]
+    name = parts[1]
     return (
         name in _LEGACY_ORCHESTRATION_NAMES
         or name.startswith("orchestration-artifacts")
         or name.startswith("orchestration-gc-")
+    )
+
+
+def _is_agent_kernel_path(path: Path, workspace: Path) -> bool:
+    try:
+        relative = path.relative_to(workspace)
+    except ValueError:
+        return False
+    parts = tuple(part.casefold() for part in relative.parts)
+    if len(parts) < 2 or parts[0] != WORKSPACE_RUNTIME_DIR:
+        return False
+    name = parts[1]
+    return (
+        name in {AGENT_KERNEL_DIR, "checkpoints"}
+        or name.startswith("file_index.sqlite3")
     )
 
 
@@ -393,6 +502,17 @@ def expand_file_refs(content: str, cwd: str | None = None) -> str:
             )
 
         file_path = resolve_path(ref_path, cwd, operation="read")
+        workspace = Path(cwd or Path.cwd()).resolve()
+        if _is_managed_memory_path(file_path, workspace):
+            raise WorkspacePermissionError(
+                (
+                    "managed memory cannot be expanded through file references: "
+                    f"{file_path} (workspace: {workspace}, operation: read)"
+                ),
+                file_path,
+                workspace,
+                "read",
+            )
         if not file_path.exists():
             raise FileNotFoundError(f"file ref not found: {file_path}")
         if file_path.is_dir():

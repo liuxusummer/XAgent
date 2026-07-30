@@ -133,6 +133,26 @@ class FilePatchTests(unittest.TestCase):
             self.assertEqual((root / "foo.txt").read_text(encoding="utf-8"), "root file")
             self.assertFalse((root / "business" / "foo.txt").exists())
 
+    def test_file_tools_cannot_access_root_control_plane_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            for name in ("_intervene", "_keyinfo", "plan.md"):
+                target = root / name
+                target.write_text("trusted", encoding="utf-8")
+                with self.subTest(name=name):
+                    results = (
+                        read_file(path=name, cwd=str(root)),
+                        write_file(path=name, content="poison", cwd=str(root)),
+                        delete_file(path=name, cwd=str(root)),
+                    )
+                    self.assertTrue(
+                        all(result["status"] == "ERROR" for result in results)
+                    )
+                    self.assertEqual(
+                        target.read_text(encoding="utf-8"),
+                        "trusted",
+                    )
+
     def test_write_file_returns_error_for_directory_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -226,6 +246,85 @@ class FilePatchTests(unittest.TestCase):
             self.assertEqual(result["status"], "ERROR")
             self.assertIn("explicit read authorization", result["error"])
             self.assertFalse((root / "inside.txt").exists())
+
+    def test_file_references_cannot_expand_managed_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            target = root / "business" / "target.txt"
+            target.parent.mkdir(parents=True)
+            target.write_text("before\n", encoding="utf-8")
+            memory_paths = (
+                "memory/global.md",
+                "system/memory/project.md",
+                "system/agents/main/MEMORY.md",
+            )
+            for index, memory_path in enumerate(memory_paths):
+                secret = root / memory_path
+                secret.parent.mkdir(parents=True, exist_ok=True)
+                secret.write_text(f"secret-{index}\n", encoding="utf-8")
+                reference = f"{{{{file:{memory_path}:1:1}}}}"
+                with self.subTest(memory_path=memory_path):
+                    write_result = write_file(
+                        path=f"business/leak-{index}.txt",
+                        content=reference,
+                        cwd=str(root),
+                    )
+                    patch_result = patch_file(
+                        path="business/target.txt",
+                        old_content="before\n",
+                        new_content=reference,
+                        cwd=str(root),
+                    )
+                    self.assertEqual(write_result["status"], "ERROR")
+                    self.assertEqual(patch_result["status"], "ERROR")
+                    self.assertFalse(
+                        (root / "business" / f"leak-{index}.txt").exists()
+                    )
+                    self.assertEqual(
+                        target.read_text(encoding="utf-8"),
+                        "before\n",
+                    )
+
+    def test_mixed_case_protected_paths_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            memory = root / "SYSTEM" / "MEMORY" / "secret.md"
+            checkpoint = root / "RUNTIME" / "CHECKPOINTS" / "latest.json"
+            memory.parent.mkdir(parents=True)
+            checkpoint.parent.mkdir(parents=True)
+            memory.write_text("MEMORY-SCOPE-SECRET", encoding="utf-8")
+            checkpoint.write_text("CHECKPOINT-SECRET", encoding="utf-8")
+
+            denied_memory = read_file(
+                path="SYSTEM/MEMORY/secret.md",
+                cwd=str(root),
+            )
+            allowed_memory = read_file(
+                path="SYSTEM/MEMORY/secret.md",
+                cwd=str(root),
+                allow_managed_memory=True,
+            )
+            denied_checkpoint = read_file(
+                path="RUNTIME/CHECKPOINTS/latest.json",
+                cwd=str(root),
+            )
+            denied_write = write_file(
+                path="SYSTEM/MEMORY/secret.md",
+                content="POISON",
+                cwd=str(root),
+            )
+            denied_reference = write_file(
+                path="business/leak.txt",
+                content="{{file:SYSTEM/MEMORY/secret.md:1:1}}",
+                cwd=str(root),
+            )
+
+            self.assertEqual(denied_memory["status"], "ERROR")
+            self.assertEqual(allowed_memory["status"], "OK")
+            self.assertEqual(denied_checkpoint["status"], "ERROR")
+            self.assertEqual(denied_write["status"], "ERROR")
+            self.assertEqual(denied_reference["status"], "ERROR")
+            self.assertFalse((root / "business" / "leak.txt").exists())
 
     def test_concurrent_appends_do_not_lose_updates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -362,6 +461,95 @@ class FilePatchTests(unittest.TestCase):
             self.assertEqual(artifact_result["status"], "ERROR")
             self.assertEqual(database.read_bytes(), b"durable-store")
             self.assertFalse(artifact.exists())
+
+    def test_file_tools_cannot_read_or_modify_agent_kernel_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            target = root / "runtime" / "agent_kernel" / "memory-store.json"
+            target.parent.mkdir(parents=True)
+            target.write_text('{"secret":"candidate"}', encoding="utf-8")
+
+            read_result = read_file(
+                path="runtime/agent_kernel/memory-store.json",
+                cwd=str(root),
+            )
+            write_result = write_file(
+                path="runtime/agent_kernel/memory-store.json",
+                content='{"poison":true}',
+                cwd=str(root),
+            )
+            delete_result = delete_file(
+                path="runtime/agent_kernel/memory-store.json",
+                cwd=str(root),
+            )
+
+            self.assertEqual(read_result["status"], "ERROR")
+            self.assertEqual(write_result["status"], "ERROR")
+            self.assertEqual(delete_result["status"], "ERROR")
+            self.assertIn("agent control-plane", read_result["error"])
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                '{"secret":"candidate"}',
+            )
+
+    def test_file_tools_cannot_access_checkpoint_or_index_control_plane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            checkpoint = root / "runtime" / "checkpoints" / "latest.json"
+            index = root / "runtime" / "file_index.sqlite3"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_text('{"task":"trusted"}', encoding="utf-8")
+            index.write_bytes(b"sqlite")
+
+            results = [
+                read_file(path="runtime/checkpoints/latest.json", cwd=str(root)),
+                write_file(
+                    path="runtime/checkpoints/latest.json",
+                    content='{"task":"poison"}',
+                    cwd=str(root),
+                ),
+                delete_file(path="runtime/file_index.sqlite3", cwd=str(root)),
+            ]
+
+            self.assertTrue(all(item["status"] == "ERROR" for item in results))
+            self.assertEqual(
+                checkpoint.read_text(encoding="utf-8"),
+                '{"task":"trusted"}',
+            )
+            self.assertTrue(index.exists())
+
+    def test_file_tools_cannot_write_runtime_or_legacy_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            runtime_state = root / "runtime" / "chats" / "state.json"
+            runtime_state.parent.mkdir(parents=True)
+            runtime_state.write_text('{"trusted":true}', encoding="utf-8")
+
+            runtime_write = write_file(
+                path="runtime/chats/state.json",
+                content='{"poison":true}',
+                cwd=str(root),
+            )
+            memory_write = write_file(
+                path="memory/global_mem.txt",
+                content="poison",
+                cwd=str(root),
+            )
+            runtime_read = read_file(
+                path="runtime/chats/state.json",
+                cwd=str(root),
+            )
+
+            self.assertEqual(runtime_write["status"], "ERROR")
+            self.assertEqual(memory_write["status"], "ERROR")
+            self.assertEqual(runtime_read["status"], "OK")
+            self.assertEqual(
+                runtime_state.read_text(encoding="utf-8"),
+                '{"trusted":true}',
+            )
+            self.assertFalse(
+                (root / "memory" / "global_mem.txt").exists()
+            )
 
     def test_file_ops_allow_absolute_path_inside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

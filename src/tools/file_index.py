@@ -16,6 +16,15 @@ from typing import Any, Iterable, Protocol
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from src.core.agent_kernel import (
+    DataSensitivity,
+    KnowledgeItem,
+    KnowledgeKind,
+    Principal,
+    TrustLevel,
+)
+from src.core.retrieval import EvidenceBundle, EvidenceItem
+
 
 INDEX_DB_RELATIVE_PATH = Path("runtime") / "file_index.sqlite3"
 DEFAULT_EXCLUDE_GLOBS = (
@@ -29,17 +38,25 @@ DEFAULT_EXCLUDE_GLOBS = (
     "dist/**",
     "build/**",
     "runtime/**",
+    "memory/**",
+    "system/memory/**",
+    "system/agents/*/MEMORY.md",
 )
 DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024
 SNIPPET_CONTEXT_CHARS = 80
 QUERY_TOKEN_PATTERN = re.compile(r"[\w\u4e00-\u9fff]+", re.UNICODE)
 SYMBOL_QUERY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:[.:/][A-Za-z0-9_]+)*")
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "4"
+MIGRATABLE_SCHEMA_VERSIONS = {"1", "2", "3", SCHEMA_VERSION}
+INDEX_OWNER_META = "owner_tenant_id"
+INDEX_ACL_META = "owner_acl"
+INDEX_REVISION_META = "index_revision"
 DEFAULT_CHUNK_TARGET_CHARS = 3000
 DEFAULT_CHUNK_OVERLAP_CHARS = 300
 DEFAULT_LINE_WINDOW = 120
 DEFAULT_SEMANTIC_OVERFETCH = 5
 SUPPORTED_SEARCH_MODES = {"keyword", "semantic", "hybrid"}
+FILE_INDEX_READ_SCOPE = "workspace.read"
 
 
 class EmbeddingProvider(Protocol):
@@ -71,7 +88,20 @@ def refresh_file_index(
     semantic: bool = False,
     embedding_config: dict[str, Any] | EmbeddingConfig | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    principal: Principal | None = None,
 ) -> dict[str, Any]:
+    if not isinstance(principal, Principal):
+        return {
+            "status": "ERROR",
+            "error": "authenticated principal is required to build the file index",
+            "reason_code": "principal_required",
+        }
+    if FILE_INDEX_READ_SCOPE not in principal.scopes:
+        return {
+            "status": "ERROR",
+            "error": "workspace.read scope is required to build the file index",
+            "reason_code": "principal_scope_missing",
+        }
     try:
         workspace = _workspace(cwd)
         scan_root = _resolve_index_root(root, workspace)
@@ -110,6 +140,7 @@ def refresh_file_index(
     try:
         with closing(sqlite3.connect(db_path)) as conn:
             _ensure_schema(conn)
+            _bind_index_owner(conn, principal, reset_unowned=True)
             if semantic_state["enabled"] and semantic_config:
                 _reset_semantic_if_config_changed(conn, semantic_config)
                 sqlite_vec_status = _ensure_semantic_schema(conn, semantic_config)
@@ -178,7 +209,14 @@ def refresh_file_index(
                     _delete_path(conn, rel_path)
                     continue
 
-                row_id = _upsert_file(conn, rel_path, content, stat.st_size, stat.st_mtime_ns, stat.st_mtime)
+                row_id = _upsert_file(
+                    conn,
+                    rel_path,
+                    content,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_mtime,
+                )
                 _replace_fts(conn, row_id, rel_path, content)
                 if semantic_state["enabled"] and semantic_config:
                     if _refresh_file_semantics(
@@ -203,8 +241,17 @@ def refresh_file_index(
                 if _is_under_root(rel_path, root_prefix) and rel_path not in seen:
                     _delete_path(conn, rel_path)
                     stats["removed"] += 1
+            revision = _next_index_revision(conn)
             conn.commit()
+            stats["index_version"] = f"{SCHEMA_VERSION}:{revision}"
             stats["semantic_status"] = semantic_state.get("status", semantic_state)
+    except (PermissionError, ValueError) as exc:
+        return {
+            "status": "ERROR",
+            "error": str(exc),
+            "reason_code": "index_acl_denied",
+            "index_path": str(db_path),
+        }
     except sqlite3.Error as exc:
         return {"status": "ERROR", "error": f"index database error: {exc}", "index_path": str(db_path)}
 
@@ -221,7 +268,22 @@ def search_file_index(
     mode: str = "hybrid",
     embedding_config: dict[str, Any] | EmbeddingConfig | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    principal: Principal | None = None,
 ) -> dict[str, Any]:
+    if not isinstance(principal, Principal):
+        return {
+            "status": "ERROR",
+            "error": "authenticated principal is required to search the file index",
+            "reason_code": "principal_required",
+            "matches": [],
+        }
+    if FILE_INDEX_READ_SCOPE not in principal.scopes:
+        return {
+            "status": "ERROR",
+            "error": "workspace.read scope is required to search the file index",
+            "reason_code": "principal_scope_missing",
+            "matches": [],
+        }
     query = str(query or "").strip()
     if not query:
         return {"status": "ERROR", "error": "query is required"}
@@ -243,13 +305,22 @@ def search_file_index(
 
     refreshed = False
     refresh_result: dict[str, Any] | None = None
-    if refresh or not db_path.exists():
+    existing_schema = _stored_index_schema(db_path)
+    if (
+        refresh
+        or not db_path.exists()
+        or (
+            existing_schema in MIGRATABLE_SCHEMA_VERSIONS
+            and existing_schema != SCHEMA_VERSION
+        )
+    ):
         refresh_result = refresh_file_index(
             root=root_prefix,
             cwd=str(workspace),
             semantic=mode != "keyword",
             embedding_config=semantic_config,
             embedding_provider=embedding_provider,
+            principal=principal,
         )
         if refresh_result.get("status") != "OK":
             return {
@@ -262,6 +333,8 @@ def search_file_index(
     try:
         with closing(sqlite3.connect(db_path)) as conn:
             _ensure_schema(conn)
+            acl = _bind_index_owner(conn, principal, reset_unowned=False)
+            index_version = _current_index_version(conn)
             semantic_status: dict[str, Any] = {"enabled": False, "reason": "mode is keyword"}
             keyword_matches: list[dict[str, Any]] = []
             semantic_matches: list[dict[str, Any]] = []
@@ -283,7 +356,23 @@ def search_file_index(
                 deduped = _hybrid_matches(keyword_matches, semantic_matches, query, limit)
             else:
                 deduped = _dedupe_matches(keyword_matches, query, limit)
+            deduped, evidence_bundle = _attach_evidence(
+                conn,
+                deduped,
+                query=query,
+                principal=principal,
+                acl=acl,
+                index_version=index_version,
+            )
             index_stats = _index_stats(conn, root_prefix)
+    except (PermissionError, ValueError) as exc:
+        return {
+            "status": "ERROR",
+            "error": str(exc),
+            "reason_code": "index_acl_denied",
+            "index_path": str(db_path),
+            "matches": [],
+        }
     except sqlite3.Error as exc:
         return {"status": "ERROR", "error": f"index database error: {exc}", "index_path": str(db_path)}
 
@@ -296,11 +385,31 @@ def search_file_index(
         "index_stats": index_stats,
         "refresh_stats": refresh_result,
         "semantic_status": semantic_status,
+        "index_version": index_version,
+        "evidence_bundle": evidence_bundle.to_dict(),
+        "evidence_bundle_digest": evidence_bundle.bundle_digest,
         "matches": deduped,
     }
 
 
-def get_file_index_stats(cwd: str | None = None, root: str = "") -> dict[str, Any]:
+def get_file_index_stats(
+    cwd: str | None = None,
+    root: str = "",
+    *,
+    principal: Principal | None = None,
+) -> dict[str, Any]:
+    if not isinstance(principal, Principal):
+        return {
+            "status": "ERROR",
+            "error": "authenticated principal is required to inspect the file index",
+            "reason_code": "principal_required",
+        }
+    if FILE_INDEX_READ_SCOPE not in principal.scopes:
+        return {
+            "status": "ERROR",
+            "error": "workspace.read scope is required to inspect the file index",
+            "reason_code": "principal_scope_missing",
+        }
     try:
         workspace = _workspace(cwd)
         search_root = _resolve_index_root(root, workspace)
@@ -325,8 +434,16 @@ def get_file_index_stats(cwd: str | None = None, root: str = "") -> dict[str, An
     try:
         with closing(sqlite3.connect(db_path)) as conn:
             _ensure_schema(conn)
+            _bind_index_owner(conn, principal, reset_unowned=False)
             stats = _index_stats(conn, root_prefix)
             row = conn.execute("SELECT max(indexed_at) FROM file_index_files").fetchone()
+    except (PermissionError, ValueError) as exc:
+        return {
+            "status": "ERROR",
+            "error": str(exc),
+            "reason_code": "index_acl_denied",
+            "index_path": str(db_path),
+        }
     except sqlite3.Error as exc:
         return {"status": "ERROR", "error": f"index database error: {exc}", "index_path": str(db_path)}
 
@@ -356,9 +473,18 @@ def _resolve_index_root(root: str, workspace: Path) -> Path:
     candidate = Path(root or ".").expanduser()
     resolved = candidate.resolve() if candidate.is_absolute() else (workspace / candidate).resolve()
     try:
-        resolved.relative_to(workspace)
+        relative = resolved.relative_to(workspace)
     except ValueError as exc:
         raise ValueError(f"file index root must be inside workspace: {resolved}") from exc
+    parts = tuple(part.casefold() for part in relative.parts)
+    if (
+        parts
+        and (
+            parts[0] in {"memory", "runtime"}
+            or parts[:2] == ("system", "memory")
+        )
+    ):
+        raise ValueError("file index root is a protected workspace path")
     if not resolved.exists():
         raise ValueError(f"file index root does not exist: {resolved}")
     if not resolved.is_dir():
@@ -380,6 +506,28 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    existing_schema = _get_meta(conn, "schema_version")
+    if existing_schema is None:
+        existing_tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type IN ('table', 'view') "
+                "AND name NOT LIKE 'sqlite_%' "
+                "AND name != 'file_index_meta'"
+            ).fetchall()
+        }
+        if existing_tables:
+            raise PermissionError(
+                "file index schema metadata is missing"
+            )
+    if (
+        existing_schema is not None
+        and existing_schema not in MIGRATABLE_SCHEMA_VERSIONS
+    ):
+        raise PermissionError(
+            "file index schema is unsupported; an explicit migration is required"
+        )
     conn.execute(
         "INSERT OR REPLACE INTO file_index_meta(key, value) VALUES ('schema_version', ?)",
         (SCHEMA_VERSION,),
@@ -390,6 +538,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY,
             path TEXT NOT NULL UNIQUE,
             content TEXT NOT NULL,
+            content_sha256 TEXT NOT NULL,
             size_bytes INTEGER NOT NULL,
             mtime_ns INTEGER NOT NULL,
             mtime REAL NOT NULL,
@@ -438,6 +587,107 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_file_index_embeddings_model ON file_index_chunk_embeddings(model, dimension)"
     )
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(file_index_files)").fetchall()
+    }
+    if "content_sha256" not in columns:
+        conn.execute(
+            "ALTER TABLE file_index_files "
+            "ADD COLUMN content_sha256 TEXT NOT NULL DEFAULT ''"
+        )
+    if existing_schema is not None and existing_schema != SCHEMA_VERSION:
+        # Exclusion and evidence-integrity rules are security boundaries.
+        # Never carry old indexed content across such a schema change.
+        _clear_index_content(conn)
+        if _get_meta(conn, INDEX_REVISION_META) is not None:
+            _set_meta(conn, INDEX_REVISION_META, "0")
+
+
+def _stored_index_schema(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    try:
+        with closing(sqlite3.connect(path)) as conn:
+            row = conn.execute(
+                "SELECT value FROM file_index_meta "
+                "WHERE key = 'schema_version'"
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    return str(row[0]) if row is not None else None
+
+
+def _bind_index_owner(
+    conn: sqlite3.Connection,
+    principal: Principal,
+    *,
+    reset_unowned: bool,
+) -> tuple[str, ...]:
+    owner = _get_meta(conn, INDEX_OWNER_META)
+    raw_acl = _get_meta(conn, INDEX_ACL_META)
+    if owner is None:
+        count_row = conn.execute("SELECT COUNT(*) FROM file_index_files").fetchone()
+        has_legacy_content = bool(count_row and int(count_row[0]) > 0)
+        if has_legacy_content and not reset_unowned:
+            raise PermissionError(
+                "file index owner is unknown; an authenticated refresh is required"
+            )
+        if has_legacy_content:
+            _clear_index_content(conn)
+        acl = (f"tenant:{principal.tenant_id}",)
+        _set_meta(conn, INDEX_OWNER_META, principal.tenant_id)
+        _set_meta(conn, INDEX_ACL_META, json.dumps(list(acl), separators=(",", ":")))
+        _set_meta(conn, INDEX_REVISION_META, "0")
+        return acl
+    if owner != principal.tenant_id:
+        raise PermissionError("file index belongs to a different tenant")
+    if raw_acl is None:
+        raise PermissionError("file index ACL metadata is missing")
+    try:
+        decoded_acl = json.loads(raw_acl)
+    except json.JSONDecodeError as exc:
+        raise PermissionError("file index ACL metadata is invalid") from exc
+    if (
+        not isinstance(decoded_acl, list)
+        or not decoded_acl
+        or not all(isinstance(item, str) and item.strip() for item in decoded_acl)
+    ):
+        raise PermissionError("file index ACL metadata is invalid")
+    acl = tuple(sorted(set(decoded_acl)))
+    if f"tenant:{principal.tenant_id}" not in acl:
+        raise PermissionError("file index ACL does not authorize the caller")
+    revision = _get_meta(conn, INDEX_REVISION_META)
+    if revision is None or not revision.isdigit():
+        raise PermissionError("file index revision metadata is invalid")
+    return acl
+
+
+def _clear_index_content(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM file_index_chunk_embeddings")
+    conn.execute("DELETE FROM file_index_chunks")
+    conn.execute("DELETE FROM file_index_fts")
+    conn.execute("DELETE FROM file_index_files")
+    try:
+        conn.execute("DELETE FROM file_index_vec")
+    except sqlite3.Error:
+        pass
+
+
+def _next_index_revision(conn: sqlite3.Connection) -> int:
+    raw = _get_meta(conn, INDEX_REVISION_META)
+    if raw is None or not raw.isdigit():
+        raise PermissionError("file index revision metadata is invalid")
+    revision = int(raw) + 1
+    _set_meta(conn, INDEX_REVISION_META, str(revision))
+    return revision
+
+
+def _current_index_version(conn: sqlite3.Connection) -> str:
+    raw = _get_meta(conn, INDEX_REVISION_META)
+    if raw is None or not raw.isdigit():
+        raise PermissionError("file index revision metadata is invalid")
+    return f"{SCHEMA_VERSION}:{int(raw)}"
 
 
 def _load_existing(conn: sqlite3.Connection) -> dict[str, tuple[int, int]]:
@@ -470,8 +720,11 @@ def _walk_files(root: Path, workspace: Path, exclude: Iterable[str], stats: dict
 
 
 def _matches_any(path: str, patterns: Iterable[str]) -> bool:
-    normalized = path.replace("\\", "/")
-    return any(fnmatch.fnmatch(normalized, pattern) for pattern in patterns)
+    normalized = path.replace("\\", "/").casefold()
+    return any(
+        fnmatch.fnmatch(normalized, str(pattern).casefold())
+        for pattern in patterns
+    )
 
 
 def _relative_path(path: Path, workspace: Path) -> str:
@@ -493,18 +746,30 @@ def _upsert_file(
     mtime_ns: int,
     mtime: float,
 ) -> int:
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
     conn.execute(
         """
-        INSERT INTO file_index_files(path, content, size_bytes, mtime_ns, mtime, indexed_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO file_index_files(
+            path, content, content_sha256, size_bytes, mtime_ns, mtime, indexed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             content=excluded.content,
+            content_sha256=excluded.content_sha256,
             size_bytes=excluded.size_bytes,
             mtime_ns=excluded.mtime_ns,
             mtime=excluded.mtime,
             indexed_at=excluded.indexed_at
         """,
-        (path, content, size_bytes, mtime_ns, mtime, time.time()),
+        (
+            path,
+            content,
+            content_sha256,
+            size_bytes,
+            mtime_ns,
+            mtime,
+            time.time(),
+        ),
     )
     row = conn.execute("SELECT id FROM file_index_files WHERE path = ?", (path,)).fetchone()
     return int(row[0])
@@ -633,6 +898,105 @@ def _dedupe_chunk_matches(matches: list[dict[str, Any]], query: str, limit: int)
         if current is None or _match_priority(match, query) > _match_priority(current, query):
             best[key] = match
     return sorted(best.values(), key=lambda item: (-float(item["score"]), item["path"], item.get("line") or 0))[:limit]
+
+
+def _attach_evidence(
+    conn: sqlite3.Connection,
+    matches: list[dict[str, Any]],
+    *,
+    query: str,
+    principal: Principal,
+    acl: tuple[str, ...],
+    index_version: str,
+) -> tuple[list[dict[str, Any]], EvidenceBundle]:
+    paths = tuple(sorted({str(match.get("path", "")) for match in matches if match.get("path")}))
+    metadata: dict[str, tuple[str, float, str]] = {}
+    if paths:
+        placeholders = ",".join("?" for _ in paths)
+        rows = conn.execute(
+            (
+                "SELECT path, content_sha256, indexed_at, content "
+                f"FROM file_index_files WHERE path IN ({placeholders})"
+            ),
+            paths,
+        ).fetchall()
+        metadata = {
+            str(path): (
+                str(content_sha256),
+                float(indexed_at),
+                str(content),
+            )
+            for path, content_sha256, indexed_at, content in rows
+        }
+
+    authorized_matches: list[dict[str, Any]] = []
+    evidence_items: list[EvidenceItem] = []
+    for match in matches:
+        path = str(match.get("path", ""))
+        file_metadata = metadata.get(path)
+        if file_metadata is None:
+            continue
+        content_sha256, indexed_at, indexed_content = file_metadata
+        if (
+            len(content_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in content_sha256)
+        ):
+            raise PermissionError("file index content digest is invalid")
+        if (
+            hashlib.sha256(indexed_content.encode("utf-8")).hexdigest()
+            != content_sha256
+        ):
+            raise PermissionError("file index content integrity check failed")
+        path_sha256 = hashlib.sha256(path.encode("utf-8")).hexdigest()
+        knowledge = KnowledgeItem(
+            item_id=f"file-{path_sha256[:24]}-{content_sha256[:24]}",
+            kind=KnowledgeKind.RETRIEVAL,
+            namespace=("tenant", principal.tenant_id, "workspace"),
+            content_sha256=content_sha256,
+            source_refs=(f"workspace-path-sha256:{path_sha256}",),
+            trust=TrustLevel.RETRIEVED,
+            sensitivity=DataSensitivity.INTERNAL,
+            acl=acl,
+            created_at=indexed_at,
+        )
+        if not knowledge.is_authorized(principal):
+            continue
+        snippet = str(match.get("snippet", ""))
+        snippet_sha256 = hashlib.sha256(snippet.encode("utf-8")).hexdigest()
+        start_line = match.get("start_line") or match.get("line")
+        end_line = match.get("end_line") or start_line
+        evidence_key = (
+            f"{knowledge.envelope_digest}\0{path}\0{start_line}\0{end_line}\0"
+            f"{snippet_sha256}\0{index_version}"
+        )
+        evidence_id = f"ev-{hashlib.sha256(evidence_key.encode('utf-8')).hexdigest()[:32]}"
+        evidence = EvidenceItem(
+            evidence_id=evidence_id,
+            knowledge=knowledge,
+            path=path,
+            start_line=int(start_line) if start_line is not None else None,
+            end_line=int(end_line) if end_line is not None else None,
+            snippet_sha256=snippet_sha256,
+            index_version=index_version,
+        )
+        enriched = dict(match)
+        enriched.update(
+            {
+                "evidence_id": evidence_id,
+                "content_sha256": content_sha256,
+                "snippet_sha256": snippet_sha256,
+                "index_version": index_version,
+            }
+        )
+        authorized_matches.append(enriched)
+        evidence_items.append(evidence)
+    bundle = EvidenceBundle.build(
+        query=query,
+        principal=principal,
+        index_version=index_version,
+        items=evidence_items,
+    )
+    return authorized_matches, bundle
 
 
 def _match_priority(match: dict[str, Any], query: str) -> tuple[float, int]:

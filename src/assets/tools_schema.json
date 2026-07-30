@@ -296,10 +296,12 @@
         "properties": {
           "key_info": {
             "type": "string",
+            "maxLength": 8000,
             "description": "Key information to remember for the current task."
           },
           "related_sop": {
             "type": "string",
+            "maxLength": 8000,
             "description": "Related SOP reference or hint."
           }
         }
@@ -310,10 +312,45 @@
     "type": "function",
     "function": {
       "name": "start_long_term_update",
-      "description": "Trigger a long-term memory settlement. Reads the memory management SOP and instructs the agent to summarize key findings into persistent memory.",
+      "description": "Trigger a long-term memory settlement. Reads the SOP and instructs the agent to submit reviewed-source findings through memory_propose; it does not write active memory.",
       "parameters": {
         "type": "object",
         "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "memory_propose",
+      "description": "Submit a bounded long-term memory candidate for separate review. The candidate is quarantined and is not active memory.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "Concise candidate fact, decision, or reusable procedure."
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["semantic", "episodic", "procedural"],
+            "description": "Memory kind."
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Confidence supported by the cited sources."
+          },
+          "source_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Bounded source identifiers that allow a reviewer to verify the candidate."
+          }
+        },
+        "required": ["content", "kind", "source_refs"]
       }
     }
   },

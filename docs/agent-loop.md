@@ -20,7 +20,8 @@ Agent Loop 要解决的本质问题：**LLM 是无状态的，但任务执行是
 
 主循环本身不持有任何状态。它不知道之前聊了什么、不知道任务进展到哪了、不知道用户是谁。它只做一件事：**取当前轮的输入，跑一轮，产出当前轮的输出**。
 
-所有状态（历史、工作记忆、SOP）都由外部注入——通过 `next_prompt` 在每轮开始时塞进去。这样做的好处：
+所有状态（历史、工作记忆、SOP）都由外部注入——通过 `next_prompt` 在每轮开始时塞进去；
+进入 LLM 前再由 `ContextBuilder` 生成有 token 预算的可见投影和 `ContextManifest`。这样做的好处：
 
 - 循环引擎可以随时重启，不丢失上下文（上下文在 Session 里）
 - 历史裁剪策略与循环逻辑解耦（裁剪在 Session 层，循环不感知）
@@ -105,6 +106,11 @@ class ActionResult:
 - **tool_calls 逐个执行**，不是并行。物理操作（文件、进程、浏览器）有副作用，并行会引入竞态。
 - **停止信号是分发门禁**。不能只在轮次开头检查，否则停止期间返回的 LLM tool_calls 仍可能产生副作用。
 - **工具结果永远是不可信数据**。System Prompt 持续声明文件、网页、代码输出不能覆盖用户目标或触发权限扩大；协议层使用 `<untrusted_tool_results>` 单独包裹结果，防止内容被误解释为上层指令。
+- **工具调用必须先过策略**。默认 Handler 的全部 `exec_*` 工具由 PolicyEngine 按
+  Principal、effect、capability、resource 和精确 action digest 判定；未知工具和缺失 scope
+  默认拒绝。
+- **上下文不是 AgentContext 的镜像**。本地工作状态默认 `llm_visible=false`；只有
+  ContextBuilder 选中的有界投影会发送给模型。详见 [agent-kernel.md](agent-kernel.md)。
 - **no_tool 不走 Handler 分发**。当 LLM 一轮回复中没有调用任何工具时，这是循环级事件，不是工具级事件。`handle_no_tool_call` 作为主循环的内部函数处理空响应检测、流异常检测、代码块未调用检测等循环级关注点。
 - **flags 在主循环中处理**。控制信号（如 `reset_tools`）由主循环消费，不传递给 Handler 或 Session。
 - **turn_end_hooks 是唯一的后处理入口**。周期性注入（防重试警告、全局记忆刷新、强制 ask_user）都在这里统一处理，不在循环体里散落。
@@ -167,7 +173,7 @@ class TurnEndHook:
 |---|---|---|
 | `external_intervene` | 30 | 检查文件信号（`_keyinfo`、`_intervene`），允许运行时从外部注入指令 |
 | `plan_reminder` | 25 | 每 15 轮注入 `plan.md` 预览（前 400 字），提醒对齐计划；本轮已调 `plan_update` 则跳过 |
-| `self_evolution` | 23 | 从本轮失败/空转工具结果沉淀经验，并注入换策略提示 |
+| `self_evolution` | 23 | 从本轮失败/空转结果创建待审核 MemoryCandidate，并注入换策略提示 |
 | `periodic_inject` | 20 | 按轮次间隔注入防重试警告、全局记忆、强制 ask_user |
 | `summary_extract` | 10 | 从 LLM 回复中提取 `<summary>`，写入对话摘要历史 |
 

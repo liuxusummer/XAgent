@@ -287,8 +287,9 @@ BaseSession
 
 - 3.8.2 `trim_messages_history`：
   - 先调 `compress_history_tags`
-  - 计算总字符数
-  - 超过 `context_win * 3` 时：强制压缩 → 从头部删除消息 → 修复孤立 tool_result
+  - 使用保守 token 估算计算历史预算
+  - 超过输入预算时：强制压缩 → 从头部删除消息 → 记录 compaction digest → 修复孤立 tool_result
+  - 当前轮另由 `ContextBuilder` 对 system/task/history/retrieval/memory/tool 分组件预算
 
 - 3.8.3 `_sanitize_leading_user_msg`：
   - 删除历史头部后，首条 user 消息中的 `tool_result` block 改写为纯文本
@@ -328,7 +329,8 @@ BaseSession
 - 基于当前 workspace 的 `runtime/file_index.sqlite3` 做路径 / 全文关键词检索，可选启用 chunk 级语义向量检索
 - 首次搜索或 `refresh=true` 时增量刷新索引，按 `relative_path + mtime_ns + size` 判断文件是否变化
 - `mode=keyword|semantic|hybrid` 控制检索模式；默认 `hybrid`，但未配置 embedding 或缺少 `sqlite-vec` 时保持 FTS5 兼容降级
-- 只返回候选路径、行号、短片段和基础元信息；修改或依赖精确内容前仍需 `file_read`
+- 必须携带 Principal；索引绑定 tenant，ACL/owner/revision 不可验证时 fail closed
+- 返回候选路径、行号、短片段、内容哈希、索引版本和 `EvidenceBundle`；修改或依赖精确内容前仍需 `file_read`
 - `root` 只能位于当前 workspace 内，索引默认跳过 symlink、超过 5 MiB 的文件、二进制、依赖/构建目录和 `runtime/**`
 
 #### 4.2.4 file_patch
@@ -358,7 +360,12 @@ BaseSession
 - 中断循环等待用户输入，返回 `ActionResult(should_exit=True)`
 
 #### 4.2.10 start_long_term_update
-- 触发长期记忆结算：读取 SOP → 判断类型 → 最小化更新
+- 触发长期记忆结算：读取 SOP → 判断类型 → 调用 `memory_propose`
+- 不直接修改 `MEMORY.md` 或 `global_mem.txt`
+
+#### 4.2.11 memory_propose
+- 提交带来源、trust、confidence、sensitivity、ACL、TTL 的待审核候选
+- candidate 在单独 reviewer 批准前不属于 active memory
 
 ### 4.3 中英文 Schema 切换
 - `tools_schema.json`（英文）vs `tools_schema_cn.json`（中文）
@@ -429,12 +436,17 @@ Handler 具有双重身份：分发器（`exec_*` 命名约定分发工具调用
 - 构造记忆结算 prompt → 读取 memory_management_sop.md → 返回 SOP + 结算指令
 - 输出：`ActionResult(sop_content, next_prompt=结算prompt)`
 
-### 5.12 get_anchor_prompt（核心 prompt 构造）
+### 5.12 exec_memory_propose
+- namespace、ACL 从当前 Principal 派生；模型不能选择 tenant
+- 只返回 candidate ID、content SHA-256、trust 和 review status
+- pending candidate 不注入运行时上下文
+
+### 5.13 get_anchor_prompt（核心 prompt 构造）
 - `earlier_context`：ctx.history_info[:-30] 折叠（连续 [Agent] 行合并，超限时标注裁剪边界）
 - `history`：ctx.history_info[-30:] 原样展示
 - `current_turn` + `key_info` 注入 + `related_sop` 提示 + `workspace` 提示
 
-### 5.13 turn_end_callback（声明式钩子分发器）
+### 5.14 turn_end_callback（声明式钩子分发器）
 - 按 `_turn_end_hooks` 列表优先级降序执行各钩子
 - `summary_extract` 钩子：提取 `<summary>` 写入 ctx.history_info + 调用 `align_history_info` 对齐双历史
 - `periodic_inject` 钩子：每7轮防重试警告、每10轮全局记忆、每65轮强制 ask_user

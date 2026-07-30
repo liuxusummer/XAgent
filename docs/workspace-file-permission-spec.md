@@ -9,7 +9,8 @@ XAgent 已经有工作区概念：`ctx.cwd` 指向当前 Agent 工作区，相�
 目标行为是：
 
 - 工作区内文件允许创建、读取、修改、删除。
-- 工作区外文件只允许在用户逐次授权后查看。
+- 工作区外文件只允许具有本地 operator `host.read` 能力的会话在用户逐次授权后查看。
+- 多用户安全 Web 的注册表不能授予 `host.read`，租户会话必须直接拒绝工作区外读取。
 - 无论文件在工作区内还是工作区外，删除文件都必须先获得用户明确授权。
 
 本文档定义该行为的第一版实现边界。
@@ -29,7 +30,7 @@ XAgent 已经有工作区概念：`ctx.cwd` 指向当前 Agent 工作区，相�
 - 不把 `memory/`、`assets/` 等仓库资源迁移到工作区模型下。
 - 不引入数据库权限、ACL 文件或长期授权状态。
 - 不做超出删除授权所需的工具 Schema 大改。
-- 第一版不保证 `code_run` 执行的任意代码具备 OS 级写入/删除隔离。
+- 显式开发兼容模式 `XAGENT_CODE_RUN_BACKEND=unsafe` 不属于生产隔离保证。
 - 工作区内普通创建、修改操作不要求用户授权。
 
 ## 4. 当前代码路径
@@ -43,7 +44,7 @@ XAgent 已经有工作区概念：`ctx.cwd` 指向当前 Agent 工作区，相�
 - `src/handler/XAgentHandler.py::exec_file_patch()` 调用 `patch_file(..., cwd=self.ctx.cwd)`。
 - `src/tools/file_ops.py::resolve_path()` 当前强制所有解析后路径必须位于 `cwd` 内。
 - `src/tools/browser_driver.py::save_result()` 也通过 `resolve_path()` 处理 `web_execute_js.save_to_file`。
-- `src/tools/code_run.py::_start_process()` 以 `cwd=ctx.cwd` 启动子进程。
+- `src/tools/code_sandbox.py` 生成并验证不可变隔离计划，`src/tools/code_run.py` 只按该计划启动和监督进程树。
 
 ## 5. 权限模型
 
@@ -66,7 +67,7 @@ XAgent 已经有工作区概念：`ctx.cwd` 指向当前 Agent 工作区，相�
 
 | 操作 | 示例 | 工作区内 | 工作区外 |
 |---|---|---|---|
-| 查看 | `file_read`、目录 listing | 允许 | 逐次授权 |
+| 查看 | `file_read`、目录 listing | 允许 | 仅本地 operator：`host.read` + 逐次授权；安全 Web 租户拒绝 |
 | 文件引用展开 | `{{file:...}}` | 允许 | 拒绝 |
 | 创建 | `file_write` 写入不存在文件、创建父目录 | 允许 | 拒绝 |
 | 修改 | `file_write` 覆盖/追加/前插、`file_patch` | 允许 | 拒绝 |
@@ -112,8 +113,9 @@ path outside workspace is read-only: /tmp/example.txt (workspace: /repo/workspac
 
 - 读取工作区内文件。
 - 列出工作区内目录。
-- 用户逐次授权后读取工作区外文件。
-- 用户逐次授权后，在 OS 权限允许时列出工作区外目录。
+- 具有本地 operator `host.read` 时，用户逐次授权后读取工作区外文件。
+- 具有本地 operator `host.read` 时，用户逐次授权后在 OS 权限允许范围内列出工作区外目录。
+- 安全 Web 注册表拒绝 `host.read`（包括规范化后的空白变体），租户确认不能提升能力。
 - 保持现有截断、行范围读取行为。
 
 底层 `read_file` 默认拒绝工作区外路径；授权由 Handler 负责，授权只对提示中展示的规范化绝对路径和本次调用生效。访问工作区外路径时不得创建文件、目录、缓存、旁路元数据或任何其他写入产物。
@@ -163,17 +165,11 @@ exec_file_delete(args)
 
 ### 6.6 代码执行边界
 
-`code_run` 当前会以 `cwd=ctx.cwd` 执行任意 Python 或 shell 代码。这能保持相对路径默认落在工作区，但不能阻止代码在 OS 权限允许时读取、写入或删除绝对路径。
+`code_run` 的生产默认模式要求经过功能探测的 OS sandbox：工作区只读可见，控制面目录和根级控制文件被隐藏，私有临时目录可写，网络默认拒绝，并限制进程、CPU、内存、文件和输出资源。隔离后端不可用时直接拒绝，不回退到宿主进程。
 
-因此默认执行策略为 `XAGENT_CODE_RUN_POLICY=confirm`：每次执行都必须取得用户明确授权；`deny` 可完全禁用，`allow` 只用于用户明确接受风险的受控环境。子进程使用最小环境，宿主 API key、代理、SSH agent 等敏感变量不得透传，`HOME` / `TMPDIR` 固定到工作区。
+默认执行策略为 `XAGENT_CODE_RUN_POLICY=confirm`：每次执行都必须取得用户明确授权；`deny` 可完全禁用。`XAGENT_CODE_RUN_BACKEND=unsafe` 仅用于显式开发兼容，并且即使策略为 `allow` 仍需逐次审批。所有模式都使用最小环境，宿主 API key、代理、SSH agent 等敏感变量不得透传。
 
-在本 spec 中，文件权限模型只保证覆盖一等文件工具和浏览器结果保存操作。逐次授权可以阻止提示注入静默升级为宿主代码执行，但不等价于 OS 文件系统沙箱。
-
-在声称所有 Agent 能力都具备完整删除保护之前，后续实现必须增加以下能力之一：
-
-- 能阻止工作区外写入/删除的子进程沙箱。
-- 受限命令执行器，用于文件系统操作。
-- 运行可能删除文件的代码前，先触发用户授权的策略层。
+逐次授权与 OS sandbox 是两道独立门禁：前者表达调用意图，后者限制实际可见资源；任何一层都不能替代另一层。
 
 ## 7. 错误处理
 
@@ -206,7 +202,8 @@ exec_file_delete(args)
 - 工作区内相对路径读取成功。
 - 工作区内绝对路径读取成功。
 - 工作区外绝对路径默认拒绝。
-- 用户逐次授权后，工作区外文件读取或目录 listing 成功。
+- 本地 operator 具有 `host.read` 且逐次授权后，工作区外文件读取或目录 listing 成功。
+- 安全 Web Principal 在 Policy preflight 和 Handler 执行层均无法读取工作区外路径。
 - 工作区外写入在创建父目录前被拒绝。
 - 工作区外 patch 在读取并修改目标文件前被拒绝。
 - 写入工作区内目标时，`{{file:outside:path}}` 被拒绝。
@@ -225,7 +222,7 @@ exec_file_delete(args)
 ## 9. 验收标准
 
 - 工作区仍是一等工具唯一允许创建或修改文件的位置。
-- 一等文件读取工具只有在用户逐次授权后才可查看工作区外绝对路径。
+- 一等文件读取工具只有在本地 operator 同时具有 `host.read` 且逐次授权后，才可查看工作区外绝对路径；安全 Web 租户始终拒绝。
 - 任何一等文件删除路径在删除前都会触发用户授权往返。
 - 被拒绝的操作返回权限专属诊断，而不是泛化的 path escape 错误。
 - 现有基于工作区相对路径的文件工作流继续可用。
@@ -242,5 +239,5 @@ exec_file_delete(args)
 风险：
 
 - 授权读取工作区外文件仍会扩大 Agent 可查看的本地信息范围，因此授权提示必须显示规范化绝对路径，工具结果始终按不可信数据处理。
-- 在增加子进程沙箱或命令策略前，`code_run` 仍可能绕过一等文件工具权限。
+- 私有 scratch 总量由父进程周期监督，存在短暂超限窗口；生产部署仍需在目标 OS 验证 sandbox、资源限制和进程树终止。
 - 如果后续引入递归删除，需要额外处理符号链接和路径分类问题。
