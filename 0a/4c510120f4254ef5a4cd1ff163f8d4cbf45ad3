@@ -1,0 +1,49 @@
+README.md
+  s_72af05a5dabd4c::t_91777e61f79f15 546-547
+README_zh.md
+  s_72af05a5dabd4c::t_5f2e2dff20f50d 483-484
+docs/agent-platform-roadmap.md
+  s_72af05a5dabd4c::t_25773d32328ed5 68-73
+docs/eval-regression-gates.md
+  s_72af05a5dabd4c::t_d9e58bb3611e4b 1-81
+docs/examples/eval-regression-budget.json
+  s_72af05a5dabd4c::t_8c3f861a891f67 1-26
+frontends/web/src/components/EvalPanel.tsx
+  s_72af05a5dabd4c::t_a65231e298d904 874-903
+frontends/web/src/types/index.ts
+  s_72af05a5dabd4c::t_9d625adbf203c2 411-412,414,416-430,443-449,460-463
+src/core/agent_loop.py
+  s_72af05a5dabd4c::t_afcb371a11c768 92,1030-1041,1043,1097
+src/core/eval.py
+  s_72af05a5dabd4c::t_a0f74ceef6d34c 7,30-42,202-203,209-213,226-235,298-300,318-332,401,407,684-744,835-852,859-898,907-908,910,912-943,947-965,976-983,1004-1009,1087-1090,1206,1217-1222
+src/core/eval_report.py
+  s_72af05a5dabd4c::t_4c9a715be32b09 1-270
+src/eval_report.py
+  s_72af05a5dabd4c::t_6a0f5e1ce8549d 1-121
+src/handler/XAgentHandler.py
+  s_72af05a5dabd4c::t_3864606aabbec8 285-291,295
+tests/test_agent_loop.py
+  s_72af05a5dabd4c::t_e9a8a63f2a92b7 13,76-87,102-105,209-245
+tests/test_eval.py
+  s_72af05a5dabd4c::t_2dd46793a06762 27,97-122,308-375,378-417,527-603
+tests/test_eval_report.py
+  s_72af05a5dabd4c::t_fd9c4271fa881d 1-289
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0a4c510120f4254ef5a4cd1ff163f8d4cbf45ad3",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
