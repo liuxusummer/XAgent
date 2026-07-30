@@ -140,6 +140,8 @@ sequenceDiagram
 - [`docs/tool-layer.md`](docs/tool-layer.md)
 - [`docs/observability.md`](docs/observability.md)
 - [`docs/outlines.md`](docs/outlines.md)
+- [`docs/distributed-execution-adr.md`](docs/distributed-execution-adr.md)
+- [`docs/distributed-execution-quickstart.md`](docs/distributed-execution-quickstart.md)
 
 ---
 
@@ -161,6 +163,8 @@ worker、创建存储，也不会改变默认 CLI、Gradio、FastAPI、React 或
 - 无会话 MCP 2026-07-28 discovery 与编排工具；协议元数据和授权上下文均按请求校验；
   malformed、oversized、over-deep 输入使用独立的预解析 token budget，不消耗正常合法
   请求预算
+- 无宿主路径、会话绑定的远程执行参考组合，包含 Artifact grant、签名 runtime
+  proof、取消 receipt 与 replay 证据
 
 高级适配器仍从各自的 `src.orchestration.<module>` 模块导入。顶层包刻意不导入 Web
 projection，因此核心 API 不要求安装 FastAPI。
@@ -184,6 +188,10 @@ projection，因此核心 API 不要求安装 FastAPI。
   grant 以更高 fencing token 重新调度；拒绝或取消在不调用 backend 的前提下终止。
 - XAgent **不承诺**任意工具 exactly-once、外部系统自动回滚、分布式共识，或进程 /
   provider / 浏览器内部状态的精确恢复。
+- 远程参考实现按 Run 轮询且仅在进程内组合：它不是生产 server/pull transport、
+  真实 mTLS、gVisor 或异构 fleet 集成；prepared execution 与 staged output registry
+  也只存在于进程内。OCI/HMAC 证据只证明绑定与校验，不证明生产 sandbox 隔离。fleet
+  claim 在准入后失败时，必须先从 Store 重新投影再分配。
 - checkpoint 摘要与 telemetry 是有用的 projection，不是执行事实；大型或敏感内容只能
   通过经过审查的 Artifact 引用跨越控制面。
 - Event Store、Artifact 根、GC 隔离区和锁必须位于所有 Agent 可写 workspace 之外，
@@ -211,7 +219,8 @@ projection，因此核心 API 不要求安装 FastAPI。
   Event 总数、canonical payload 累计字节数和协作式 wall-time。
 
 组合部署前，请先阅读[设计规范](docs/durable-orchestration-spec.md)，运行
-[本地 quickstart](docs/durable-orchestration-quickstart.md)，并检查
+[本地 quickstart](docs/durable-orchestration-quickstart.md)或
+[分布式参考 quickstart](docs/distributed-execution-quickstart.md)，并检查
 [故障矩阵](docs/durable-orchestration-fault-matrix.md)。
 
 最小可运行组合：

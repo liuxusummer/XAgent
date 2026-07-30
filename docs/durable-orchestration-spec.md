@@ -1,7 +1,8 @@
 # Durable Orchestration 规范
 
-> 状态：v1 本地内核已实现并通过 F01–F30 故障矩阵；远程 worker、强隔离和生产
-> 多租户仍不在承诺范围
+> 状态：v1 本地内核已实现并通过 F01–F30 故障矩阵；Phase 2 远程 worker 参考面
+> 已提供独立 ADR、故障矩阵和 runnable demo；强隔离、生产传输与生产多租户仍不在
+> 承诺范围
 >
 > 适用范围：XAgent 编排内核、Team Workflow、长任务恢复、工具活动持久化
 >
@@ -46,8 +47,9 @@ Durable Orchestration
   声明式 DAG，Agent Loop 内部的多轮工具调用仍保持原有串行语义。
 - “不做自动重试”继续适用于 LLM 在 Agent Loop 内对普通工具错误的决策；编排层只依据
   显式、确定性的 RetryPolicy 重试整个 Activity Attempt。
-- “不做分布式”在 v1 继续成立；本规范定义 lease 是为了让单进程崩溃恢复语义完整，
-  不等于 v1 支持远程 worker。
+- “不做分布式”对本地 v1 默认路径继续成立；lease 首先用于单进程崩溃恢复。可选
+  Phase 2 参考面由独立的 [分布式执行 ADR](distributed-execution-adr.md) 约束，
+  不把单机 lease 或参考轮询协议解释为生产分布式基础设施。
 
 ## 2. 术语和规范用语
 
@@ -81,9 +83,10 @@ Durable Orchestration
 
 ### 3.2 非目标
 
-v1 不实现：
+本地 v1 不实现：
 
-- 远程 worker、RPC、消息中间件或跨机器一致性。
+- 生产远程 worker server/pull transport、消息中间件或跨机器一致性；Phase 2
+  参考协议与安全组合由独立 ADR 管理。
 - 任意 Python/JavaScript Workflow 代码；只运行经过校验和版本化的声明式定义。
 - 持久化或恢复 Python 生成器栈、线程栈、WebDriver 内部对象、子进程内存。
 - 通用文件系统事务、通用分布式事务或任意工具的自动回滚。
@@ -1178,10 +1181,15 @@ v1 必须满足：
 - telemetry exporter 全部失败时，Domain Run 仍正确完成。
 - 能报告恢复成功率、`OUTCOME_UNKNOWN` 率、重复副作用率、取消泄漏率和 replay divergence。
 
-### Phase 6：远程执行评估
+### Phase 6：远程执行参考面
 
-只有 Phase 1–5 的故障矩阵稳定后才评估 remote worker/A2A。进入该阶段前必须另写 ADR，
-不得直接把 lease 表解释为已具备分布式正确性。
+Phase 1–5 稳定后已交付独立
+[分布式执行 ADR](distributed-execution-adr.md)、
+[故障矩阵](distributed-execution-fault-matrix.md)和
+[runnable quickstart](distributed-execution-quickstart.md)。该参考面验证会话身份、
+fencing、Artifact grant、runtime proof、取消与 replay；不得把它解释为生产
+server/pull、真实 mTLS/gVisor、持久 broker registry 或异构 fleet 集成。生产化仍需
+独立 transport、持久化准入/暂存状态，并在 fleet claim 失败后从 Store 重新投影。
 
 ## 18. 故障注入矩阵
 

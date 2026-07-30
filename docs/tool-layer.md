@@ -217,6 +217,12 @@ payload 只携带 key digest，Web/telemetry 不导出原值。
 claim lease，把 Run/Node/同一 Attempt 置为 `WAITING_APPROVAL`，并持久化有界的
 `approval.requested`。可信 grant 将同一 Attempt 恢复为 `SCHEDULED`，下次 claim
 获得更高 fencing token；可信 rejection 或 durable cancel 在 backend 调用前终止。
+远程 preclaim 路径更严格：首次 poll 在同一 Store 事务中只执行
+`attempt.scheduled` → `WAITING_APPROVAL` → `approval.requested`，不创建
+idempotency owner/lease、不写 `attempt.claimed`、不签发 WorkerAuthorization 或
+Artifact grant，未领取过的 Attempt 此时 fencing token 为 0。可信 grant 仍恢复同一
+Attempt 为 `SCHEDULED`；下一次 poll 必须重新完成精确授权，并在 claim/policy 的同一
+事务中校验、过期判断和单次消费 grant。
 终态工具结果通过 `DurableRunStore.get_tool_receipt(run_id, attempt_id)` 查询时会重新
 验证 Receipt digest、Run/Attempt identity 和 Event 状态，禁止把任意 result dict
 冒充已验证 Receipt。
@@ -240,6 +246,22 @@ TERM→有界 grace→KILL→reap，并由 Executor 确认 durable CANCELLED 终
 `Popen` 成功后，selector 注册、读取或监督逻辑的任意异常都必须走同一
 TERM→有界等待→KILL→wait 进程组清理，并在异常返回前关闭 selector 与
 stdout/stderr；初始化失败不能绕过 parent/child/grandchild 的回收契约。
+
+远程参考执行不会把 `cwd`、Artifact 文件路径或控制面根发给 worker。可信控制面先把
+请求编译为容器内路径的 execution plan，再签发与 tenant、worker、session、Run、
+Attempt、Action 和 authorization digest 绑定的 Artifact grant；worker 只回传有界
+output handle 与签名 runtime proof，最终 ArtifactRef 和 ToolReceipt 仍由控制面校验
+后提交。参考实现的 prepared-execution/staged-output registry 是进程内状态，OCI
+attestation 与 HMAC proof 只演示验证链，不等同于真实 mTLS 或 gVisor 隔离。生产部署
+必须提供独立传输、持久 broker 状态和真实隔离 backend；详见
+`distributed-execution-adr.md`。
+
+进程内 Artifact broker 除单 Artifact 上限外，还对所有 staged/finalizing 内容实施
+全局驻留字节硬上限；超限的新增 stage 必须 fail closed，不能淘汰已接受的旧 stage。
+内容进入 finalizing 后仍持续计费，直到 Store 写入与校验在锁外返回，再由锁内的幂等
+accounting 释放。已观察过期或进入 failed/consumed 的 write grant 是不可逆终态，
+时钟回拨不得恢复；过期时仍在 Store I/O 中的本地内容必须保留计费，待 I/O 返回后
+再释放和清理，防止并发 finalize/expiry 造成预算漏记或重复释放。
 
 Executor 会从 Store 文件、已绑定 ArtifactStore 和 backend ArtifactStore 推导控制面
 根，并在构造执行请求前解析 profile allowed roots 与 cwd；任何相等、祖先或后代重叠

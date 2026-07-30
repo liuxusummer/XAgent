@@ -13,6 +13,7 @@ import math
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
@@ -21,7 +22,9 @@ from .models import (
     AttemptRecord,
     AttemptStatus,
     ClaimDisposition,
+    EventRecord,
     IdempotencyClaim,
+    IdempotencyStatus,
     NodeRecord,
     NodeStatus,
     RunRecord,
@@ -39,7 +42,7 @@ from .store import (
     RunAlreadyExistsError,
     RunNotFoundError,
 )
-from .workflow import CompiledWorkflow, NodeDefinition, TEMPLATE_RE
+from .workflow import CompiledWorkflow, FrozenDict, NodeDefinition, TEMPLATE_RE
 
 ACTIVITY_KINDS = frozenset({"agent", "tool"})
 CONTROL_KINDS = frozenset(
@@ -148,7 +151,7 @@ class HierarchyController(Protocol):
     ) -> "DurableScheduler": ...
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class ActivityClaim:
     run_id: str
     node_id: str
@@ -171,6 +174,74 @@ class ActivityClaim:
         ...,
     ]
     input_artifact_refs: tuple[ArtifactRef, ...]
+
+    def __repr__(self) -> str:
+        """Return claim diagnostics without exposing its live lease credential."""
+
+        return (
+            f"ActivityClaim(run_id={self.run_id!r}, node_id={self.node_id!r}, "
+            f"attempt_id={self.attempt_id!r}, attempt_number={self.attempt_number}, "
+            f"worker_id={self.worker_id!r}, fencing_token={self.fencing_token}, "
+            f"activity_kind={self.activity_kind!r}, effect_class={self.effect_class!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityAdmissionCandidate:
+    """Read-only exact Activity identity with no lease authority."""
+
+    claim: ActivityClaim
+    attempt: AttemptRecord
+    definition_digest: str
+    expected_run_version: int
+    expected_node_version: int
+    expected_attempt_version: int | None
+    new_attempt: bool
+
+    @property
+    def candidate_digest(self) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "schema": "activity_admission_candidate_v1",
+                    "definition_digest": self.definition_digest,
+                    "expected_run_version": self.expected_run_version,
+                    "expected_node_version": self.expected_node_version,
+                    "expected_attempt_version": self.expected_attempt_version,
+                    "new_attempt": self.new_attempt,
+                    "attempt": self.attempt.to_dict(),
+                    "run_id": self.claim.run_id,
+                    "node_id": self.claim.node_id,
+                    "attempt_id": self.claim.attempt_id,
+                    "attempt_number": self.claim.attempt_number,
+                    "worker_id": self.claim.worker_id,
+                    "request_hash": self.claim.request_hash,
+                    "operation_key": self.claim.operation_key,
+                    "claim_key": self.claim.claim_key,
+                    "activity_kind": self.claim.activity_kind,
+                    "effect_class": self.claim.effect_class,
+                    "resource_keys": list(self.claim.resource_keys),
+                    "config": (
+                        self.claim.config.to_dict()
+                        if isinstance(self.claim.config, FrozenDict)
+                        else normalize_json(dict(self.claim.config))
+                    ),
+                    "input_artifacts": [
+                        ref.to_dict() for ref in self.claim.input_artifact_refs
+                    ],
+                    "input_artifact_bindings": [
+                        {
+                            "name": name,
+                            "artifacts": [ref.to_dict() for ref in refs],
+                        }
+                        for name, refs in self.claim.input_artifact_bindings
+                    ],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -569,6 +640,281 @@ class DurableScheduler:
             )
         return None
 
+    def prepare_next_admission(
+        self,
+        run_id: str,
+        worker_id: str,
+        *,
+        resource_keys: Sequence[str] | None = None,
+    ) -> ActivityAdmissionCandidate | None:
+        """Build a read-only exact candidate before worker authorization.
+
+        This deliberately does not call :meth:`reconcile`, schedule an Attempt,
+        acquire a lease, or reserve capacity.  The eventual claim path must
+        revalidate every snapshot field with Store CAS.
+        """
+
+        if not str(worker_id or "").strip():
+            raise ValueError("worker_id must not be empty")
+        run = self._require_run(run_id)
+        if run.status is not RunStatus.RUNNING:
+            return None
+        available_resources = (
+            None
+            if resource_keys is None
+            else frozenset(str(key) for key in resource_keys)
+        )
+        nodes = {node.node_id: node for node in self.store.list_nodes(run_id)}
+        attempts = self.store.list_attempts(run_id)
+        by_node: dict[str, list[AttemptRecord]] = {}
+        for attempt in attempts:
+            by_node.setdefault(attempt.node_id, []).append(attempt)
+
+        for node_id in self.workflow.topological_order:
+            node = nodes[node_id]
+            definition = self.workflow.get_node(node_id)
+            if (
+                definition.kind not in ACTIVITY_KINDS
+                or node_id in self._map_template_node_ids
+                or not self._worker_has_resources(
+                    definition,
+                    available_resources=available_resources,
+                )
+            ):
+                continue
+            active = next(
+                (
+                    attempt
+                    for attempt in by_node.get(node_id, ())
+                    if attempt.status in ACTIVE_ATTEMPT_STATUSES
+                ),
+                None,
+            )
+            if active is not None and active.status is not AttemptStatus.SCHEDULED:
+                continue
+            if active is None and node.status is not NodeStatus.READY:
+                continue
+
+            if active is None:
+                previous = by_node.get(node_id, ())
+                attempt_number = max(
+                    (item.attempt_number for item in previous),
+                    default=0,
+                ) + 1
+                input_bindings = self._resolve_input_artifacts(run, definition)
+                request_hash, input_digest = self._request_hash(
+                    run,
+                    definition,
+                    input_bindings=input_bindings,
+                )
+                operation_key = self._render_operation_key(
+                    run,
+                    definition,
+                    input_digest=input_digest,
+                )
+                claim_key = f"{operation_key}:attempt:{attempt_number}"
+                attempt_id = str(self._id_factory("attempt"))
+                now = self._now()
+                timeout_policy = definition.timeout_policy.to_dict()
+                schedule_deadline = node.metadata.get("schedule_deadline_at")
+                candidate_attempt = AttemptRecord(
+                    attempt_id=attempt_id,
+                    run_id=run.run_id,
+                    node_id=node.node_id,
+                    attempt_number=attempt_number,
+                    idempotency_key=claim_key,
+                    activity_kind=definition.kind,
+                    effect_class=definition.effect_class,
+                    metadata={
+                        "definition_digest": self.workflow.definition_digest,
+                        "request_hash": request_hash,
+                        "input_mapping_digest": self._input_mapping_digest(
+                            definition,
+                            input_bindings,
+                        ),
+                        "operation_key": operation_key,
+                        "resource_keys": list(definition.resource_keys),
+                        "concurrency_key": definition.concurrency_key,
+                        "timeout_policy": timeout_policy,
+                        **(
+                            {
+                                "schedule_deadline_at": float(
+                                    schedule_deadline
+                                )
+                            }
+                            if isinstance(
+                                schedule_deadline,
+                                (int, float),
+                            )
+                            else {}
+                        ),
+                    },
+                    scheduled_at=now,
+                )
+                expected_attempt_version = None
+                new_attempt = True
+            else:
+                request_hash = active.metadata.get("request_hash")
+                operation_key = active.metadata.get("operation_key")
+                if not isinstance(request_hash, str) or not isinstance(
+                    operation_key,
+                    str,
+                ):
+                    raise DefinitionMismatchError(
+                        f"attempt {active.attempt_id} lacks scheduler identity metadata"
+                    )
+                input_bindings = self._resolve_input_artifacts(run, definition)
+                attempt_number = active.attempt_number
+                claim_key = active.idempotency_key
+                attempt_id = active.attempt_id
+                expected_attempt_version = active.projection_version
+                new_attempt = False
+                candidate_attempt = active
+            input_refs = tuple(
+                ref for _name, refs in input_bindings for ref in refs
+            )
+            proposal = ActivityClaim(
+                run_id=run_id,
+                node_id=node_id,
+                attempt_id=attempt_id,
+                attempt_number=attempt_number,
+                worker_id=worker_id,
+                request_hash=request_hash,
+                claim_token="",
+                fencing_token=0,
+                lease_expires_at=0.0,
+                operation_key=operation_key,
+                idempotency_key=operation_key,
+                claim_key=claim_key,
+                activity_kind=definition.kind,
+                effect_class=definition.effect_class,
+                resource_keys=definition.resource_keys,
+                config=definition.config,
+                input_artifact_bindings=input_bindings,
+                input_artifact_refs=input_refs,
+            )
+            return ActivityAdmissionCandidate(
+                claim=proposal,
+                attempt=candidate_attempt,
+                definition_digest=self.workflow.definition_digest,
+                expected_run_version=run.projection_version,
+                expected_node_version=node.projection_version,
+                expected_attempt_version=expected_attempt_version,
+                new_attempt=new_attempt,
+            )
+        # Hierarchy routing is intentionally not delegated to the existing
+        # claim_next_child path because that path may reconcile and mutate.
+        return None
+
+    def claim_admitted(
+        self,
+        candidate: ActivityAdmissionCandidate,
+        *,
+        lease_seconds: float,
+        capacity: int,
+        admission_expires_at: float,
+        policy_binding: Mapping[str, str | None],
+        linearization_guard: Callable[[], Any] | None = None,
+        linearization_validator: Callable[[], bool] | None = None,
+    ) -> tuple[ActivityClaim | None, EventRecord]:
+        """Linearize one externally preauthorized candidate in Store."""
+
+        if not isinstance(candidate, ActivityAdmissionCandidate):
+            raise TypeError("candidate must be an ActivityAdmissionCandidate")
+        if (
+            candidate.definition_digest != self.workflow.definition_digest
+            or candidate.claim.worker_id == ""
+            or capacity < 1
+        ):
+            raise SchedulerStateError("invalid Activity admission candidate")
+        if (linearization_guard is None) != (
+            linearization_validator is None
+        ):
+            raise SchedulerStateError(
+                "incomplete admission linearization context"
+            )
+        guard = (
+            nullcontext()
+            if linearization_guard is None
+            else linearization_guard()
+        )
+        with guard:
+            if linearization_validator is not None:
+                try:
+                    current = linearization_validator()
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException:
+                    current = False
+                if current is not True:
+                    raise ActivityAdmissionDenied(
+                        "admission session is no longer current"
+                    )
+            run = self._require_run(candidate.claim.run_id)
+            node = self._require_node(
+                candidate.claim.run_id,
+                candidate.claim.node_id,
+            )
+            definition = self.workflow.get_node(candidate.claim.node_id)
+            if (
+                run.status is not RunStatus.RUNNING
+                or node.status is not NodeStatus.READY
+                or definition.kind != candidate.claim.activity_kind
+                or definition.effect_class != candidate.claim.effect_class
+                or definition.resource_keys != candidate.claim.resource_keys
+            ):
+                raise SchedulerStateError(
+                    "Activity admission candidate is stale"
+                )
+            if node.projection_version != candidate.expected_node_version:
+                raise SchedulerStateError(
+                    "Activity admission Node projection changed"
+                )
+            claim, _claimed_event, policy_event = (
+                self.store.claim_activity_with_policy(
+                    candidate.claim.run_id,
+                    candidate.claim.node_id,
+                    candidate.attempt,
+                    candidate.claim.request_hash,
+                    candidate.claim.worker_id,
+                    definition_digest=candidate.definition_digest,
+                    schedule_new=candidate.new_attempt,
+                    expected_run_version=run.projection_version,
+                    expected_node_version=node.projection_version,
+                    expected_attempt_version=(
+                        candidate.expected_attempt_version
+                    ),
+                    admission_expires_at=admission_expires_at,
+                    admission_clock=self._clock,
+                    policy_binding=policy_binding,
+                    lease_seconds=lease_seconds,
+                    now=self._now(),
+                    max_active_attempts=self.max_active_attempts,
+                    worker_capacity=capacity,
+                )
+            )
+            if policy_binding.get("outcome") == "require_approval":
+                if claim is not None or _claimed_event is not None:
+                    raise SchedulerStateError(
+                        "approval admission unexpectedly acquired a claim"
+                    )
+                return None, policy_event
+            if claim is None:
+                raise SchedulerStateError(
+                    "authorized Activity admission did not return a claim"
+                )
+            if claim.disposition is not ClaimDisposition.ACQUIRED:
+                raise SchedulerStateError(
+                    "Activity admission claim was not acquired"
+                )
+            active_claim = replace(
+                candidate.claim,
+                claim_token=claim.record.claim_token,
+                fencing_token=claim.record.claim_count,
+                lease_expires_at=claim.record.lease_expires_at,
+            )
+            return active_claim, policy_event
+
     def start_claim(self, claim: ActivityClaim) -> Any:
         routed = self._scheduler_for_claim(claim)
         if routed is not self:
@@ -580,6 +926,104 @@ class DurableScheduler:
             claim.attempt_id,
             claim.worker_id,
             claim_token=claim.claim_token,
+            now=self._now(),
+        )
+
+    def restore_claim(
+        self,
+        run_id: str,
+        node_id: str,
+        attempt_id: str,
+        worker_id: str,
+        *,
+        request_hash: str,
+        claim_token: str,
+        fencing_token: int,
+    ) -> ActivityClaim:
+        """Rebuild an active claim handle from durable state without mutation.
+
+        Remote control-plane processes use this after restart.  Every
+        caller-supplied identity component is checked against the current
+        Attempt and idempotency lease; terminal, expired, foreign, and stale
+        claims fail closed.
+        """
+
+        run = self._require_run(run_id)
+        try:
+            definition = self.workflow.get_node(node_id)
+        except KeyError as exc:
+            raise SchedulerStateError("claim node is not in the Workflow") from exc
+        node = self.store.get_node(run_id, node_id)
+        attempt = self.store.get_attempt(attempt_id)
+        if (
+            node is None
+            or attempt is None
+            or attempt.run_id != run_id
+            or attempt.node_id != node_id
+            or attempt.status not in {AttemptStatus.CLAIMED, AttemptStatus.RUNNING}
+            or node.status
+            not in {
+                NodeStatus.READY,
+                NodeStatus.RUNNING,
+            }
+            or run.status.is_terminal
+        ):
+            raise SchedulerStateError("claim is not active")
+        record = self.store.get_idempotency(run_id, attempt.idempotency_key)
+        try:
+            expected_fencing = int(fencing_token)
+        except (TypeError, ValueError) as exc:
+            raise SchedulerStateError("invalid claim fencing token") from exc
+        if (
+            not isinstance(request_hash, str)
+            or not request_hash
+            or not isinstance(worker_id, str)
+            or not worker_id
+            or not isinstance(claim_token, str)
+            or not claim_token
+            or record is None
+            or record.status is not IdempotencyStatus.IN_PROGRESS
+            or record.lease_expires_at <= self._now()
+            or record.request_hash != request_hash
+            or record.owner_id != worker_id
+            or record.claim_token != claim_token
+            or record.claim_count != expected_fencing
+            or attempt.metadata.get("request_hash") != request_hash
+            or attempt.worker_id != worker_id
+            or attempt.lease_id != claim_token
+            or attempt.fencing_token != expected_fencing
+        ):
+            raise SchedulerStateError("claim binding is stale or foreign")
+        claim = self._claim_handle(
+            definition,
+            attempt,
+            IdempotencyClaim(ClaimDisposition.ACQUIRED, record),
+            worker_id,
+        )
+        self._validate_claim_handle(claim)
+        return claim
+
+    def renew_claim(
+        self,
+        claim: ActivityClaim,
+        *,
+        lease_seconds: float = 60.0,
+    ) -> Any:
+        """Renew one active claim using the Scheduler's trusted clock."""
+
+        routed = self._scheduler_for_claim(claim)
+        if routed is not self:
+            return routed.renew_claim(claim, lease_seconds=lease_seconds)
+        self._validate_claim_handle(claim)
+        return self.store.renew_activity_lease(
+            claim.run_id,
+            claim.node_id,
+            claim.attempt_id,
+            claim.request_hash,
+            claim.worker_id,
+            claim_token=claim.claim_token,
+            fencing_token=claim.fencing_token,
+            lease_seconds=lease_seconds,
             now=self._now(),
         )
 
@@ -2494,10 +2938,14 @@ class DurableScheduler:
             or claim_record.owner_id != claim.worker_id
             or claim_record.claim_token != claim.claim_token
             or claim_record.claim_count != claim.fencing_token
-            or claim_record.lease_expires_at != claim.lease_expires_at
+            # A heartbeat may monotonically extend the same token/fencing
+            # authority between this method's read steps.  An older deadline
+            # is therefore a valid view of the same claim; a worker-supplied
+            # future deadline is not.
+            or claim.lease_expires_at > claim_record.lease_expires_at
         ):
             raise SchedulerStateError("claim handle does not match durable projections")
-        if self._now() >= claim.lease_expires_at:
+        if self._now() >= claim_record.lease_expires_at:
             raise SchedulerStateError(
                 "claim lease expired; recovery scanner must resolve it"
             )

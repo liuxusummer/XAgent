@@ -12,7 +12,7 @@ import json
 import math
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -375,6 +375,61 @@ class ActivityExecutionResult:
         return self.attempt_status is AttemptStatus.SUCCEEDED
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedActivityExecution:
+    """Control-plane-only authorization prepared for one exact claim.
+
+    The opaque executor binding deliberately makes preparations process-local.
+    A controller restart must recover the durable RUNNING Attempt through the
+    normal lease/effect-class recovery path; it must not reconstruct authority
+    from an untrusted remote completion.
+    """
+
+    claim: ActivityClaim
+    action: ActionRequest
+    request: ExecutionRequest
+    profile: SandboxProfile
+    policy_event: EventRecord
+    policy_digest: str
+    _executor_binding: object = field(
+        repr=False,
+        compare=False,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PreauthorizedActivityExecution:
+    """Read-only exact policy intent prepared before a durable claim exists."""
+
+    claim: ActivityClaim
+    action: ActionRequest
+    profile: SandboxProfile
+    argv: tuple[str, ...]
+    cwd: str
+    limits: ResourceLimits
+    input_artifact_refs: tuple[ArtifactRef, ...]
+    script_artifact_ref: ArtifactRef | None
+    materialized_script: bytes | None = field(repr=False)
+    environment: tuple[EnvironmentBinding, ...]
+    decision: PolicyDecision
+    policy_digest: str
+    decision_digest: str
+    approval_grant_digest: str | None
+    _executor_binding: object = field(repr=False, compare=False)
+
+    @property
+    def durable_policy_binding(self) -> dict[str, str | None]:
+        return {
+            "outcome": self.decision.outcome.value,
+            "reason_code": self.decision.reason_code,
+            "action_digest": self.action.action_digest,
+            "policy_digest": self.policy_digest,
+            "profile_digest": self.profile.profile_digest,
+            "decision_digest": self.decision_digest,
+            "approval_grant_digest": self.approval_grant_digest,
+        }
+
+
 class DurableApprovalRegistry:
     """Trusted control-plane ingress for durable single-use approval grants.
 
@@ -460,6 +515,7 @@ class TrustedActivityExecutor:
         self._artifact_reader = artifact_reader
         self._clock = clock or time.time
         self._fault_hook = fault_hook
+        self._preparation_binding = object()
         self._control_plane_paths = self._resolve_control_plane_paths(
             control_plane_roots,
         )
@@ -645,7 +701,7 @@ class TrustedActivityExecutor:
                         "agent scope overlaps trusted control-plane storage"
                     )
 
-    def execute(
+    def prepare_execution(
         self,
         claim: ActivityClaim,
         *,
@@ -660,8 +716,13 @@ class TrustedActivityExecutor:
         input_artifact_refs: tuple[ArtifactRef, ...] = (),
         script_artifact_ref: ArtifactRef | None = None,
         environment: tuple[EnvironmentBinding, ...] = (),
-    ) -> ActivityExecutionResult:
-        """Execute at most once for the exact durable claim and fencing token."""
+    ) -> PreparedActivityExecution | ActivityExecutionResult:
+        """Persist policy authorization without starting the sandbox.
+
+        A successful preparation remains control-plane local.  Callers must
+        durably start the exact claim before passing a trusted SandboxReceipt
+        to :meth:`complete_prepared`.
+        """
 
         self._validate_claim_binding(claim)
         capability_values = tuple(capabilities)
@@ -836,16 +897,195 @@ class TrustedActivityExecutor:
         )
         request = request.validated_for_profile(profile)
         self._fault("authorization.committed")
+        return PreparedActivityExecution(
+            claim=claim,
+            action=action,
+            request=request,
+            profile=profile,
+            policy_event=existing,
+            policy_digest=policy_digest,
+            _executor_binding=self._preparation_binding,
+        )
+
+    def preauthorize_execution(
+        self,
+        claim: ActivityClaim,
+        *,
+        argv: tuple[str, ...],
+        cwd: str,
+        profile: SandboxProfile,
+        approval_grant: ApprovalGrant | None = None,
+        capabilities: Iterable[Capability | str] = (),
+        resource_locks: Iterable[str] = (),
+        sensitive_keys: Iterable[str] = (),
+        limits: ResourceLimits | None = None,
+        input_artifact_refs: tuple[ArtifactRef, ...] = (),
+        script_artifact_ref: ArtifactRef | None = None,
+        environment: tuple[EnvironmentBinding, ...] = (),
+    ) -> PreauthorizedActivityExecution:
+        """Evaluate one exact unclaimed intent without Domain mutation.
+
+        Artifact verification, approval issuance checks, and policy evaluation
+        happen here, outside the Store write transaction.  Only ALLOW may
+        proceed to the candidate-CAS path; deny/approval-needed outcomes cannot
+        reserve an Attempt or lease.
+        """
+
+        if claim.claim_token or claim.fencing_token != 0:
+            raise ActivityExecutionConflict(
+                "preauthorization requires an unclaimed Activity candidate"
+            )
+        capability_values = tuple(capabilities)
+        resource_lock_values = tuple(resource_locks)
+        environment_values = tuple(environment)
+        effective_limits = limits or profile.limits
+        (
+            action,
+            verified_inputs,
+            verified_script_ref,
+            materialized_script,
+        ) = self._build_execution_intent(
+            claim,
+            argv=argv,
+            cwd=cwd,
+            profile=profile,
+            capabilities=capability_values,
+            resource_locks=resource_lock_values,
+            sensitive_keys=sensitive_keys,
+            limits=effective_limits,
+            input_artifact_refs=tuple(input_artifact_refs),
+            script_artifact_ref=script_artifact_ref,
+            environment=environment_values,
+        )
+        decision, approval_identity = self._authorize_decision(
+            action,
+            approval_grant,
+        )
+        if decision.outcome is PolicyOutcome.DENY:
+            raise ActivityExecutionConflict(
+                "remote candidate policy did not authorize execution"
+            )
+        return PreauthorizedActivityExecution(
+            claim=claim,
+            action=action,
+            profile=profile,
+            argv=tuple(argv),
+            cwd=cwd,
+            limits=effective_limits,
+            input_artifact_refs=verified_inputs,
+            script_artifact_ref=verified_script_ref,
+            materialized_script=materialized_script,
+            environment=environment_values,
+            decision=decision,
+            policy_digest=_policy_digest(self.policy.policy_version),
+            decision_digest=_decision_digest(decision),
+            approval_grant_digest=approval_identity,
+            _executor_binding=self._preparation_binding,
+        )
+
+    def activate_preauthorized(
+        self,
+        preview: PreauthorizedActivityExecution,
+        claim: ActivityClaim,
+        policy_event: EventRecord,
+    ) -> PreparedActivityExecution:
+        """Bind a consumed candidate ticket to its exact durable claim."""
+
+        if (
+            not isinstance(preview, PreauthorizedActivityExecution)
+            or preview._executor_binding is not self._preparation_binding
+            or _preclaim_identity(preview.claim) != _preclaim_identity(claim)
+            or preview.claim.worker_id != claim.worker_id
+        ):
+            raise ActivityExecutionConflict(
+                "preauthorization does not match the durable claim"
+            )
+        self._validate_claim_binding(claim)
+        self._validate_policy_binding(
+            policy_event,
+            claim=claim,
+            action=preview.action,
+            policy_digest=preview.policy_digest,
+            profile_digest=preview.profile.profile_digest,
+            require_allow=True,
+        )
+        if (
+            policy_event.payload.get("decision_digest")
+            != preview.decision_digest
+            or policy_event.payload.get("approval_grant_digest")
+            != preview.approval_grant_digest
+        ):
+            raise ActivityExecutionConflict(
+                "durable policy event does not match preauthorization"
+            )
+        request = ExecutionRequest(
+            action=preview.action,
+            policy_decision=preview.decision,
+            argv=preview.argv,
+            operation_key=claim.operation_key,
+            idempotency_key=claim.idempotency_key,
+            cwd=preview.cwd,
+            limits=preview.limits,
+            input_artifact_refs=preview.input_artifact_refs,
+            script_artifact_ref=preview.script_artifact_ref,
+            materialized_script=preview.materialized_script,
+            environment=preview.environment,
+            cancellation_probe=self._durable_cancellation_probe(claim),
+        ).validated_for_profile(preview.profile)
+        return PreparedActivityExecution(
+            claim=claim,
+            action=preview.action,
+            request=request,
+            profile=preview.profile,
+            policy_event=policy_event,
+            policy_digest=preview.policy_digest,
+            _executor_binding=self._preparation_binding,
+        )
+
+    def execute(
+        self,
+        claim: ActivityClaim,
+        *,
+        argv: tuple[str, ...],
+        cwd: str,
+        profile: SandboxProfile,
+        approval_grant: ApprovalGrant | None = None,
+        capabilities: Iterable[Capability | str] = (),
+        resource_locks: Iterable[str] = (),
+        sensitive_keys: Iterable[str] = (),
+        limits: ResourceLimits | None = None,
+        input_artifact_refs: tuple[ArtifactRef, ...] = (),
+        script_artifact_ref: ArtifactRef | None = None,
+        environment: tuple[EnvironmentBinding, ...] = (),
+    ) -> ActivityExecutionResult:
+        """Execute at most once for the exact durable claim and fencing token."""
+
+        prepared = self.prepare_execution(
+            claim,
+            argv=argv,
+            cwd=cwd,
+            profile=profile,
+            approval_grant=approval_grant,
+            capabilities=capabilities,
+            resource_locks=resource_locks,
+            sensitive_keys=sensitive_keys,
+            limits=limits,
+            input_artifact_refs=input_artifact_refs,
+            script_artifact_ref=script_artifact_ref,
+            environment=environment,
+        )
+        if isinstance(prepared, ActivityExecutionResult):
+            return prepared
         self.scheduler.start_claim(claim)
 
         try:
-            receipt = self.sandbox.dispatch(request, profile)
+            receipt = self.sandbox.dispatch(prepared.request, profile)
         except SandboxDispatchDenied as exc:
             return self._complete_without_backend(
                 claim,
-                existing,
-                action=action,
-                policy_digest=policy_digest,
+                prepared.policy_event,
+                action=prepared.action,
+                policy_digest=prepared.policy_digest,
                 profile=profile,
                 error_code=exc.reason_code,
             )
@@ -854,21 +1094,93 @@ class TrustedActivityExecutor:
                 raise
             return self._complete_unknown_dispatch(
                 claim,
-                existing,
-                action=action,
-                policy_digest=policy_digest,
+                prepared.policy_event,
+                action=prepared.action,
+                policy_digest=prepared.policy_digest,
                 profile=profile,
             )
 
+        return self.complete_prepared(prepared, receipt)
+
+    def complete_prepared(
+        self,
+        prepared: PreparedActivityExecution,
+        receipt: SandboxReceipt,
+        *,
+        completion_evidence: Mapping[str, str] | None = None,
+        claim: ActivityClaim | None = None,
+    ) -> ActivityExecutionResult:
+        """Verify and durably commit a trusted receipt for a preparation."""
+
+        completion_claim = prepared.claim if claim is None else claim
+        self._validate_prepared(prepared, completion_claim)
+        if not isinstance(receipt, SandboxReceipt):
+            raise ActivityExecutionConflict(
+                "completion requires a trusted SandboxReceipt"
+            )
+        evidence = _completion_evidence(completion_evidence)
         self._fault("backend.returned")
         return self._complete_receipt(
-            claim,
-            existing,
-            action=action,
-            policy_digest=policy_digest,
-            profile=profile,
+            completion_claim,
+            prepared.policy_event,
+            action=prepared.action,
+            policy_digest=prepared.policy_digest,
+            profile=prepared.profile,
             receipt=receipt,
+            completion_evidence=evidence,
         )
+
+    def _validate_prepared(
+        self,
+        prepared: PreparedActivityExecution,
+        claim: ActivityClaim,
+    ) -> None:
+        if (
+            not isinstance(prepared, PreparedActivityExecution)
+            or prepared._executor_binding is not self._preparation_binding
+        ):
+            raise ActivityExecutionConflict(
+                "execution preparation does not belong to this controller"
+            )
+        if _prepared_claim_authority(prepared.claim) != (
+            _prepared_claim_authority(claim)
+        ):
+            raise ActivityExecutionConflict(
+                "completion claim changed durable execution authority"
+            )
+        self._validate_claim_binding(claim)
+        attempt = self.store.get_attempt(claim.attempt_id)
+        if attempt is None or attempt.status is not AttemptStatus.RUNNING:
+            raise ActivityExecutionConflict(
+                "prepared completion requires the exact RUNNING Attempt"
+            )
+        current_policy = self.store.get_activity_policy_event(
+            claim.run_id,
+            claim.attempt_id,
+        )
+        if current_policy != prepared.policy_event:
+            raise ActivityExecutionConflict(
+                "durable policy authorization changed after preparation"
+            )
+        self._validate_policy_binding(
+            prepared.policy_event,
+            claim=claim,
+            action=prepared.action,
+            policy_digest=prepared.policy_digest,
+            profile_digest=prepared.profile.profile_digest,
+            require_allow=True,
+        )
+        if (
+            prepared.request.action != prepared.action
+            or prepared.request.policy_decision.outcome is not PolicyOutcome.ALLOW
+            or prepared.request.policy_decision.action_digest
+            != prepared.action.action_digest
+            or prepared.request.validated_for_profile(prepared.profile)
+            != prepared.request
+        ):
+            raise ActivityExecutionConflict(
+                "prepared execution request binding is inconsistent"
+            )
 
     def _authorize_decision(
         self,
@@ -1245,6 +1557,7 @@ class TrustedActivityExecutor:
         policy_digest: str,
         profile: SandboxProfile,
         receipt: SandboxReceipt,
+        completion_evidence: Mapping[str, str] | None = None,
     ) -> ActivityExecutionResult:
         if (
             receipt.action_digest != action.action_digest
@@ -1263,6 +1576,7 @@ class TrustedActivityExecutor:
                 policy_digest=policy_digest,
                 profile=profile,
                 receipt=receipt,
+                completion_evidence=completion_evidence,
             )
         if receipt.outcome is SandboxOutcome.CANCELLATION_UNKNOWN:
             return self._complete_failure(
@@ -1276,6 +1590,7 @@ class TrustedActivityExecutor:
                 error_code="cancellation_probe_unavailable",
                 uncertain=True,
                 verification=ToolReceiptVerification.UNVERIFIED,
+                completion_evidence=completion_evidence,
             )
         if receipt.outcome is SandboxOutcome.SUCCEEDED:
             try:
@@ -1297,6 +1612,7 @@ class TrustedActivityExecutor:
                     error_code="artifact_integrity",
                     uncertain=EffectClass(claim.effect_class) in _UNCERTAIN_EFFECTS,
                     verification=ToolReceiptVerification.UNVERIFIED,
+                    completion_evidence=completion_evidence,
                 )
             tool_receipt = self._build_tool_receipt(
                 action=action,
@@ -1322,6 +1638,7 @@ class TrustedActivityExecutor:
                 event_payload=self._receipt_event_payload(
                     tool_receipt=tool_receipt,
                     sandbox_outcome=receipt.outcome.value,
+                    completion_evidence=completion_evidence,
                 ),
                 now=self._now(),
             )
@@ -1357,6 +1674,7 @@ class TrustedActivityExecutor:
                 if receipt.outcome is SandboxOutcome.BACKEND_ERROR
                 else ToolReceiptVerification.INFERRED
             ),
+            completion_evidence=completion_evidence,
         )
 
     def _complete_cancelled(
@@ -1368,6 +1686,7 @@ class TrustedActivityExecutor:
         policy_digest: str,
         profile: SandboxProfile,
         receipt: SandboxReceipt,
+        completion_evidence: Mapping[str, str] | None = None,
     ) -> ActivityExecutionResult:
         run = self.store.get_run(claim.run_id)
         if run is None or run.status not in {
@@ -1391,6 +1710,7 @@ class TrustedActivityExecutor:
             event_payload=self._receipt_event_payload(
                 tool_receipt=tool_receipt,
                 sandbox_outcome=receipt.outcome.value,
+                completion_evidence=completion_evidence,
             ),
         )
         return ActivityExecutionResult(
@@ -1464,6 +1784,7 @@ class TrustedActivityExecutor:
         timed_out: bool = False,
         receipt_absence_reason: str | None = None,
         verification: ToolReceiptVerification,
+        completion_evidence: Mapping[str, str] | None = None,
     ) -> ActivityExecutionResult:
         if uncertain:
             attempt_status = AttemptStatus.OUTCOME_UNKNOWN
@@ -1501,6 +1822,7 @@ class TrustedActivityExecutor:
             event_payload=self._receipt_event_payload(
                 tool_receipt=tool_receipt,
                 sandbox_outcome=sandbox_outcome,
+                completion_evidence=completion_evidence,
             ),
             attempt_status=attempt_status,
             node_status=node_status,
@@ -1591,8 +1913,9 @@ class TrustedActivityExecutor:
         *,
         tool_receipt: ToolReceipt,
         sandbox_outcome: str,
+        completion_evidence: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "action_digest": tool_receipt.action_digest,
             "policy_digest": tool_receipt.policy_digest,
             "profile_digest": tool_receipt.profile_digest,
@@ -1609,6 +1932,9 @@ class TrustedActivityExecutor:
             "error_code": tool_receipt.error_code,
             "tool_receipt": tool_receipt.to_dict(),
         }
+        if completion_evidence is not None:
+            payload["remote_evidence"] = dict(completion_evidence)
+        return payload
 
     def _fault(self, stage: str) -> None:
         if self._fault_hook is not None:
@@ -1678,6 +2004,75 @@ def _canonical_digest(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _completion_evidence(
+    value: Mapping[str, str] | None,
+) -> dict[str, str] | None:
+    """Normalize the only remote evidence permitted in a Domain Event."""
+
+    if value is None:
+        return None
+    required = {
+        "authorization_digest",
+        "execution_plan_digest",
+        "grant_binding_digest",
+        "runtime_proof_digest",
+        "session_binding_digest",
+        "runtime_attestation_digest",
+        "sandbox_spec_digest",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise ActivityExecutionConflict("remote completion evidence is invalid")
+    return {
+        key: _receipt_digest(value[key], key)
+        for key in sorted(required)
+    }
+
+
+def _prepared_claim_authority(claim: ActivityClaim) -> tuple[Any, ...]:
+    """Bind a preparation to claim authority while allowing lease renewal."""
+
+    return (
+        claim.run_id,
+        claim.node_id,
+        claim.attempt_id,
+        claim.attempt_number,
+        claim.worker_id,
+        claim.request_hash,
+        claim.claim_token,
+        claim.fencing_token,
+        claim.operation_key,
+        claim.idempotency_key,
+        claim.claim_key,
+        claim.activity_kind,
+        claim.effect_class,
+        claim.resource_keys,
+        dict(claim.config),
+        claim.input_artifact_bindings,
+        claim.input_artifact_refs,
+    )
+
+
+def _preclaim_identity(claim: ActivityClaim) -> tuple[Any, ...]:
+    """Immutable claim fields authorized before lease authority is minted."""
+
+    return (
+        claim.run_id,
+        claim.node_id,
+        claim.attempt_id,
+        claim.attempt_number,
+        claim.request_hash,
+        claim.operation_key,
+        claim.idempotency_key,
+        claim.claim_key,
+        claim.activity_kind,
+        claim.effect_class,
+        claim.resource_keys,
+        dict(claim.config),
+        claim.input_artifact_bindings,
+        claim.input_artifact_refs,
+    )
+
+
 def _approval_execution_binding_digest(grant: ApprovalGrant) -> str:
     """Hash execution scope only; actor and approval identity stay in memory."""
 
@@ -1725,6 +2120,7 @@ __all__ = [
     "ArtifactReceiptError",
     "ControlPlaneIsolationError",
     "DurableApprovalRegistry",
+    "PreparedActivityExecution",
     "ToolReceipt",
     "ToolReceiptError",
     "ToolReceiptVerification",

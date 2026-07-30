@@ -1,0 +1,45 @@
+{
+  "schema_version": 2,
+  "name": "secure-distributed-reference-demo",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "shard_a",
+      "kind": "tool",
+      "depends_on": [],
+      "config": {
+        "tool": "reference_task",
+        "arguments": {"shard": "a"}
+      },
+      "effect_class": "read_only"
+    },
+    {
+      "id": "shard_b",
+      "kind": "tool",
+      "depends_on": [],
+      "config": {
+        "tool": "reference_task",
+        "arguments": {"shard": "b"}
+      },
+      "effect_class": "read_only"
+    },
+    {
+      "id": "shard_c",
+      "kind": "tool",
+      "depends_on": [],
+      "config": {
+        "tool": "reference_task",
+        "arguments": {"shard": "c"}
+      },
+      "effect_class": "read_only"
+    },
+    {
+      "id": "operator_approval",
+      "kind": "approval",
+      "depends_on": ["shard_a", "shard_b", "shard_c"],
+      "config": {
+        "prompt": "Approve the immutable three-shard result set."
+      }
+    }
+  ]
+}

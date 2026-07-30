@@ -69,6 +69,22 @@
   重建 Scheduler，外部 `scheduler_resolver` 只用于部署覆盖或非 Runtime 创建的 Run。
   缺失/损坏/身份不匹配的 definition fail closed。LRU 锁串行化缓存替换，但缓存容量不
   限制可持久 Run 数量。
+- 可选的 Phase 2 远程参考面保持 Store/Scheduler 为唯一执行事实：worker 只接收无宿主
+  路径的 execution plan、会话绑定 Artifact grant，并回传 output handle 与签名 runtime
+  proof。`RemoteControlPlane` 是按 Run 轮询的参考协议，尚未与 fleet scheduler 的
+  server/pull transport 集成。可信 reconciler 必须先把 Run/Node 推进到
+  `RUNNING/READY`；poll 随后只读生成不含 lease authority 的精确 Attempt candidate，
+  在 Store mutation 前完成节点级 policy、Worker session、Action、profile、Artifact
+  与 runtime attestation 绑定，再以短期单次 ticket 做原子 candidate CAS + claim。
+  旧的 claim-then-authorize reference adapter 默认禁用，只有控制面显式开启且 adapter
+  同时标为 reference-only 时才可用于开发测试。
+  Worker session epoch 与 request-id digest identity 使用独立、受保护的控制面 SQLite
+  journal；journal 路径不得挂载给 Worker，内存 journal 的 secure path fail closed。
+  durable journal 首次建库经临时库完整提交后原子发布；既有库必须通过 schema/FK/
+  integrity 校验，禁止缺表时自动重建。
+  prepared/staging registry 仍为进程内状态，fleet claim 准入后失败必须从 Store
+  重新投影，不能把内存队列或 journal 当作 Domain 事实源。完整边界见
+  `docs/distributed-execution-adr.md`。
 
 ## 3. 核心数据流
 
@@ -206,8 +222,9 @@ XAgent/
 - **不做 ORM / 业务数据库**：记忆系统和业务工作区仍基于文件；仅 Durable
   Orchestration 控制面使用 Python 标准库 SQLite 保存编排元数据
 - **不做插件热加载**：工具集编译期确定，运行期不动态增删
-- **不要求分布式基础设施**：默认仍是单机进程；Durable Orchestration 的租约和 fencing
-  只为崩溃恢复及多 worker 安全预留，不引入消息中间件
+- **默认不要求分布式基础设施**：默认仍是单机进程，不引入消息中间件；可选远程参考面
+  用于验证协议、授权与恢复边界，但不声称已经提供生产 server/pull、真实 mTLS/gVisor
+  或异构 fleet
 - **不做无边界的通用 Agent 框架**：编排抽象只覆盖物理执行所需的确定性控制面
 - **不做前端渲染引擎**：前端只负责消息展示，不做 Markdown/Rich 渲染
 

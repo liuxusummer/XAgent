@@ -51,6 +51,21 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             "ApprovalGrant",
             "TrustedActivityExecutor",
             "DurableApprovalRegistry",
+            # Explicit secure-distributed composition.
+            "ArtifactGrantBroker",
+            "AuthenticatedWorker",
+            "BoundedRemoteObservability",
+            "DeterministicRemoteScheduler",
+            "OciGvisorSandboxBackend",
+            "RemoteControlJournal",
+            "RemoteControlPlane",
+            "RemoteFleetCoordinator",
+            "RemoteWorkerClient",
+            "RemoteWorkerDaemon",
+            "SecureRemoteAssignmentAdmitter",
+            "SecureRemoteExecutionAdapter",
+            "WorkerAuthorizationGate",
+            "WorkerDescriptor",
             # Replay / Evaluation.
             "ReplayReport",
             "build_replay_report",
@@ -77,6 +92,12 @@ class OrchestrationPublicApiTests(unittest.TestCase):
         from src.orchestration.artifacts_gc import LocalArtifactGarbageCollector
         from src.orchestration.evaluation import Suite
         from src.orchestration.executor import TrustedActivityExecutor
+        from src.orchestration.remote_control import RemoteControlPlane
+        from src.orchestration.remote_journal import RemoteControlJournal
+        from src.orchestration.remote_execution import (
+            SecureRemoteAssignmentAdmitter,
+        )
+        from src.orchestration.remote_worker import RemoteWorkerDaemon
         from src.orchestration.hierarchy import DurableHierarchy
         from src.orchestration.mcp import MCPServer
         from src.orchestration.policy import PolicyEngine
@@ -98,6 +119,13 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             ("DurableHierarchy", DurableHierarchy),
             ("PolicyEngine", PolicyEngine),
             ("TrustedActivityExecutor", TrustedActivityExecutor),
+            ("RemoteControlPlane", RemoteControlPlane),
+            ("RemoteControlJournal", RemoteControlJournal),
+            ("RemoteWorkerDaemon", RemoteWorkerDaemon),
+            (
+                "SecureRemoteAssignmentAdmitter",
+                SecureRemoteAssignmentAdmitter,
+            ),
             ("ReplayReport", ReplayReport),
             ("Suite", Suite),
             ("MCPServer", MCPServer),
