@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import threading
 import unittest
@@ -14,10 +15,12 @@ from src.orchestration.policy import (
     InMemoryApprovalLedger,
     PolicyEngine,
     PolicyOutcome,
+    PolicyResolutionSource,
     PolicyRule,
     PolicyValidationError,
     ToolTimeoutBehavior,
     ToolPolicy,
+    sensitive_argument_bytes,
 )
 
 
@@ -116,6 +119,159 @@ def grant_for(
 
 
 class PolicyEngineTests(unittest.TestCase):
+    def test_action_argument_trees_have_depth_node_and_secret_byte_bounds(self) -> None:
+        nested: object = "leaf"
+        for _index in range(34):
+            nested = [nested]
+        with self.assertRaisesRegex(PolicyValidationError, "bounded"):
+            action(
+                "file_read",
+                EffectClass.READ_ONLY,
+                (READ,),
+                args={"value": nested},
+            )
+
+        with self.assertRaisesRegex(PolicyValidationError, "bounded"):
+            sensitive_argument_bytes(
+                {"password": [0] * 4097},
+                (),
+            )
+        with self.assertRaisesRegex(PolicyValidationError, "bounded"):
+            sensitive_argument_bytes(
+                {"password": "x" * (64 * 1024 + 1)},
+                (),
+            )
+
+        cyclic: dict[str, object] = {}
+        cyclic["password"] = cyclic
+        self.assertEqual(sensitive_argument_bytes(cyclic, ()), ())
+
+    def test_policy_metadata_iterables_are_consumed_with_hard_bounds(self) -> None:
+        with self.assertRaisesRegex(PolicyValidationError, "bounded"):
+            ActionRequest.from_args(
+                run_id="run",
+                node_id="node",
+                attempt_id="attempt",
+                tool_name="file_read",
+                args={},
+                execution_binding_digest="e" * 64,
+                operation_key="operation",
+                idempotency_key="operation",
+                effect_class=EffectClass.READ_ONLY,
+                capabilities=itertools.repeat(READ),
+            )
+        valid_tool = ToolPolicy(
+            "file_read",
+            EffectClass.READ_ONLY,
+            (READ,),
+            allowed_resource_keys=("workspace:/project",),
+        )
+        with self.assertRaisesRegex(PolicyValidationError, "bounded"):
+            PolicyEngine(itertools.repeat(valid_tool))
+
+    def test_simulation_is_the_same_decision_path_and_not_authority(self) -> None:
+        request = action("file_write", EffectClass.IDEMPOTENT_WRITE, (WRITE,))
+        policy = engine()
+
+        simulation = policy.simulate(request)
+        decision = policy.evaluate(request)
+        payload = simulation.to_dict()
+
+        self.assertEqual(simulation.decision, decision)
+        self.assertEqual(
+            simulation.resolution_source,
+            PolicyResolutionSource.DEFAULT,
+        )
+        self.assertEqual(decision.outcome, PolicyOutcome.REQUIRE_APPROVAL)
+        self.assertFalse(payload["authorizes_execution"])
+        self.assertTrue(payload["runtime_recheck_required"])
+        self.assertEqual(len(simulation.simulation_digest), 64)
+        self.assertEqual(
+            simulation.simulation_digest,
+            policy.simulate(request).simulation_digest,
+        )
+
+    def test_simulation_explains_rule_precedence_without_action_payload(self) -> None:
+        secret = "simulation-secret-must-not-leak"
+        resource = "workspace:/private/customer-path"
+        request = ActionRequest.from_args(
+            run_id="run",
+            node_id="node",
+            attempt_id="attempt",
+            tool_name="file_write",
+            args={"path": resource, "api_key": secret},
+            execution_binding_digest="e" * 64,
+            operation_key="operation",
+            idempotency_key="operation",
+            effect_class=EffectClass.IDEMPOTENT_WRITE,
+            capabilities=(WRITE,),
+            resource_locks=("workspace:/project",),
+        )
+        broad = PolicyRule("broad", PolicyOutcome.DENY)
+        exact_allow = PolicyRule(
+            "exact-allow",
+            PolicyOutcome.ALLOW,
+            tool_name="file_write",
+        )
+        exact_deny = PolicyRule(
+            "exact-deny",
+            PolicyOutcome.DENY,
+            tool_name="file_write",
+        )
+
+        simulation = engine((broad, exact_allow, exact_deny)).simulate(request)
+        serialized = json.dumps(simulation.to_dict(), sort_keys=True)
+
+        self.assertEqual(
+            simulation.resolution_source,
+            PolicyResolutionSource.RULE,
+        )
+        self.assertEqual(
+            simulation.matching_rule_ids,
+            ("broad", "exact-allow", "exact-deny"),
+        )
+        self.assertEqual(
+            simulation.finalist_rule_ids,
+            ("exact-allow", "exact-deny"),
+        )
+        self.assertEqual(simulation.winning_rule_id, "exact-deny")
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn(resource, serialized)
+        self.assertNotIn("workspace:/project", serialized)
+
+    def test_simulation_explains_contract_failure_and_destructive_floor(self) -> None:
+        policy = engine(
+            (
+                PolicyRule(
+                    "allow-delete",
+                    PolicyOutcome.ALLOW,
+                    tool_name="delete_tree",
+                ),
+            )
+        )
+        bad = policy.simulate(
+            action("file_write", EffectClass.READ_ONLY, (WRITE,))
+        )
+        destructive = policy.simulate(
+            action("delete_tree", EffectClass.DESTRUCTIVE, (DELETE,))
+        )
+
+        self.assertEqual(
+            bad.resolution_source,
+            PolicyResolutionSource.CONTRACT,
+        )
+        self.assertEqual(bad.checks[-1].code, "effect_class_matches")
+        self.assertFalse(bad.checks[-1].passed)
+        self.assertEqual(
+            destructive.resolution_source,
+            PolicyResolutionSource.DESTRUCTIVE_FLOOR,
+        )
+        self.assertEqual(
+            destructive.decision.reason_code,
+            "destructive_requires_approval",
+        )
+        self.assertEqual(destructive.winning_rule_id, "allow-delete")
+
     def test_known_read_only_action_is_allowed(self) -> None:
         request = action("file_read", EffectClass.READ_ONLY, (READ,))
 

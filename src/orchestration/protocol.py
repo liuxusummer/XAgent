@@ -19,6 +19,11 @@ from enum import StrEnum
 from typing import Any, Mapping, TypeAlias
 
 from .artifacts import ArtifactRef
+from .recovery import (
+    RecoveryDecisionError,
+    UnknownOutcomeDecision,
+    UnknownOutcomeResolution,
+)
 from .scheduler import RunInputReceipt
 
 PROTOCOL_VERSION = 1
@@ -42,6 +47,7 @@ class Operation(StrEnum):
     PAUSE = "pause"
     RESUME = "resume"
     RECOVER = "recover"
+    RESOLVE_RECOVERY = "resolve_recovery"
     TICK = "tick"
 
     @property
@@ -52,6 +58,7 @@ class Operation(StrEnum):
             Operation.PAUSE,
             Operation.RESUME,
             Operation.RECOVER,
+            Operation.RESOLVE_RECOVERY,
             Operation.TICK,
         }
 
@@ -101,12 +108,23 @@ class RecoverBody:
 
 
 @dataclass(frozen=True, slots=True)
+class ResolveRecoveryBody:
+    decision: UnknownOutcomeDecision
+
+    @property
+    def run_id(self) -> str:
+        return self.decision.run_id
+
+
+@dataclass(frozen=True, slots=True)
 class TickBody:
     run_id: str
     max_steps: int = 1
 
 
-RequestBody: TypeAlias = SubmitBody | RunBody | EventsBody | RecoverBody | TickBody
+RequestBody: TypeAlias = (
+    SubmitBody | RunBody | EventsBody | RecoverBody | ResolveRecoveryBody | TickBody
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +270,39 @@ def _parse_body(operation: Operation, body: dict[str, Any]) -> RequestBody:
                 maximum=MAX_CONTROL_STEPS,
             ),
         )
+    if operation is Operation.RESOLVE_RECOVERY:
+        _exact_fields(
+            body,
+            {
+                "resolution_id",
+                "run_id",
+                "node_id",
+                "attempt_id",
+                "resolution",
+                "evidence_ref",
+                "result_ref",
+            },
+            "resolve_recovery body",
+        )
+        try:
+            decision = UnknownOutcomeDecision(
+                resolution_id=_identifier(body["resolution_id"], "resolution_id"),
+                run_id=_identifier(body["run_id"], "run_id"),
+                node_id=_identifier(body["node_id"], "node_id"),
+                attempt_id=_identifier(body["attempt_id"], "attempt_id"),
+                resolution=UnknownOutcomeResolution(body["resolution"]),
+                evidence_ref=_artifact_ref(body["evidence_ref"], "evidence_ref"),
+                result_ref=(
+                    None
+                    if body["result_ref"] is None
+                    else _artifact_ref(body["result_ref"], "result_ref")
+                ),
+            )
+        except (RecoveryDecisionError, TypeError, ValueError) as exc:
+            raise ProtocolValidationError(
+                "resolve_recovery body is invalid"
+            ) from exc
+        return ResolveRecoveryBody(decision)
     if operation is Operation.TICK:
         _exact_fields(body, {"run_id", "max_steps"}, "tick body")
         return TickBody(
@@ -395,6 +446,7 @@ __all__ = [
     "ProtocolResponse",
     "ProtocolValidationError",
     "RecoverBody",
+    "ResolveRecoveryBody",
     "RunBody",
     "SubmitBody",
     "TickBody",

@@ -49,11 +49,19 @@ CLI、Web、Team Workflow 和可选 Durable Orchestration 的调用方式不变�
 7. grant 在工作区持久账本中单次消费后才执行工具；
 8. `tool_finally_callback` 清除线程局部授权，异常不得把授权留给下一次调用。
 
+执行前可调用 `LocalPolicyGate.simulate(...)` 获取不含参数、路径和审批人的策略解释。
+preview 使用独立 identity，不消耗真实 call counter，其 action digest 不能用于后续
+grant；真正执行仍必须重新通过同一个 `PolicyEngine`。`conformance_report()` 会为每个
+本地工具契约运行基线 case，新增 `exec_*` 工具同时受到注册表集合测试和 conformance
+覆盖约束。完整运维契约见 `docs/policy-operations.md`。
+
 `NaN`、不可规范化、递归或超过 ActionRequest 元数据上限的参数在策略入口直接
 `DENY(reason_code=invalid_action_args)`，不能用校验异常终止循环或绕过工具前置检查。
 
 审批后进程崩溃且没有持久工具结果时，checkpoint 将结果标为 unknown。恢复只允许先探测当前
-状态，禁止自动重放。
+状态，禁止自动重放。Durable Runtime 的 `resolve_recovery` 还要求受权控制面提交经
+Artifact Store 验证的 evidence；确认成功时必须同时提交 result Artifact，原
+`OUTCOME_UNKNOWN` Attempt 保留为审计事实。
 
 普通文件工具不能读取 `runtime/agent_kernel/`、`runtime/checkpoints/`、文件索引数据库以及
 根级控制文件 `_intervene`、`_keyinfo`、`plan.md`，

@@ -11,6 +11,7 @@ from src.orchestration.protocol import (
     ParentSubmission,
     ProtocolResponse,
     ProtocolValidationError,
+    ResolveRecoveryBody,
     SubmitBody,
     parse_request,
 )
@@ -139,6 +140,15 @@ class OrchestrationProtocolTests(unittest.TestCase):
             "pause": {"run_id": "run"},
             "resume": {"run_id": "run"},
             "recover": {"run_id": "run", "limit": 5},
+            "resolve_recovery": {
+                "resolution_id": "resolution-1",
+                "run_id": "run",
+                "node_id": "node",
+                "attempt_id": "attempt",
+                "resolution": "confirmed_succeeded",
+                "evidence_ref": self.input_ref.to_dict(),
+                "result_ref": self.input_ref.to_dict(),
+            },
             "tick": {"run_id": "run", "max_steps": 3},
         }
         for operation, body in cases.items():
@@ -148,6 +158,28 @@ class OrchestrationProtocolTests(unittest.TestCase):
         events = parse_request(self._request("events", cases["events"]))
         self.assertIsInstance(events.body, EventsBody)
         self.assertEqual(events.body.limit, 10)
+        resolution = parse_request(
+            self._request("resolve_recovery", cases["resolve_recovery"])
+        )
+        self.assertIsInstance(resolution.body, ResolveRecoveryBody)
+        self.assertEqual(
+            resolution.body.decision.resolution.value,
+            "confirmed_succeeded",
+        )
+
+    def test_recovery_resolution_requires_consistent_artifact_evidence(self) -> None:
+        invalid = {
+            "resolution_id": "resolution-1",
+            "run_id": "run",
+            "node_id": "node",
+            "attempt_id": "attempt",
+            "resolution": "confirmed_failed",
+            "evidence_ref": self.input_ref.to_dict(),
+            "result_ref": self.input_ref.to_dict(),
+        }
+
+        with self.assertRaises(ProtocolValidationError):
+            parse_request(self._request("resolve_recovery", invalid))
 
     def test_response_marks_only_protocol_success_or_failure(self) -> None:
         success = ProtocolResponse.success(

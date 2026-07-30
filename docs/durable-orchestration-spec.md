@@ -861,6 +861,17 @@ Activity 审批是可恢复状态，不是一次函数调用：
 预先签发 grant 仍可使用，但消费必须是单次且与执行意图完全一致。审批 actor、原始
 operation key、argv、路径和 Artifact 内容不得进入公共 Event。
 
+### 10.3.1 Unknown outcome resolution
+
+`OUTCOME_UNKNOWN` 禁止自动重试。可信 operator control plane 只能提交两种结论：
+`confirmed_succeeded` 或 `confirmed_failed`。两者都必须绑定原 Run/Node/Attempt 和经
+Artifact Store 验证的 immutable evidence Artifact；确认成功还必须绑定 result Artifact。
+Store 以 `run.recovery_resolved` 原子更新 Run/Node，但保留原 terminal
+`OUTCOME_UNKNOWN` Attempt。重复相同 decision 幂等，冲突 decision fail closed。
+公共 projection 只暴露固定状态、reason code、允许的 operator action 和 digest，不暴露
+evidence 内容、错误 payload、路径或 actor。模拟和 diagnostics 不是授权，执行/恢复入口仍须
+通过受信 authorizer。
+
 ### 10.4 Cancel
 
 取消流程：

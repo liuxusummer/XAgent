@@ -131,6 +131,17 @@ The three-round threat/concurrency/upgrade review is recorded in
 Exit evidence: operators can predict and audit policy outcomes, while runtime
 enforcement remains the sole authority.
 
+Foundation delivered: policy simulation and enforcement share one deterministic
+decision path, with payload-free check/rule explanations that never grant
+execution. Bounded conformance packs cover every default Handler tool contract.
+Runtime and Web projections expose allowlisted approval/recovery diagnostics,
+while an authorized `resolve_recovery` protocol requires verified immutable
+evidence and result Artifacts, preserves the original `OUTCOME_UNKNOWN` Attempt,
+and never offers blind retry. The operational contract is documented in
+[`policy-operations.md`](policy-operations.md).
+The three-round authorization/concurrency/compatibility review is recorded in
+[`policy-operations-adversarial-review.md`](policy-operations-adversarial-review.md).
+
 ### Phase 5 — Durable execution integration
 
 - Replace reference-only remote polling with an authenticated server/pull

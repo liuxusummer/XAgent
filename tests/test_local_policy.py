@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -47,6 +49,91 @@ class LocalPolicyGateTests(unittest.TestCase):
         self.assertEqual(allowed.decision.outcome, PolicyOutcome.ALLOW)
         self.assertEqual(denied.decision.outcome, PolicyOutcome.DENY)
         self.assertEqual(denied.decision.reason_code, "unknown_tool")
+
+    def test_simulation_does_not_consume_live_identity_or_expose_arguments(self) -> None:
+        secret = "local-policy-preview-secret"
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline_gate = LocalPolicyGate(tmp, actor="user-1")
+            preview_gate = LocalPolicyGate(tmp, actor="user-1")
+            principal = self._principal()
+            baseline = baseline_gate.evaluate(
+                principal=principal,
+                tool_name="code_run",
+                args={"language": "shell", "script": secret},
+                turn=3,
+            )
+            simulation = preview_gate.simulate(
+                principal=principal,
+                tool_name="code_run",
+                args={"language": "shell", "script": secret},
+                turn=3,
+            )
+            after_preview = preview_gate.evaluate(
+                principal=principal,
+                tool_name="code_run",
+                args={"language": "shell", "script": secret},
+                turn=3,
+            )
+
+        self.assertEqual(
+            baseline.action.action_digest,
+            after_preview.action.action_digest,
+        )
+        self.assertNotEqual(
+            simulation.authorization.action.action_digest,
+            after_preview.action.action_digest,
+        )
+        self.assertIsNotNone(simulation.engine_simulation)
+        self.assertFalse(simulation.to_dict()["authorizes_execution"])
+        self.assertNotIn(secret, json.dumps(simulation.to_dict(), sort_keys=True))
+
+    def test_simulation_explains_local_preflight_denial(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gate = LocalPolicyGate(tmp, actor="user-1")
+            simulation = gate.simulate(
+                principal=self._principal(("workspace.read",)),
+                tool_name="file_write",
+                args={"path": "notes.txt", "content": "safe"},
+                turn=1,
+            )
+
+        self.assertIsNone(simulation.engine_simulation)
+        self.assertEqual(
+            simulation.authorization.decision.reason_code,
+            "principal_scope_missing",
+        )
+        self.assertEqual(simulation.checks[0].code, "principal_scope_missing")
+        self.assertFalse(simulation.checks[0].passed)
+
+    def test_concurrent_live_authorizations_have_unique_action_identities(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gate = LocalPolicyGate(tmp, actor="user-1")
+            principal = self._principal()
+            barrier = threading.Barrier(32)
+            digests: list[str] = []
+            lock = threading.Lock()
+
+            def authorize() -> None:
+                barrier.wait()
+                authorization = gate.evaluate(
+                    principal=principal,
+                    tool_name="file_read",
+                    args={"path": "README.md"},
+                    turn=1,
+                )
+                with lock:
+                    digests.append(authorization.action.action_digest)
+
+            threads = [threading.Thread(target=authorize) for _ in range(32)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(len(digests), 32)
+        self.assertEqual(len(set(digests)), 32)
 
     def test_principal_scope_cannot_be_inferred_from_tool_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -172,6 +259,20 @@ class LocalPolicyGateTests(unittest.TestCase):
             if name.startswith("exec_")
         }
         self.assertEqual(handler_tools, set(LOCAL_TOOL_CONTRACT_MAP))
+
+    def test_every_local_tool_contract_has_a_passing_conformance_case(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = LocalPolicyGate(tmp, actor="user-1").conformance_report()
+
+        self.assertTrue(report.passed)
+        self.assertEqual(
+            set(report.covered_tools),
+            set(LOCAL_TOOL_CONTRACT_MAP),
+        )
+        self.assertEqual(
+            {result.tool_name for result in report.results},
+            set(LOCAL_TOOL_CONTRACT_MAP),
+        )
 
     def test_managed_memory_cannot_be_modified_with_file_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

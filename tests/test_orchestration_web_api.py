@@ -34,6 +34,7 @@ from src.orchestration.web_api import (
     MAX_INTEGRITY_REPLAY_SECONDS,
     WorkspaceStoreRegistry,
     _load_snapshot,
+    _sanitize_attempt,
     _stream_events,
     create_projection_router,
 )
@@ -544,6 +545,62 @@ class OrchestrationWebApiTests(unittest.TestCase):
         self.assertNotIn("claim_token_mismatch", response.text)
         self.assertNotIn("current_fencing_token", response.text)
         self.assertNotIn("payload", projected)
+
+    def test_unknown_outcome_diagnostic_is_payload_free(self) -> None:
+        secret = "web-diagnostic-secret"
+        projected = _sanitize_attempt(
+            AttemptRecord(
+                "attempt-unknown",
+                "run-web-1",
+                "work",
+                2,
+                status=AttemptStatus.OUTCOME_UNKNOWN,
+                error={
+                    "error_class": "timeout",
+                    "error_code": "external_outcome_unknown",
+                    "detail": secret,
+                },
+                scheduled_at=100,
+                finished_at=101,
+            )
+        )
+        serialized = json.dumps(projected, sort_keys=True)
+
+        self.assertEqual(
+            projected["diagnostic"]["state"],
+            "manual_resolution_required",
+        )
+        self.assertFalse(
+            projected["diagnostic"]["automatic_retry_allowed"],
+        )
+        self.assertNotIn(secret, serialized)
+
+    def test_expired_approval_diagnostic_uses_only_allowlisted_codes(self) -> None:
+        secret = "credential_canary_123"
+        projected = _sanitize_attempt(
+            AttemptRecord(
+                "attempt-expired",
+                "run-web-1",
+                "work",
+                2,
+                status=AttemptStatus.FAILED,
+                error={
+                    "class": "policy",
+                    "code": secret,
+                    "credential": "web-approval-secret",
+                },
+                scheduled_at=100,
+                finished_at=101,
+            )
+        )
+        serialized = json.dumps(projected, sort_keys=True)
+
+        self.assertEqual(
+            projected["diagnostic"]["reason_code"],
+            "policy_denied",
+        )
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn("web-approval-secret", serialized)
 
     def test_slow_sse_consumer_does_not_hold_a_writer_lock(self) -> None:
         read_store = self.registry.get("alpha.ws")

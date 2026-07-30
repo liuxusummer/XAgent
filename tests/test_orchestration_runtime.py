@@ -8,6 +8,7 @@ from pathlib import Path
 
 from src.orchestration.artifacts import LocalArtifactStore
 from src.orchestration.evaluation import ReliabilityEvidence
+from src.orchestration.models import AttemptStatus
 from src.orchestration.protocol import ParentSubmission
 from src.orchestration.runtime import (
     AuthorizationRequest,
@@ -680,6 +681,84 @@ class OrchestrationRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result["recovery"], {"attempted": True, "processed": 1})
         self.assertEqual(calls[0][1:], ("recovery-bound-run", 4))
+
+    def test_operator_can_resolve_unknown_outcome_with_verified_artifacts(
+        self,
+    ) -> None:
+        runtime = self.runtime()
+        self.assertTrue(self.handle(runtime, self.submit_payload())["ok"])
+        claim = runtime._scheduler_for("stable-run").claim_next(
+            "stable-run",
+            "worker",
+            lease_seconds=60,
+        )
+        assert claim is not None
+        self.store.start_activity(
+            "stable-run",
+            claim.node_id,
+            claim.attempt_id,
+            "worker",
+            claim_token=claim.claim_token,
+            now=101,
+        )
+        self.store.complete_activity(
+            "stable-run",
+            claim.node_id,
+            claim.attempt_id,
+            claim.request_hash,
+            "worker",
+            claim_token=claim.claim_token,
+            result={"outcome": "unknown"},
+            attempt_status=AttemptStatus.OUTCOME_UNKNOWN,
+            now=102,
+        )
+        evidence = self.artifacts.put_json({"probe": "confirmed"})
+        result = self.artifacts.put_json({"value": "recovered"})
+
+        response = self.handle(
+            runtime,
+            {
+                "protocol_version": 1,
+                "request_id": "resolve-recovery",
+                "operation": "resolve_recovery",
+                "body": {
+                    "resolution_id": "resolution-runtime-1",
+                    "run_id": "stable-run",
+                    "node_id": claim.node_id,
+                    "attempt_id": claim.attempt_id,
+                    "resolution": "confirmed_succeeded",
+                    "evidence_ref": evidence.to_dict(),
+                    "result_ref": result.to_dict(),
+                },
+            },
+        )
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(
+            response["result"]["recovery_resolution"]["resolution"],
+            "confirmed_succeeded",
+        )
+        self.assertEqual(response["result"]["status"], "completed")
+        self.assertEqual(
+            self.store.get_attempt(claim.attempt_id).status,
+            AttemptStatus.OUTCOME_UNKNOWN,
+        )
+        self.assertEqual(
+            self.authorizer.requests[-1].operation,
+            "resolve_recovery",
+        )
+        self.assertEqual(
+            self.authorizer.requests[-1].node_id,
+            claim.node_id,
+        )
+        self.assertEqual(
+            self.authorizer.requests[-1].attempt_id,
+            claim.attempt_id,
+        )
+        self.assertEqual(
+            self.authorizer.requests[-1].intent_digest,
+            response["result"]["recovery_resolution"]["decision_digest"],
+        )
 
     def test_restart_scheduler_resolver_supports_control_mutation(self) -> None:
         first = self.runtime()

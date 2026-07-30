@@ -82,6 +82,10 @@
   service/OS identity 持有，且不挂载给 legacy 文件、代码或浏览器工具。默认 Web UI 不会
   自动发现数据库；投影服务必须显式注入受信 tenant→database 映射。同 UID 隐藏路径不构成
   隔离。
+- Policy simulation、conformance 和 operator diagnostics 只读取并解释现有
+  `PolicyEngine`/projection；它们不签发 grant。未知副作用只能经受权
+  `resolve_recovery` 使用已验证 evidence/result Artifact 收敛，原
+  `OUTCOME_UNKNOWN` Attempt 不可变。边界见 `docs/policy-operations.md`。
 - Orchestration Runtime 的进程内 Scheduler 仅是有界 LRU 加速层，默认最多缓存 64 个，
   构造参数只接受 1–1024；
   Domain Store 与不可变 Workflow Artifact 才是事实源。缓存优先淘汰 terminal Run；

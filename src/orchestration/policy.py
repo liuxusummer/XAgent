@@ -16,6 +16,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
+from itertools import islice
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Protocol, runtime_checkable
 
@@ -31,6 +32,11 @@ MAX_ACTION_ARGS_BYTES = 64 * 1024
 MAX_CAPABILITIES = 32
 MAX_RESOURCE_LOCKS = 32
 MAX_RULES = 1024
+MAX_TOOLS = 1024
+MAX_APPROVAL_ACTORS = 1024
+MAX_SENSITIVE_KEYS = 64
+MAX_ACTION_JSON_DEPTH = 32
+MAX_ACTION_JSON_NODES = 4096
 MAX_TEXT_CHARS = 256
 MAX_OPERATION_KEY_CHARS = 1024
 
@@ -53,6 +59,13 @@ class PolicyOutcome(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
     REQUIRE_APPROVAL = "require_approval"
+
+
+class PolicyResolutionSource(StrEnum):
+    CONTRACT = "contract"
+    RULE = "rule"
+    DEFAULT = "default"
+    DESTRUCTIVE_FLOOR = "destructive_floor"
 
 
 class ToolTimeoutBehavior(StrEnum):
@@ -99,6 +112,38 @@ def _canonical_json(value: Any, *, field_name: str, size_limit: int | None = Non
     return encoded
 
 
+def _bounded_iterable(
+    values: Iterable[Any],
+    limit: int,
+    field_name: str,
+) -> tuple[Any, ...]:
+    try:
+        items = tuple(islice(iter(values), limit + 1))
+    except TypeError as exc:
+        raise PolicyValidationError(f"{field_name} must be iterable") from exc
+    if len(items) > limit:
+        raise PolicyValidationError(
+            f"{field_name} exceeds the bounded metadata limit"
+        )
+    return items
+
+
+def _validate_bounded_json_tree(value: Any, field_name: str) -> None:
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    visited = 0
+    while stack:
+        item, depth = stack.pop()
+        visited += 1
+        if visited > MAX_ACTION_JSON_NODES or depth > MAX_ACTION_JSON_DEPTH:
+            raise PolicyValidationError(
+                f"{field_name} exceeds the bounded metadata limit"
+            )
+        if isinstance(item, dict):
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+
+
 def _redact_sensitive(value: Any, explicit: frozenset[str]) -> Any:
     if isinstance(value, dict):
         redacted: dict[str, Any] = {}
@@ -131,13 +176,38 @@ def sensitive_argument_bytes(
         canonical_metadata_key(
             _bounded_text(key, "sensitive_key", max_chars=128)
         )
-        for key in sensitive_keys
+        for key in _bounded_iterable(
+            sensitive_keys,
+            MAX_SENSITIVE_KEYS,
+            "sensitive_keys",
+        )
     )
     collected: set[bytes] = set()
-
-    def visit(value: Any, *, sensitive: bool) -> None:
+    collected_bytes = 0
+    visited_containers: set[tuple[int, bool]] = set()
+    stack: list[tuple[Any, bool, int]] = [(args, False, 0)]
+    visited_nodes = 0
+    while stack:
+        value, sensitive, depth = stack.pop()
+        visited_nodes += 1
+        if (
+            visited_nodes > MAX_ACTION_JSON_NODES
+            or depth > MAX_ACTION_JSON_DEPTH
+        ):
+            raise PolicyValidationError(
+                "args exceeds the bounded metadata limit"
+            )
         if isinstance(value, Mapping):
-            for key, item in value.items():
+            identity = (id(value), sensitive)
+            if identity in visited_containers:
+                continue
+            visited_containers.add(identity)
+            items = _bounded_iterable(
+                value.items(),
+                MAX_ACTION_JSON_NODES,
+                "args",
+            )
+            for key, item in reversed(items):
                 nested_sensitive = sensitive or (
                     isinstance(key, str)
                     and is_sensitive_metadata_key(
@@ -145,31 +215,57 @@ def sensitive_argument_bytes(
                         additional_keys=explicit,
                     )
                 )
-                visit(item, sensitive=nested_sensitive)
-            return
+                stack.append((item, nested_sensitive, depth + 1))
+            continue
         if isinstance(value, (list, tuple)):
-            for item in value:
-                visit(item, sensitive=sensitive)
-            return
+            identity = (id(value), sensitive)
+            if identity in visited_containers:
+                continue
+            visited_containers.add(identity)
+            items = _bounded_iterable(
+                value,
+                MAX_ACTION_JSON_NODES,
+                "args",
+            )
+            stack.extend(
+                (item, sensitive, depth + 1)
+                for item in reversed(items)
+            )
+            continue
         if not sensitive:
-            return
+            continue
         if isinstance(value, str):
+            if len(value) > MAX_ACTION_ARGS_BYTES:
+                raise PolicyValidationError(
+                    "sensitive scalar exceeds the bounded metadata limit"
+                )
             encoded = value.encode("utf-8")
         elif isinstance(value, (bytes, bytearray, memoryview)):
+            if len(value) > MAX_ACTION_ARGS_BYTES:
+                raise PolicyValidationError(
+                    "sensitive scalar exceeds the bounded metadata limit"
+                )
             encoded = bytes(value)
         elif value is None:
-            return
+            continue
         elif isinstance(value, (bool, int, float)):
             encoded = _canonical_json(
                 value,
                 field_name="sensitive scalar",
             )
         else:
-            return
-        if encoded:
+            continue
+        if len(encoded) > MAX_ACTION_ARGS_BYTES:
+            raise PolicyValidationError(
+                "sensitive scalar exceeds the bounded metadata limit"
+            )
+        if encoded and encoded not in collected:
+            if collected_bytes + len(encoded) > MAX_ACTION_ARGS_BYTES:
+                raise PolicyValidationError(
+                    "sensitive values exceed the bounded metadata limit"
+                )
             collected.add(encoded)
-
-    visit(args, sensitive=False)
+            collected_bytes += len(encoded)
     return tuple(sorted(collected))
 
 
@@ -186,12 +282,9 @@ class Capability:
 
 def _capabilities(values: Iterable[Capability | str]) -> tuple[Capability, ...]:
     normalized: dict[str, Capability] = {}
-    try:
-        for value in values:
-            capability = value if isinstance(value, Capability) else Capability(value)
-            normalized[capability.name] = capability
-    except TypeError as exc:
-        raise PolicyValidationError("capabilities must be iterable") from exc
+    for value in _bounded_iterable(values, MAX_CAPABILITIES, "capabilities"):
+        capability = value if isinstance(value, Capability) else Capability(value)
+        normalized[capability.name] = capability
     if len(normalized) > MAX_CAPABILITIES:
         raise PolicyValidationError("capabilities exceed the bounded metadata limit")
     return tuple(normalized[name] for name in sorted(normalized))
@@ -199,11 +292,8 @@ def _capabilities(values: Iterable[Capability | str]) -> tuple[Capability, ...]:
 
 def _resource_locks(values: Iterable[str]) -> tuple[str, ...]:
     normalized: set[str] = set()
-    try:
-        for value in values:
-            normalized.add(_bounded_text(value, "resource_lock", max_chars=256))
-    except TypeError as exc:
-        raise PolicyValidationError("resource_locks must be iterable") from exc
+    for value in _bounded_iterable(values, MAX_RESOURCE_LOCKS, "resource_locks"):
+        normalized.add(_bounded_text(value, "resource_lock", max_chars=256))
     if len(normalized) > MAX_RESOURCE_LOCKS:
         raise PolicyValidationError("resource_locks exceed the bounded metadata limit")
     return tuple(sorted(normalized))
@@ -309,11 +399,16 @@ class ActionRequest:
             size_limit=MAX_ACTION_ARGS_BYTES,
         )
         normalized = json.loads(raw_encoded.decode("utf-8"))
+        _validate_bounded_json_tree(normalized, "args")
         explicit_keys = frozenset(
             canonical_metadata_key(
                 _bounded_text(key, "sensitive_key", max_chars=128)
             )
-            for key in sensitive_keys
+            for key in _bounded_iterable(
+                sensitive_keys,
+                MAX_SENSITIVE_KEYS,
+                "sensitive_keys",
+            )
         )
         redacted = _redact_sensitive(normalized, explicit_keys)
         args_digest = hashlib.sha256(
@@ -351,8 +446,16 @@ class ActionRequest:
             ),
             requires_script_artifact=requires_script_artifact,
             effect_class=effect_class,
-            capabilities=tuple(capabilities),
-            resource_locks=tuple(resource_locks),
+            capabilities=_bounded_iterable(
+                capabilities,
+                MAX_CAPABILITIES,
+                "capabilities",
+            ),
+            resource_locks=_bounded_iterable(
+                resource_locks,
+                MAX_RESOURCE_LOCKS,
+                "resource_locks",
+            ),
         )
 
     @property
@@ -483,9 +586,13 @@ class PolicyRule:
             )
         effects: set[EffectClass] = set()
         try:
-            for effect in self.effect_classes:
+            for effect in _bounded_iterable(
+                self.effect_classes,
+                len(EffectClass),
+                "effect_classes",
+            ):
                 effects.add(EffectClass(effect))
-        except (TypeError, ValueError) as exc:
+        except ValueError as exc:
             raise PolicyValidationError("invalid rule effect_classes") from exc
         object.__setattr__(
             self,
@@ -607,6 +714,173 @@ class PolicyDecision:
             "approval_id": self.approval_id,
             "approved_by": self.approved_by,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyCheck:
+    """One payload-free constraint evaluated by the policy engine."""
+
+    code: str
+    passed: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "code",
+            _bounded_text(self.code, "policy check code", max_chars=128),
+        )
+        if not isinstance(self.passed, bool):
+            raise PolicyValidationError("policy check result must be boolean")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"code": self.code, "passed": self.passed}
+
+
+@dataclass(frozen=True, slots=True)
+class PolicySimulation:
+    """Side-effect-free explanation of the exact runtime policy path.
+
+    A simulation is evidence about a decision, never execution authority.
+    Callers must evaluate the action again at the execution boundary.
+    """
+
+    decision: PolicyDecision
+    checks: tuple[PolicyCheck, ...]
+    resolution_source: PolicyResolutionSource
+    tool_registered: bool
+    matching_rule_ids: tuple[str, ...] = ()
+    finalist_rule_ids: tuple[str, ...] = ()
+    winning_rule_id: str | None = None
+    timeout_behavior: ToolTimeoutBehavior | None = None
+    supports_idempotency_key: bool | None = None
+    supports_status_probe: bool | None = None
+    supports_compensation: bool | None = None
+    required_resource_lock_count: int = 0
+    provided_resource_lock_count: int = 0
+    schema_version: int = POLICY_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.decision, PolicyDecision):
+            raise PolicyValidationError("simulation decision must be a PolicyDecision")
+        if not self.checks or not all(
+            isinstance(check, PolicyCheck) for check in self.checks
+        ):
+            raise PolicyValidationError("simulation checks must contain PolicyCheck values")
+        try:
+            object.__setattr__(
+                self,
+                "resolution_source",
+                PolicyResolutionSource(self.resolution_source),
+            )
+        except ValueError as exc:
+            raise PolicyValidationError("invalid policy resolution source") from exc
+        if not isinstance(self.tool_registered, bool):
+            raise PolicyValidationError("tool_registered must be boolean")
+        matching = _bounded_rule_ids(self.matching_rule_ids, "matching_rule_id")
+        finalists = _bounded_rule_ids(self.finalist_rule_ids, "finalist_rule_id")
+        if not set(finalists).issubset(matching):
+            raise PolicyValidationError(
+                "simulation finalists must be a subset of matching rules"
+            )
+        object.__setattr__(self, "matching_rule_ids", matching)
+        object.__setattr__(self, "finalist_rule_ids", finalists)
+        if tuple(self.decision.matched_rule_ids) != finalists:
+            raise PolicyValidationError(
+                "simulation finalists must match the decision rule binding"
+            )
+        if self.winning_rule_id is not None:
+            winner = _bounded_text(self.winning_rule_id, "winning_rule_id")
+            if winner not in finalists:
+                raise PolicyValidationError(
+                    "simulation winner must be a finalist rule"
+                )
+            object.__setattr__(self, "winning_rule_id", winner)
+        if (
+            self.resolution_source is PolicyResolutionSource.RULE
+            and self.winning_rule_id is None
+        ):
+            raise PolicyValidationError("rule resolution requires a winning rule")
+        if self.timeout_behavior is not None:
+            try:
+                object.__setattr__(
+                    self,
+                    "timeout_behavior",
+                    ToolTimeoutBehavior(self.timeout_behavior),
+                )
+            except ValueError as exc:
+                raise PolicyValidationError(
+                    "invalid simulation timeout behavior"
+                ) from exc
+        for field_name in (
+            "supports_idempotency_key",
+            "supports_status_probe",
+            "supports_compensation",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, bool):
+                raise PolicyValidationError(
+                    f"{field_name} simulation value must be boolean or null"
+                )
+        for field_name in (
+            "required_resource_lock_count",
+            "provided_resource_lock_count",
+        ):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                or value > MAX_RESOURCE_LOCKS
+            ):
+                raise PolicyValidationError(
+                    f"{field_name} exceeds the bounded metadata limit"
+                )
+        if self.schema_version != POLICY_SCHEMA_VERSION:
+            raise PolicyValidationError("unsupported policy simulation schema_version")
+
+    @property
+    def simulation_digest(self) -> str:
+        return hashlib.sha256(
+            _canonical_json(self.to_dict(), field_name="policy simulation")
+        ).hexdigest()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "decision": self.decision.to_dict(),
+            "checks": [check.to_dict() for check in self.checks],
+            "resolution_source": self.resolution_source.value,
+            "tool_registered": self.tool_registered,
+            "matching_rule_ids": list(self.matching_rule_ids),
+            "finalist_rule_ids": list(self.finalist_rule_ids),
+            "winning_rule_id": self.winning_rule_id,
+            "timeout_behavior": (
+                None
+                if self.timeout_behavior is None
+                else self.timeout_behavior.value
+            ),
+            "supports_idempotency_key": self.supports_idempotency_key,
+            "supports_status_probe": self.supports_status_probe,
+            "supports_compensation": self.supports_compensation,
+            "required_resource_lock_count": self.required_resource_lock_count,
+            "provided_resource_lock_count": self.provided_resource_lock_count,
+            "authorizes_execution": False,
+            "runtime_recheck_required": True,
+        }
+
+
+def _bounded_rule_ids(values: Iterable[str], field_name: str) -> tuple[str, ...]:
+    normalized = tuple(
+        sorted(
+            {
+                _bounded_text(value, field_name)
+                for value in _bounded_iterable(values, MAX_RULES, f"{field_name}s")
+            }
+        )
+    )
+    if len(normalized) > MAX_RULES:
+        raise PolicyValidationError("rule IDs exceed the bounded policy limit")
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -741,7 +1015,7 @@ class PolicyEngine:
         ledger: ApprovalLedger | None = None,
     ) -> None:
         tool_map: dict[str, ToolPolicy] = {}
-        for tool in tools:
+        for tool in _bounded_iterable(tools, MAX_TOOLS, "tools"):
             if not isinstance(tool, ToolPolicy):
                 raise PolicyValidationError("tools must contain ToolPolicy values")
             if tool.tool_name in tool_map:
@@ -750,9 +1024,7 @@ class PolicyEngine:
         if not tool_map:
             raise PolicyValidationError("at least one tool policy is required")
 
-        normalized_rules = tuple(rules)
-        if len(normalized_rules) > MAX_RULES:
-            raise PolicyValidationError("rules exceed the bounded policy limit")
+        normalized_rules = _bounded_iterable(rules, MAX_RULES, "rules")
         rule_ids: set[str] = set()
         known_capabilities = {
             capability.name
@@ -774,7 +1046,12 @@ class PolicyEngine:
                 raise PolicyValidationError("policy rule references an unknown capability")
 
         actors = frozenset(
-            _bounded_text(actor, "approval_actor") for actor in approval_actors
+            _bounded_text(actor, "approval_actor")
+            for actor in _bounded_iterable(
+                approval_actors,
+                MAX_APPROVAL_ACTORS,
+                "approval_actors",
+            )
         )
         self._tools = MappingProxyType(dict(sorted(tool_map.items())))
         self._rules = tuple(sorted(normalized_rules, key=lambda rule: rule.rule_id))
@@ -796,82 +1073,191 @@ class PolicyEngine:
         self.policy_version = f"sha256:{self.policy_digest}"
 
     def evaluate(self, action: ActionRequest) -> PolicyDecision:
+        """Evaluate one action through the same path used by simulation."""
+
+        return self.simulate(action).decision
+
+    def simulate(self, action: ActionRequest) -> PolicySimulation:
+        """Explain a policy outcome without granting execution authority."""
+
         if not isinstance(action, ActionRequest):
             raise PolicyValidationError("action must be an ActionRequest")
+        checks: list[PolicyCheck] = []
         profile = self._tools.get(action.tool_name)
         if profile is None:
-            return self._decision(action, PolicyOutcome.DENY, "unknown_tool")
+            checks.append(PolicyCheck("tool_registered", False))
+            return self._simulation(
+                action,
+                self._decision(action, PolicyOutcome.DENY, "unknown_tool"),
+                checks,
+                PolicyResolutionSource.CONTRACT,
+                profile=None,
+            )
+        checks.append(PolicyCheck("tool_registered", True))
 
         action_capabilities = {capability.name for capability in action.capabilities}
         if not action_capabilities.issubset(self._known_capabilities):
-            return self._decision(action, PolicyOutcome.DENY, "unknown_capability")
+            checks.append(PolicyCheck("capabilities_known", False))
+            return self._simulation(
+                action,
+                self._decision(action, PolicyOutcome.DENY, "unknown_capability"),
+                checks,
+                PolicyResolutionSource.CONTRACT,
+                profile=profile,
+            )
+        checks.append(PolicyCheck("capabilities_known", True))
         if action.effect_class is not profile.effect_class:
-            return self._decision(action, PolicyOutcome.DENY, "effect_class_mismatch")
+            checks.append(PolicyCheck("effect_class_matches", False))
+            return self._simulation(
+                action,
+                self._decision(action, PolicyOutcome.DENY, "effect_class_mismatch"),
+                checks,
+                PolicyResolutionSource.CONTRACT,
+                profile=profile,
+            )
+        checks.append(PolicyCheck("effect_class_matches", True))
         profile_capabilities = {capability.name for capability in profile.capabilities}
         if action_capabilities != profile_capabilities:
-            return self._decision(action, PolicyOutcome.DENY, "capability_mismatch")
-        if action.requires_script_artifact != profile.requires_script_artifact:
-            return self._decision(
+            checks.append(PolicyCheck("capability_contract_matches", False))
+            return self._simulation(
                 action,
-                PolicyOutcome.DENY,
-                "script_artifact_contract_mismatch",
+                self._decision(action, PolicyOutcome.DENY, "capability_mismatch"),
+                checks,
+                PolicyResolutionSource.CONTRACT,
+                profile=profile,
             )
+        checks.append(PolicyCheck("capability_contract_matches", True))
+        if action.requires_script_artifact != profile.requires_script_artifact:
+            checks.append(PolicyCheck("script_artifact_contract_matches", False))
+            return self._simulation(
+                action,
+                self._decision(
+                    action,
+                    PolicyOutcome.DENY,
+                    "script_artifact_contract_mismatch",
+                ),
+                checks,
+                PolicyResolutionSource.CONTRACT,
+                profile=profile,
+            )
+        checks.append(PolicyCheck("script_artifact_contract_matches", True))
         if (
             profile.requires_script_artifact
             and action.script_artifact_sha256 is None
         ):
-            return self._decision(
+            checks.append(PolicyCheck("script_artifact_present", False))
+            return self._simulation(
                 action,
-                PolicyOutcome.DENY,
-                "script_artifact_required",
+                self._decision(
+                    action,
+                    PolicyOutcome.DENY,
+                    "script_artifact_required",
+                ),
+                checks,
+                PolicyResolutionSource.CONTRACT,
+                profile=profile,
             )
+        if profile.requires_script_artifact:
+            checks.append(PolicyCheck("script_artifact_present", True))
         action_resource_locks = set(action.resource_locks)
         if not set(profile.required_resource_keys).issubset(action_resource_locks):
-            return self._decision(
+            checks.append(PolicyCheck("required_resource_locks_present", False))
+            return self._simulation(
                 action,
-                PolicyOutcome.DENY,
-                "required_resource_lock_missing",
+                self._decision(
+                    action,
+                    PolicyOutcome.DENY,
+                    "required_resource_lock_missing",
+                ),
+                checks,
+                PolicyResolutionSource.CONTRACT,
+                profile=profile,
             )
+        checks.append(PolicyCheck("required_resource_locks_present", True))
         if not action_resource_locks.issubset(profile.allowed_resource_keys):
-            return self._decision(
+            checks.append(PolicyCheck("resource_locks_allowed", False))
+            return self._simulation(
                 action,
-                PolicyOutcome.DENY,
-                "resource_lock_not_allowed",
+                self._decision(
+                    action,
+                    PolicyOutcome.DENY,
+                    "resource_lock_not_allowed",
+                ),
+                checks,
+                PolicyResolutionSource.CONTRACT,
+                profile=profile,
             )
+        checks.append(PolicyCheck("resource_locks_allowed", True))
         if action.effect_class is not EffectClass.READ_ONLY:
             if not profile.required_resource_keys:
-                return self._decision(
+                checks.append(PolicyCheck("write_resource_contract_declared", False))
+                return self._simulation(
                     action,
-                    PolicyOutcome.DENY,
-                    "write_resource_contract_missing",
+                    self._decision(
+                        action,
+                        PolicyOutcome.DENY,
+                        "write_resource_contract_missing",
+                    ),
+                    checks,
+                    PolicyResolutionSource.CONTRACT,
+                    profile=profile,
                 )
+            checks.append(PolicyCheck("write_resource_contract_declared", True))
             if profile.timeout_behavior is ToolTimeoutBehavior.SAFE_TO_RETRY:
-                return self._decision(
+                checks.append(PolicyCheck("write_timeout_contract_safe", False))
+                return self._simulation(
                     action,
-                    PolicyOutcome.DENY,
-                    "write_timeout_contract_unsafe",
+                    self._decision(
+                        action,
+                        PolicyOutcome.DENY,
+                        "write_timeout_contract_unsafe",
+                    ),
+                    checks,
+                    PolicyResolutionSource.CONTRACT,
+                    profile=profile,
                 )
+            checks.append(PolicyCheck("write_timeout_contract_safe", True))
             if (
                 profile.timeout_behavior is ToolTimeoutBehavior.PROBE_BEFORE_RETRY
                 and not profile.supports_status_probe
             ):
-                return self._decision(
+                checks.append(PolicyCheck("status_probe_contract_satisfied", False))
+                return self._simulation(
                     action,
-                    PolicyOutcome.DENY,
-                    "status_probe_unsupported",
+                    self._decision(
+                        action,
+                        PolicyOutcome.DENY,
+                        "status_probe_unsupported",
+                    ),
+                    checks,
+                    PolicyResolutionSource.CONTRACT,
+                    profile=profile,
                 )
+            if profile.timeout_behavior is ToolTimeoutBehavior.PROBE_BEFORE_RETRY:
+                checks.append(PolicyCheck("status_probe_contract_satisfied", True))
             if (
                 action.effect_class is EffectClass.IDEMPOTENT_WRITE
                 and not profile.supports_idempotency_key
             ):
-                return self._decision(
+                checks.append(PolicyCheck("idempotency_contract_satisfied", False))
+                return self._simulation(
                     action,
-                    PolicyOutcome.DENY,
-                    "idempotency_key_unsupported",
+                    self._decision(
+                        action,
+                        PolicyOutcome.DENY,
+                        "idempotency_key_unsupported",
+                    ),
+                    checks,
+                    PolicyResolutionSource.CONTRACT,
+                    profile=profile,
                 )
+            if action.effect_class is EffectClass.IDEMPOTENT_WRITE:
+                checks.append(PolicyCheck("idempotency_contract_satisfied", True))
 
         matching = [rule for rule in self._rules if rule.matches(action)]
+        matching_rule_ids = tuple(rule.rule_id for rule in matching)
         matched_rule_ids: tuple[str, ...] = ()
+        winning_rule_id: str | None = None
         if matching:
             highest_specificity = max(rule.specificity for rule in matching)
             finalists = [
@@ -888,23 +1274,39 @@ class PolicyEngine:
             outcome = chosen.outcome
             reason_code = chosen.reason_code
             matched_rule_ids = tuple(rule.rule_id for rule in finalists)
+            winning_rule_id = chosen.rule_id
+            source = PolicyResolutionSource.RULE
         elif action.effect_class is EffectClass.READ_ONLY:
             outcome = PolicyOutcome.ALLOW
             reason_code = "known_read_only"
+            source = PolicyResolutionSource.DEFAULT
         else:
             outcome = PolicyOutcome.REQUIRE_APPROVAL
             reason_code = "write_requires_approval"
+            source = PolicyResolutionSource.DEFAULT
+        checks.append(PolicyCheck("policy_rules_resolved", True))
 
         # Destructive actions always retain an approval gate; an ALLOW rule
         # cannot silently remove the strongest built-in safety boundary.
         if action.effect_class is EffectClass.DESTRUCTIVE and outcome is PolicyOutcome.ALLOW:
             outcome = PolicyOutcome.REQUIRE_APPROVAL
             reason_code = "destructive_requires_approval"
-        return self._decision(
+            source = PolicyResolutionSource.DESTRUCTIVE_FLOOR
+            checks.append(PolicyCheck("destructive_approval_floor_applied", True))
+        return self._simulation(
             action,
-            outcome,
-            reason_code,
-            matched_rule_ids=matched_rule_ids,
+            self._decision(
+                action,
+                outcome,
+                reason_code,
+                matched_rule_ids=matched_rule_ids,
+            ),
+            checks,
+            source,
+            profile=profile,
+            matching_rule_ids=matching_rule_ids,
+            finalist_rule_ids=matched_rule_ids,
+            winning_rule_id=winning_rule_id,
         )
 
     def tool_policy(self, tool_name: str) -> ToolPolicy | None:
@@ -985,4 +1387,42 @@ class PolicyEngine:
             matched_rule_ids=matched_rule_ids,
             approval_id=approval_id,
             approved_by=approved_by,
+        )
+
+    def _simulation(
+        self,
+        action: ActionRequest,
+        decision: PolicyDecision,
+        checks: Iterable[PolicyCheck],
+        resolution_source: PolicyResolutionSource,
+        *,
+        profile: ToolPolicy | None,
+        matching_rule_ids: tuple[str, ...] = (),
+        finalist_rule_ids: tuple[str, ...] = (),
+        winning_rule_id: str | None = None,
+    ) -> PolicySimulation:
+        return PolicySimulation(
+            decision=decision,
+            checks=tuple(checks),
+            resolution_source=resolution_source,
+            tool_registered=profile is not None,
+            matching_rule_ids=matching_rule_ids,
+            finalist_rule_ids=finalist_rule_ids,
+            winning_rule_id=winning_rule_id,
+            timeout_behavior=(
+                None if profile is None else profile.timeout_behavior
+            ),
+            supports_idempotency_key=(
+                None if profile is None else profile.supports_idempotency_key
+            ),
+            supports_status_probe=(
+                None if profile is None else profile.supports_status_probe
+            ),
+            supports_compensation=(
+                None if profile is None else profile.supports_compensation
+            ),
+            required_resource_lock_count=(
+                0 if profile is None else len(profile.required_resource_keys)
+            ),
+            provided_resource_lock_count=len(action.resource_locks),
         )

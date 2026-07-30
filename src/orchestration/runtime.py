@@ -34,6 +34,7 @@ from .evaluation import (
     evaluate_reliability,
 )
 from .models import EventRecord, RunRecord
+from .operator_diagnostics import summarize_operator_diagnostics
 from .protocol import (
     EventsBody,
     MAX_CONTROL_STEPS,
@@ -44,12 +45,14 @@ from .protocol import (
     ProtocolResponse,
     ProtocolValidationError,
     RecoverBody,
+    ResolveRecoveryBody,
     RunBody,
     SubmitBody,
     TickBody,
     parse_request,
     validate_identifier,
 )
+from .recovery import RecoveryDecisionError, UnknownOutcomeDecision
 from .replay import ReplayReport, build_replay_report
 from .scheduler import DurableScheduler, RunInputReceipt
 from .store import (
@@ -91,6 +94,9 @@ class AuthorizationRequest:
     run_id: str | None
     parent_run_id: str | None = None
     parent_node_id: str | None = None
+    node_id: str | None = None
+    attempt_id: str | None = None
+    intent_digest: str | None = None
 
 
 @runtime_checkable
@@ -294,6 +300,28 @@ class OrchestrationRuntime:
             raise RuntimeInputError("recovery bound is invalid")
         return self._recover(RecoverBody(run_id, limit))
 
+    def resolve_recovery(
+        self,
+        decision: UnknownOutcomeDecision,
+        *,
+        authorization_context: Any = None,
+    ) -> dict[str, Any]:
+        """Resolve one unknown outcome through the trusted operator boundary."""
+
+        if not isinstance(decision, UnknownOutcomeDecision):
+            raise RuntimeInputError(
+                "decision must be an UnknownOutcomeDecision"
+            )
+        self._authorize_direct(
+            Operation.RESOLVE_RECOVERY,
+            decision.run_id,
+            authorization_context,
+            node_id=decision.node_id,
+            attempt_id=decision.attempt_id,
+            intent_digest=decision.decision_digest,
+        )
+        return self._resolve_recovery(ResolveRecoveryBody(decision))
+
     def tick(
         self,
         run_id: str,
@@ -429,6 +457,9 @@ class OrchestrationRuntime:
         if operation is Operation.RECOVER:
             assert isinstance(request.body, RecoverBody)
             return self._recover(request.body)
+        if operation is Operation.RESOLVE_RECOVERY:
+            assert isinstance(request.body, ResolveRecoveryBody)
+            return self._resolve_recovery(request.body)
         if operation is Operation.TICK:
             assert isinstance(request.body, TickBody)
             return self._tick(request.body)
@@ -565,11 +596,13 @@ class OrchestrationRuntime:
         run = self.store.get_run(run_id)
         if run is None:
             raise RunNotFoundError(run_id)
+        nodes = self.store.list_nodes(run_id)
+        attempts = self.store.list_attempts(run_id)
         node_counts = Counter(
-            node.status.value for node in self.store.list_nodes(run_id)
+            node.status.value for node in nodes
         )
         attempt_counts = Counter(
-            attempt.status.value for attempt in self.store.list_attempts(run_id)
+            attempt.status.value for attempt in attempts
         )
         return {
             "run_id": run_id,
@@ -583,6 +616,11 @@ class OrchestrationRuntime:
             "attempt_status_counts": {
                 key: attempt_counts[key] for key in sorted(attempt_counts)
             },
+            "operator_diagnostics": summarize_operator_diagnostics(
+                run,
+                nodes,
+                attempts,
+            ),
         }
 
     def _events(self, body: EventsBody) -> dict[str, Any]:
@@ -619,6 +657,41 @@ class OrchestrationRuntime:
         result["recovery"] = {
             "attempted": True,
             "processed": processed,
+        }
+        return result
+
+    def _resolve_recovery(
+        self,
+        body: ResolveRecoveryBody,
+    ) -> dict[str, Any]:
+        scheduler = self._scheduler_for(body.run_id)
+        decision = body.decision
+        try:
+            evidence_ref = self._verified_ref(decision.evidence_ref)
+            result_ref = (
+                None
+                if decision.result_ref is None
+                else self._verified_ref(decision.result_ref)
+            )
+            verified = UnknownOutcomeDecision(
+                resolution_id=decision.resolution_id,
+                run_id=decision.run_id,
+                node_id=decision.node_id,
+                attempt_id=decision.attempt_id,
+                resolution=decision.resolution,
+                evidence_ref=evidence_ref,
+                result_ref=result_ref,
+            )
+        except (RecoveryDecisionError, TypeError, ValueError) as exc:
+            raise RuntimeInputError("recovery decision is invalid") from exc
+        event = self.store.resolve_unknown_outcome(verified)
+        scheduler.reconcile(body.run_id)
+        result = self._status(body.run_id)
+        result["recovery_resolution"] = {
+            "resolution_id": verified.resolution_id,
+            "resolution": verified.resolution.value,
+            "decision_digest": verified.decision_digest,
+            "event_sequence": event.seq,
         }
         return result
 
@@ -878,6 +951,11 @@ class OrchestrationRuntime:
             if isinstance(request.body, SubmitBody)
             else None
         )
+        recovery = (
+            request.body.decision
+            if isinstance(request.body, ResolveRecoveryBody)
+            else None
+        )
         self._authorize(
             AuthorizationRequest(
                 operation=request.operation.value,
@@ -890,6 +968,15 @@ class OrchestrationRuntime:
                 parent_node_id=(
                     parent.parent_node_id if parent is not None else None
                 ),
+                node_id=(
+                    recovery.node_id if recovery is not None else None
+                ),
+                attempt_id=(
+                    recovery.attempt_id if recovery is not None else None
+                ),
+                intent_digest=(
+                    recovery.decision_digest if recovery is not None else None
+                ),
             ),
             context,
         )
@@ -901,6 +988,9 @@ class OrchestrationRuntime:
         context: Any,
         *,
         parent: ParentSubmission | None = None,
+        node_id: str | None = None,
+        attempt_id: str | None = None,
+        intent_digest: str | None = None,
     ) -> None:
         self._authorize(
             AuthorizationRequest(
@@ -914,6 +1004,9 @@ class OrchestrationRuntime:
                 parent_node_id=(
                     parent.parent_node_id if parent is not None else None
                 ),
+                node_id=node_id,
+                attempt_id=attempt_id,
+                intent_digest=intent_digest,
             ),
             context,
         )

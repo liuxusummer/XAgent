@@ -28,6 +28,8 @@ from src.orchestration import (
     RunHierarchyLimitError,
     RunStatus,
     StoreSchemaError,
+    UnknownOutcomeDecision,
+    UnknownOutcomeResolution,
     WorkflowBindingConflictError,
 )
 from src.orchestration.store import ConcurrentProjectionUpdate
@@ -729,12 +731,16 @@ class DurableRunStoreTests(unittest.TestCase):
                 "run.started",
                 run_projection=replace(waiting, status=RunStatus.RUNNING),
             )
-        self.store.append_event(
-            running.run_id,
-            "run.recovery_resolved",
-            run_projection=replace(waiting, status=RunStatus.RUNNING),
+        with self.assertRaises(ValueError):
+            self.store.append_event(
+                running.run_id,
+                "run.recovery_resolved",
+                run_projection=replace(waiting, status=RunStatus.RUNNING),
+            )
+        self.assertEqual(
+            self.store.get_run(running.run_id).status,
+            RunStatus.WAITING_RECOVERY,
         )
-        self.assertEqual(self.store.get_run(running.run_id).status, RunStatus.RUNNING)
 
     def test_invalid_event_is_rejected_before_transaction(self) -> None:
         run = self._create_running_run()
@@ -1336,6 +1342,308 @@ class DurableRunStoreTests(unittest.TestCase):
             self.store.get_attempt(attempt.attempt_id).status,
             AttemptStatus.OUTCOME_UNKNOWN,
         )
+
+    def test_unknown_outcome_resolution_is_artifact_backed_and_idempotent(
+        self,
+    ) -> None:
+        run, node, attempt = self._schedule_attempt("recovery-success")
+        claim, _ = self.store.claim_activity(
+            run.run_id,
+            node.node_id,
+            attempt.attempt_id,
+            "request",
+            "worker",
+            now=10,
+        )
+        self.store.start_activity(
+            run.run_id,
+            node.node_id,
+            attempt.attempt_id,
+            "worker",
+            claim_token=claim.record.claim_token,
+            now=11,
+        )
+        self.store.complete_activity(
+            run.run_id,
+            node.node_id,
+            attempt.attempt_id,
+            "request",
+            "worker",
+            claim_token=claim.record.claim_token,
+            result={"reason": "external outcome unknown"},
+            attempt_status=AttemptStatus.OUTCOME_UNKNOWN,
+            now=12,
+        )
+        artifacts = LocalArtifactStore(
+            Path(self.temp_dir.name) / "recovery-artifacts"
+        )
+        evidence = artifacts.put_json({"probe": "confirmed"})
+        result = artifacts.put_json({"external_operation": "completed"})
+        decision = UnknownOutcomeDecision(
+            resolution_id="resolution-1",
+            run_id=run.run_id,
+            node_id=node.node_id,
+            attempt_id=attempt.attempt_id,
+            resolution=UnknownOutcomeResolution.CONFIRMED_SUCCEEDED,
+            evidence_ref=evidence,
+            result_ref=result,
+        )
+
+        first = self.store.resolve_unknown_outcome(decision, now=13)
+        second = self.store.resolve_unknown_outcome(decision, now=99)
+        recovered_run = self.store.get_run(run.run_id)
+        recovered_node = self.store.get_node(run.run_id, node.node_id)
+        preserved_attempt = self.store.get_attempt(attempt.attempt_id)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first.event_type, "run.recovery_resolved")
+        self.assertEqual(recovered_run.status, RunStatus.RUNNING)
+        self.assertEqual(recovered_node.status, NodeStatus.SUCCEEDED)
+        self.assertEqual(
+            recovered_node.output["artifact_refs"][0]["sha256"],
+            result.sha256,
+        )
+        self.assertEqual(
+            preserved_attempt.status,
+            AttemptStatus.OUTCOME_UNKNOWN,
+        )
+        self.assertTrue(self.store.verify_projections(run.run_id))
+
+    def test_unknown_outcome_confirmed_failure_is_auditable_and_fail_closed(
+        self,
+    ) -> None:
+        run, node, attempt = self._schedule_attempt("recovery-failure")
+        claim, _ = self.store.claim_activity(
+            run.run_id,
+            node.node_id,
+            attempt.attempt_id,
+            "request",
+            "worker",
+            now=10,
+        )
+        self.store.start_activity(
+            run.run_id,
+            node.node_id,
+            attempt.attempt_id,
+            "worker",
+            claim_token=claim.record.claim_token,
+            now=11,
+        )
+        self.store.complete_activity(
+            run.run_id,
+            node.node_id,
+            attempt.attempt_id,
+            "request",
+            "worker",
+            claim_token=claim.record.claim_token,
+            result={"reason": "unknown"},
+            attempt_status=AttemptStatus.OUTCOME_UNKNOWN,
+            now=12,
+        )
+        artifacts = LocalArtifactStore(
+            Path(self.temp_dir.name) / "failure-recovery-artifacts"
+        )
+        decision = UnknownOutcomeDecision(
+            resolution_id="resolution-failed",
+            run_id=run.run_id,
+            node_id=node.node_id,
+            attempt_id=attempt.attempt_id,
+            resolution=UnknownOutcomeResolution.CONFIRMED_FAILED,
+            evidence_ref=artifacts.put_json({"probe": "failed"}),
+        )
+
+        event = self.store.resolve_unknown_outcome(decision, now=13)
+        recovered_node = self.store.get_node(run.run_id, node.node_id)
+
+        self.assertEqual(event.payload["decision_digest"], decision.decision_digest)
+        self.assertEqual(recovered_node.status, NodeStatus.FAILED)
+        self.assertEqual(
+            recovered_node.error,
+            {"class": "recovery", "code": "external_failure_confirmed"},
+        )
+        with self.assertRaises(InvalidStateTransition):
+            self.store.resolve_unknown_outcome(
+                UnknownOutcomeDecision(
+                    resolution_id="resolution-second",
+                    run_id=run.run_id,
+                    node_id=node.node_id,
+                    attempt_id=attempt.attempt_id,
+                    resolution=UnknownOutcomeResolution.CONFIRMED_FAILED,
+                    evidence_ref=decision.evidence_ref,
+                ),
+                now=14,
+            )
+
+    def test_conflicting_recovery_decisions_linearize_exactly_once(self) -> None:
+        run, node, attempt = self._schedule_attempt("recovery-race")
+        claim, _ = self.store.claim_activity(
+            run.run_id,
+            node.node_id,
+            attempt.attempt_id,
+            "request",
+            "worker",
+            now=10,
+        )
+        self.store.start_activity(
+            run.run_id,
+            node.node_id,
+            attempt.attempt_id,
+            "worker",
+            claim_token=claim.record.claim_token,
+            now=11,
+        )
+        self.store.complete_activity(
+            run.run_id,
+            node.node_id,
+            attempt.attempt_id,
+            "request",
+            "worker",
+            claim_token=claim.record.claim_token,
+            result={"reason": "unknown"},
+            attempt_status=AttemptStatus.OUTCOME_UNKNOWN,
+            now=12,
+        )
+        artifacts = LocalArtifactStore(
+            Path(self.temp_dir.name) / "race-recovery-artifacts"
+        )
+        evidence = artifacts.put_json({"probe": "race"})
+        decisions = (
+            UnknownOutcomeDecision(
+                "race-success",
+                run.run_id,
+                node.node_id,
+                attempt.attempt_id,
+                UnknownOutcomeResolution.CONFIRMED_SUCCEEDED,
+                evidence,
+                artifacts.put_json({"result": "success"}),
+            ),
+            UnknownOutcomeDecision(
+                "race-failure",
+                run.run_id,
+                node.node_id,
+                attempt.attempt_id,
+                UnknownOutcomeResolution.CONFIRMED_FAILED,
+                evidence,
+            ),
+        )
+        barrier = threading.Barrier(2)
+
+        def resolve(decision: UnknownOutcomeDecision) -> str:
+            barrier.wait()
+            try:
+                self.store.resolve_unknown_outcome(decision, now=13)
+            except InvalidStateTransition:
+                return "conflict"
+            return "committed"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(resolve, decisions))
+
+        self.assertCountEqual(outcomes, ["committed", "conflict"])
+        resolution_events = [
+            event
+            for event in self.store.list_events(run.run_id)
+            if event.event_type == "run.recovery_resolved"
+        ]
+        self.assertEqual(len(resolution_events), 1)
+        self.assertEqual(
+            self.store.get_attempt(attempt.attempt_id).status,
+            AttemptStatus.OUTCOME_UNKNOWN,
+        )
+
+    def test_resolving_one_of_multiple_unknowns_keeps_run_waiting(self) -> None:
+        run = self._create_running_run("multi-recovery")
+        active: list[tuple[NodeRecord, AttemptRecord, object]] = []
+        for index, node_id in enumerate(("first", "second"), start=1):
+            self.store.append_event(
+                run.run_id,
+                "node.created",
+                node_projection=NodeRecord(run.run_id, node_id, "tool"),
+            )
+            current_run = self.store.get_run(run.run_id)
+            node = self.store.get_node(run.run_id, node_id)
+            assert current_run is not None and node is not None
+            self.store.append_event(
+                run.run_id,
+                "node.ready",
+                run_projection=current_run,
+                node_projection=replace(node, status=NodeStatus.READY),
+            )
+            current_run = self.store.get_run(run.run_id)
+            node = self.store.get_node(run.run_id, node_id)
+            assert current_run is not None and node is not None
+            attempt = AttemptRecord(
+                f"attempt-{node_id}",
+                run.run_id,
+                node_id,
+                1,
+                idempotency_key=f"key-{node_id}",
+                scheduled_at=float(index),
+            )
+            self.store.append_event(
+                run.run_id,
+                "attempt.scheduled",
+                run_projection=current_run,
+                attempt_projection=attempt,
+            )
+            stored = self.store.get_attempt(attempt.attempt_id)
+            assert stored is not None
+            claim, _ = self.store.claim_activity(
+                run.run_id,
+                node_id,
+                stored.attempt_id,
+                f"request-{node_id}",
+                f"worker-{node_id}",
+                now=10,
+            )
+            self.store.start_activity(
+                run.run_id,
+                node_id,
+                stored.attempt_id,
+                f"worker-{node_id}",
+                claim_token=claim.record.claim_token,
+                now=11,
+            )
+            active.append((node, stored, claim))
+        for node, attempt, claim in active:
+            self.store.complete_activity(
+                run.run_id,
+                node.node_id,
+                attempt.attempt_id,
+                f"request-{node.node_id}",
+                f"worker-{node.node_id}",
+                claim_token=claim.record.claim_token,
+                result={"reason": "unknown"},
+                attempt_status=AttemptStatus.OUTCOME_UNKNOWN,
+                now=12,
+            )
+        artifacts = LocalArtifactStore(
+            Path(self.temp_dir.name) / "multi-recovery-artifacts"
+        )
+        evidence = artifacts.put_json({"probe": "confirmed"})
+        result = artifacts.put_json({"result": "success"})
+
+        for index, (node, attempt, _claim) in enumerate(active, start=1):
+            self.store.resolve_unknown_outcome(
+                UnknownOutcomeDecision(
+                    f"multi-resolution-{index}",
+                    run.run_id,
+                    node.node_id,
+                    attempt.attempt_id,
+                    UnknownOutcomeResolution.CONFIRMED_SUCCEEDED,
+                    evidence,
+                    result,
+                ),
+                now=12 + index,
+            )
+            expected = (
+                RunStatus.WAITING_RECOVERY
+                if index == 1
+                else RunStatus.RUNNING
+            )
+            self.assertEqual(self.store.get_run(run.run_id).status, expected)
+
+        self.assertTrue(self.store.verify_projections(run.run_id))
 
     def test_node_pause_resumes_through_ready(self) -> None:
         run, node, attempt = self._schedule_attempt()

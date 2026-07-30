@@ -196,6 +196,7 @@ class MCPServerTests(unittest.TestCase):
                 "pause",
                 "resume",
                 "recover",
+                "resolve_recovery",
                 "tick",
             ],
         )
@@ -290,6 +291,15 @@ class MCPServerTests(unittest.TestCase):
                 "payload": "SECRET-PAYLOAD",
                 "token": "SECRET-TOKEN",
                 "path": "/private/workspace",
+                "operator_diagnostics": {
+                    "attention_required": True,
+                    "diagnostic_count": 2,
+                    "automatic_retry_blocked": False,
+                    "category_counts": {
+                        "approval": 1,
+                        "credential_canary": 1,
+                    },
+                },
             },
         )
 
@@ -307,9 +317,19 @@ class MCPServerTests(unittest.TestCase):
         encoded = json.dumps(response)
         self.assertNotIn("SECRET", encoded)
         self.assertNotIn("/private", encoded)
+        self.assertNotIn("credential_canary", encoded)
         self.assertEqual(
             response["result"]["structuredContent"],
-            {"run_id": "run-1", "status": "running"},
+            {
+                "run_id": "run-1",
+                "status": "running",
+                "operator_diagnostics": {
+                    "attention_required": True,
+                    "diagnostic_count": 2,
+                    "automatic_retry_blocked": False,
+                    "category_counts": {"approval": 1},
+                },
+            },
         )
 
     def test_default_runtime_authorization_fails_closed_as_tool_error(self) -> None:

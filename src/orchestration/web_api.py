@@ -16,6 +16,7 @@ from fastapi.responses import StreamingResponse
 
 from .event_types import PUBLIC_EVENT_TYPES
 from .models import AttemptRecord, EventRecord, NodeRecord, RunRecord
+from .operator_diagnostics import diagnose_attempt, diagnose_node, diagnose_run
 from .store import (
     DurableRunStore,
     OrchestrationStoreError,
@@ -576,6 +577,7 @@ def _sanitize_snapshot(
 
 
 def _sanitize_run(run: RunRecord) -> dict[str, Any]:
+    diagnostic = diagnose_run(run)
     return {
         "schema_version": run.schema_version,
         "run_id": run.run_id,
@@ -588,10 +590,14 @@ def _sanitize_run(run: RunRecord) -> dict[str, Any]:
         "updated_at": run.updated_at,
         "last_event_sequence": run.last_event_sequence,
         "projection_version": run.projection_version,
+        "diagnostic": (
+            None if diagnostic is None else diagnostic.to_dict()
+        ),
     }
 
 
 def _sanitize_node(node: NodeRecord) -> dict[str, Any]:
+    diagnostic = diagnose_node(node)
     return {
         "schema_version": node.schema_version,
         "run_id": node.run_id,
@@ -604,10 +610,14 @@ def _sanitize_node(node: NodeRecord) -> dict[str, Any]:
         "updated_at": node.updated_at,
         "last_event_sequence": node.last_event_sequence,
         "projection_version": node.projection_version,
+        "diagnostic": (
+            None if diagnostic is None else diagnostic.to_dict()
+        ),
     }
 
 
 def _sanitize_attempt(attempt: AttemptRecord) -> dict[str, Any]:
+    diagnostic = diagnose_attempt(attempt)
     return {
         "schema_version": attempt.schema_version,
         "run_id": attempt.run_id,
@@ -623,6 +633,9 @@ def _sanitize_attempt(attempt: AttemptRecord) -> dict[str, Any]:
         "finished_at": attempt.finished_at,
         "last_event_sequence": attempt.last_event_sequence,
         "projection_version": attempt.projection_version,
+        "diagnostic": (
+            None if diagnostic is None else diagnostic.to_dict()
+        ),
     }
 
 

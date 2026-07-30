@@ -48,6 +48,7 @@ from .models import (
     normalize_run_input,
     utc_timestamp,
 )
+from .recovery import UnknownOutcomeDecision, UnknownOutcomeResolution
 
 if TYPE_CHECKING:
     from .executor import ToolReceipt
@@ -140,6 +141,7 @@ _NODE_TRANSITIONS = {
     },
     NodeStatus.WAITING_RECOVERY: {
         NodeStatus.READY,
+        NodeStatus.SUCCEEDED,
         NodeStatus.FAILED,
         NodeStatus.CANCELLED,
     },
@@ -192,8 +194,8 @@ _RUN_EVENT_STATUS = {
     "run.failed": RunStatus.FAILED,
     "run.cancelled": RunStatus.CANCELLED,
     "run.waiting_recovery": RunStatus.WAITING_RECOVERY,
-    "run.recovery_resolved": RunStatus.RUNNING,
 }
+_PROJECTION_MUTATION_EVENT_TYPES = frozenset({"run.recovery_resolved"})
 _NODE_EVENT_STATUS = {
     "node.created": NodeStatus.PENDING,
     "node.pending": NodeStatus.PENDING,
@@ -603,6 +605,46 @@ def _validate_activity_commit_rejection_payload(
         raise ValueError("activity commit rejection terminal fact is invalid")
     if not isinstance(payload.get("claim_terminal"), bool):
         raise ValueError("activity commit rejection terminal fact is invalid")
+
+
+def _validate_recovery_resolution_payload(
+    payload: dict[str, JsonValue],
+    *,
+    run_id: str,
+    node_id: str | None,
+    attempt_id: str | None,
+) -> None:
+    if set(payload) != {
+        "kind",
+        "resolution_id",
+        "resolution",
+        "decision_digest",
+        "evidence_ref",
+        "result_ref",
+    } or payload.get("kind") != "unknown_outcome_resolution":
+        raise ValueError("recovery resolution payload is not bounded")
+    if node_id is None or attempt_id is None:
+        raise ValueError("recovery resolution must bind a Node and Attempt")
+    try:
+        evidence_ref = _canonical_optional_workflow_ref(
+            payload.get("evidence_ref")
+        )
+        result_ref = _canonical_optional_workflow_ref(payload.get("result_ref"))
+        if evidence_ref is None:
+            raise ValueError("recovery evidence Artifact is required")
+        decision = UnknownOutcomeDecision(
+            resolution_id=payload.get("resolution_id"),
+            run_id=run_id,
+            node_id=node_id,
+            attempt_id=attempt_id,
+            resolution=payload.get("resolution"),
+            evidence_ref=evidence_ref,
+            result_ref=result_ref,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("recovery resolution payload is invalid") from exc
+    if payload.get("decision_digest") != decision.decision_digest:
+        raise ValueError("recovery resolution decision digest is invalid")
 
 
 def _verified_probe_receipt(value: Any) -> dict[str, JsonValue]:
@@ -1971,12 +2013,20 @@ class DurableRunStore:
                 raise ProjectionConflictError("node_id conflicts with attempt projection")
             attempt_id = attempt_projection.attempt_id
             node_id = attempt_projection.node_id
+        if event_type == "run.recovery_resolved":
+            _validate_recovery_resolution_payload(
+                requested_payload,
+                run_id=run_id,
+                node_id=node_id,
+                attempt_id=attempt_id,
+            )
         if run_projection is not None and run_projection.run_id != run_id:
             raise ProjectionConflictError("run projection belongs to another run")
         known_transition_event = (
             event_type in _RUN_EVENT_STATUS
             or event_type in _NODE_EVENT_STATUS
             or event_type in _ATTEMPT_EVENT_STATUS
+            or event_type in _PROJECTION_MUTATION_EVENT_TYPES
         )
         if (
             not known_transition_event
@@ -3606,6 +3656,163 @@ class DurableRunStore:
                 "durable ToolReceipt failed integrity validation"
             ) from exc
         return receipt
+
+    def resolve_unknown_outcome(
+        self,
+        decision: UnknownOutcomeDecision,
+        *,
+        now: float | None = None,
+    ) -> EventRecord:
+        """Atomically apply one trusted, artifact-backed recovery decision.
+
+        This is a trusted control-plane ingress. It never retries the original
+        side effect and leaves its terminal ``OUTCOME_UNKNOWN`` Attempt intact
+        as audit evidence.
+        """
+
+        if not isinstance(decision, UnknownOutcomeDecision):
+            raise TypeError("decision must be an UnknownOutcomeDecision")
+        occurred_at = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        payload: dict[str, JsonValue] = {
+            "kind": "unknown_outcome_resolution",
+            "resolution_id": decision.resolution_id,
+            "resolution": decision.resolution.value,
+            "decision_digest": decision.decision_digest,
+            "evidence_ref": decision.evidence_ref.to_dict(),
+            "result_ref": (
+                None
+                if decision.result_ref is None
+                else decision.result_ref.to_dict()
+            ),
+        }
+        event_id = f"evt_recovery_{decision.decision_digest}"
+        with self._write_transaction() as conn:
+            existing_row = conn.execute(
+                "SELECT * FROM domain_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._event_from_row(existing_row)
+                existing_payload = dict(existing.payload)
+                existing_payload.pop("projection", None)
+                if (
+                    existing.run_id != decision.run_id
+                    or existing.node_id != decision.node_id
+                    or existing.attempt_id != decision.attempt_id
+                    or existing.event_type != "run.recovery_resolved"
+                    or existing_payload != payload
+                ):
+                    raise ProjectionConflictError(
+                        "recovery decision identity was reused"
+                    )
+                return existing
+
+            run, node, attempt = self._load_activity_tx(
+                conn,
+                decision.run_id,
+                decision.node_id,
+                decision.attempt_id,
+            )
+            if (
+                run.status is not RunStatus.WAITING_RECOVERY
+                or node.status is not NodeStatus.WAITING_RECOVERY
+                or attempt.status is not AttemptStatus.OUTCOME_UNKNOWN
+            ):
+                raise InvalidStateTransition(
+                    "recovery decision requires an OUTCOME_UNKNOWN Activity"
+                )
+            terminal_row = conn.execute(
+                """
+                SELECT event_type FROM domain_events
+                WHERE run_id = ? AND node_id = ? AND attempt_id = ?
+                  AND event_type = 'attempt.outcome_unknown'
+                ORDER BY seq DESC
+                LIMIT 1
+                """,
+                (
+                    decision.run_id,
+                    decision.node_id,
+                    decision.attempt_id,
+                ),
+            ).fetchone()
+            if terminal_row is None:
+                raise StoreSchemaError(
+                    "OUTCOME_UNKNOWN Attempt is missing its durable terminal Event"
+                )
+
+            recovery_metadata = {
+                "resolution_id": decision.resolution_id,
+                "resolution": decision.resolution.value,
+                "decision_digest": decision.decision_digest,
+                "evidence_artifact_id": decision.evidence_ref.artifact_id,
+                "evidence_sha256": decision.evidence_ref.sha256,
+            }
+            node_metadata = dict(node.metadata)
+            node_metadata["unknown_outcome_recovery"] = recovery_metadata
+            if (
+                decision.resolution
+                is UnknownOutcomeResolution.CONFIRMED_SUCCEEDED
+            ):
+                assert decision.result_ref is not None
+                target_node = replace(
+                    node,
+                    status=NodeStatus.SUCCEEDED,
+                    output={
+                        "kind": "artifact_output",
+                        "artifact_refs": [decision.result_ref.to_dict()],
+                    },
+                    error=None,
+                    metadata=node_metadata,
+                )
+            else:
+                target_node = replace(
+                    node,
+                    status=NodeStatus.FAILED,
+                    error={
+                        "class": "recovery",
+                        "code": "external_failure_confirmed",
+                    },
+                    metadata=node_metadata,
+                )
+            remaining_recovery = conn.execute(
+                """
+                SELECT 1 FROM node_runs
+                WHERE run_id = ? AND node_id != ? AND status = ?
+                LIMIT 1
+                """,
+                (
+                    decision.run_id,
+                    decision.node_id,
+                    NodeStatus.WAITING_RECOVERY.value,
+                ),
+            ).fetchone()
+            target_run = replace(
+                run,
+                status=(
+                    RunStatus.WAITING_RECOVERY
+                    if remaining_recovery is not None
+                    else RunStatus.RUNNING
+                ),
+                error=(
+                    run.error if remaining_recovery is not None else None
+                ),
+            )
+            return self._commit_event_tx(
+                conn,
+                run,
+                "run.recovery_resolved",
+                payload=payload,
+                event_id=event_id,
+                occurred_at=occurred_at,
+                node_id=node.node_id,
+                attempt_id=attempt.attempt_id,
+                run_projection=target_run,
+                node_projection=target_node,
+                attempt_projection=None,
+            )
 
     def reject_activity_approval(
         self,
@@ -6098,6 +6305,13 @@ class DurableRunStore:
         allow_policy_rejection_transition: bool = False,
         allow_deadline_transition: bool = False,
     ) -> EventRecord:
+        if event_type == "run.recovery_resolved":
+            _validate_recovery_resolution_payload(
+                payload,
+                run_id=current_run.run_id,
+                node_id=node_id,
+                attempt_id=attempt_id,
+            )
         if allow_claimed_recovery_transition and (
             event_type != "attempt.abandoned"
             or attempt_projection is None

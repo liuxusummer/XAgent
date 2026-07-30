@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,11 +26,18 @@ from src.orchestration.policy import (
     EffectClass,
     PolicyDecision,
     PolicyEngine,
+    PolicyCheck,
     PolicyOutcome,
     PolicyRule,
+    PolicySimulation,
     PolicyValidationError,
     ToolPolicy,
     ToolTimeoutBehavior,
+)
+from src.orchestration.policy_conformance import (
+    PolicyConformanceCase,
+    PolicyConformanceReport,
+    evaluate_policy_conformance,
 )
 
 _FILE_REF_PATTERN = re.compile(r"\{\{file:(.+?):(\d+):(\d+)}}")
@@ -252,6 +260,42 @@ class DurableLocalApprovalLedger:
 class LocalAuthorization:
     action: ActionRequest | None
     decision: PolicyDecision
+    engine_evaluated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class LocalPolicySimulation:
+    """Payload-free local preflight preview that never authorizes execution."""
+
+    authorization: LocalAuthorization
+    checks: tuple[PolicyCheck, ...]
+    engine_simulation: PolicySimulation | None = None
+
+    @property
+    def simulation_digest(self) -> str:
+        encoded = json.dumps(
+            self.to_dict(),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": LOCAL_POLICY_SCHEMA_VERSION,
+            "decision": self.authorization.decision.to_dict(),
+            "checks": [check.to_dict() for check in self.checks],
+            "engine_simulation": (
+                None
+                if self.engine_simulation is None
+                else self.engine_simulation.to_dict()
+            ),
+            "preview_identity": True,
+            "authorizes_execution": False,
+            "runtime_recheck_required": True,
+        }
 
 
 class LocalPolicyGate:
@@ -281,6 +325,7 @@ class LocalPolicyGate:
             ledger=self.ledger,
         )
         self._call_counter = 0
+        self._counter_lock = threading.Lock()
 
     def evaluate(
         self,
@@ -290,6 +335,63 @@ class LocalPolicyGate:
         args: Mapping[str, Any],
         turn: int,
     ) -> LocalAuthorization:
+        return self._authorize(
+            principal=principal,
+            tool_name=tool_name,
+            args=args,
+            turn=turn,
+            preview=False,
+        )
+
+    def simulate(
+        self,
+        *,
+        principal: Principal,
+        tool_name: str,
+        args: Mapping[str, Any],
+        turn: int,
+    ) -> LocalPolicySimulation:
+        """Preview local preflight without consuming a live call identity."""
+
+        authorization = self._authorize(
+            principal=principal,
+            tool_name=tool_name,
+            args=args,
+            turn=turn,
+            preview=True,
+        )
+        action = authorization.action
+        if action is not None and authorization.engine_evaluated:
+            engine_simulation = self.engine.simulate(action)
+            if engine_simulation.decision != authorization.decision:
+                raise RuntimeError("local policy simulation diverged from enforcement")
+            checks = (
+                PolicyCheck("local_preflight_passed", True),
+                *engine_simulation.checks,
+            )
+        else:
+            engine_simulation = None
+            checks = (
+                PolicyCheck(
+                    authorization.decision.reason_code,
+                    False,
+                ),
+            )
+        return LocalPolicySimulation(
+            authorization=authorization,
+            checks=checks,
+            engine_simulation=engine_simulation,
+        )
+
+    def _authorize(
+        self,
+        *,
+        principal: Principal,
+        tool_name: str,
+        args: Mapping[str, Any],
+        turn: int,
+        preview: bool,
+    ) -> LocalAuthorization:
         contract = LOCAL_TOOL_CONTRACT_MAP.get(tool_name)
         if contract is None:
             return LocalAuthorization(
@@ -297,7 +399,13 @@ class LocalPolicyGate:
                 decision=self._unknown_tool_decision(tool_name),
             )
         try:
-            action = self._action(principal, contract, args, turn)
+            action = self._action(
+                principal,
+                contract,
+                args,
+                turn,
+                preview=preview,
+            )
         except (
             PolicyValidationError,
             TypeError,
@@ -402,7 +510,11 @@ class LocalPolicyGate:
                     reason_code=protected_reason,
                 ),
             )
-        return LocalAuthorization(action=action, decision=self.engine.evaluate(action))
+        return LocalAuthorization(
+            action=action,
+            decision=self.engine.evaluate(action),
+            engine_evaluated=True,
+        )
 
     def approve(
         self,
@@ -439,15 +551,64 @@ class LocalPolicyGate:
             )
         return self.engine.consume_approval(action, grant, now=current)
 
+    def conformance_report(self) -> PolicyConformanceReport:
+        """Evaluate the versioned baseline case for every local tool contract."""
+
+        cases = []
+        for contract in LOCAL_TOOL_CONTRACTS:
+            if contract.explicitly_allowed:
+                expected_outcome = PolicyOutcome.ALLOW
+                expected_reason = "local_explicit_allow"
+            elif contract.effect_class is EffectClass.READ_ONLY:
+                expected_outcome = PolicyOutcome.ALLOW
+                expected_reason = "known_read_only"
+            else:
+                expected_outcome = PolicyOutcome.REQUIRE_APPROVAL
+                expected_reason = "write_requires_approval"
+            operation_key = f"conformance:{contract.tool_name}"
+            cases.append(
+                PolicyConformanceCase(
+                    case_id=f"local-{contract.tool_name}-baseline",
+                    action=ActionRequest.from_args(
+                        run_id="local-conformance",
+                        node_id="contract-baseline",
+                        attempt_id=f"case-{contract.tool_name}",
+                        tool_name=contract.tool_name,
+                        args={},
+                        execution_binding_digest="0" * 64,
+                        operation_key=operation_key,
+                        idempotency_key=operation_key,
+                        effect_class=contract.effect_class,
+                        capabilities=contract.capabilities,
+                        resource_locks=contract.resource_keys,
+                    ),
+                    expected_outcome=expected_outcome,
+                    expected_reason_code=expected_reason,
+                )
+            )
+        return evaluate_policy_conformance(
+            self.engine,
+            cases,
+            required_tools=LOCAL_TOOL_CONTRACT_MAP,
+        )
+
     def _action(
         self,
         principal: Principal,
         contract: LocalToolContract,
         args: Mapping[str, Any],
         turn: int,
+        *,
+        preview: bool,
     ) -> ActionRequest:
-        self._call_counter += 1
-        call_id = f"turn-{max(0, int(turn))}-call-{self._call_counter}"
+        turn_number = max(0, int(turn))
+        if preview:
+            call_id = f"turn-{turn_number}-preview"
+        else:
+            with self._counter_lock:
+                self._call_counter += 1
+                call_number = self._call_counter
+            call_id = f"turn-{turn_number}-call-{call_number}"
         binding_digest = hashlib.sha256(
             (
                 f"{principal.principal_digest}\0{self.workspace_root}\0"
@@ -622,5 +783,6 @@ __all__ = [
     "LOCAL_TOOL_CONTRACT_MAP",
     "LocalAuthorization",
     "LocalPolicyGate",
+    "LocalPolicySimulation",
     "LocalToolContract",
 ]

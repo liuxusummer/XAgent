@@ -92,7 +92,11 @@ _TOOL_NAMES = (
     "pause",
     "resume",
     "recover",
+    "resolve_recovery",
     "tick",
+)
+_OPERATOR_DIAGNOSTIC_CATEGORIES = frozenset(
+    {"approval", "execution", "policy", "recovery"}
 )
 _SAFE_RUNTIME_ERROR_MESSAGES = {
     "authorization_denied": "operation is not authorized",
@@ -759,6 +763,30 @@ def _project_runtime_result(name: str, result: Any) -> dict[str, Any]:
                 and not isinstance(count, bool)
                 and count >= 0
             }
+    diagnostics = result.get("operator_diagnostics")
+    if isinstance(diagnostics, dict):
+        projected_diagnostics = _project_control_summary(
+            diagnostics,
+            (
+                "attention_required",
+                "diagnostic_count",
+                "automatic_retry_blocked",
+            ),
+        )
+        category_counts = diagnostics.get("category_counts")
+        if isinstance(category_counts, dict):
+            projected_diagnostics["category_counts"] = {
+                category: count
+                for category, count in sorted(category_counts.items())
+                if (
+                    isinstance(category, str)
+                    and category in _OPERATOR_DIAGNOSTIC_CATEGORIES
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                    and count >= 0
+                )
+            }
+        projected["operator_diagnostics"] = projected_diagnostics
     if name == "events":
         events = result.get("events")
         if isinstance(events, list):
@@ -776,6 +804,30 @@ def _project_runtime_result(name: str, result: Any) -> dict[str, Any]:
                 recovery,
                 ("attempted", "processed"),
             )
+    if name == "resolve_recovery":
+        resolution = result.get("recovery_resolution")
+        if isinstance(resolution, dict):
+            projected_resolution: dict[str, Any] = {}
+            for key in (
+                "resolution_id",
+                "resolution",
+                "decision_digest",
+                "event_sequence",
+            ):
+                item = resolution.get(key)
+                if (
+                    isinstance(item, (str, int))
+                    and not isinstance(item, bool)
+                    and not (
+                        isinstance(item, str)
+                        and (
+                            len(item) > 160
+                            or _has_control_character(item)
+                        )
+                    )
+                ):
+                    projected_resolution[key] = item
+            projected["recovery_resolution"] = projected_resolution
     if name == "tick":
         tick = result.get("tick")
         if isinstance(tick, dict):
@@ -1183,6 +1235,38 @@ _RECOVER_SCHEMA = {
         ("run_id", "limit"),
     ),
 }
+_RESOLVE_RECOVERY_SCHEMA = {
+    "$schema": JSON_SCHEMA_2020_12,
+    **_object_schema(
+        {
+            "resolution_id": dict(_RUN_ID_SCHEMA),
+            "run_id": dict(_RUN_ID_SCHEMA),
+            "node_id": dict(_RUN_ID_SCHEMA),
+            "attempt_id": dict(_RUN_ID_SCHEMA),
+            "resolution": {
+                "type": "string",
+                "enum": ["confirmed_succeeded", "confirmed_failed"],
+            },
+            "evidence_ref": {"$ref": "#/$defs/artifactRef"},
+            "result_ref": {
+                "oneOf": [
+                    {"type": "null"},
+                    {"$ref": "#/$defs/artifactRef"},
+                ]
+            },
+        },
+        (
+            "resolution_id",
+            "run_id",
+            "node_id",
+            "attempt_id",
+            "resolution",
+            "evidence_ref",
+            "result_ref",
+        ),
+    ),
+    "$defs": {"artifactRef": _ARTIFACT_REF_SCHEMA},
+}
 _TICK_SCHEMA = {
     "$schema": JSON_SCHEMA_2020_12,
     **_object_schema(
@@ -1290,6 +1374,18 @@ _TOOL_DEFINITIONS = (
         read_only=False,
         destructive=False,
         idempotent=False,
+    ),
+    _tool_definition(
+        "resolve_recovery",
+        "Resolve unknown outcome",
+        (
+            "Apply an operator-authorized, immutable evidence-backed conclusion "
+            "to one OUTCOME_UNKNOWN Activity without retrying its side effect."
+        ),
+        _RESOLVE_RECOVERY_SCHEMA,
+        read_only=False,
+        destructive=True,
+        idempotent=True,
     ),
     _tool_definition(
         "tick",
