@@ -58,6 +58,10 @@ class AgentContext:
   descriptor-relative no-follow 原语完成；读取对象必须在开始/结束时保持相同
   device/inode/size/mtime/ctime，单文件原始读取上限为 20MB。能力缺失、符号链接替换或
   并发改写均 fail closed，不退回 `Path.read_text()`
+- **安全变更**：文件写入使用已授权父目录描述符内的临时文件与原子 rename；删除使用
+  descriptor-relative unlink/rmdir，递归删除只进入 no-follow 打开的真实目录。
+  写锁文件也通过相同边界安全打开。父目录被并发替换、目标为 symlink 或平台缺少
+  安全原语时均 fail closed
 
 `code_run` 默认要求真实 OS 隔离，独立策略门禁不能替代隔离：
 

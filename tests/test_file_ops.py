@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from src.core.safe_fs import open_path_beneath
+from src.core.safe_fs import (
+    atomic_write_text_beneath,
+    open_path_beneath,
+    remove_path_beneath,
+)
+from src.core.workspace_storage import workspace_write_lock
 from src.tools.file_ops import delete_file, patch_file, read_file, write_file
 
 
@@ -185,6 +191,218 @@ class FilePatchTests(unittest.TestCase):
             result = write_file(path="parent/out.txt", content="text", cwd=str(root))
 
             self.assertEqual(result["status"], "ERROR")
+
+    def test_write_file_rejects_parent_symlink_swap_after_authorization(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            container = Path(tmp_dir)
+            root = container / "workspace"
+            parent = root / "business" / "safe"
+            parent.mkdir(parents=True)
+            target = parent / "target.txt"
+            target.write_text("trusted", encoding="utf-8")
+            moved_parent = root / "business" / "moved"
+            outside = container / "outside"
+            outside.mkdir()
+            outside_target = outside / "target.txt"
+            outside_target.write_text("outside", encoding="utf-8")
+
+            def replace_then_write(*args, **kwargs):
+                parent.rename(moved_parent)
+                parent.symlink_to(outside, target_is_directory=True)
+                return atomic_write_text_beneath(*args, **kwargs)
+
+            with patch(
+                "src.tools.file_ops.atomic_write_text_beneath",
+                side_effect=replace_then_write,
+            ):
+                result = write_file(
+                    path="business/safe/target.txt",
+                    content="attacker-controlled",
+                    cwd=str(root),
+                )
+
+            self.assertEqual(result["status"], "ERROR")
+            self.assertEqual(
+                outside_target.read_text(encoding="utf-8"),
+                "outside",
+            )
+            self.assertEqual(
+                (moved_parent / "target.txt").read_text(encoding="utf-8"),
+                "trusted",
+            )
+
+    def test_write_file_fails_closed_without_secure_mutation_primitives(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+
+            with patch(
+                "src.core.safe_fs.secure_descriptor_mutations_supported",
+                return_value=False,
+            ):
+                result = write_file(
+                    path="created.txt",
+                    content="data",
+                    cwd=str(root),
+                )
+
+            self.assertEqual(result["status"], "ERROR")
+            self.assertIn("unavailable", result["error"])
+            self.assertFalse((root / "created.txt").exists())
+
+    def test_write_file_does_not_create_lock_through_runtime_symlink(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            container = Path(tmp_dir)
+            root = container / "workspace"
+            outside = container / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (root / "runtime").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+
+            result = write_file(
+                path="business/result.txt",
+                content="data",
+                cwd=str(root),
+            )
+
+            self.assertEqual(result["status"], "ERROR")
+            self.assertFalse((outside / ".workspace-write.lock").exists())
+            self.assertFalse((root / "business" / "result.txt").exists())
+
+    def test_secure_file_write_cannot_nest_under_path_based_lock(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+
+            with workspace_write_lock(root):
+                result = write_file(
+                    path="result.txt",
+                    content="data",
+                    cwd=str(root),
+                )
+
+            self.assertEqual(result["status"], "ERROR")
+            self.assertIn("cannot upgrade", result["error"])
+            self.assertFalse((root / "result.txt").exists())
+
+    def test_failed_atomic_write_removes_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            target = root / "target.txt"
+            target.write_text("trusted", encoding="utf-8")
+
+            with patch(
+                "src.core.safe_fs.os.write",
+                side_effect=OSError("injected write failure"),
+            ):
+                result = write_file(
+                    path="target.txt",
+                    content="replacement",
+                    cwd=str(root),
+                )
+
+            self.assertEqual(result["status"], "ERROR")
+            self.assertEqual(target.read_text(encoding="utf-8"), "trusted")
+            self.assertEqual(
+                [path for path in root.iterdir() if path.name.endswith(".tmp")],
+                [],
+            )
+
+    def test_new_file_respects_process_umask(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            previous_umask = os.umask(0o077)
+            try:
+                result = write_file(
+                    path="private.txt",
+                    content="private",
+                    cwd=str(root),
+                )
+            finally:
+                os.umask(previous_umask)
+
+            self.assertEqual(result["status"], "OK")
+            self.assertEqual(
+                (root / "private.txt").stat().st_mode & 0o777,
+                0o600,
+            )
+
+    def test_replacement_does_not_preserve_special_permission_bits(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            target = root / "executable"
+            target.write_text("old", encoding="utf-8")
+            target.chmod(0o6755)
+
+            result = write_file(
+                path="executable",
+                content="new",
+                cwd=str(root),
+            )
+
+            self.assertEqual(result["status"], "OK")
+            self.assertEqual(target.stat().st_mode & 0o7777, 0o755)
+
+    def test_safe_write_supports_near_limit_target_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            target_name = "a" * 240
+
+            result = write_file(
+                path=target_name,
+                content="data",
+                cwd=str(root),
+            )
+
+            self.assertEqual(result["status"], "OK", result)
+            self.assertEqual(
+                (root / target_name).read_text(encoding="utf-8"),
+                "data",
+            )
+
+    def test_parent_creation_tolerates_a_concurrent_creator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            original_mkdir = os.mkdir
+            injected = False
+
+            def create_then_report_race(path, mode=0o777, *, dir_fd=None):
+                nonlocal injected
+                if not injected and path == "nested":
+                    injected = True
+                    original_mkdir(path, mode=mode, dir_fd=dir_fd)
+                    raise FileExistsError(path)
+                return original_mkdir(path, mode=mode, dir_fd=dir_fd)
+
+            with patch(
+                "src.core.safe_fs.os.mkdir",
+                side_effect=create_then_report_race,
+            ), patch(
+                "src.core.safe_fs.secure_descriptor_mutations_supported",
+                return_value=True,
+            ):
+                result = write_file(
+                    path="nested/child.txt",
+                    content="data",
+                    cwd=str(root),
+                )
+
+            self.assertEqual(result["status"], "OK", result)
+            self.assertEqual(
+                (root / "nested" / "child.txt").read_text(encoding="utf-8"),
+                "data",
+            )
 
     def test_read_file_denies_outside_workspace_path_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -406,6 +624,75 @@ class FilePatchTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "OK")
             self.assertFalse(target.exists())
+
+    def test_delete_file_rejects_parent_symlink_swap_after_authorization(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            container = Path(tmp_dir)
+            root = container / "workspace"
+            parent = root / "business" / "safe"
+            parent.mkdir(parents=True)
+            target = parent / "target.txt"
+            target.write_text("trusted", encoding="utf-8")
+            moved_parent = root / "business" / "moved"
+            outside = container / "outside"
+            outside.mkdir()
+            outside_target = outside / "target.txt"
+            outside_target.write_text("outside", encoding="utf-8")
+
+            def replace_then_delete(*args, **kwargs):
+                parent.rename(moved_parent)
+                parent.symlink_to(outside, target_is_directory=True)
+                return remove_path_beneath(*args, **kwargs)
+
+            with patch(
+                "src.tools.file_ops.remove_path_beneath",
+                side_effect=replace_then_delete,
+            ):
+                result = delete_file(
+                    path="business/safe/target.txt",
+                    cwd=str(root),
+                )
+
+            self.assertEqual(result["status"], "ERROR")
+            self.assertEqual(
+                outside_target.read_text(encoding="utf-8"),
+                "outside",
+            )
+            self.assertEqual(
+                (moved_parent / "target.txt").read_text(encoding="utf-8"),
+                "trusted",
+            )
+
+    def test_recursive_delete_does_not_follow_nested_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            container = Path(tmp_dir)
+            root = container / "workspace"
+            tree = root / "tree"
+            tree.mkdir(parents=True)
+            (tree / "inside.txt").write_text("delete", encoding="utf-8")
+            outside = container / "outside"
+            outside.mkdir()
+            outside_target = outside / "keep.txt"
+            outside_target.write_text("keep", encoding="utf-8")
+            (tree / "outside-link").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+
+            result = delete_file(
+                path="tree",
+                cwd=str(root),
+                recursive=True,
+            )
+
+            self.assertEqual(result["status"], "OK")
+            self.assertFalse(tree.exists())
+            self.assertEqual(
+                outside_target.read_text(encoding="utf-8"),
+                "keep",
+            )
 
     def test_delete_file_outside_workspace_is_denied(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

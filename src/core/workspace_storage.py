@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from src.core.safe_fs import open_lock_file_beneath
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback
@@ -43,16 +45,33 @@ def _thread_depths() -> dict[str, int]:
     return depths
 
 
+def _thread_secure_locks() -> set[str]:
+    secure_locks = getattr(_thread_state, "secure_workspace_locks", None)
+    if secure_locks is None:
+        secure_locks = set()
+        _thread_state.secure_workspace_locks = secure_locks
+    return secure_locks
+
+
 @contextmanager
-def workspace_write_lock(workspace_root: str | Path) -> Iterator[None]:
+def workspace_write_lock(
+    workspace_root: str | Path,
+    *,
+    require_secure_path: bool = False,
+) -> Iterator[None]:
     """Serialize read-modify-write operations for one workspace."""
 
     key, root = _workspace_key(workspace_root)
     lock = _process_lock(key)
     with lock:
         depths = _thread_depths()
+        secure_locks = _thread_secure_locks()
         depth = depths.get(key, 0)
         if depth:
+            if require_secure_path and key not in secure_locks:
+                raise OSError(
+                    "cannot upgrade an active path-based workspace lock"
+                )
             depths[key] = depth + 1
             try:
                 yield
@@ -62,15 +81,29 @@ def workspace_write_lock(workspace_root: str | Path) -> Iterator[None]:
 
         lock_handle = None
         try:
-            lock_path = root / _LOCK_FILE
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            lock_handle = lock_path.open("a+b")
+            if require_secure_path:
+                lock_descriptor = open_lock_file_beneath(
+                    root,
+                    _LOCK_FILE,
+                )
+                try:
+                    lock_handle = os.fdopen(lock_descriptor, "a+b")
+                except BaseException:
+                    os.close(lock_descriptor)
+                    raise
+            else:
+                lock_path = root / _LOCK_FILE
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                lock_handle = lock_path.open("a+b")
             if fcntl is not None:
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
             depths[key] = 1
+            if require_secure_path:
+                secure_locks.add(key)
             yield
         finally:
             depths.pop(key, None)
+            secure_locks.discard(key)
             if lock_handle is not None:
                 if fcntl is not None:
                     fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)

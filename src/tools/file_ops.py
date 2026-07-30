@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import stat as stat_module
 from pathlib import Path
 from typing import Any
@@ -13,11 +12,13 @@ from src.core.safe_fs import (
     SecureFileReadUnavailableError,
     SecurePathError,
     UnsafeFileContentError,
+    atomic_write_text_beneath,
     open_path_beneath,
     open_regular_file_beneath,
     read_stable_text,
+    remove_path_beneath,
 )
-from src.core.workspace_storage import atomic_write_text, workspace_write_lock
+from src.core.workspace_storage import workspace_write_lock
 
 
 FILE_READ_CHAR_LIMIT = 20000
@@ -265,8 +266,6 @@ def write_file(
         return exc.to_result()
     except (OSError, ValueError) as exc:
         return {"status": "ERROR", "error": str(exc)}
-    if file_path.exists() and file_path.is_dir():
-        return {"status": "ERROR", "error": f"path is a directory: {file_path}", "path": str(file_path)}
     try:
         content = expand_file_refs(content, cwd)
     except (FileNotFoundError, ValueError, OSError) as exc:
@@ -274,29 +273,27 @@ def write_file(
 
     try:
         workspace = Path(cwd or Path.cwd()).resolve()
-        with workspace_write_lock(workspace):
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            if file_path.exists() and file_path.is_dir():
-                return {
-                    "status": "ERROR",
-                    "error": f"path is a directory: {file_path}",
-                    "path": str(file_path),
-                }
+        relative_path = file_path.relative_to(workspace)
+        with workspace_write_lock(workspace, require_secure_path=True):
             if mode == "overwrite":
                 final_content = content
             elif mode == "append":
-                previous = (
-                    _read_workspace_regular_text(file_path, workspace)
-                    if file_path.exists()
-                    else ""
-                )
+                try:
+                    previous = _read_workspace_regular_text(
+                        file_path,
+                        workspace,
+                    )
+                except FileNotFoundError:
+                    previous = ""
                 final_content = previous + content
             elif mode == "prepend":
-                previous = (
-                    _read_workspace_regular_text(file_path, workspace)
-                    if file_path.exists()
-                    else ""
-                )
+                try:
+                    previous = _read_workspace_regular_text(
+                        file_path,
+                        workspace,
+                    )
+                except FileNotFoundError:
+                    previous = ""
                 final_content = content + previous
             else:
                 return {
@@ -305,8 +302,12 @@ def write_file(
                     "path": str(file_path),
                 }
 
-            atomic_write_text(file_path, final_content)
-    except (OSError, UnicodeDecodeError) as exc:
+            atomic_write_text_beneath(
+                workspace,
+                relative_path,
+                final_content,
+            )
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         return {"status": "ERROR", "error": f"failed to write file: {exc}", "path": str(file_path)}
 
     return {
@@ -343,11 +344,8 @@ def patch_file(
 
     try:
         workspace = Path(cwd or Path.cwd()).resolve()
-        with workspace_write_lock(workspace):
-            if not file_path.exists():
-                return {"status": "ERROR", "error": f"file not found: {file_path}"}
-            if file_path.is_dir():
-                return {"status": "ERROR", "error": f"path is a directory: {file_path}"}
+        relative_path = file_path.relative_to(workspace)
+        with workspace_write_lock(workspace, require_secure_path=True):
             current = _read_workspace_regular_text(file_path, workspace)
             match_count = current.count(old_content)
             if match_count == 0:
@@ -365,8 +363,13 @@ def patch_file(
                 }
 
             updated = current.replace(old_content, new_content, 1)
-            atomic_write_text(file_path, updated)
-    except (OSError, UnicodeDecodeError) as exc:
+            atomic_write_text_beneath(
+                workspace,
+                relative_path,
+                updated,
+                create_parents=False,
+            )
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         return {"status": "ERROR", "error": f"failed to patch file: {exc}", "path": str(file_path)}
     return {
         "status": "OK",
@@ -384,26 +387,36 @@ def delete_file(path: str, cwd: str | None = None, recursive: bool = False) -> d
     except (OSError, ValueError) as exc:
         return {"status": "ERROR", "error": str(exc)}
     try:
-        with workspace_write_lock(Path(cwd or Path.cwd()).resolve()):
-            if not file_path.exists():
-                return {
-                    "status": "ERROR",
-                    "error": f"file not found: {file_path}",
-                    "path": str(file_path),
-                }
-            if file_path.is_dir():
-                if not recursive:
-                    return {
-                        "status": "ERROR",
-                        "error": f"path is a directory; recursive=true is required: {file_path}",
-                        "path": str(file_path),
-                    }
-                shutil.rmtree(file_path)
-                return {"status": "OK", "path": str(file_path), "deleted": True, "recursive": True}
-            file_path.unlink()
+        workspace = Path(cwd or Path.cwd()).resolve()
+        relative_path = file_path.relative_to(workspace)
+        with workspace_write_lock(workspace, require_secure_path=True):
+            removed_directory = remove_path_beneath(
+                workspace,
+                relative_path,
+                recursive=recursive,
+            )
+    except FileNotFoundError:
+        return {
+            "status": "ERROR",
+            "error": f"file not found: {file_path}",
+            "path": str(file_path),
+        }
+    except IsADirectoryError:
+        return {
+            "status": "ERROR",
+            "error": (
+                f"path is a directory; recursive=true is required: {file_path}"
+            ),
+            "path": str(file_path),
+        }
     except OSError as exc:
         return {"status": "ERROR", "error": f"failed to delete file: {exc}", "path": str(file_path)}
-    return {"status": "OK", "path": str(file_path), "deleted": True, "recursive": False}
+    return {
+        "status": "OK",
+        "path": str(file_path),
+        "deleted": True,
+        "recursive": bool(removed_directory),
+    }
 
 
 def resolve_path(path: str, cwd: str | None = None, operation: str = "write") -> Path:
