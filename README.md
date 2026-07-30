@@ -140,6 +140,8 @@ Design docs live in [`docs/`](docs/):
 - [`docs/tool-layer.md`](docs/tool-layer.md)
 - [`docs/observability.md`](docs/observability.md)
 - [`docs/outlines.md`](docs/outlines.md)
+- [`docs/distributed-execution-adr.md`](docs/distributed-execution-adr.md)
+- [`docs/distributed-execution-quickstart.md`](docs/distributed-execution-quickstart.md)
 
 ---
 
@@ -164,6 +166,9 @@ Its small top-level API exposes the main composition entries for:
   metadata and authorization context checked per request; malformed,
   oversized, and over-deep inputs use a separate pre-parse token budget and do
   not consume the normal valid-request budget
+- a path-free, session-bound remote-execution reference composition with
+  Artifact grants, signed runtime proofs, cancellation receipts, and replay
+  evidence
 
 Advanced adapters remain available from their defining
 `src.orchestration.<module>` modules. Web projections are deliberately not
@@ -196,6 +201,12 @@ imported by the top-level package, so the core API does not require FastAPI.
 - XAgent does **not** claim exactly-once execution for arbitrary tools, automatic
   rollback of external systems, distributed consensus, or exact restoration of
   process/provider/browser state.
+- The remote reference is run-scoped and process-local: it is not a production
+  server/pull transport, real mTLS, gVisor, or a heterogeneous fleet
+  integration. Its prepared-execution and staged-output registries are also
+  process-local. OCI/HMAC evidence demonstrates binding and verification, not
+  production sandbox isolation. A fleet claim that fails after admission must
+  be reprojected from Store before reassignment.
 - Checkpoint summaries and telemetry are useful projections, not execution
   truth. Large or sensitive content crosses the control plane only through
   reviewed Artifact references.
@@ -235,9 +246,10 @@ imported by the top-level package, so the core API does not require FastAPI.
   canonical-payload-byte, and cooperative wall-time budgets.
 
 Read the [design specification](docs/durable-orchestration-spec.md), run the
-[local quickstart](docs/durable-orchestration-quickstart.md), and review the
-[fault matrix](docs/durable-orchestration-fault-matrix.md) before composing this
-control plane into a deployment.
+[local quickstart](docs/durable-orchestration-quickstart.md) or
+[distributed reference quickstart](docs/distributed-execution-quickstart.md),
+and review the [fault matrix](docs/durable-orchestration-fault-matrix.md) before
+composing this control plane into a deployment.
 
 The smallest runnable composition is:
 

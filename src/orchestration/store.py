@@ -24,7 +24,7 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Sequence
 
 from .artifacts import ArtifactRef
 from .event_types import DURABLE_EVENT_TYPES
@@ -150,7 +150,11 @@ _NODE_TRANSITIONS = {
 }
 
 _ATTEMPT_TRANSITIONS = {
-    AttemptStatus.SCHEDULED: {AttemptStatus.CLAIMED, AttemptStatus.CANCELLED},
+    AttemptStatus.SCHEDULED: {
+        AttemptStatus.CLAIMED,
+        AttemptStatus.WAITING_APPROVAL,
+        AttemptStatus.CANCELLED,
+    },
     AttemptStatus.CLAIMED: {
         AttemptStatus.WAITING_APPROVAL,
         AttemptStatus.RUNNING,
@@ -3684,11 +3688,11 @@ class DurableRunStore:
                 attempt.idempotency_key,
             )
             if (
-                record is None
-                or record.status is not IdempotencyStatus.IN_PROGRESS
+                record is not None
+                and record.status is not IdempotencyStatus.IN_PROGRESS
             ):
                 raise IdempotencyConflictError(
-                    "pending approval has no resumable idempotency record"
+                    "pending approval idempotency record is not resumable"
                 )
             result: dict[str, JsonValue] = {
                 "outcome": "policy_rejected",
@@ -3696,30 +3700,31 @@ class DurableRunStore:
                 "decision_digest": request_payload.get("decision_digest"),
             }
             result_json = _json_dump(result)
-            updated = conn.execute(
-                """
-                UPDATE idempotency_records
-                SET status = ?, result_json = ?, updated_at = ?,
-                    completed_at = ?, lease_expires_at = ?
-                WHERE run_id = ? AND key = ? AND status = ?
-                  AND claim_count = ?
-                """,
-                (
-                    IdempotencyStatus.COMPLETED.value,
-                    result_json,
-                    occurred_at,
-                    occurred_at,
-                    occurred_at,
-                    run_id,
-                    attempt.idempotency_key,
-                    IdempotencyStatus.IN_PROGRESS.value,
-                    record.claim_count,
-                ),
-            )
-            if updated.rowcount != 1:
-                raise IdempotencyConflictError(
-                    "approval rejection changed concurrently"
+            if record is not None:
+                updated = conn.execute(
+                    """
+                    UPDATE idempotency_records
+                    SET status = ?, result_json = ?, updated_at = ?,
+                        completed_at = ?, lease_expires_at = ?
+                    WHERE run_id = ? AND key = ? AND status = ?
+                      AND claim_count = ?
+                    """,
+                    (
+                        IdempotencyStatus.COMPLETED.value,
+                        result_json,
+                        occurred_at,
+                        occurred_at,
+                        occurred_at,
+                        run_id,
+                        attempt.idempotency_key,
+                        IdempotencyStatus.IN_PROGRESS.value,
+                        record.claim_count,
+                    ),
                 )
+                if updated.rowcount != 1:
+                    raise IdempotencyConflictError(
+                        "approval rejection changed concurrently"
+                    )
             payload: dict[str, JsonValue] = {
                 "kind": "request_rejected",
                 "reason_code": reason,
@@ -4290,6 +4295,492 @@ class DurableRunStore:
                 attempt_projection=claimed,
             )
             return claim, event
+
+    def claim_activity_with_policy(
+        self,
+        run_id: str,
+        node_id: str,
+        candidate_attempt: AttemptRecord,
+        request_hash: str,
+        owner_id: str,
+        *,
+        definition_digest: str,
+        schedule_new: bool,
+        expected_run_version: int,
+        expected_node_version: int,
+        expected_attempt_version: int | None,
+        admission_expires_at: float,
+        admission_clock: Callable[[], float],
+        policy_binding: Mapping[str, str | None],
+        lease_seconds: float = 60.0,
+        now: float | None = None,
+        max_active_attempts: int | None = None,
+        worker_capacity: int | None = None,
+    ) -> tuple[
+        IdempotencyClaim | None,
+        EventRecord | None,
+        EventRecord,
+    ]:
+        """Atomically suspend for approval or claim an authorized Activity.
+
+        All external authorization, attestation, Artifact verification, and
+        policy evaluation must finish before entering this method.  The write
+        transaction only validates the immutable candidate snapshot, capacity,
+        claim CAS, and the supplied digest-only policy binding.
+        """
+
+        if not isinstance(candidate_attempt, AttemptRecord):
+            raise TypeError("candidate_attempt must be an AttemptRecord")
+        if (
+            candidate_attempt.run_id != run_id
+            or candidate_attempt.node_id != node_id
+            or candidate_attempt.status is not AttemptStatus.SCHEDULED
+        ):
+            raise ProjectionConflictError(
+                "admission candidate does not identify a SCHEDULED Activity"
+            )
+        definition_digest = _sha256_digest(
+            definition_digest,
+            "definition_digest",
+        )
+        required_policy = {
+            "outcome",
+            "reason_code",
+            "action_digest",
+            "policy_digest",
+            "profile_digest",
+            "decision_digest",
+            "approval_grant_digest",
+        }
+        if set(policy_binding) != required_policy:
+            raise ValueError("policy_binding fields are invalid")
+        policy_outcome = policy_binding["outcome"]
+        if policy_outcome not in {"allow", "require_approval"}:
+            raise ValueError(
+                "only ALLOW or REQUIRE_APPROVAL may enter remote admission"
+            )
+        reason_code = _safe_receipt_code(
+            policy_binding["reason_code"],
+            "reason_code",
+        )
+        action_digest = _sha256_digest(
+            policy_binding["action_digest"],
+            "action_digest",
+        )
+        policy_digest = _sha256_digest(
+            policy_binding["policy_digest"],
+            "policy_digest",
+        )
+        profile_digest = _sha256_digest(
+            policy_binding["profile_digest"],
+            "profile_digest",
+        )
+        decision_digest = _sha256_digest(
+            policy_binding["decision_digest"],
+            "decision_digest",
+        )
+        approval_grant_digest = policy_binding["approval_grant_digest"]
+        if approval_grant_digest is not None:
+            approval_grant_digest = _sha256_digest(
+                approval_grant_digest,
+                "approval_grant_digest",
+            )
+        if (
+            policy_outcome == "require_approval"
+            and approval_grant_digest is not None
+        ):
+            raise ValueError(
+                "REQUIRE_APPROVAL cannot consume an approval grant"
+            )
+        current_time = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        admission_deadline = _finite_timestamp(
+            admission_expires_at,
+            "admission_expires_at",
+        )
+        if not callable(admission_clock):
+            raise TypeError("admission_clock must be callable")
+        lease_duration = _lease_duration(lease_seconds)
+        if max_active_attempts is not None and max_active_attempts < 1:
+            raise ValueError("max_active_attempts must be positive")
+        if worker_capacity is not None and worker_capacity < 1:
+            raise ValueError("worker_capacity must be positive")
+
+        with self._write_transaction() as conn:
+            # This check must run after BEGIN IMMEDIATE acquires the writer
+            # lock.  A request waiting behind another writer cannot linearize
+            # with authority that expired during the wait.
+            current_time = _finite_timestamp(
+                admission_clock(),
+                "admission linearization time",
+            )
+            if current_time >= admission_deadline:
+                raise IdempotencyConflictError(
+                    "remote admission authority expired before claim"
+                )
+            run_row = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            node_row = conn.execute(
+                "SELECT * FROM node_runs WHERE run_id = ? AND node_id = ?",
+                (run_id, node_id),
+            ).fetchone()
+            if run_row is None or node_row is None:
+                raise ProjectionConflictError("admission candidate disappeared")
+            run = self._run_from_row(run_row)
+            node = self._node_from_row(node_row)
+            if (
+                node.projection_version != expected_node_version
+                or run.status is not RunStatus.RUNNING
+                or node.status is not NodeStatus.READY
+                or run.definition_digest != definition_digest
+                or candidate_attempt.metadata.get("definition_digest")
+                != definition_digest
+                or candidate_attempt.metadata.get("request_hash")
+                != request_hash
+            ):
+                raise ConcurrentProjectionUpdate(
+                    "remote_admission",
+                    expected_node_version,
+                    node.projection_version,
+                )
+
+            if schedule_new:
+                if expected_attempt_version is not None:
+                    raise ProjectionConflictError(
+                        "new candidate has an Attempt projection version"
+                    )
+                collision = conn.execute(
+                    "SELECT 1 FROM attempts WHERE attempt_id = ?",
+                    (candidate_attempt.attempt_id,),
+                ).fetchone()
+                active = conn.execute(
+                    """
+                    SELECT 1 FROM attempts
+                    WHERE run_id = ? AND node_id = ?
+                      AND status IN ('scheduled', 'claimed', 'waiting_approval', 'running')
+                    LIMIT 1
+                    """,
+                    (run_id, node_id),
+                ).fetchone()
+                maximum_row = conn.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt_number), 0) AS maximum_number
+                    FROM attempts WHERE run_id = ? AND node_id = ?
+                    """,
+                    (run_id, node_id),
+                ).fetchone()
+                assert maximum_row is not None
+                if (
+                    collision is not None
+                    or active is not None
+                    or candidate_attempt.attempt_number
+                    != int(maximum_row["maximum_number"]) + 1
+                ):
+                    raise ProjectionConflictError(
+                        "admission candidate lost the scheduling CAS"
+                    )
+                self._commit_event_tx(
+                    conn,
+                    run,
+                    "attempt.scheduled",
+                    payload={
+                        "attempt_number": candidate_attempt.attempt_number,
+                        "operation_key_digest": hashlib.sha256(
+                            str(
+                                candidate_attempt.metadata["operation_key"]
+                            ).encode("utf-8")
+                        ).hexdigest(),
+                    },
+                    event_id=f"evt_schedule_{candidate_attempt.attempt_id}",
+                    occurred_at=current_time,
+                    node_id=node_id,
+                    attempt_id=candidate_attempt.attempt_id,
+                    run_projection=run,
+                    node_projection=replace(
+                        node,
+                        attempt_count=max(
+                            node.attempt_count,
+                            candidate_attempt.attempt_number,
+                        ),
+                    ),
+                    attempt_projection=candidate_attempt,
+                )
+                run_row = conn.execute(
+                    "SELECT * FROM runs WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                node_row = conn.execute(
+                    "SELECT * FROM node_runs WHERE run_id = ? AND node_id = ?",
+                    (run_id, node_id),
+                ).fetchone()
+                attempt_row = conn.execute(
+                    "SELECT * FROM attempts WHERE attempt_id = ?",
+                    (candidate_attempt.attempt_id,),
+                ).fetchone()
+                assert run_row is not None and node_row is not None
+                assert attempt_row is not None
+                run = self._run_from_row(run_row)
+                node = self._node_from_row(node_row)
+                attempt = self._attempt_from_row(attempt_row)
+            else:
+                attempt_row = conn.execute(
+                    "SELECT * FROM attempts WHERE attempt_id = ?",
+                    (candidate_attempt.attempt_id,),
+                ).fetchone()
+                if attempt_row is None:
+                    raise ProjectionConflictError(
+                        "scheduled admission candidate disappeared"
+                    )
+                attempt = self._attempt_from_row(attempt_row)
+                if (
+                    expected_attempt_version is None
+                    or attempt.projection_version != expected_attempt_version
+                    or attempt != candidate_attempt
+                ):
+                    raise ProjectionConflictError(
+                        "scheduled admission candidate changed"
+                    )
+                competing = conn.execute(
+                    """
+                    SELECT 1 FROM attempts
+                    WHERE run_id = ? AND node_id = ? AND attempt_id <> ?
+                      AND status IN ('scheduled', 'claimed', 'waiting_approval', 'running')
+                    LIMIT 1
+                    """,
+                    (run_id, node_id, attempt.attempt_id),
+                ).fetchone()
+                if competing is not None:
+                    raise ProjectionConflictError(
+                        "scheduled admission candidate has a competing Attempt"
+                    )
+
+            if policy_outcome == "require_approval":
+                approval_request_digest = hashlib.sha256(
+                    (
+                        f"{run_id}\0{node_id}\0{attempt.attempt_id}\0"
+                        f"{action_digest}\0{policy_digest}\0{profile_digest}"
+                    ).encode("utf-8")
+                ).hexdigest()
+                policy_event_id = (
+                    f"evt_activity_approval_{approval_request_digest}"
+                )
+                if conn.execute(
+                    "SELECT 1 FROM domain_events WHERE event_id = ?",
+                    (policy_event_id,),
+                ).fetchone() is not None:
+                    raise ProjectionConflictError(
+                        "approval request identity was already consumed"
+                    )
+                policy_event = self._commit_event_tx(
+                    conn,
+                    run,
+                    "approval.requested",
+                    payload={
+                        "kind": "activity_approval_request",
+                        "outcome": policy_outcome,
+                        "reason_code": reason_code,
+                        "action_digest": action_digest,
+                        "policy_digest": policy_digest,
+                        "profile_digest": profile_digest,
+                        "decision_digest": decision_digest,
+                        "approval_grant_digest": None,
+                        "approval_request_digest": (
+                            approval_request_digest
+                        ),
+                    },
+                    event_id=policy_event_id,
+                    occurred_at=current_time,
+                    node_id=node_id,
+                    attempt_id=attempt.attempt_id,
+                    run_projection=replace(
+                        run,
+                        status=RunStatus.WAITING_APPROVAL,
+                    ),
+                    node_projection=replace(
+                        node,
+                        status=NodeStatus.WAITING_APPROVAL,
+                    ),
+                    attempt_projection=replace(
+                        attempt,
+                        status=AttemptStatus.WAITING_APPROVAL,
+                        worker_id=None,
+                        lease_id=None,
+                    ),
+                )
+                return None, None, policy_event
+
+            self._admit_activity_tx(
+                conn,
+                attempt,
+                owner_id=owner_id,
+                max_active_attempts=max_active_attempts,
+                worker_capacity=worker_capacity,
+            )
+            schedule_deadline = _attempt_deadline(run, attempt)
+            if (
+                schedule_deadline is not None
+                and current_time >= schedule_deadline[1]
+            ):
+                raise IdempotencyConflictError(
+                    f"{schedule_deadline[0]} deadline prevents Activity claim"
+                )
+            start_timeout = _timeout_milliseconds(
+                attempt,
+                "start_timeout_ms",
+            )
+            start_deadline = (
+                current_time + start_timeout / 1_000
+                if start_timeout is not None
+                else None
+            )
+            heartbeat_timeout = _timeout_milliseconds(
+                attempt,
+                "heartbeat_timeout_ms",
+            )
+            heartbeat_deadline = (
+                current_time + heartbeat_timeout / 1_000
+                if heartbeat_timeout is not None
+                else None
+            )
+            lease_deadline = _earliest_deadline(
+                _run_deadline(run),
+                start_deadline,
+                heartbeat_deadline,
+            )
+            claim = self._claim_idempotency_tx(
+                conn,
+                run_id,
+                attempt.idempotency_key,
+                request_hash,
+                owner_id,
+                lease_seconds=lease_duration,
+                lease_deadline_at=lease_deadline,
+                now=current_time,
+                minimum_fencing_token=attempt.attempt_number,
+            )
+            if claim.disposition is not ClaimDisposition.ACQUIRED:
+                raise ProjectionConflictError(
+                    "admission candidate lost the claim CAS"
+                )
+            claimed_metadata = dict(attempt.metadata)
+            if start_deadline is not None:
+                claimed_metadata["start_deadline_at"] = min(
+                    start_deadline,
+                    _run_deadline(run)
+                    if _run_deadline(run) is not None
+                    else start_deadline,
+                )
+            claimed_attempt = replace(
+                attempt,
+                status=AttemptStatus.CLAIMED,
+                worker_id=owner_id,
+                lease_id=claim.record.claim_token,
+                fencing_token=claim.record.claim_count,
+                metadata=claimed_metadata,
+            )
+            claimed_event = self._commit_event_tx(
+                conn,
+                run,
+                "attempt.claimed",
+                payload={
+                    "fencing_token": claim.record.claim_count,
+                    "effect_class": attempt.effect_class,
+                },
+                event_id=(
+                    f"evt_claim_{attempt.attempt_id}_{claim.record.claim_count}"
+                ),
+                occurred_at=current_time,
+                node_id=node_id,
+                attempt_id=attempt.attempt_id,
+                run_projection=run,
+                node_projection=None,
+                attempt_projection=claimed_attempt,
+            )
+
+            claim_token_digest = hashlib.sha256(
+                claim.record.claim_token.encode("utf-8")
+            ).hexdigest()
+            binding_digest = hashlib.sha256(
+                (
+                    f"{run_id}\0{node_id}\0{attempt.attempt_id}\0"
+                    f"{claim.record.claim_token}"
+                ).encode("utf-8")
+            ).hexdigest()
+            policy_event_id = (
+                f"evt_policy_approval_{approval_grant_digest}"
+                if approval_grant_digest is not None
+                else f"evt_policy_{binding_digest}"
+            )
+            if conn.execute(
+                "SELECT 1 FROM domain_events WHERE event_id = ?",
+                (policy_event_id,),
+            ).fetchone() is not None:
+                raise ProjectionConflictError(
+                    "policy authorization identity was already consumed"
+                )
+            if approval_grant_digest is not None:
+                issue_row = conn.execute(
+                    "SELECT * FROM domain_events WHERE event_id = ?",
+                    (f"evt_approval_issue_{approval_grant_digest}",),
+                ).fetchone()
+                if issue_row is None:
+                    raise IdempotencyConflictError(
+                        "approval grant was not issued"
+                    )
+                issue = self._event_from_row(issue_row)
+                issue_payload = dict(issue.payload)
+                issue_payload.pop("projection", None)
+                if (
+                    issue.run_id != run_id
+                    or issue_payload.get("kind") != "grant_issued"
+                    or issue_payload.get("grant_binding_digest")
+                    != approval_grant_digest
+                    or issue_payload.get("action_digest") != action_digest
+                    or issue_payload.get("policy_digest") != policy_digest
+                    or not isinstance(
+                        issue_payload.get("expires_at"),
+                        (int, float),
+                    )
+                    or float(issue_payload["expires_at"]) <= current_time
+                ):
+                    raise IdempotencyConflictError(
+                        "approval grant does not match or is expired"
+                    )
+            run_row = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            assert run_row is not None
+            claimed_run = self._run_from_row(run_row)
+            policy_payload: dict[str, JsonValue] = {
+                "kind": "activity_authorization",
+                "outcome": policy_outcome,
+                "reason_code": reason_code,
+                "action_digest": action_digest,
+                "policy_digest": policy_digest,
+                "profile_digest": profile_digest,
+                "decision_digest": decision_digest,
+                "claim_token_digest": claim_token_digest,
+                "approval_grant_digest": approval_grant_digest,
+            }
+            policy_event = self._commit_event_tx(
+                conn,
+                claimed_run,
+                "policy.decided",
+                payload=policy_payload,
+                event_id=policy_event_id,
+                occurred_at=current_time,
+                node_id=node_id,
+                attempt_id=attempt.attempt_id,
+                run_projection=claimed_run,
+                node_projection=None,
+                attempt_projection=None,
+            )
+            return claim, claimed_event, policy_event
 
     @_audit_stale_activity_rejection
     def complete_activity(

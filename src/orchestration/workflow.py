@@ -11,6 +11,11 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias, Union
 
+from .runtime_compatibility import (
+    RuntimeCompatibility,
+    RuntimeCompatibilityValidationError,
+)
+
 WORKFLOW_SCHEMA_VERSION = 2
 MAX_WORKFLOW_BYTES = 1024 * 1024
 MAX_NODES = 1000
@@ -36,6 +41,7 @@ NODE_KINDS = frozenset(
         "subworkflow",
     }
 )
+RUNTIME_COMPATIBLE_NODE_KINDS = frozenset({"agent", "tool"})
 EFFECT_CLASSES = frozenset(
     {"read_only", "idempotent_write", "non_idempotent_write", "destructive"}
 )
@@ -177,6 +183,7 @@ class NodeDefinition:
     input_mapping: FrozenDict
     config: FrozenDict
     metadata: FrozenDict
+    runtime_compatibility: RuntimeCompatibility | None
     resource_keys: tuple[str, ...]
     concurrency_key: str | None
     retry_policy: RetryPolicy
@@ -446,6 +453,14 @@ def _compile_node(raw: Any, index: int) -> NodeDefinition:
     )
     config = _compile_config(kind, raw.get("config", {}), node_id)
     metadata = _frozen_object(raw.get("metadata", {}), f"node {node_id} metadata")
+    runtime_compatibility = _compile_runtime_compatibility(metadata, node_id)
+    if (
+        runtime_compatibility is not None
+        and kind not in RUNTIME_COMPATIBLE_NODE_KINDS
+    ):
+        raise WorkflowCompileError(
+            f"node {node_id} runtime compatibility is only valid for Activities"
+        )
     resources = _string_tuple(
         raw.get("resource_keys", []),
         f"node {node_id} resource_keys",
@@ -486,6 +501,7 @@ def _compile_node(raw: Any, index: int) -> NodeDefinition:
         input_mapping=input_mapping,
         config=config,
         metadata=metadata,
+        runtime_compatibility=runtime_compatibility,
         resource_keys=resources,
         concurrency_key=concurrency_key,
         retry_policy=retry,
@@ -494,6 +510,34 @@ def _compile_node(raw: Any, index: int) -> NodeDefinition:
         idempotency_key_template=idempotency_template,
         on_error=on_error,
     )
+
+
+def _compile_runtime_compatibility(
+    metadata: FrozenDict,
+    node_id: str,
+) -> RuntimeCompatibility | None:
+    """Compile reserved Activity compatibility metadata without changing v2 JSON."""
+
+    keys = {"min_runtime_version", "max_runtime_version"}
+    if not keys.intersection(metadata):
+        return None
+    minimum = metadata.get("min_runtime_version", "0")
+    maximum = metadata.get("max_runtime_version")
+    if not isinstance(minimum, str) or (
+        maximum is not None and not isinstance(maximum, str)
+    ):
+        raise WorkflowCompileError(
+            f"node {node_id} has invalid runtime compatibility"
+        )
+    try:
+        return RuntimeCompatibility(
+            min_runtime_version=minimum,
+            max_runtime_version=maximum,
+        )
+    except RuntimeCompatibilityValidationError as exc:
+        raise WorkflowCompileError(
+            f"node {node_id} has invalid runtime compatibility"
+        ) from exc
 
 
 def _compile_input_mapping(raw: Any, node_id: str) -> FrozenDict:

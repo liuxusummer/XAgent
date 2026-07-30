@@ -29,6 +29,26 @@ sharing an executor that was constructed for another Run's scheduler.
 `execution_driver` and `recovery_driver` receive the exact requested `run_id`;
 they must not scan for or act on unrelated Runs.
 
+For rolling Worker upgrades, an Activity may declare an immutable runtime
+range in its Node metadata:
+
+```json
+{
+  "metadata": {
+    "min_runtime_version": "2",
+    "max_runtime_version": "2.9"
+  }
+}
+```
+
+These are canonical numeric runtime versions with one to four components, not
+Workflow versions or free-form runtime labels. The compiler rejects malformed
+or inverted ranges and includes the declaration in the Workflow definition
+digest. Secure remote poll checks the exact ready Activity before scheduling
+or claiming it; an incompatible Worker receives no assignment and no Attempt
+is created. Existing Workflows with neither field remain unconstrained for
+backward compatibility.
+
 ## Fault-injection acceptance demo
 
 From the repository root:

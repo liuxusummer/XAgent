@@ -459,7 +459,7 @@ class NodeRecord:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class AttemptRecord:
     attempt_id: str
     run_id: str
@@ -481,6 +481,17 @@ class AttemptRecord:
     last_event_sequence: int = 0
     projection_version: int = 0
     schema_version: int = MODEL_SCHEMA_VERSION
+
+    def __repr__(self) -> str:
+        """Summarize durable state without rendering lease credentials or payloads."""
+
+        return (
+            f"AttemptRecord(attempt_id={self.attempt_id!r}, "
+            f"run_id={self.run_id!r}, node_id={self.node_id!r}, "
+            f"attempt_number={self.attempt_number}, status={self.status.value!r}, "
+            f"worker_id={self.worker_id!r}, lease_bound={self.lease_id is not None}, "
+            f"fencing_token={self.fencing_token})"
+        )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "attempt_id", _required_text(self.attempt_id, "attempt_id"))
@@ -545,10 +556,9 @@ class AttemptRecord:
                 or self.lease_id is not None
                 or started_at is not None
                 or finished_at is not None
-                or self.fencing_token < 1
             ):
                 raise ModelValidationError(
-                    "WAITING_APPROVAL attempt must release its owner and retain fencing"
+                    "WAITING_APPROVAL attempt must not retain execution authority"
                 )
         if self.status in {AttemptStatus.CLAIMED, AttemptStatus.RUNNING}:
             if self.worker_id is None or self.lease_id is None or self.fencing_token < 1:
@@ -682,7 +692,7 @@ class EventRecord:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class IdempotencyRecord:
     run_id: str
     key: str
@@ -697,6 +707,16 @@ class IdempotencyRecord:
     updated_at: float = field(default_factory=utc_timestamp)
     completed_at: float | None = None
     schema_version: int = MODEL_SCHEMA_VERSION
+
+    def __repr__(self) -> str:
+        """Summarize claim state without rendering its live bearer credential."""
+
+        return (
+            f"IdempotencyRecord(run_id={self.run_id!r}, "
+            f"status={self.status.value!r}, owner_id={self.owner_id!r}, "
+            f"claim_bound={bool(self.claim_token)}, claim_count={self.claim_count}, "
+            f"lease_expires_at={self.lease_expires_at!r})"
+        )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_id", _required_text(self.run_id, "run_id"))

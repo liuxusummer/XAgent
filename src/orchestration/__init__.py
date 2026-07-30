@@ -29,6 +29,7 @@ from .artifacts_gc import (
     QuarantinedArtifact,
     QuarantinedTemporaryArtifact,
 )
+from .artifact_broker import ArtifactGrantBroker
 from .deadline import (
     DeadlineAction,
     DeadlineReport,
@@ -123,6 +124,24 @@ from .sandbox import (
     SecurityLevel,
 )
 from .process_backend import LocalProcessSupervisorBackend
+from .oci_backend import OciGvisorSandboxBackend
+from .remote_control import RemoteControlPlane
+from .remote_journal import RemoteControlJournal
+from .remote_execution import (
+    SecureRemoteAssignmentAdmitter,
+    SecureRemoteExecutionAdapter,
+)
+from .remote_fleet import RemoteFleetCoordinator
+from .remote_observability import BoundedRemoteObservability
+from .remote_protocol import AuthenticatedWorker
+from .remote_scheduling import (
+    DeterministicRemoteScheduler,
+    WorkerDescriptor,
+)
+from .remote_worker import (
+    RemoteWorkerClient,
+    RemoteWorkerDaemon,
+)
 from .scheduler import (
     ActivityClaim,
     ActivityReceipt,
@@ -154,6 +173,7 @@ from .store import (
     WorkflowBindingConflictError,
     WorkflowBindingRecord,
 )
+from .worker_security import WorkerAuthorizationGate
 from .workflow import (
     CompiledWorkflow,
     NodeDefinition,
@@ -178,6 +198,7 @@ __all__ = [
     "LocalArtifactGarbageCollector",
     "QuarantinedArtifact",
     "QuarantinedTemporaryArtifact",
+    "ArtifactGrantBroker",
     # Durable records and Store.
     "AttemptRecord",
     "AttemptStatus",
@@ -278,6 +299,21 @@ __all__ = [
     "SandboxReceipt",
     "SandboxValidationError",
     "SecurityLevel",
+    # Explicit secure-distributed composition. These imports are inert: users
+    # must inject transport, identity, broker, runtime, and trust adapters.
+    "AuthenticatedWorker",
+    "RemoteControlPlane",
+    "RemoteControlJournal",
+    "SecureRemoteAssignmentAdmitter",
+    "SecureRemoteExecutionAdapter",
+    "RemoteWorkerClient",
+    "RemoteWorkerDaemon",
+    "WorkerAuthorizationGate",
+    "DeterministicRemoteScheduler",
+    "WorkerDescriptor",
+    "RemoteFleetCoordinator",
+    "BoundedRemoteObservability",
+    "OciGvisorSandboxBackend",
     # Replay and evaluation.
     "ReliabilityEvidence",
     "ReliabilityReport",
