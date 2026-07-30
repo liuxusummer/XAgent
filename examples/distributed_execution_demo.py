@@ -526,9 +526,13 @@ class _ReferenceDistributedPlane:
                 ),
             ),
         )
+        execution_journal = RemoteExecutionJournal(
+            control_root / "remote-execution.sqlite3"
+        )
         self.broker = ArtifactGrantBroker(
             self.artifacts,
             authorization_verifier=self.worker_gate,
+            recovery_journal=execution_journal,
         )
         self.runtime_verifier = _ReferenceRuntimeProofVerifier()
         self.admitter = SecureRemoteAssignmentAdmitter(
@@ -540,9 +544,7 @@ class _ReferenceDistributedPlane:
             self.runtime_verifier,
             _ReferencePreflightAuthorizer(),
             pool_resolver=lambda _registration: POOL_ID,
-            recovery_journal=RemoteExecutionJournal(
-                control_root / "remote-execution.sqlite3"
-            ),
+            recovery_journal=execution_journal,
         )
         self.identities = {
             worker_id: AuthenticatedWorker(
@@ -810,6 +812,9 @@ def run_demo(
             "runtime_proof": "hmac_binding_reference",
             "digest_only_execution_recovery": (
                 plane.control.production_recovery_ready
+            ),
+            "bearer_free_artifact_recovery": (
+                plane.broker.durable_recovery_ready
             ),
             "mtls_deployed": False,
             "spiffe_deployed": False,

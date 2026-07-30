@@ -457,10 +457,16 @@ class SecureRemoteExecutionTests(unittest.TestCase):
             ),
             clock=self.clock,
         )
+        self.recovery_journal_path = (
+            self.control_root / "remote-execution.sqlite3"
+        )
         self.broker = ArtifactGrantBroker(
             self.artifacts,
             authorization_verifier=self.worker_gate,
             clock=self.clock,
+            recovery_journal=RemoteExecutionJournal(
+                self.recovery_journal_path
+            ),
         )
         self.runtime_verifier = _RuntimeVerifier(self.clock)
         self.preparation = RemoteExecutionPreparation(
@@ -482,7 +488,7 @@ class SecureRemoteExecutionTests(unittest.TestCase):
             "preflight_authorizer": _PreflightAuthorizer(),
             "pool_resolver": lambda registration: "pool-a",
             "recovery_journal": RemoteExecutionJournal(
-                self.control_root / "remote-execution.sqlite3"
+                self.recovery_journal_path
             ),
             "clock": self.clock,
         }
@@ -953,6 +959,9 @@ class SecureRemoteExecutionTests(unittest.TestCase):
                     self.artifacts,
                     authorization_verifier=fresh_gate,
                     clock=self.clock,
+                    recovery_journal=RemoteExecutionJournal(
+                        self.recovery_journal_path
+                    ),
                 ),
             ),
             clock=self.clock,
@@ -1483,6 +1492,9 @@ class SecureRemoteExecutionTests(unittest.TestCase):
                 self.artifacts,
                 authorization_verifier=fresh_gate,
                 clock=self.clock,
+                recovery_journal=RemoteExecutionJournal(
+                    self.recovery_journal_path
+                ),
             ),
         )
         with self.assertRaisesRegex(
@@ -1540,7 +1552,7 @@ class SecureRemoteExecutionTests(unittest.TestCase):
         self.assertEqual(report.retained, 0)
         self.assertEqual(report.discarded, 1)
 
-    def test_digest_recovery_never_resurrects_output_bearer(self):
+    def test_digest_recovery_replays_final_ref_without_persisting_bearer(self):
         claim = self._claim("recover-output")
         original = self._admitter()
         authorization = original.admit(
@@ -1577,6 +1589,9 @@ class SecureRemoteExecutionTests(unittest.TestCase):
                 self.artifacts,
                 authorization_verifier=fresh_gate,
                 clock=self.clock,
+                recovery_journal=RemoteExecutionJournal(
+                    self.recovery_journal_path
+                ),
             ),
         )
         recovered = restarted.restore_authorization(
@@ -1586,20 +1601,28 @@ class SecureRemoteExecutionTests(unittest.TestCase):
             claim,
             expected,
         )
-        with self.assertRaisesRegex(Exception, "write_grant_unavailable"):
-            restarted.complete(
-                self.identity,
-                self.registration,
-                self.scheduler,
-                claim,
-                recovered,
-                candidate,
-                candidate.runtime_proof,
-            )
+        restarted.complete(
+            self.identity,
+            self.registration,
+            self.scheduler,
+            claim,
+            recovered,
+            candidate,
+            candidate.runtime_proof,
+        )
         self.assertEqual(
             self.store.get_attempt(claim.attempt_id).status,
-            AttemptStatus.RUNNING,
+            AttemptStatus.SUCCEEDED,
         )
+        for suffix in ("", "-wal", "-shm"):
+            candidate_path = Path(
+                f"{self.recovery_journal_path}{suffix}"
+            )
+            if candidate_path.exists():
+                self.assertNotIn(
+                    candidate.output_handles[0].token.encode(),
+                    candidate_path.read_bytes(),
+                )
 
     def test_new_worker_session_cannot_take_over_old_claim(self):
         claim = self._claim()

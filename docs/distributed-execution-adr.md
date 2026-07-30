@@ -205,7 +205,8 @@ grant_digest
 
 - grant 使用服务端不可预测随机数，不使用 Artifact digest 充当 bearer credential；
 - grant 原文不进入 Domain Event、telemetry 或错误文本；
-- 使用时 atomically consume；重复使用只允许幂等读取同一内容；
+- read 使用时先 atomically consume 再发送字节；响应丢失后的重复读取仍拒绝，必须重新
+  授权；
 - read 完成后重新验证 size/SHA-256；
 - write 先进入临时对象，验证后才能由控制面 Event Tx 建立引用；
 - completion 只携带 finalize 后的 opaque output handle；控制面必须再次 resolve，
@@ -340,10 +341,16 @@ Fleet queue/active registry 仍是单进程、可重建 projection，不是共�
 写入独立 `RemoteExecutionJournal`。其 SQLite 与 session journal 一样必须位于隔离的
 control-plane root；记录不含 bearer、claim token 原文、脚本、环境值、Artifact 内容
 或 raw plan。重启后只能结合 Store 中既有 policy Event、当前可信 resolver、重新
-attest 的相同 workload/session/runtime lineage 重建 digest-only authority。该路径可
-恢复 start/heartbeat/取消和无输出终态，不能生成新 assignment 或复活 Artifact grant。
-reference Artifact broker 的 grant/finalized registry 仍为进程内状态，所以成功输出在
-broker 重启后 fail closed；已写但未被 Domain Event 引用的 Artifact 由保守 GC 处理。
+attest 的相同 workload/session/runtime lineage 重建 digest-only authority，不能生成
+新 assignment。
+
+同一 journal 的 schema v2 为 Artifact broker 持久化 token digest、canonical safe
+metadata、read `issued/consumed`、write `issued/finalized/failed` 与 exact final
+`ArtifactRef`，但不保存 bearer 明文或 staged bytes。Worker 持有的原 read grant 可在
+broker 重启后通过 SQLite CAS 只兑换一次；已 finalize 的原 output handle 可重放同一
+ref。Store 已写而 journal 尚未 commit 的崩溃窗口只允许留下未引用 orphan，不能写入
+Domain Event；仅内存 staging 仍需调用方重新发送原内容。过期 tombstone 有硬容量和
+索引清理，不允许 LRU 淘汰未过期防重放证据。
 完整契约见 [remote-execution-recovery.md](remote-execution-recovery.md)。
 
 ## 8. Observability

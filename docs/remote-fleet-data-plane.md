@@ -163,8 +163,9 @@ resources 一致，否则不发送给 Worker；已经发生的 durable claim 由
    重建；projection 随后由 completion 或周期 `reconcile_terminals()` 收敛。
 
 不要从 Fleet snapshot 推断 Attempt 状态，也不要把 `execution_truth=false` 的报告写回
-Domain Store。跨进程共享 Fleet 队列、持久 Artifact grant/finalization registry、真实
-TLS-extension server 和生产 Sandbox 仍是部署/后续实现边界。
+Domain Store。Artifact grant/finalization 已通过 token-digest-only journal 跨进程
+恢复，但 Fleet queue/active projection 仍非共享共识队列。跨进程共享 Fleet 队列、
+真实 TLS-extension server 和生产 Sandbox 仍是部署/后续实现边界。
 
 ## 验证
 

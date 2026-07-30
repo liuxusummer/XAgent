@@ -1,14 +1,17 @@
-"""Durable digest-only recovery authority for remote executions.
+"""Durable bearer-free recovery authority for remote executions.
 
 The journal proves which authorization binding the control plane actually
-issued for one durable Attempt.  It intentionally stores no claim token,
-bearer grant, response body, script bytes, Artifact content, environment
-value, runtime proof, or raw execution plan.
+issued for one durable Attempt and tracks monotonic Artifact grant state.  It
+intentionally stores no claim token, bearer plaintext, response body, script
+bytes, Artifact content, environment value, runtime proof, or raw execution
+plan.
 """
 
 from __future__ import annotations
 
 import fcntl
+import hmac
+import json
 import math
 import os
 import re
@@ -20,14 +23,16 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Iterator
 
-REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION = 1
+REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION = 2
 DEFAULT_EXECUTION_JOURNAL_BUSY_TIMEOUT_MS = 10_000
 MAX_EXECUTION_JOURNAL_RECORDS = 100_000
+MAX_ARTIFACT_GRANT_JOURNAL_RECORDS = 100_000
+MAX_ARTIFACT_GRANT_METADATA_BYTES = 16 * 1024
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,254}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _SECURITY_LEVELS = frozenset({"container"})
-_SCHEMA_COLUMNS = {
+_V1_SCHEMA_COLUMNS = {
     "remote_execution_journal_metadata": (
         ("singleton", "INTEGER", 0, 1),
         ("schema_version", "INTEGER", 1, 0),
@@ -52,6 +57,40 @@ _SCHEMA_COLUMNS = {
         ("runtime_verifier_id", "TEXT", 1, 0),
         ("runtime_security_level", "TEXT", 1, 0),
         ("created_at", "REAL", 1, 0),
+    ),
+}
+_SCHEMA_COLUMNS = {
+    **_V1_SCHEMA_COLUMNS,
+    "remote_artifact_read_grants": (
+        ("grant_id", "TEXT", 1, 1),
+        ("token_digest", "TEXT", 1, 0),
+        ("grant_metadata", "TEXT", 1, 0),
+        ("artifact_ref", "TEXT", 1, 0),
+        ("state", "TEXT", 1, 0),
+        ("expires_at", "REAL", 1, 0),
+        ("updated_at", "REAL", 1, 0),
+    ),
+    "remote_artifact_write_grants": (
+        ("grant_id", "TEXT", 1, 1),
+        ("token_digest", "TEXT", 1, 0),
+        ("grant_metadata", "TEXT", 1, 0),
+        ("state", "TEXT", 1, 0),
+        ("staging_digest", "TEXT", 0, 0),
+        ("final_ref", "TEXT", 0, 0),
+        ("expires_at", "REAL", 1, 0),
+        ("updated_at", "REAL", 1, 0),
+    ),
+}
+_SCHEMA_INDEXES = {
+    "idx_remote_artifact_read_grants_expires": (
+        "remote_artifact_read_grants",
+        0,
+        ("expires_at",),
+    ),
+    "idx_remote_artifact_write_grants_expires": (
+        "remote_artifact_write_grants",
+        0,
+        ("expires_at",),
     ),
 }
 _SCHEMA_STATEMENTS = (
@@ -86,7 +125,51 @@ _SCHEMA_STATEMENTS = (
         PRIMARY KEY(run_id, attempt_id, fencing_token)
     )
     """,
+    """
+    CREATE TABLE remote_artifact_read_grants(
+        grant_id TEXT NOT NULL PRIMARY KEY,
+        token_digest TEXT NOT NULL,
+        grant_metadata TEXT NOT NULL,
+        artifact_ref TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('issued', 'consumed')),
+        expires_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE remote_artifact_write_grants(
+        grant_id TEXT NOT NULL PRIMARY KEY,
+        token_digest TEXT NOT NULL,
+        grant_metadata TEXT NOT NULL,
+        state TEXT NOT NULL
+            CHECK(state IN ('issued', 'finalized', 'failed')),
+        staging_digest TEXT,
+        final_ref TEXT,
+        expires_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        CHECK(
+            (state = 'finalized'
+                AND staging_digest IS NOT NULL
+                AND final_ref IS NOT NULL)
+            OR
+            (state <> 'finalized'
+                AND staging_digest IS NULL
+                AND final_ref IS NULL)
+        )
+    )
+    """,
+    """
+    CREATE INDEX idx_remote_artifact_read_grants_expires
+    ON remote_artifact_read_grants(expires_at)
+    """,
+    """
+    CREATE INDEX idx_remote_artifact_write_grants_expires
+    ON remote_artifact_write_grants(expires_at)
+    """,
 )
+_ARTIFACT_SCHEMA_STATEMENTS = _SCHEMA_STATEMENTS[2:]
+_READ_GRANT_STATES = frozenset({"issued", "consumed"})
+_WRITE_GRANT_STATES = frozenset({"issued", "finalized", "failed"})
 
 
 class RemoteExecutionJournalError(RuntimeError):
@@ -99,6 +182,14 @@ class RemoteExecutionJournalCapacityError(RemoteExecutionJournalError):
 
 class RemoteExecutionJournalConflict(RemoteExecutionJournalError):
     """An Attempt was rebound to different execution authority."""
+
+
+class RemoteArtifactGrantUnavailable(RemoteExecutionJournalError):
+    """A persisted grant is absent, consumed, failed, or expired."""
+
+
+class RemoteArtifactGrantConflict(RemoteExecutionJournalError):
+    """A grant id or finalization was rebound to different metadata."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,12 +260,74 @@ class RemoteExecutionBindingRecord:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteArtifactReadGrantRecord:
+    """Bearer-free durable read grant state."""
+
+    grant_id: str
+    token_digest: str
+    grant_metadata: str
+    artifact_ref: str
+    state: str
+    expires_at: float
+    updated_at: float
+
+    def __post_init__(self) -> None:
+        _identifier(self.grant_id, "grant_id")
+        _digest(self.token_digest, "token_digest")
+        _canonical_json_text(self.grant_metadata, "grant_metadata")
+        _canonical_json_text(self.artifact_ref, "artifact_ref")
+        if self.state not in _READ_GRANT_STATES:
+            raise RemoteExecutionJournalError("invalid_read_grant_state")
+        expires_at = _finite_time(self.expires_at)
+        updated_at = _finite_time(self.updated_at)
+        if expires_at <= 0 or updated_at > expires_at:
+            raise RemoteExecutionJournalError("invalid_read_grant_time")
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteArtifactWriteGrantRecord:
+    """Bearer-free durable write/finalization state."""
+
+    grant_id: str
+    token_digest: str
+    grant_metadata: str
+    state: str
+    staging_digest: str | None
+    final_ref: str | None
+    expires_at: float
+    updated_at: float
+
+    def __post_init__(self) -> None:
+        _identifier(self.grant_id, "grant_id")
+        _digest(self.token_digest, "token_digest")
+        _canonical_json_text(self.grant_metadata, "grant_metadata")
+        if self.state not in _WRITE_GRANT_STATES:
+            raise RemoteExecutionJournalError("invalid_write_grant_state")
+        if self.state == "finalized":
+            if self.staging_digest is None or self.final_ref is None:
+                raise RemoteExecutionJournalError(
+                    "invalid_write_grant_finalization"
+                )
+            _digest(self.staging_digest, "staging_digest")
+            _canonical_json_text(self.final_ref, "final_ref")
+        elif self.staging_digest is not None or self.final_ref is not None:
+            raise RemoteExecutionJournalError(
+                "invalid_write_grant_finalization"
+            )
+        expires_at = _finite_time(self.expires_at)
+        updated_at = _finite_time(self.updated_at)
+        if expires_at <= 0 or updated_at > expires_at:
+            raise RemoteExecutionJournalError("invalid_write_grant_time")
+
+
 class RemoteExecutionJournal:
     """SQLite-backed exact authorization binding registry.
 
-    Rows are immutable.  Re-recording the same binding is idempotent; changing
-    any authority field for the same Run/Attempt is a conflict.  Live rows are
-    never evicted to make room because doing so would erase recovery evidence.
+    Execution rows are immutable.  Artifact rows move only through explicit
+    issued/consumed/finalized/failed transitions.  Rebinding is a conflict and
+    unexpired rows are never evicted to make room because doing so would erase
+    recovery or anti-replay evidence.
     """
 
     def __init__(
@@ -182,6 +335,9 @@ class RemoteExecutionJournal:
         path: str | Path = ":memory:",
         *,
         maximum_records: int = MAX_EXECUTION_JOURNAL_RECORDS,
+        maximum_artifact_grants: int = (
+            MAX_ARTIFACT_GRANT_JOURNAL_RECORDS
+        ),
         busy_timeout_ms: int = DEFAULT_EXECUTION_JOURNAL_BUSY_TIMEOUT_MS,
     ) -> None:
         self.path = str(path)
@@ -192,6 +348,12 @@ class RemoteExecutionJournal:
             "maximum_records",
             1,
             MAX_EXECUTION_JOURNAL_RECORDS,
+        )
+        self.maximum_artifact_grants = _bounded_int(
+            maximum_artifact_grants,
+            "maximum_artifact_grants",
+            1,
+            MAX_ARTIFACT_GRANT_JOURNAL_RECORDS,
         )
         self.busy_timeout_ms = _bounded_int(
             busy_timeout_ms,
@@ -385,6 +547,432 @@ class RemoteExecutionJournal:
             )
             return cursor.rowcount == 1
 
+    def record_read_grant(
+        self,
+        record: RemoteArtifactReadGrantRecord,
+    ) -> RemoteArtifactReadGrantRecord:
+        if not isinstance(record, RemoteArtifactReadGrantRecord):
+            raise TypeError(
+                "record must be a RemoteArtifactReadGrantRecord"
+            )
+        if record.state != "issued" or record.updated_at >= record.expires_at:
+            raise RemoteExecutionJournalError("invalid_read_grant_state")
+        with self._transaction() as connection:
+            self._delete_expired_grants_locked(
+                connection,
+                now=record.updated_at,
+            )
+            existing = self._read_grant_locked(connection, record.grant_id)
+            if existing is not None:
+                if (
+                    existing.token_digest != record.token_digest
+                    or existing.grant_metadata != record.grant_metadata
+                    or existing.artifact_ref != record.artifact_ref
+                    or existing.expires_at != record.expires_at
+                    or existing.state != "issued"
+                ):
+                    raise RemoteArtifactGrantConflict(
+                        "read_grant_conflict"
+                    )
+                return existing
+            self._require_artifact_capacity_locked(connection)
+            connection.execute(
+                """
+                INSERT INTO remote_artifact_read_grants(
+                    grant_id, token_digest, grant_metadata, artifact_ref,
+                    state, expires_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                tuple(
+                    getattr(record, item.name)
+                    for item in fields(record)
+                ),
+            )
+            return record
+
+    def consume_read_grant(
+        self,
+        *,
+        grant_id: str,
+        token_digest: str,
+        grant_metadata: str,
+        expires_at: float,
+        now: float,
+    ) -> RemoteArtifactReadGrantRecord:
+        _identifier(grant_id, "grant_id")
+        _digest(token_digest, "token_digest")
+        _canonical_json_text(grant_metadata, "grant_metadata")
+        expected_expires_at = _finite_time(expires_at)
+        current = _finite_time(now)
+        consumed: RemoteArtifactReadGrantRecord | None = None
+        expired = False
+        with self._transaction() as connection:
+            record = self._read_grant_locked(connection, grant_id)
+            if record is None:
+                raise RemoteArtifactGrantUnavailable(
+                    "read_grant_unavailable"
+                )
+            if (
+                not hmac.compare_digest(
+                    record.token_digest,
+                    token_digest,
+                )
+                or record.grant_metadata != grant_metadata
+                or record.expires_at != expected_expires_at
+            ):
+                raise RemoteArtifactGrantConflict(
+                    "read_grant_binding_mismatch"
+                )
+            if current >= expected_expires_at:
+                connection.execute(
+                    """
+                    DELETE FROM remote_artifact_read_grants
+                    WHERE grant_id = ?
+                    """,
+                    (grant_id,),
+                )
+                expired = True
+            elif record.state != "issued":
+                raise RemoteArtifactGrantUnavailable(
+                    "read_grant_unavailable"
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    UPDATE remote_artifact_read_grants
+                    SET state = 'consumed', updated_at = ?
+                    WHERE grant_id = ? AND state = 'issued'
+                    """,
+                    (current, grant_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RemoteArtifactGrantUnavailable(
+                        "read_grant_unavailable"
+                    )
+                consumed = RemoteArtifactReadGrantRecord(
+                    grant_id=record.grant_id,
+                    token_digest=record.token_digest,
+                    grant_metadata=record.grant_metadata,
+                    artifact_ref=record.artifact_ref,
+                    state="consumed",
+                    expires_at=record.expires_at,
+                    updated_at=current,
+                )
+        if expired:
+            raise RemoteArtifactGrantUnavailable("read_grant_unavailable")
+        if consumed is None:
+            raise RemoteExecutionJournalError(
+                "invalid_artifact_grant_record"
+            )
+        return consumed
+
+    def record_write_grant(
+        self,
+        record: RemoteArtifactWriteGrantRecord,
+    ) -> RemoteArtifactWriteGrantRecord:
+        if not isinstance(record, RemoteArtifactWriteGrantRecord):
+            raise TypeError(
+                "record must be a RemoteArtifactWriteGrantRecord"
+            )
+        if record.state != "issued" or record.updated_at >= record.expires_at:
+            raise RemoteExecutionJournalError("invalid_write_grant_state")
+        with self._transaction() as connection:
+            self._delete_expired_grants_locked(
+                connection,
+                now=record.updated_at,
+            )
+            existing = self._write_grant_locked(
+                connection,
+                record.grant_id,
+            )
+            if existing is not None:
+                if (
+                    existing.token_digest != record.token_digest
+                    or existing.grant_metadata != record.grant_metadata
+                    or existing.expires_at != record.expires_at
+                    or existing.state != "issued"
+                ):
+                    raise RemoteArtifactGrantConflict(
+                        "write_grant_conflict"
+                    )
+                return existing
+            self._require_artifact_capacity_locked(connection)
+            connection.execute(
+                """
+                INSERT INTO remote_artifact_write_grants(
+                    grant_id, token_digest, grant_metadata, state,
+                    staging_digest, final_ref, expires_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                tuple(
+                    getattr(record, item.name)
+                    for item in fields(record)
+                ),
+            )
+            return record
+
+    def get_write_grant(
+        self,
+        *,
+        grant_id: str,
+        token_digest: str,
+        now: float,
+    ) -> RemoteArtifactWriteGrantRecord:
+        _identifier(grant_id, "grant_id")
+        _digest(token_digest, "token_digest")
+        current = _finite_time(now)
+        result: RemoteArtifactWriteGrantRecord | None = None
+        expired = False
+        with self._transaction() as connection:
+            record = self._write_grant_locked(connection, grant_id)
+            if record is None:
+                raise RemoteArtifactGrantUnavailable(
+                    "write_grant_unavailable"
+                )
+            if current >= record.expires_at:
+                connection.execute(
+                    """
+                    DELETE FROM remote_artifact_write_grants
+                    WHERE grant_id = ?
+                    """,
+                    (grant_id,),
+                )
+                expired = True
+            elif not hmac.compare_digest(
+                record.token_digest,
+                token_digest,
+            ):
+                raise RemoteArtifactGrantConflict(
+                    "write_grant_binding_mismatch"
+                )
+            elif record.state == "failed":
+                raise RemoteArtifactGrantUnavailable(
+                    "write_grant_unavailable"
+                )
+            else:
+                result = record
+        if expired:
+            raise RemoteArtifactGrantUnavailable("write_grant_unavailable")
+        if result is None:
+            raise RemoteExecutionJournalError(
+                "invalid_artifact_grant_record"
+            )
+        return result
+
+    def finalize_write_grant(
+        self,
+        *,
+        grant_id: str,
+        token_digest: str,
+        grant_metadata: str,
+        staging_digest: str,
+        final_ref: str,
+        now: float,
+    ) -> RemoteArtifactWriteGrantRecord:
+        _identifier(grant_id, "grant_id")
+        _digest(token_digest, "token_digest")
+        _canonical_json_text(grant_metadata, "grant_metadata")
+        _digest(staging_digest, "staging_digest")
+        _canonical_json_text(final_ref, "final_ref")
+        current = _finite_time(now)
+        finalized: RemoteArtifactWriteGrantRecord | None = None
+        expired = False
+        with self._transaction() as connection:
+            record = self._write_grant_locked(connection, grant_id)
+            if record is None:
+                raise RemoteArtifactGrantUnavailable(
+                    "write_grant_unavailable"
+                )
+            if current >= record.expires_at:
+                connection.execute(
+                    """
+                    DELETE FROM remote_artifact_write_grants
+                    WHERE grant_id = ?
+                    """,
+                    (grant_id,),
+                )
+                expired = True
+            elif (
+                not hmac.compare_digest(
+                    record.token_digest,
+                    token_digest,
+                )
+                or record.grant_metadata != grant_metadata
+            ):
+                raise RemoteArtifactGrantConflict(
+                    "write_grant_binding_mismatch"
+                )
+            elif record.state == "failed":
+                raise RemoteArtifactGrantUnavailable(
+                    "write_grant_unavailable"
+                )
+            elif record.state == "finalized":
+                if (
+                    record.staging_digest != staging_digest
+                    or record.final_ref != final_ref
+                ):
+                    raise RemoteArtifactGrantConflict(
+                        "write_finalization_conflict"
+                    )
+                finalized = record
+            else:
+                cursor = connection.execute(
+                    """
+                    UPDATE remote_artifact_write_grants
+                    SET state = 'finalized', staging_digest = ?,
+                        final_ref = ?, updated_at = ?
+                    WHERE grant_id = ? AND state = 'issued'
+                    """,
+                    (staging_digest, final_ref, current, grant_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RemoteArtifactGrantUnavailable(
+                        "write_grant_unavailable"
+                    )
+                finalized = RemoteArtifactWriteGrantRecord(
+                    grant_id=record.grant_id,
+                    token_digest=record.token_digest,
+                    grant_metadata=record.grant_metadata,
+                    state="finalized",
+                    staging_digest=staging_digest,
+                    final_ref=final_ref,
+                    expires_at=record.expires_at,
+                    updated_at=current,
+                )
+        if expired:
+            raise RemoteArtifactGrantUnavailable("write_grant_unavailable")
+        if finalized is None:
+            raise RemoteExecutionJournalError(
+                "invalid_artifact_grant_record"
+            )
+        return finalized
+
+    def fail_write_grant(
+        self,
+        *,
+        grant_id: str,
+        token_digest: str,
+        now: float,
+    ) -> bool:
+        _identifier(grant_id, "grant_id")
+        _digest(token_digest, "token_digest")
+        current = _finite_time(now)
+        with self._transaction() as connection:
+            record = self._write_grant_locked(connection, grant_id)
+            if record is None:
+                return False
+            if not hmac.compare_digest(
+                record.token_digest,
+                token_digest,
+            ):
+                raise RemoteArtifactGrantConflict(
+                    "write_grant_binding_mismatch"
+                )
+            if record.state == "finalized":
+                return False
+            if record.state == "failed":
+                raise RemoteArtifactGrantUnavailable(
+                    "write_grant_unavailable"
+                )
+            if current >= record.expires_at:
+                connection.execute(
+                    """
+                    DELETE FROM remote_artifact_write_grants
+                    WHERE grant_id = ?
+                    """,
+                    (grant_id,),
+                )
+                return True
+            connection.execute(
+                """
+                UPDATE remote_artifact_write_grants
+                SET state = 'failed', staging_digest = NULL,
+                    final_ref = NULL, updated_at = ?
+                WHERE grant_id = ? AND state = 'issued'
+                """,
+                (current, grant_id),
+            )
+            return True
+
+    def purge_expired_artifact_grants(self, *, now: float) -> int:
+        current = _finite_time(now)
+        with self._transaction() as connection:
+            return self._delete_expired_grants_locked(
+                connection,
+                now=current,
+            )
+
+    def _require_artifact_capacity_locked(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        count = int(
+            connection.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM remote_artifact_read_grants)
+                    +
+                    (SELECT COUNT(*) FROM remote_artifact_write_grants)
+                """
+            ).fetchone()[0]
+        )
+        if count >= self.maximum_artifact_grants:
+            raise RemoteExecutionJournalCapacityError(
+                "artifact_grant_capacity"
+            )
+
+    @staticmethod
+    def _delete_expired_grants_locked(
+        connection: sqlite3.Connection,
+        *,
+        now: float,
+    ) -> int:
+        read_cursor = connection.execute(
+            """
+            DELETE FROM remote_artifact_read_grants
+            WHERE expires_at <= ?
+            """,
+            (now,),
+        )
+        write_cursor = connection.execute(
+            """
+            DELETE FROM remote_artifact_write_grants
+            WHERE expires_at <= ?
+            """,
+            (now,),
+        )
+        return read_cursor.rowcount + write_cursor.rowcount
+
+    @staticmethod
+    def _read_grant_locked(
+        connection: sqlite3.Connection,
+        grant_id: str,
+    ) -> RemoteArtifactReadGrantRecord | None:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM remote_artifact_read_grants
+            WHERE grant_id = ?
+            """,
+            (grant_id,),
+        ).fetchone()
+        return None if row is None else _read_grant_from_row(row)
+
+    @staticmethod
+    def _write_grant_locked(
+        connection: sqlite3.Connection,
+        grant_id: str,
+    ) -> RemoteArtifactWriteGrantRecord | None:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM remote_artifact_write_grants
+            WHERE grant_id = ?
+            """,
+            (grant_id,),
+        ).fetchone()
+        return None if row is None else _write_grant_from_row(row)
+
     @staticmethod
     def _get_locked(
         connection: sqlite3.Connection,
@@ -404,39 +992,13 @@ class RemoteExecutionJournal:
 
     def _initialize(self) -> None:
         with self._transaction() as connection:
-            expected_tables = frozenset(_SCHEMA_COLUMNS)
-            existing_tables = frozenset(
-                str(row["name"])
-                for row in connection.execute(
-                    """
-                    SELECT name
-                    FROM sqlite_master
-                    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-                    """
-                )
-            )
-            if existing_tables and existing_tables != expected_tables:
-                raise RemoteExecutionJournalError("invalid_execution_schema")
+            existing_tables = self._table_names(connection)
             is_new = not existing_tables and self._bootstrap_new_database
             if not existing_tables and not is_new:
                 raise RemoteExecutionJournalError("invalid_execution_schema")
             if is_new:
                 for statement in _SCHEMA_STATEMENTS:
                     connection.execute(statement)
-            else:
-                self._validate_schema(connection)
-            row = connection.execute(
-                """
-                SELECT schema_version
-                FROM remote_execution_journal_metadata
-                WHERE singleton = 1
-                """
-            ).fetchone()
-            if row is None:
-                if not is_new:
-                    raise RemoteExecutionJournalError(
-                        "invalid_execution_schema"
-                    )
                 connection.execute(
                     """
                     INSERT INTO remote_execution_journal_metadata(
@@ -445,15 +1007,86 @@ class RemoteExecutionJournal:
                     """,
                     (REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION,),
                 )
-            elif (
-                int(row["schema_version"])
-                != REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION
-            ):
-                raise RemoteExecutionJournalError(
-                    "unsupported_execution_schema"
+                self._validate_schema(
+                    connection,
+                    _SCHEMA_COLUMNS,
+                    schema_indexes=_SCHEMA_INDEXES,
                 )
-            if is_new:
-                self._validate_schema(connection)
+                return
+
+            if existing_tables == frozenset(_V1_SCHEMA_COLUMNS):
+                self._validate_schema(connection, _V1_SCHEMA_COLUMNS)
+                self._require_schema_version(connection, expected=1)
+                for statement in _ARTIFACT_SCHEMA_STATEMENTS:
+                    connection.execute(statement)
+                cursor = connection.execute(
+                    """
+                    UPDATE remote_execution_journal_metadata
+                    SET schema_version = ?
+                    WHERE singleton = 1 AND schema_version = 1
+                    """,
+                    (REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION,),
+                )
+                if cursor.rowcount != 1:
+                    raise RemoteExecutionJournalError(
+                        "unsupported_execution_schema"
+                    )
+                self._validate_schema(
+                    connection,
+                    _SCHEMA_COLUMNS,
+                    schema_indexes=_SCHEMA_INDEXES,
+                )
+                return
+
+            if existing_tables != frozenset(_SCHEMA_COLUMNS):
+                raise RemoteExecutionJournalError("invalid_execution_schema")
+            self._validate_schema(
+                connection,
+                _SCHEMA_COLUMNS,
+                schema_indexes=_SCHEMA_INDEXES,
+            )
+            self._require_schema_version(
+                connection,
+                expected=REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION,
+            )
+
+    @staticmethod
+    def _require_schema_version(
+        connection: sqlite3.Connection,
+        *,
+        expected: int,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT schema_version
+            FROM remote_execution_journal_metadata
+            WHERE singleton = 1
+            """
+        ).fetchone()
+        if row is None:
+            raise RemoteExecutionJournalError("invalid_execution_schema")
+        version = row["schema_version"]
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version != expected
+        ):
+            raise RemoteExecutionJournalError(
+                "unsupported_execution_schema"
+            )
+
+    @staticmethod
+    def _table_names(connection: sqlite3.Connection) -> frozenset[str]:
+        return frozenset(
+            str(row["name"])
+            for row in connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                """
+            )
+        )
 
     def _prepare_durable_database(self, journal_path: Path) -> None:
         lock_path = (
@@ -525,7 +1158,11 @@ class RemoteExecutionJournal:
                     """,
                     (REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION,),
                 )
-                self._validate_schema(connection)
+                self._validate_schema(
+                    connection,
+                    _SCHEMA_COLUMNS,
+                    schema_indexes=_SCHEMA_INDEXES,
+                )
             except BaseException:
                 connection.rollback()
                 raise
@@ -585,24 +1222,23 @@ class RemoteExecutionJournal:
         try:
             connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
             connection.execute("PRAGMA synchronous = FULL")
-            self._validate_schema(connection)
-            row = connection.execute(
-                """
-                SELECT schema_version
-                FROM remote_execution_journal_metadata
-                WHERE singleton = 1
-                """
-            ).fetchone()
-            if row is None:
+            tables = self._table_names(connection)
+            if tables == frozenset(_V1_SCHEMA_COLUMNS):
+                self._validate_schema(connection, _V1_SCHEMA_COLUMNS)
+                self._require_schema_version(connection, expected=1)
+            elif tables == frozenset(_SCHEMA_COLUMNS):
+                self._validate_schema(
+                    connection,
+                    _SCHEMA_COLUMNS,
+                    schema_indexes=_SCHEMA_INDEXES,
+                )
+                self._require_schema_version(
+                    connection,
+                    expected=REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION,
+                )
+            else:
                 raise RemoteExecutionJournalError(
                     "invalid_execution_schema"
-                )
-            if (
-                int(row["schema_version"])
-                != REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION
-            ):
-                raise RemoteExecutionJournalError(
-                    "unsupported_execution_schema"
                 )
             mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()
             if mode is None or str(mode[0]).lower() != "wal":
@@ -613,13 +1249,24 @@ class RemoteExecutionJournal:
             connection.close()
 
     @staticmethod
-    def _validate_schema(connection: sqlite3.Connection) -> None:
+    def _validate_schema(
+        connection: sqlite3.Connection,
+        schema_columns: dict[
+            str,
+            tuple[tuple[str, str, int, int], ...],
+        ],
+        *,
+        schema_indexes: dict[
+            str,
+            tuple[str, int, tuple[str, ...]],
+        ] | None = None,
+    ) -> None:
         quick_check = connection.execute("PRAGMA quick_check(1)").fetchone()
         if quick_check is None or str(quick_check[0]).lower() != "ok":
             raise RemoteExecutionJournalError(
                 "execution_journal_integrity_failed"
             )
-        for table, expected_columns in _SCHEMA_COLUMNS.items():
+        for table, expected_columns in schema_columns.items():
             actual_columns = tuple(
                 (
                     str(row["name"]),
@@ -632,6 +1279,56 @@ class RemoteExecutionJournal:
                 )
             )
             if actual_columns != expected_columns:
+                raise RemoteExecutionJournalError(
+                    "invalid_execution_schema"
+                )
+        expected_indexes = schema_indexes or {}
+        auxiliary = {
+            str(row["name"]): (
+                str(row["type"]),
+                str(row["tbl_name"]),
+            )
+            for row in connection.execute(
+                """
+                SELECT type, name, tbl_name
+                FROM sqlite_master
+                WHERE type IN ('index', 'trigger', 'view')
+                    AND name NOT LIKE 'sqlite_%'
+                """
+            )
+        }
+        if set(auxiliary) != set(expected_indexes):
+            raise RemoteExecutionJournalError("invalid_execution_schema")
+        for index_name, (
+            expected_table,
+            expected_unique,
+            expected_index_columns,
+        ) in expected_indexes.items():
+            if auxiliary[index_name] != ("index", expected_table):
+                raise RemoteExecutionJournalError(
+                    "invalid_execution_schema"
+                )
+            index_list = {
+                str(row["name"]): (
+                    int(row["unique"]),
+                    str(row["origin"]),
+                    int(row["partial"]),
+                )
+                for row in connection.execute(
+                    f"PRAGMA index_list({expected_table})"
+                )
+            }
+            actual_columns = tuple(
+                str(row["name"])
+                for row in connection.execute(
+                    f"PRAGMA index_info({index_name})"
+                )
+            )
+            if (
+                index_list.get(index_name)
+                != (expected_unique, "c", 0)
+                or actual_columns != expected_index_columns
+            ):
                 raise RemoteExecutionJournalError(
                     "invalid_execution_schema"
                 )
@@ -725,6 +1422,70 @@ def _record_from_row(row: sqlite3.Row) -> RemoteExecutionBindingRecord:
         ) from exc
 
 
+def _read_grant_from_row(
+    row: sqlite3.Row,
+) -> RemoteArtifactReadGrantRecord:
+    try:
+        return RemoteArtifactReadGrantRecord(
+            **{
+                item.name: row[item.name]
+                for item in fields(RemoteArtifactReadGrantRecord)
+            }
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RemoteExecutionJournalError(
+            "invalid_artifact_grant_record"
+        ) from exc
+
+
+def _write_grant_from_row(
+    row: sqlite3.Row,
+) -> RemoteArtifactWriteGrantRecord:
+    try:
+        return RemoteArtifactWriteGrantRecord(
+            **{
+                item.name: row[item.name]
+                for item in fields(RemoteArtifactWriteGrantRecord)
+            }
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RemoteExecutionJournalError(
+            "invalid_artifact_grant_record"
+        ) from exc
+
+
+def _canonical_json_text(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise RemoteExecutionJournalError(f"invalid_{name}")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeError as exc:
+        raise RemoteExecutionJournalError(f"invalid_{name}") from exc
+    if not encoded or len(encoded) > MAX_ARTIFACT_GRANT_METADATA_BYTES:
+        raise RemoteExecutionJournalError(f"invalid_{name}")
+    try:
+        decoded = json.loads(
+            value,
+            parse_constant=_reject_json_constant,
+        )
+        canonical = json.dumps(
+            decoded,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise RemoteExecutionJournalError(f"invalid_{name}") from exc
+    if not isinstance(decoded, dict) or canonical != value:
+        raise RemoteExecutionJournalError(f"invalid_{name}")
+    return value
+
+
+def _reject_json_constant(constant: str) -> object:
+    raise ValueError(f"invalid JSON constant: {constant}")
+
+
 def _identifier(value: object, name: str) -> str:
     if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
         raise RemoteExecutionJournalError(f"invalid_{name}")
@@ -738,10 +1499,9 @@ def _digest(value: object, name: str) -> str:
 
 
 def _finite_time(value: object) -> float:
-    try:
-        timestamp = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise RemoteExecutionJournalError("invalid_created_at") from exc
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RemoteExecutionJournalError("invalid_created_at")
+    timestamp = float(value)
     if timestamp < 0 or not math.isfinite(timestamp):
         raise RemoteExecutionJournalError("invalid_created_at")
     return timestamp
@@ -761,8 +1521,13 @@ def _bounded_int(
 
 
 __all__ = [
+    "MAX_ARTIFACT_GRANT_JOURNAL_RECORDS",
     "MAX_EXECUTION_JOURNAL_RECORDS",
     "REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION",
+    "RemoteArtifactGrantConflict",
+    "RemoteArtifactGrantUnavailable",
+    "RemoteArtifactReadGrantRecord",
+    "RemoteArtifactWriteGrantRecord",
     "RemoteExecutionBindingRecord",
     "RemoteExecutionJournal",
     "RemoteExecutionJournalCapacityError",

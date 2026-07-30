@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -25,6 +26,7 @@ from src.orchestration.artifacts import (
     LocalArtifactStore,
 )
 from src.orchestration.policy import ActionRequest, Capability, EffectClass
+from src.orchestration.remote_execution_journal import RemoteExecutionJournal
 from src.orchestration.worker_security import (
     WorkerAccessRule,
     WorkerAuthorization,
@@ -98,6 +100,19 @@ class _FailingArtifactStore(_CountingArtifactStore):
         del content, metadata
         self.put_bytes_calls += 1
         raise OSError("/private/control-plane/path")
+
+
+class _CommitThenInterruptJournal(RemoteExecutionJournal):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.interrupt_once = True
+
+    def finalize_write_grant(self, **kwargs):
+        record = super().finalize_write_grant(**kwargs)
+        if self.interrupt_once:
+            self.interrupt_once = False
+            raise SystemExit("simulated crash after durable commit")
+        return record
 
 
 EXECUTE = Capability("process.execute")
@@ -1122,6 +1137,417 @@ class ArtifactGrantBrokerTests(unittest.TestCase):
         self.clock.value -= 1
         with self.assertRaises(ArtifactGrantConsumed):
             broker.resolve_output_handle(grant.output_handle)
+
+    def test_durable_read_grant_survives_restart_and_remains_single_use(
+        self,
+    ) -> None:
+        journal_path = self.root / "read-grants.sqlite3"
+        first = ArtifactGrantBroker(
+            self.store,
+            authorization_verifier=self.authorization_verifier,
+            clock=self.clock,
+            recovery_journal=RemoteExecutionJournal(journal_path),
+        )
+        grant = first.issue_read_grant(
+            _authorization(),
+            tenant_id="tenant-1",
+            run_id="run-1",
+            attempt_id="attempt-1",
+            ref=self.ref,
+        )
+        restarted = ArtifactGrantBroker(
+            self.store,
+            authorization_verifier=self.authorization_verifier,
+            clock=self.clock,
+            recovery_journal=RemoteExecutionJournal(journal_path),
+        )
+
+        payload = restarted.redeem_read_grant(
+            grant,
+            _authorization(),
+        )
+        self.assertEqual(payload.content, self.content)
+        with self.assertRaisesRegex(
+            ArtifactGrantConsumed,
+            "grant_unavailable",
+        ):
+            first.redeem_read_grant(grant, _authorization())
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{journal_path}{suffix}")
+            if candidate.exists():
+                self.assertNotIn(
+                    grant.token.encode(),
+                    candidate.read_bytes(),
+                )
+
+    def test_durable_final_ref_replays_after_restart_without_store_write(
+        self,
+    ) -> None:
+        journal_path = self.root / "write-grants.sqlite3"
+        first = ArtifactGrantBroker(
+            self.store,
+            authorization_verifier=self.worker_gate,
+            clock=self.clock,
+            recovery_journal=RemoteExecutionJournal(journal_path),
+        )
+        content = b"durable completion response"
+        grant = first.issue_write_grant(
+            self.worker_authorization,
+            tenant_id="tenant-1",
+            run_id="run-1",
+            node_id="node-1",
+            attempt_id="attempt-1",
+            kind=ArtifactKind.TOOL_RESULT,
+            sensitivity=ArtifactSensitivity.INTERNAL,
+            media_type="application/json",
+            maximum_bytes=len(content),
+            declared_sha256=hashlib.sha256(content).hexdigest(),
+        )
+        receipt = first.stage_write(
+            grant,
+            self.worker_authorization,
+            content=content,
+            declared_sha256=grant.declared_sha256,
+        )
+        expected = first.finalize_write(
+            grant,
+            self.worker_authorization,
+            receipt,
+        )
+        baseline = self.store.put_bytes_calls
+        restarted = ArtifactGrantBroker(
+            self.store,
+            authorization_verifier=self.worker_gate,
+            clock=self.clock,
+            recovery_journal=RemoteExecutionJournal(journal_path),
+        )
+
+        replay = restarted.finalize_output_handle(
+            grant.output_handle,
+            self.worker_authorization,
+        )
+        self.assertEqual(replay, expected)
+        self.assertEqual(self.store.put_bytes_calls, baseline)
+        with self.assertRaisesRegex(
+            ArtifactGrantDenied,
+            "grant_binding_mismatch",
+        ):
+            restarted.finalize_output_handle(
+                replace(grant.output_handle, token="wrong-token"),
+                self.worker_authorization,
+            )
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{journal_path}{suffix}")
+            if candidate.exists():
+                self.assertNotIn(
+                    grant.token.encode(),
+                    candidate.read_bytes(),
+                )
+
+    def test_crash_after_finalization_commit_replays_without_second_write(
+        self,
+    ) -> None:
+        journal_path = self.root / "commit-crash.sqlite3"
+        first = ArtifactGrantBroker(
+            self.store,
+            authorization_verifier=self.worker_gate,
+            clock=self.clock,
+            recovery_journal=_CommitThenInterruptJournal(journal_path),
+        )
+        content = b"journal committed before process crash"
+        grant = first.issue_write_grant(
+            self.worker_authorization,
+            tenant_id="tenant-1",
+            run_id="run-1",
+            node_id="node-1",
+            attempt_id="attempt-1",
+            kind=ArtifactKind.TOOL_RESULT,
+            sensitivity=ArtifactSensitivity.INTERNAL,
+            media_type="application/json",
+            maximum_bytes=len(content),
+            declared_sha256=hashlib.sha256(content).hexdigest(),
+        )
+        receipt = first.stage_write(
+            grant,
+            self.worker_authorization,
+            content=content,
+            declared_sha256=grant.declared_sha256,
+        )
+        baseline = self.store.put_bytes_calls
+        with self.assertRaisesRegex(
+            SystemExit,
+            "simulated crash",
+        ):
+            first.finalize_write(
+                grant,
+                self.worker_authorization,
+                receipt,
+            )
+        self.assertEqual(self.store.put_bytes_calls, baseline + 1)
+
+        restarted = ArtifactGrantBroker(
+            self.store,
+            authorization_verifier=self.worker_gate,
+            clock=self.clock,
+            recovery_journal=RemoteExecutionJournal(journal_path),
+        )
+        recovered = restarted.finalize_output_handle(
+            grant.output_handle,
+            self.worker_authorization,
+        )
+        self.assertEqual(recovered.sha256, grant.declared_sha256)
+        self.assertEqual(self.store.put_bytes_calls, baseline + 1)
+
+    def test_failed_finalization_tombstone_survives_restart(self) -> None:
+        journal_path = self.root / "failed-grant.sqlite3"
+        store = _FailingArtifactStore(self.root / "durable-failing-store")
+        first = ArtifactGrantBroker(
+            store,
+            authorization_verifier=self.worker_gate,
+            clock=self.clock,
+            recovery_journal=RemoteExecutionJournal(journal_path),
+        )
+        content = b"fail"
+        grant = first.issue_write_grant(
+            self.worker_authorization,
+            tenant_id="tenant-1",
+            run_id="run-1",
+            node_id="node-1",
+            attempt_id="attempt-1",
+            kind=ArtifactKind.TOOL_RESULT,
+            sensitivity=ArtifactSensitivity.INTERNAL,
+            media_type="application/json",
+            maximum_bytes=len(content),
+            declared_sha256=hashlib.sha256(content).hexdigest(),
+        )
+        receipt = first.stage_write(
+            grant,
+            self.worker_authorization,
+            content=content,
+            declared_sha256=grant.declared_sha256,
+        )
+        with self.assertRaisesRegex(
+            ArtifactGrantDenied,
+            "artifact_write_failed",
+        ):
+            first.finalize_write(
+                grant,
+                self.worker_authorization,
+                receipt,
+            )
+        restarted = ArtifactGrantBroker(
+            store,
+            authorization_verifier=self.worker_gate,
+            clock=self.clock,
+            recovery_journal=RemoteExecutionJournal(journal_path),
+        )
+        with self.assertRaisesRegex(
+            ArtifactGrantConsumed,
+            "write_grant_unavailable",
+        ):
+            restarted.resolve_output_handle(grant.output_handle)
+
+    def test_tampered_durable_staging_or_final_ref_fails_closed(self) -> None:
+        journal_path = self.root / "tampered-final.sqlite3"
+        first = ArtifactGrantBroker(
+            self.store,
+            authorization_verifier=self.worker_gate,
+            clock=self.clock,
+            recovery_journal=RemoteExecutionJournal(journal_path),
+        )
+        content = b"durable binding must be exact"
+        grant = first.issue_write_grant(
+            self.worker_authorization,
+            tenant_id="tenant-1",
+            run_id="run-1",
+            node_id="node-1",
+            attempt_id="attempt-1",
+            kind=ArtifactKind.TOOL_RESULT,
+            sensitivity=ArtifactSensitivity.INTERNAL,
+            media_type="application/json",
+            maximum_bytes=len(content),
+            declared_sha256=hashlib.sha256(content).hexdigest(),
+        )
+        receipt = first.stage_write(
+            grant,
+            self.worker_authorization,
+            content=content,
+            declared_sha256=grant.declared_sha256,
+        )
+        first.finalize_write(
+            grant,
+            self.worker_authorization,
+            receipt,
+        )
+        baseline = self.store.put_bytes_calls
+        connection = sqlite3.connect(journal_path)
+        original_ref = connection.execute(
+            """
+            SELECT final_ref
+            FROM remote_artifact_write_grants
+            WHERE grant_id = ?
+            """,
+            (grant.grant_id,),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            UPDATE remote_artifact_write_grants
+            SET staging_digest = ?
+            WHERE grant_id = ?
+            """,
+            ("f" * 64, grant.grant_id),
+        )
+        connection.commit()
+        connection.close()
+
+        with self.assertRaisesRegex(
+            ArtifactGrantDenied,
+            "staging_binding_mismatch",
+        ):
+            ArtifactGrantBroker(
+                self.store,
+                authorization_verifier=self.worker_gate,
+                clock=self.clock,
+                recovery_journal=RemoteExecutionJournal(journal_path),
+            ).finalize_output_handle(
+                grant.output_handle,
+                self.worker_authorization,
+            )
+
+        tampered_ref = json.loads(original_ref)
+        tampered_ref["sha256"] = "e" * 64
+        tampered_staging = hashlib.sha256(
+            json.dumps(
+                {
+                    "schema": "artifact_write_staging_v1",
+                    "grant_id": grant.grant_id,
+                    "authorization_digest": (
+                        grant.authorization_digest
+                    ),
+                    "action_digest": grant.action_digest,
+                    "sha256": tampered_ref["sha256"],
+                    "size": tampered_ref["size"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        connection = sqlite3.connect(journal_path)
+        connection.execute(
+            """
+            UPDATE remote_artifact_write_grants
+            SET staging_digest = ?, final_ref = ?
+            WHERE grant_id = ?
+            """,
+            (
+                tampered_staging,
+                json.dumps(
+                    tampered_ref,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                grant.grant_id,
+            ),
+        )
+        connection.commit()
+        connection.close()
+        with self.assertRaisesRegex(
+            ArtifactGrantDenied,
+            "artifact_store_ref_binding_mismatch",
+        ):
+            ArtifactGrantBroker(
+                self.store,
+                authorization_verifier=self.worker_gate,
+                clock=self.clock,
+                recovery_journal=RemoteExecutionJournal(journal_path),
+            ).finalize_output_handle(
+                grant.output_handle,
+                self.worker_authorization,
+            )
+        self.assertEqual(self.store.put_bytes_calls, baseline)
+
+    def test_observed_expiry_cannot_recover_after_clock_rollback(self) -> None:
+        journal_path = self.root / "expiry-rollback.sqlite3"
+        read_broker = ArtifactGrantBroker(
+            self.store,
+            authorization_verifier=self.authorization_verifier,
+            clock=self.clock,
+            recovery_journal=RemoteExecutionJournal(journal_path),
+        )
+        read_grant = read_broker.issue_read_grant(
+            _authorization(),
+            tenant_id="tenant-1",
+            run_id="run-1",
+            attempt_id="attempt-1",
+            ref=self.ref,
+            ttl_seconds=5,
+        )
+        write_broker = ArtifactGrantBroker(
+            self.store,
+            authorization_verifier=self.worker_gate,
+            clock=self.clock,
+            recovery_journal=RemoteExecutionJournal(journal_path),
+        )
+        content = b"expiry rollback"
+        write_grant = write_broker.issue_write_grant(
+            self.worker_authorization,
+            tenant_id="tenant-1",
+            run_id="run-1",
+            node_id="node-1",
+            attempt_id="attempt-1",
+            kind=ArtifactKind.TOOL_RESULT,
+            sensitivity=ArtifactSensitivity.INTERNAL,
+            media_type="application/json",
+            maximum_bytes=len(content),
+            declared_sha256=hashlib.sha256(content).hexdigest(),
+            ttl_seconds=5,
+        )
+        receipt = write_broker.stage_write(
+            write_grant,
+            self.worker_authorization,
+            content=content,
+            declared_sha256=write_grant.declared_sha256,
+        )
+        write_broker.finalize_write(
+            write_grant,
+            self.worker_authorization,
+            receipt,
+        )
+
+        self.clock.value = 105.0
+        with self.assertRaises(ArtifactGrantConsumed):
+            read_broker.redeem_read_grant(
+                read_grant,
+                _authorization(),
+            )
+        with self.assertRaises(ArtifactGrantConsumed):
+            write_broker.finalize_output_handle(
+                write_grant.output_handle,
+                self.worker_authorization,
+            )
+        self.clock.value = 104.0
+        restarted_read = ArtifactGrantBroker(
+            self.store,
+            authorization_verifier=self.authorization_verifier,
+            clock=self.clock,
+            recovery_journal=RemoteExecutionJournal(journal_path),
+        )
+        restarted_write = ArtifactGrantBroker(
+            self.store,
+            authorization_verifier=self.worker_gate,
+            clock=self.clock,
+            recovery_journal=RemoteExecutionJournal(journal_path),
+        )
+        with self.assertRaises(ArtifactGrantConsumed):
+            restarted_read.redeem_read_grant(
+                read_grant,
+                _authorization(),
+            )
+        with self.assertRaises(ArtifactGrantConsumed):
+            restarted_write.finalize_output_handle(
+                write_grant.output_handle,
+                self.worker_authorization,
+            )
 
 
 if __name__ == "__main__":

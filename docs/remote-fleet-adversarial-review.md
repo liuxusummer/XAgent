@@ -112,8 +112,9 @@ Store 线性化 guard 内再次检查 current registration。poll body 为空，
 - ready Run 的发现、周期投影、策略变更后的 rebuild 和 terminal reconcile 由部署的
   可信控制循环调用；本模块不隐式启动后台线程。
 - digest-only execution binding 已可跨重启从 Store/当前配置/新鲜 attestation 重建，
-  且不会从 Worker 候选结果恢复 bearer。Artifact grant/finalization registry 仍是
-  进程内状态，因此成功输出 completion 在 broker 重启后继续 fail closed。
+  且不会从 Worker 候选结果恢复 bearer。Artifact broker 只持久化 token digest、消费/
+  失败墓碑和 exact finalized ref；持有原 grant/handle 的 Worker 可跨 broker 重启完成
+  单次读取或成功 completion，但控制面仍不能重新发送 assignment/bearer。
 - 生产声明仍依赖真实 TLS-extension server、PKI/Workload Identity 和经过验证的
   Sandbox 部署。
 

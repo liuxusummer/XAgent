@@ -97,6 +97,8 @@ from src.orchestration import (
 - Store/scheduler resolver；
 - 位于独立 control-plane isolation root 的持久 `RemoteControlJournal`；
 - 位于同一受保护控制面根、独立文件的持久 `RemoteExecutionJournal`；
+- 将该 durable journal 显式注入 `ArtifactGrantBroker(recovery_journal=...)`，使
+  execution authority 与 Artifact grant/finalization 共享同一受保护恢复边界；
 - 生产部署所需的 server、pull、mTLS 和隔离适配器。
 
 ## 生产边界
@@ -105,8 +107,8 @@ from src.orchestration import (
 |---|---|---|
 | 协议 | 严格、有界、版本化 wire model；持久 request digest identity 与有界 response LRU 分离；严格 HTTPS/ASGI adapter、固定证书 pin identity 和 TLS 客户端 | 已验证的 TLS-extension server 部署、gRPC/queue、SPIFFE |
 | Session | 持久单调 epoch；当前 identity + instance 可跨重启恢复；被替换 instance 的 tombstone 防 A→B→A；启动时校验完整 schema/FK/integrity，首次建库原子发布 | journal 备份、跨服务认证会话续期与证书轮换运维 |
-| Execution recovery | digest-only authorization journal；重建 Store policy/plan/workload/runtime binding；start、heartbeat、取消及无输出终态可跨控制面重启 | 成功输出依赖的持久 Artifact grant/finalization registry |
-| Artifact | path-free grant、单次读取、受绑定的 staging/finalize、完整性复验、跨 Attempt 常驻字节硬上限、过期不可逆 | 远程对象服务、传输加密、持久 grant/staging/finalization registry |
+| Execution recovery | digest-only authorization journal；重建 Store policy/plan/workload/runtime binding；start、heartbeat、取消及有/无输出终态可跨控制面重启 | 自动重发 assignment、跨过 grant expiry 恢复 |
+| Artifact | path-free grant、跨进程单次读取 CAS、受绑定的 staging/finalize、token-digest-only 持久 registry、exact final-ref replay、完整性复验、硬容量与过期索引 | 远程对象服务、传输加密、durable staged bytes |
 | Sandbox | 限制性 OCI spec、精确 attestation/proof binding、缺证据 fail closed | 本机真实 gVisor/Kubernetes 部署与部署 attestation |
 | 调度 | 有界、确定性 tenant round-robin、quota、drain、session/generation 防 ABA；`poll_fleet` 端到端绑定服务端 Tool/Worker policy、资源、精确节点和 durable claim | 跨控制面共享 broker/共识队列、自动 Run discovery/rebuild 控制循环 |
 | 观测 | 低基数、best-effort、明确 `execution_truth=false` | 生产 exporter、告警与容量规划 |
@@ -122,12 +124,13 @@ from src.orchestration import (
   tombstone 不做不安全 TTL 淘汰，容量满时拒绝新请求/instance，需要运维在证明无活动
   authority 后迁移或轮换 control journal。
 - secure deployment 还必须注入受保护的持久 `RemoteExecutionJournal`。
-  `production_recovery_ready` 只在该 journal 与恢复 API ready 时成立。journal 仅保存
-  digest/fencing/verifier 谱系；重启后从 Store/当前可信配置/新鲜 attestation 重建，
-  不能从 untrusted completion 重建或重新发送 bearer。
-- reference broker 的 grant/staged/finalized registry 当前仍在进程内。控制面崩溃后
-  pre-restart output handle 不能恢复；已写但未被 Domain Event 引用的不可变 Artifact
-  只能由 GC 保守回收。
+  `production_recovery_ready` 只在 execution journal、broker durable registry 与恢复
+  API 都 ready 时成立。journal 只保存 authority/grant digest、safe canonical metadata、
+  consume/failure tombstone 和 exact final ref；重启后从 Store/当前可信配置/新鲜
+  attestation 重建，不能从 untrusted completion 重建或重新发送 bearer。
+- reference broker 不持久化 staged bytes。控制面在 ArtifactStore 写成功而 journal
+  commit 前崩溃时，可能留下未被 Domain Event 引用的 immutable Artifact，由 GC 保守
+  回收；若只有内存 staging，调用方必须在原 grant 有效期内重新发送内容。
 - `OciGvisorSandboxBackend` 只在注入 verifier 对当前 adapter、runtime class 和有效期
   返回精确 attestation 时暴露 `SecurityLevel.CONTAINER`。示例中的 HMAC proof 只证明
   绑定代码，不证明进程真的在 gVisor 中运行。

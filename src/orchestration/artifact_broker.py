@@ -27,6 +27,15 @@ from .artifacts import (
     ArtifactSensitivity,
     ArtifactStore,
 )
+from .remote_execution_journal import (
+    RemoteArtifactGrantConflict,
+    RemoteArtifactGrantUnavailable,
+    RemoteArtifactReadGrantRecord,
+    RemoteArtifactWriteGrantRecord,
+    RemoteExecutionJournal,
+    RemoteExecutionJournalCapacityError,
+    RemoteExecutionJournalError,
+)
 from .worker_security import WorkerAuthorization, WorkerAuthorizationVerifier
 
 ARTIFACT_BROKER_SCHEMA_VERSION = 1
@@ -98,6 +107,32 @@ def _canonical_digest(value: Any) -> str:
     except (TypeError, ValueError, OverflowError, RecursionError) as exc:
         raise ArtifactGrantDenied("invalid_broker_metadata") from exc
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_json(value: Any) -> str:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ArtifactGrantDenied("invalid_broker_metadata") from exc
+
+
+def _decode_canonical_object(value: str) -> dict[str, Any]:
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ArtifactGrantDenied("invalid_broker_metadata") from exc
+    if (
+        not isinstance(decoded, dict)
+        or _canonical_json(decoded) != value
+    ):
+        raise ArtifactGrantDenied("invalid_broker_metadata")
+    return decoded
 
 
 def _artifact_binding_digest(ref: ArtifactRef) -> str:
@@ -455,6 +490,135 @@ class ArtifactStagingReceipt:
         }
 
 
+_WRITE_GRANT_METADATA_KEYS = frozenset(
+    {
+        "schema_version",
+        "grant_id",
+        "tenant_id",
+        "worker_id",
+        "run_id",
+        "node_id",
+        "attempt_id",
+        "action_digest",
+        "authorization_digest",
+        "kind",
+        "sensitivity",
+        "media_type",
+        "maximum_bytes",
+        "declared_sha256",
+        "issued_at",
+        "expires_at",
+    }
+)
+_ARTIFACT_REF_KEYS = frozenset(
+    {
+        "schema_version",
+        "artifact_id",
+        "sha256",
+        "size",
+        "media_type",
+        "kind",
+        "uri",
+        "sensitivity",
+        "encryption",
+        "producer_run_id",
+        "producer_node_id",
+        "producer_attempt_id",
+        "encryption_key_ref",
+        "metadata",
+        "created_at",
+    }
+)
+
+
+def _read_grant_metadata(grant: ArtifactReadGrant) -> str:
+    payload = grant.to_wire_dict()
+    payload.pop("token")
+    return _canonical_json(payload)
+
+
+def _write_grant_metadata(grant: ArtifactWriteGrant) -> str:
+    payload = grant.to_wire_dict()
+    handle = payload.pop("handle")
+    if not isinstance(handle, dict):
+        raise ArtifactGrantDenied("invalid_artifact_write_grant")
+    payload["grant_id"] = handle.get("grant_id")
+    if set(payload) != _WRITE_GRANT_METADATA_KEYS:
+        raise ArtifactGrantDenied("invalid_artifact_write_grant")
+    return _canonical_json(payload)
+
+
+def _write_grant_from_metadata(
+    metadata: str,
+    *,
+    token: str,
+) -> ArtifactWriteGrant:
+    payload = _decode_canonical_object(metadata)
+    if set(payload) != _WRITE_GRANT_METADATA_KEYS:
+        raise ArtifactGrantDenied("invalid_artifact_write_grant")
+    grant = ArtifactWriteGrant(
+        grant_id=payload["grant_id"],
+        token=token,
+        tenant_id=payload["tenant_id"],
+        worker_id=payload["worker_id"],
+        run_id=payload["run_id"],
+        node_id=payload["node_id"],
+        attempt_id=payload["attempt_id"],
+        action_digest=payload["action_digest"],
+        authorization_digest=payload["authorization_digest"],
+        kind=payload["kind"],
+        sensitivity=payload["sensitivity"],
+        media_type=payload["media_type"],
+        maximum_bytes=payload["maximum_bytes"],
+        declared_sha256=payload["declared_sha256"],
+        issued_at=payload["issued_at"],
+        expires_at=payload["expires_at"],
+        schema_version=payload["schema_version"],
+    )
+    if _write_grant_metadata(grant) != metadata:
+        raise ArtifactGrantDenied("invalid_artifact_write_grant")
+    return grant
+
+
+def _artifact_ref_json(ref: ArtifactRef) -> str:
+    if not isinstance(ref, ArtifactRef):
+        raise ArtifactGrantDenied("invalid_artifact_reference")
+    return _canonical_json(ref.to_dict())
+
+
+def _artifact_ref_from_json(payload: str) -> ArtifactRef:
+    decoded = _decode_canonical_object(payload)
+    if set(decoded) != _ARTIFACT_REF_KEYS:
+        raise ArtifactGrantDenied("invalid_artifact_reference")
+    try:
+        ref = ArtifactRef.from_dict(decoded)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        raise ArtifactGrantDenied("invalid_artifact_reference") from None
+    if _artifact_ref_json(ref) != payload:
+        raise ArtifactGrantDenied("invalid_artifact_reference")
+    return ref
+
+
+def _staging_digest(
+    grant: ArtifactWriteGrant,
+    *,
+    sha256: str,
+    size: int,
+) -> str:
+    return _canonical_digest(
+        {
+            "schema": "artifact_write_staging_v1",
+            "grant_id": grant.grant_id,
+            "authorization_digest": grant.authorization_digest,
+            "action_digest": grant.action_digest,
+            "sha256": sha256,
+            "size": size,
+        }
+    )
+
+
 @dataclass(slots=True)
 class _GrantRecord:
     grant: ArtifactReadGrant
@@ -476,7 +640,7 @@ class _WriteGrantRecord:
 
 
 class ArtifactGrantBroker:
-    """In-memory one-time grant registry around a trusted ArtifactStore."""
+    """Bounded bearer-free grant registry around a trusted ArtifactStore."""
 
     def __init__(
         self,
@@ -488,6 +652,7 @@ class ArtifactGrantBroker:
         maximum_artifact_bytes: int = MAX_BROKER_ARTIFACT_BYTES,
         maximum_resident_bytes: int | None = None,
         maximum_active_grants: int = MAX_ACTIVE_GRANTS,
+        recovery_journal: RemoteExecutionJournal | None = None,
     ) -> None:
         if not isinstance(store, ArtifactStore):
             raise ArtifactGrantDenied("invalid_artifact_store")
@@ -529,10 +694,40 @@ class ArtifactGrantBroker:
         ):
             raise ArtifactGrantDenied("invalid_active_grant_limit")
         self._maximum_active_grants = maximum_active_grants
+        if recovery_journal is not None and not isinstance(
+            recovery_journal,
+            RemoteExecutionJournal,
+        ):
+            raise ArtifactGrantDenied("invalid_grant_registry")
+        self._recovery_journal = recovery_journal or RemoteExecutionJournal(
+            maximum_artifact_grants=maximum_active_grants,
+        )
         self._lock = threading.Lock()
         self._grants: dict[str, _GrantRecord] = {}
         self._write_grants: dict[str, _WriteGrantRecord] = {}
         self._resident_bytes = 0
+
+    @property
+    def durable_recovery_ready(self) -> bool:
+        return self._recovery_journal.durable
+
+    def purge_expired_grants(self) -> int:
+        """Remove expired durable tombstones without weakening replay safety."""
+
+        now = _timestamp(self._clock())
+        try:
+            removed = (
+                self._recovery_journal.purge_expired_artifact_grants(
+                    now=now
+                )
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except RemoteExecutionJournalError:
+            raise ArtifactGrantDenied("grant_registry_unavailable") from None
+        with self._lock:
+            self._purge_locked(now)
+        return removed
 
     def issue_read_grant(
         self,
@@ -611,6 +806,11 @@ class ArtifactGrantBroker:
             issued_at=now,
             expires_at=expires_at,
         )
+        record = _GrantRecord(
+            grant=grant,
+            ref=ref,
+            token_digest=token_digest,
+        )
         with self._lock:
             self._purge_locked(now)
             if (
@@ -618,11 +818,43 @@ class ArtifactGrantBroker:
                 >= self._maximum_active_grants
             ):
                 raise ArtifactGrantDenied("active_grant_limit_reached")
-            self._grants[grant.grant_id] = _GrantRecord(
-                grant=grant,
-                ref=ref,
-                token_digest=token_digest,
+            self._grants[grant.grant_id] = record
+        try:
+            persisted = self._recovery_journal.record_read_grant(
+                RemoteArtifactReadGrantRecord(
+                    grant_id=grant.grant_id,
+                    token_digest=token_digest,
+                    grant_metadata=_read_grant_metadata(grant),
+                    artifact_ref=_artifact_ref_json(ref),
+                    state="issued",
+                    expires_at=grant.expires_at,
+                    updated_at=now,
+                )
             )
+            if persisted.state != "issued":
+                raise RemoteArtifactGrantConflict(
+                    "read_grant_conflict"
+                )
+        except (KeyboardInterrupt, SystemExit):
+            with self._lock:
+                if self._grants.get(grant.grant_id) is record:
+                    self._grants.pop(grant.grant_id, None)
+            raise
+        except RemoteExecutionJournalCapacityError:
+            with self._lock:
+                if self._grants.get(grant.grant_id) is record:
+                    self._grants.pop(grant.grant_id, None)
+            raise ArtifactGrantDenied("active_grant_limit_reached") from None
+        except RemoteArtifactGrantConflict:
+            with self._lock:
+                if self._grants.get(grant.grant_id) is record:
+                    self._grants.pop(grant.grant_id, None)
+            raise ArtifactGrantDenied("grant_binding_mismatch") from None
+        except RemoteExecutionJournalError:
+            with self._lock:
+                if self._grants.get(grant.grant_id) is record:
+                    self._grants.pop(grant.grant_id, None)
+            raise ArtifactGrantDenied("grant_registry_unavailable") from None
         return grant
 
     def redeem_read_grant(
@@ -635,40 +867,52 @@ class ArtifactGrantBroker:
         if not isinstance(authorization, WorkerAuthorization):
             raise ArtifactGrantDenied("invalid_worker_authorization")
         now = _timestamp(self._clock())
+        token_digest = hashlib.sha256(
+            grant.token.encode("utf-8")
+        ).hexdigest()
+        if now >= grant.expires_at:
+            self._consume_durable_read_grant(
+                grant,
+                token_digest=token_digest,
+                now=now,
+            )
+            raise ArtifactGrantConsumed("grant_unavailable")
         self._verify_authorization(authorization, now)
+        if (
+            now >= authorization.expires_at
+            or authorization.worker_id != grant.worker_id
+            or authorization.tenant_id != grant.tenant_id
+            or authorization.run_id != grant.run_id
+            or authorization.attempt_id != grant.attempt_id
+            or authorization.action_digest != grant.action_digest
+            or authorization.authorization_digest
+            != grant.authorization_digest
+        ):
+            raise ArtifactGrantDenied("authorization_binding_mismatch")
+        durable = self._consume_durable_read_grant(
+            grant,
+            token_digest=token_digest,
+            now=now,
+        )
+        ref = _artifact_ref_from_json(durable.artifact_ref)
+        descriptor = grant.descriptor
+        assert descriptor is not None
+        if (
+            _artifact_binding_digest(ref) != grant.artifact_binding_digest
+            or ArtifactDescriptor.from_ref(ref) != descriptor
+        ):
+            raise ArtifactGrantDenied("grant_binding_mismatch")
+        # Consume before bytes leave the trusted boundary.  Any subsequent
+        # failure requires a newly authorized grant instead of replay.
         with self._lock:
             record = self._grants.get(grant.grant_id)
-            if record is None or record.consumed or now >= record.grant.expires_at:
-                self._grants.pop(grant.grant_id, None)
-                raise ArtifactGrantConsumed("grant_unavailable")
-            if not hmac.compare_digest(
-                record.token_digest,
-                hashlib.sha256(grant.token.encode("utf-8")).hexdigest(),
-            ):
-                raise ArtifactGrantDenied("grant_binding_mismatch")
-            if record.grant != grant:
-                raise ArtifactGrantDenied("grant_binding_mismatch")
-            if (
-                now >= authorization.expires_at
-                or authorization.worker_id != grant.worker_id
-                or authorization.tenant_id != grant.tenant_id
-                or authorization.run_id != grant.run_id
-                or authorization.attempt_id != grant.attempt_id
-                or authorization.action_digest != grant.action_digest
-                or authorization.authorization_digest
-                != grant.authorization_digest
-                or _artifact_binding_digest(record.ref)
-                != grant.artifact_binding_digest
-            ):
-                raise ArtifactGrantDenied("authorization_binding_mismatch")
-            # Consume before bytes leave the trusted boundary.  Any subsequent
-            # failure requires a newly authorized grant instead of replay.
-            record.consumed = True
+            if record is not None:
+                record.consumed = True
 
         try:
-            if not self._store.verify(record.ref):
+            if not self._store.verify(ref):
                 raise ArtifactGrantDenied("artifact_integrity_failed")
-            content = self._store.read(record.ref)
+            content = self._store.read(ref)
         except (KeyboardInterrupt, SystemExit):
             raise
         except ArtifactIntegrityError:
@@ -678,8 +922,6 @@ class ArtifactGrantBroker:
         except BaseException:
             # Never chain a Store exception that could contain an absolute path.
             raise ArtifactGrantDenied("artifact_read_failed") from None
-        descriptor = grant.descriptor
-        assert descriptor is not None
         if (
             len(content) != descriptor.size
             or hashlib.sha256(content).hexdigest() != descriptor.sha256
@@ -778,6 +1020,10 @@ class ArtifactGrantBroker:
             issued_at=now,
             expires_at=expires_at,
         )
+        record = _WriteGrantRecord(
+            grant=grant,
+            token_digest=token_digest,
+        )
         with self._lock:
             self._purge_locked(now)
             if (
@@ -785,10 +1031,44 @@ class ArtifactGrantBroker:
                 >= self._maximum_active_grants
             ):
                 raise ArtifactGrantDenied("active_grant_limit_reached")
-            self._write_grants[grant.grant_id] = _WriteGrantRecord(
-                grant=grant,
-                token_digest=token_digest,
+            self._write_grants[grant.grant_id] = record
+        try:
+            persisted = self._recovery_journal.record_write_grant(
+                RemoteArtifactWriteGrantRecord(
+                    grant_id=grant.grant_id,
+                    token_digest=token_digest,
+                    grant_metadata=_write_grant_metadata(grant),
+                    state="issued",
+                    staging_digest=None,
+                    final_ref=None,
+                    expires_at=grant.expires_at,
+                    updated_at=now,
+                )
             )
+            if persisted.state != "issued":
+                raise RemoteArtifactGrantConflict(
+                    "write_grant_conflict"
+                )
+        except (KeyboardInterrupt, SystemExit):
+            with self._lock:
+                if self._write_grants.get(grant.grant_id) is record:
+                    self._write_grants.pop(grant.grant_id, None)
+            raise
+        except RemoteExecutionJournalCapacityError:
+            with self._lock:
+                if self._write_grants.get(grant.grant_id) is record:
+                    self._write_grants.pop(grant.grant_id, None)
+            raise ArtifactGrantDenied("active_grant_limit_reached") from None
+        except RemoteArtifactGrantConflict:
+            with self._lock:
+                if self._write_grants.get(grant.grant_id) is record:
+                    self._write_grants.pop(grant.grant_id, None)
+            raise ArtifactGrantDenied("grant_binding_mismatch") from None
+        except RemoteExecutionJournalError:
+            with self._lock:
+                if self._write_grants.get(grant.grant_id) is record:
+                    self._write_grants.pop(grant.grant_id, None)
+            raise ArtifactGrantDenied("grant_registry_unavailable") from None
         return grant
 
     def stage_write(
@@ -809,7 +1089,16 @@ class ArtifactGrantBroker:
             raise ArtifactGrantDenied("write_payload_must_be_bytes")
         token_digest = hashlib.sha256(grant.token.encode("utf-8")).hexdigest()
         now = _timestamp(self._clock())
-        self._observe_write_grant_expiry(grant.grant_id, now=now)
+        self._observe_write_grant_expiry(
+            grant.grant_id,
+            token_digest=token_digest,
+            now=now,
+        )
+        self._recover_write_record(
+            grant.grant_id,
+            token=grant.token,
+            now=now,
+        )
         self._verify_authorization(authorization, now)
         # Reject a stolen or cross-Action grant before hashing attacker-sized
         # content.  State is checked again after hashing to close stage races.
@@ -829,15 +1118,10 @@ class ArtifactGrantBroker:
         content_digest = hashlib.sha256(content).hexdigest()
         if content_digest != declared_digest:
             raise ArtifactGrantDenied("artifact_digest_mismatch")
-        staging_digest = _canonical_digest(
-            {
-                "schema": "artifact_write_staging_v1",
-                "grant_id": grant.grant_id,
-                "authorization_digest": grant.authorization_digest,
-                "action_digest": grant.action_digest,
-                "sha256": content_digest,
-                "size": len(content),
-            }
+        staging_digest = _staging_digest(
+            grant,
+            sha256=content_digest,
+            size=len(content),
         )
         receipt = ArtifactStagingReceipt(
             grant_id=grant.grant_id,
@@ -869,6 +1153,16 @@ class ArtifactGrantBroker:
             raise ArtifactGrantDenied("invalid_output_handle")
         token_digest = hashlib.sha256(handle.token.encode("utf-8")).hexdigest()
         now = _timestamp(self._clock())
+        self._observe_write_grant_expiry(
+            handle.grant_id,
+            token_digest=token_digest,
+            now=now,
+        )
+        self._recover_write_record(
+            handle.grant_id,
+            token=handle.token,
+            now=now,
+        )
         with self._lock:
             record = self._live_write_record_locked(handle.grant_id, now=now)
             if record.state not in {"issued", "staged"}:
@@ -896,7 +1190,16 @@ class ArtifactGrantBroker:
             raise ArtifactGrantDenied("invalid_staging_receipt")
         token_digest = hashlib.sha256(grant.token.encode("utf-8")).hexdigest()
         now = _timestamp(self._clock())
-        self._observe_write_grant_expiry(grant.grant_id, now=now)
+        self._observe_write_grant_expiry(
+            grant.grant_id,
+            token_digest=token_digest,
+            now=now,
+        )
+        self._recover_write_record(
+            grant.grant_id,
+            token=grant.token,
+            now=now,
+        )
         self._verify_authorization(authorization, now)
         return self._finalize_trusted_write(
             grant,
@@ -919,7 +1222,16 @@ class ArtifactGrantBroker:
             raise ArtifactGrantDenied("invalid_worker_authorization")
         token_digest = hashlib.sha256(handle.token.encode("utf-8")).hexdigest()
         now = _timestamp(self._clock())
-        self._observe_write_grant_expiry(handle.grant_id, now=now)
+        self._observe_write_grant_expiry(
+            handle.grant_id,
+            token_digest=token_digest,
+            now=now,
+        )
+        record = self._recover_write_record(
+            handle.grant_id,
+            token=handle.token,
+            now=now,
+        )
         self._verify_authorization(authorization, now)
         with self._lock:
             record = self._write_record_for_handle_locked(
@@ -929,9 +1241,18 @@ class ArtifactGrantBroker:
                 token_digest=token_digest,
             )
             grant = record.grant
+            if record.state == "finalized":
+                if record.final_ref is None:
+                    raise ArtifactGrantDenied("finalized_ref_missing")
+                final_ref = record.final_ref
+            else:
+                final_ref = None
             staging_receipt = record.staging_receipt
-            if staging_receipt is None:
+            if final_ref is None and staging_receipt is None:
                 raise ArtifactGrantDenied("write_grant_not_staged")
+        if final_ref is not None:
+            return self._verified_final_ref(grant, final_ref)
+        assert staging_receipt is not None
         return self._finalize_trusted_write(
             grant,
             authorization,
@@ -949,6 +1270,7 @@ class ArtifactGrantBroker:
         now: float,
         token_digest: str,
     ) -> ArtifactRef:
+        staging_integrity_failed = False
         with self._lock:
             record = self._write_record_locked(
                 grant,
@@ -974,14 +1296,25 @@ class ArtifactGrantBroker:
                 ):
                     record.state = "failed"
                     self._release_content_locked(record)
-                    raise ArtifactGrantDenied("staging_integrity_failed")
-                # Claim finalization before crossing the trusted Store boundary.
-                record.state = "finalizing"
-                record.store_write_in_flight = True
-                final_ref = None
+                    staging_integrity_failed = True
+                    final_ref = None
+                    content = None
+                else:
+                    # Claim finalization before crossing the trusted Store
+                    # boundary.
+                    record.state = "finalizing"
+                    record.store_write_in_flight = True
+                    final_ref = None
             else:
                 raise ArtifactGrantConsumed("write_grant_unavailable")
 
+        if staging_integrity_failed:
+            self._persist_write_failure(
+                grant.grant_id,
+                token_digest=token_digest,
+                now=_timestamp(self._clock()),
+            )
+            raise ArtifactGrantDenied("staging_integrity_failed")
         if final_ref is not None:
             return self._verified_final_ref(grant, final_ref)
         assert content is not None
@@ -1010,11 +1343,62 @@ class ArtifactGrantBroker:
         except ArtifactGrantDenied:
             with self._lock:
                 self._fail_finalization_locked(record)
+            self._persist_write_failure(
+                grant.grant_id,
+                token_digest=token_digest,
+                now=_timestamp(self._clock()),
+            )
             raise
         except BaseException:
             with self._lock:
                 self._fail_finalization_locked(record)
+            self._persist_write_failure(
+                grant.grant_id,
+                token_digest=token_digest,
+                now=_timestamp(self._clock()),
+            )
             raise ArtifactGrantDenied("artifact_write_failed") from None
+        try:
+            finalized_at = _timestamp(self._clock())
+            durable = self._recovery_journal.finalize_write_grant(
+                grant_id=grant.grant_id,
+                token_digest=token_digest,
+                grant_metadata=_write_grant_metadata(grant),
+                staging_digest=staging_receipt.staging_digest,
+                final_ref=_artifact_ref_json(ref),
+                now=finalized_at,
+            )
+            if durable.final_ref is None:
+                raise RemoteArtifactGrantConflict(
+                    "write_finalization_conflict"
+                )
+            durable_ref = _artifact_ref_from_json(durable.final_ref)
+            if durable_ref != ref:
+                raise RemoteArtifactGrantConflict(
+                    "write_finalization_conflict"
+                )
+        except (KeyboardInterrupt, SystemExit):
+            with self._lock:
+                self._fail_finalization_locked(record)
+            raise
+        except RemoteArtifactGrantUnavailable:
+            with self._lock:
+                self._fail_finalization_locked(record)
+            raise ArtifactGrantConsumed(
+                "write_grant_unavailable"
+            ) from None
+        except RemoteArtifactGrantConflict:
+            with self._lock:
+                self._fail_finalization_locked(record)
+            raise ArtifactGrantDenied("grant_binding_mismatch") from None
+        except ArtifactGrantDenied:
+            with self._lock:
+                self._fail_finalization_locked(record)
+            raise
+        except RemoteExecutionJournalError:
+            with self._lock:
+                self._retry_finalization_locked(record)
+            raise ArtifactGrantDenied("grant_registry_unavailable") from None
         with self._lock:
             if record.state != "finalizing":
                 record.store_write_in_flight = False
@@ -1143,6 +1527,147 @@ class ArtifactGrantBroker:
             raise ArtifactGrantDenied("authorization_binding_mismatch")
         return record
 
+    def _recover_write_record(
+        self,
+        grant_id: str,
+        *,
+        token: str,
+        now: float,
+    ) -> _WriteGrantRecord:
+        token_digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with self._lock:
+            existing = self._write_grants.get(grant_id)
+            if existing is not None:
+                if not hmac.compare_digest(
+                    existing.token_digest,
+                    token_digest,
+                ):
+                    raise ArtifactGrantDenied("grant_binding_mismatch")
+                return existing
+        try:
+            durable = self._recovery_journal.get_write_grant(
+                grant_id=grant_id,
+                token_digest=token_digest,
+                now=now,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except RemoteArtifactGrantUnavailable:
+            raise ArtifactGrantConsumed(
+                "write_grant_unavailable"
+            ) from None
+        except RemoteArtifactGrantConflict:
+            raise ArtifactGrantDenied("grant_binding_mismatch") from None
+        except RemoteExecutionJournalError:
+            raise ArtifactGrantDenied("grant_registry_unavailable") from None
+        grant = _write_grant_from_metadata(
+            durable.grant_metadata,
+            token=token,
+        )
+        if (
+            grant.grant_id != grant_id
+            or grant.expires_at != durable.expires_at
+        ):
+            raise ArtifactGrantDenied("grant_binding_mismatch")
+        if now >= grant.expires_at:
+            raise ArtifactGrantConsumed("write_grant_unavailable")
+        final_ref: ArtifactRef | None = None
+        staging_receipt: ArtifactStagingReceipt | None = None
+        if durable.state == "finalized":
+            if (
+                durable.final_ref is None
+                or durable.staging_digest is None
+            ):
+                raise ArtifactGrantDenied("finalized_ref_missing")
+            final_ref = _artifact_ref_from_json(durable.final_ref)
+            if durable.staging_digest != _staging_digest(
+                grant,
+                sha256=final_ref.sha256,
+                size=final_ref.size,
+            ):
+                raise ArtifactGrantDenied("staging_binding_mismatch")
+            staging_receipt = ArtifactStagingReceipt(
+                grant_id=grant.grant_id,
+                sha256=final_ref.sha256,
+                size=final_ref.size,
+                staging_digest=durable.staging_digest,
+            )
+        recovered = _WriteGrantRecord(
+            grant=grant,
+            token_digest=token_digest,
+            state=durable.state,
+            staging_receipt=staging_receipt,
+            final_ref=final_ref,
+        )
+        with self._lock:
+            existing = self._write_grants.get(grant_id)
+            if existing is not None:
+                if (
+                    existing.grant != grant
+                    or not hmac.compare_digest(
+                        existing.token_digest,
+                        token_digest,
+                    )
+                ):
+                    raise ArtifactGrantDenied("grant_binding_mismatch")
+                return existing
+            self._purge_locked(now)
+            if (
+                len(self._grants) + len(self._write_grants)
+                >= self._maximum_active_grants
+            ):
+                raise ArtifactGrantDenied("active_grant_limit_reached")
+            self._write_grants[grant_id] = recovered
+            return recovered
+
+    def _consume_durable_read_grant(
+        self,
+        grant: ArtifactReadGrant,
+        *,
+        token_digest: str,
+        now: float,
+    ) -> RemoteArtifactReadGrantRecord:
+        try:
+            return self._recovery_journal.consume_read_grant(
+                grant_id=grant.grant_id,
+                token_digest=token_digest,
+                grant_metadata=_read_grant_metadata(grant),
+                expires_at=grant.expires_at,
+                now=now,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except RemoteArtifactGrantUnavailable:
+            raise ArtifactGrantConsumed("grant_unavailable") from None
+        except RemoteArtifactGrantConflict:
+            raise ArtifactGrantDenied("grant_binding_mismatch") from None
+        except RemoteExecutionJournalError:
+            raise ArtifactGrantDenied("grant_registry_unavailable") from None
+
+    def _persist_write_failure(
+        self,
+        grant_id: str,
+        *,
+        token_digest: str,
+        now: float,
+    ) -> None:
+        try:
+            self._recovery_journal.fail_write_grant(
+                grant_id=grant_id,
+                token_digest=token_digest,
+                now=now,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except RemoteArtifactGrantConflict:
+            raise ArtifactGrantDenied("grant_binding_mismatch") from None
+        except RemoteArtifactGrantUnavailable:
+            raise ArtifactGrantConsumed(
+                "write_grant_unavailable"
+            ) from None
+        except RemoteExecutionJournalError:
+            raise ArtifactGrantDenied("grant_registry_unavailable") from None
+
     def _verify_authorization(
         self,
         authorization: WorkerAuthorization,
@@ -1181,13 +1706,34 @@ class ArtifactGrantBroker:
         self,
         grant_id: str,
         *,
+        token_digest: str,
         now: float,
     ) -> None:
+        expired = False
         with self._lock:
             record = self._write_grants.get(grant_id)
             if record is not None and now >= record.grant.expires_at:
                 self._expire_write_record_locked(record)
-                raise ArtifactGrantConsumed("write_grant_unavailable")
+                expired = True
+        if not expired:
+            return
+        try:
+            self._recovery_journal.get_write_grant(
+                grant_id=grant_id,
+                token_digest=token_digest,
+                now=now,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except RemoteArtifactGrantUnavailable:
+            raise ArtifactGrantConsumed(
+                "write_grant_unavailable"
+            ) from None
+        except RemoteArtifactGrantConflict:
+            raise ArtifactGrantDenied("grant_binding_mismatch") from None
+        except RemoteExecutionJournalError:
+            raise ArtifactGrantDenied("grant_registry_unavailable") from None
+        raise ArtifactGrantConsumed("write_grant_unavailable")
 
     def _retain_content_locked(
         self,
@@ -1222,6 +1768,13 @@ class ArtifactGrantBroker:
         if record.state != "expired":
             record.state = "failed"
         self._release_content_locked(record)
+
+    def _retry_finalization_locked(self, record: _WriteGrantRecord) -> None:
+        record.store_write_in_flight = False
+        if record.state == "expired":
+            self._release_content_locked(record)
+        else:
+            record.state = "staged"
 
     def _purge_locked(self, now: float) -> None:
         stale = [

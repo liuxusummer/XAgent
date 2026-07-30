@@ -1,6 +1,6 @@
 # Remote Execution Authority Recovery
 
-> 状态：digest-only control-plane recovery 已实现
+> 状态：digest-only execution authority 与 bearer-free Artifact grant recovery 已实现
 > 依赖：`distributed-execution-adr.md`、`durable-orchestration-spec.md`
 
 ## 1. 问题
@@ -19,7 +19,8 @@ completion 之前重启。Domain Store 能恢复 claim/lease/fencing，但旧实
 ## 2. 决策
 
 控制面在返回 assignment 前，向独立的 `RemoteExecutionJournal` 原子写入一条不可变、
-digest-only 的 authorization binding。记录精确绑定：
+digest-only 的 authorization binding。schema v2 还为 Artifact broker 增加两种有界
+记录：
 
 ```text
 run / node / attempt / fencing generation
@@ -30,13 +31,21 @@ action / worker authorization / profile / request digest
 grant binding / execution plan / runtime attestation digest
 runtime verifier id / security level
 created_at
+
+read grant:
+grant id / token digest / canonical safe metadata / trusted ArtifactRef
+issued | consumed / expires_at
+
+write grant:
+grant id / token digest / canonical safe metadata
+issued | finalized | failed / staging digest / final ArtifactRef / expires_at
 ```
 
 记录明确不包含：
 
 ```text
 claim token plaintext
-Artifact bearer token
+Artifact bearer token（只保存 SHA-256 digest）
 input/output content
 script bytes
 environment values
@@ -46,7 +55,9 @@ raw execution plan / argv
 
 SQLite 位于 Worker 不可访问的 control-plane isolation root。首次创建使用同目录临时库、
 完整事务、`fsync` 和 no-clobber hard link 原子发布；数据库与 bootstrap lock 必须是
-`0600` 普通文件，symlink、宽权限、未知/残缺 schema、integrity failure 均拒绝启动。
+`0600` 普通文件，symlink、宽权限、未知/残缺 schema、额外 trigger/view/index、
+integrity failure 均拒绝启动。既有精确 v1 schema 在一个 SQLite transaction 内迁移到
+v2；半迁移状态不会被自动补齐。
 
 ## 3. 恢复算法
 
@@ -64,11 +75,22 @@ SQLite 位于 Worker 不可访问的 control-plane isolation root。首次创建
 6. 重新做 runtime attestation，并要求 digest、verifier id 和强隔离等级与 journal
    一致；
 7. 重建 `ExecutionAuthorizationBinding`。该对象只有摘要和 execution plan，不能序列化
-   成新 assignment，也不能签发/重放 Artifact bearer。
+   成新 assignment，也不能签发 Artifact bearer。Worker 必须持有原 assignment 中的
+   grant/handle；控制面只按 token digest 验证它。
 
 任一步不一致均 fail closed，Domain Store 不发生 completion mutation。
 
-## 4. 当前可恢复范围
+Artifact 的独立线性化点为：
+
+- read：authorization 校验后，SQLite `issued → consumed` CAS 先提交，之后才读取字节；
+  响应丢失不会使 one-time grant 可重放；
+- write：ArtifactStore 返回并通过完整 binding/integrity 校验后，SQLite 才将
+  `issued → finalized`，保存 exact final ref；Domain completion 只接受该 ref；
+- Store 已写、journal 未提交时崩溃只留下未引用的 immutable orphan，不产生伪造
+  completion；journal 已提交、响应未返回时，重启可重放 exact final ref；
+- Store/验证失败会持久化 `failed` tombstone，进程重启或时钟回拨均不能复活授权。
+
+## 4. 当前可恢复范围与边界
 
 | 操作/结果 | 重启后状态 | 原因 |
 |---|---|---|
@@ -77,52 +99,64 @@ SQLite 位于 Worker 不可访问的 control-plane isolation root。首次创建
 | failed / timed out / abandoned / outcome unknown | 可恢复 | 不携带 output handle |
 | cancellation acknowledgement | 可恢复 | signed empty-output receipt 可重新验证 |
 | terminal response replay | 可恢复 | 直接使用 Store 的 Receipt/Event evidence |
-| successful completion with pre-restart output handle | fail closed | bearer→final `ArtifactRef` registry 尚未持久化 |
-| input grant 在 broker 重启后首次兑换 | fail closed | one-time read grant registry 尚未持久化 |
+| successful completion with pre-restart output handle | 可恢复 | Worker 持有原 handle；broker 只按 token digest 重放 exact finalized `ArtifactRef` |
+| input grant 在 broker 重启后首次兑换 | 可恢复一次 | durable `issued → consumed` CAS 跨进程保持单次语义 |
+| Store 写入后、finalization journal 前崩溃 | 不猜测结果 | 只产生可 GC orphan；原 grant 保持 issued，持有原内容的一方可在有效期内重试 |
+| 只完成内存 staging、尚未写 Store 就崩溃 | staging 丢失 | journal 不保存 Artifact bytes；调用方必须重新 stage 原内容 |
 | 重新发送 assignment | 禁止 | digest-only binding 不包含 bearer token |
 
-因此本阶段提升了长任务控制与无输出终态的可用性，但没有谎称完整 output recovery。
-下一阶段必须实现持久、token-digest-only 的 Artifact grant/finalization registry；在此
-之前，旧 output handle 返回 `write_grant_unavailable`，Attempt 保持 RUNNING 并由
-effect-class recovery 收敛。
+`SecureRemoteAssignmentAdmitter.stage_output()` 在把 handle 返回给 Worker 前已完成 Store
+写入与 durable finalization，因此“Worker 已拿到 output handle”不会落入仅内存 staging
+窗口。该机制不把 bearer 复制回控制面，也不承诺任意外部 ArtifactStore 的 exactly-once
+写入；跨进程重复写必须由 immutable/content-addressed Store 幂等吸收。
 
 ## 5. 生命周期与容量
 
-Journal row 不按 TTL/LRU 淘汰活跃 authority。达到硬上限时拒绝新 assignment，不删除旧
-证据。正常终态提交后 best-effort 删除对应 generation；若进程在终态 commit 与清理之间
-崩溃，运维控制循环调用 `reconcile_recovery_journal()`：
+Execution journal row 不按 TTL/LRU 淘汰活跃 authority。达到硬上限时拒绝新 assignment，
+不删除旧证据。正常终态提交后 best-effort 删除对应 generation；若进程在终态 commit 与
+清理之间崩溃，运维控制循环调用 `reconcile_recovery_journal()`：
 
 - exact claim token digest 与 fencing 仍 active：保留；
 - Attempt terminal/缺失，或 generation 已被 durable fencing：删除；
 - Store/journal 不可用：失败退出，不猜测。
 
-`RemoteControlPlane.production_recovery_ready` 只有在 security path、持久 session journal、
-持久 execution journal 和 recovery API 同时 ready 时才为 `true`。
+Artifact consumed/finalized/failed tombstone 在 grant 严格 expiry 前保留，防止时钟回拨
+复活。读写共用硬记录上限，不做 LRU；容量满时拒绝签发。过期列有受 schema 校验的索引，
+签发会清理过期记录，运维也可显式调用 `ArtifactGrantBroker.purge_expired_grants()`。
+
+`RemoteControlPlane.production_recovery_ready` 只有在 security path、持久 session
+journal、持久 execution journal、持久 Artifact broker registry 和 recovery API 同时
+ready 时才为 `true`。
 
 ## 6. 对抗性审查
 
-### Round 1：文件系统与 schema
+### Round 1：bearer secrecy 与 replay/CAS
 
-发现并关闭 bootstrap lock symlink、SQLite 宽权限和 partial schema 风险。数据库/lock
-强制普通文件与 `0600`；既有未知表、缺表或损坏 schema 不自动修补。
+逐文件扫描 main DB/WAL/SHM，证明 read/write bearer canary 从未落盘；并发的两个 journal
+实例只能有一个成功执行 read CAS。consumed/failed tombstone 在 expiry 前不可重新签发，
+wrong token 或 canonical metadata 漂移均 fail closed。
 
-### Round 2：容量与回收
+### Round 2：崩溃窗口与并发 finalization
 
-发现如果只依赖进程内 `_drop_prepared()`，终态后崩溃会残留 row 并最终耗尽容量。加入
-显式 Store-backed reconciliation；活跃 row 不做 LRU/TTL 淘汰。
+覆盖 Store 前、Store 后 journal 前、journal commit 后 response 前和 Domain commit 前
+窗口。journal commit 后注入进程退出，新 broker 不做第二次 Store 写即可恢复 exact ref；
+Store 失败 tombstone 跨重启仍不可逆。多线程 finalization 最多产生一个进程内 Store
+调用，跨进程 exact mapping 由 SQLite CAS/idempotent compare 收敛。
 
-### Round 3：bearer 复活与授权漂移
+### Round 3：schema、容量、时钟与锁
 
-证明 digest-only recovery 不具有 `input_grants`/`output_grants`，不能生成 assignment。
-伪造 grant digest、session、identity、action、plan、runtime attestation 或 policy
-reconstruction 任一字段均拒绝。专项测试还证明：即使 Artifact bytes 已写入不可变 Store，
-新 broker 也不会仅凭旧 output handle 猜测或重建 `ArtifactRef`。
+发现并修复 expiry 清理的无索引扫描，以及“transaction 内删除后抛异常导致删除回滚、
+时钟回拨可复活 grant”的 P0；过期删除现在先提交再返回固定拒绝。v2 精确校验索引并拒绝
+额外 trigger/view。硬容量不淘汰未过期 tombstone。Broker 的 SQLite/Store I/O 均在进程
+全局锁外；本地热路径只在 cache miss 读取 journal。伪造 grant、session、authorization、
+staging digest 或 final ref 任一绑定均拒绝。
 
 ## 7. 验证
 
 ```bash
 .venv/bin/python -m unittest -q \
   tests.test_orchestration_remote_execution_journal \
+  tests.test_orchestration_artifact_broker \
   tests.test_orchestration_worker_security \
   tests.test_orchestration_remote_execution \
   tests.test_orchestration_remote_protocol
@@ -130,10 +164,13 @@ reconstruction 任一字段均拒绝。专项测试还证明：即使 Artifact b
 
 关键证据：
 
-- journal 重启、并发 publish、generation 隔离、容量、权限/symlink/schema；
+- journal v1→v2 原子迁移、并发 publish/CAS、generation 隔离、容量、权限/symlink/
+  schema/index/trigger；
 - 新 Gate 对同一 workload/session/action lineage 生成相同 authorization digest；
 - 全新 Gate/Broker/Admitter 接受运行中失败终态；
 - control-plane 端到端重启后接受 exact signed failure；
 - Worker 篡改 journal-bound digest 被拒绝；
-- pre-restart output bearer 在新 broker 上保持 fail closed；
+- pre-restart read grant 只能兑换一次，finalized output handle 重放 exact ref；
+- bearer canary 不出现在 SQLite main/WAL/SHM；
+- finalization commit 后崩溃不触发第二次 Store 写，Store 失败 tombstone 跨重启；
 - terminal crash residue 由 Store-backed reconciliation 清理。

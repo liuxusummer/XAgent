@@ -780,9 +780,12 @@ class SecureRemoteAssignmentAdmitter:
 
     @property
     def durable_recovery_ready(self) -> bool:
-        """Whether issued claim authority survives a control-plane restart."""
+        """Whether claim and Artifact authority survive process restart."""
 
-        return self.recovery_journal.durable
+        return (
+            self.recovery_journal.durable
+            and self.artifact_broker.durable_recovery_ready
+        )
 
     def reconcile_recovery_journal(
         self,

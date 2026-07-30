@@ -37,7 +37,7 @@ gVisor 隔离。
 | R13 | 满足 | `test_r13_capacity_one_concurrent_poll_claims_at_most_one` | 16 个并发 poll 攻击 capacity=1 Worker；最多一个 assignment，active_count 精确为 1。 |
 | R14 | 满足 | `test_r14_tenant_quota_race_never_crosses_tenant_or_quota` | 两个 tenant-a Worker 与一个 tenant-b Worker 并发 poll；tenant active 均不超过 quota=1，assignment tenant 必须属于 Worker 授权集合。 |
 | R15 | 满足 | `test_r15_hot_tenant_cannot_starve_an_eligible_tenant` | 热 tenant 每轮补充任务；持续 eligible 的 tenant-b 在前两个选择内获得一次服务。 |
-| R16 | 满足（reference 边界） | `test_r16_expired_or_wrongly_bound_grant_leaks_no_bytes_or_refs` | read grant 的错 Worker 绑定和严格 expiry 均拒绝 redeem；write grant 的错 Worker stage 和过期 output handle 也 fail closed。没有返回 ArtifactPayload、暂存输出或新增 Domain Event/Attempt result。 |
+| R16 | 满足（reference 边界） | `test_r16_expired_or_wrongly_bound_grant_leaks_no_bytes_or_refs` | read grant 的错 Worker 绑定和严格 expiry 均拒绝 redeem；write grant 的错 Worker stage 和过期 output handle 也 fail closed。没有返回 ArtifactPayload、暂存输出或新增 Domain Event/Attempt result。专项 broker/journal 测试另证明跨进程 read CAS 仍仅成功一次、final ref 可重放且 bearer 明文不进入 SQLite。 |
 | R17 | 满足（reference 边界） | `test_r17_artifact_digest_mismatch_prevents_sandbox_start` | read grant 签发后篡改 Store bytes，redeem 重新校验 digest/size 并拒绝；write grant 的 staged bytes 与声明 digest 不符也被拒绝。两条路径均未进入受控 sandbox-start seam。 |
 | R18 | 满足（reference 边界） | `test_r18_control_plane_path_is_rejected_before_runtime_adapter` | 将控制面目录作为 cwd；execution binding/profile 校验在 runtime adapter 前 fail closed，adapter spec 调用为零。 |
 | R19 | 满足（reference 边界） | `test_r19_forged_or_missing_attestation_never_claims_container` | attestation verifier 缺失证明或返回错绑 adapter identity 均拒绝构造 CONTAINER backend；runtime 调用为零。测试不声称 fake verifier 是真实 gVisor 证明。 |
