@@ -64,6 +64,7 @@ MAX_PROJECTION_REPLAY_PAGE = 1_000
 MAX_ACTIVITY_LEASE_SECONDS = 24 * 60 * 60
 _SAFE_RECEIPT_CODE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
 _SHA256_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_FLEET_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 _GC_QUARANTINE_ID = re.compile(r"^q[0-9]{20}_[0-9a-f]{32}$")
 _ARTIFACT_REF_FIELDS = frozenset(ArtifactRef.__dataclass_fields__)
 _DEADLINE_KINDS = frozenset(
@@ -441,6 +442,75 @@ def _timeout_milliseconds(
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ProjectionConflictError(f"{key} must be a positive integer")
     return value
+
+
+def _fleet_admission_metadata(
+    value: Mapping[str, object] | None,
+) -> dict[str, JsonValue] | None:
+    if value is None:
+        return None
+    required = {
+        "schema_version",
+        "task_id",
+        "tenant_id",
+        "pool_id",
+        "routing_policy_digest",
+        "quota_policy_digest",
+        "max_active_tasks",
+        "tenant_concurrency",
+        "pool_concurrency",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise ProjectionConflictError(
+            "Fleet admission fields are invalid"
+        )
+    if (
+        isinstance(value["schema_version"], bool)
+        or value["schema_version"] != 1
+    ):
+        raise ProjectionConflictError(
+            "Fleet admission schema version is invalid"
+        )
+    normalized: dict[str, JsonValue] = {"schema_version": 1}
+    for field_name in ("task_id", "tenant_id", "pool_id"):
+        item = value[field_name]
+        if (
+            not isinstance(item, str)
+            or _FLEET_IDENTIFIER.fullmatch(item) is None
+        ):
+            raise ProjectionConflictError(
+                f"Fleet admission {field_name} is invalid"
+            )
+        normalized[field_name] = item
+    for field_name in (
+        "routing_policy_digest",
+        "quota_policy_digest",
+    ):
+        item = value[field_name]
+        if (
+            not isinstance(item, str)
+            or _SHA256_DIGEST.fullmatch(item) is None
+        ):
+            raise ProjectionConflictError(
+                f"Fleet admission {field_name} is invalid"
+            )
+        normalized[field_name] = item
+    for field_name in (
+        "max_active_tasks",
+        "tenant_concurrency",
+        "pool_concurrency",
+    ):
+        item = value[field_name]
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, int)
+            or not 1 <= item <= 1_000_000
+        ):
+            raise ProjectionConflictError(
+                f"Fleet admission {field_name} is invalid"
+            )
+        normalized[field_name] = item
+    return normalized
 
 
 def _earliest_deadline(
@@ -4309,10 +4379,37 @@ class DurableRunStore:
         owner_id: str,
         max_active_attempts: int | None,
         worker_capacity: int | None,
+        fleet_admission: Mapping[str, object] | None = None,
     ) -> None:
         """Reserve execution capacity by deriving reservations from active Attempts."""
 
-        if max_active_attempts is None and worker_capacity is None:
+        existing_fleet_admission = attempt.metadata.get(
+            "fleet_admission"
+        )
+        if (
+            "fleet_admission" in attempt.metadata
+            and fleet_admission is None
+        ):
+            raise ProjectionConflictError(
+                "Fleet-scoped Attempt requires Fleet admission"
+            )
+        if fleet_admission is not None:
+            normalized_fleet_admission = _fleet_admission_metadata(
+                fleet_admission
+            )
+            if (
+                existing_fleet_admission is not None
+                and existing_fleet_admission
+                != normalized_fleet_admission
+            ):
+                raise ProjectionConflictError(
+                    "Attempt Fleet admission binding changed"
+                )
+        if (
+            max_active_attempts is None
+            and worker_capacity is None
+            and fleet_admission is None
+        ):
             return
         if max_active_attempts is not None:
             row = conn.execute(
@@ -4351,41 +4448,133 @@ class DurableRunStore:
             raise ProjectionConflictError(
                 "Attempt concurrency_key must be a non-empty string or null"
             )
-        if not resource_keys and concurrency_key is None:
-            return
+        if resource_keys or concurrency_key is not None:
+            conflict_clauses = [
+                "json_type(active.metadata_json, '$.resource_keys') IS NULL",
+                "json_type(active.metadata_json, '$.resource_keys') <> 'array'",
+            ]
+            parameters: list[Any] = []
+            if resource_keys:
+                placeholders = ",".join("?" for _ in resource_keys)
+                conflict_clauses.append(
+                    "EXISTS ("
+                    "SELECT 1 "
+                    "FROM json_each(active.metadata_json, '$.resource_keys') AS resource "
+                    f"WHERE resource.type = 'text' AND resource.value IN ({placeholders})"
+                    ")"
+                )
+                parameters.extend(resource_keys)
+            if concurrency_key is not None:
+                conflict_clauses.append(
+                    "json_extract(active.metadata_json, '$.concurrency_key') = ?"
+                )
+                parameters.append(concurrency_key)
+            row = conn.execute(
+                f"""
+                SELECT 1
+                FROM attempts AS active INDEXED BY attempts_admission_status_idx
+                WHERE active.status IN ('claimed', 'running')
+                  AND ({" OR ".join(conflict_clauses)})
+                LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
+            if row is not None:
+                raise ActivityAdmissionDenied("resource_conflict")
 
-        conflict_clauses = [
-            "json_type(active.metadata_json, '$.resource_keys') IS NULL",
-            "json_type(active.metadata_json, '$.resource_keys') <> 'array'",
-        ]
-        parameters: list[Any] = []
-        if resource_keys:
-            placeholders = ",".join("?" for _ in resource_keys)
-            conflict_clauses.append(
-                "EXISTS ("
-                "SELECT 1 "
-                "FROM json_each(active.metadata_json, '$.resource_keys') AS resource "
-                f"WHERE resource.type = 'text' AND resource.value IN ({placeholders})"
-                ")"
+        if fleet_admission is not None:
+            DurableRunStore._admit_fleet_tx(
+                conn,
+                normalized_fleet_admission,
             )
-            parameters.extend(resource_keys)
-        if concurrency_key is not None:
-            conflict_clauses.append(
-                "json_extract(active.metadata_json, '$.concurrency_key') = ?"
-            )
-            parameters.append(concurrency_key)
-        row = conn.execute(
-            f"""
-            SELECT 1
+
+    @staticmethod
+    def _admit_fleet_tx(
+        conn: sqlite3.Connection,
+        scope: dict[str, JsonValue] | None,
+    ) -> None:
+        """Atomically enforce Store-wide Fleet quotas for one claim."""
+
+        assert scope is not None
+        global_count = 0
+        tenant_count = 0
+        pool_count = 0
+        rows = conn.execute(
+            """
+            SELECT metadata_json, worker_id
             FROM attempts AS active INDEXED BY attempts_admission_status_idx
             WHERE active.status IN ('claimed', 'running')
-              AND ({" OR ".join(conflict_clauses)})
-            LIMIT 1
-            """,
-            parameters,
-        ).fetchone()
-        if row is not None:
-            raise ActivityAdmissionDenied("resource_conflict")
+            """
+        )
+        for row in rows:
+            metadata = _json_load(row["metadata_json"])
+            if not isinstance(metadata, dict):
+                raise ActivityAdmissionDenied("fleet_scope_corrupt")
+            if "fleet_admission" not in metadata:
+                if str(row["worker_id"] or "").startswith(
+                    "remote-session:"
+                ):
+                    raise ActivityAdmissionDenied(
+                        "fleet_unscoped_remote_active"
+                    )
+                continue
+            raw_active_scope = metadata["fleet_admission"]
+            try:
+                active_scope = _fleet_admission_metadata(
+                    raw_active_scope
+                )
+            except ProjectionConflictError as exc:
+                raise ActivityAdmissionDenied(
+                    "fleet_scope_corrupt"
+                ) from exc
+            assert active_scope is not None
+            if (
+                active_scope["quota_policy_digest"]
+                != scope["quota_policy_digest"]
+                or active_scope["max_active_tasks"]
+                != scope["max_active_tasks"]
+                or (
+                    active_scope["tenant_id"] == scope["tenant_id"]
+                    and active_scope["tenant_concurrency"]
+                    != scope["tenant_concurrency"]
+                )
+                or (
+                    active_scope["pool_id"] == scope["pool_id"]
+                    and active_scope["pool_concurrency"]
+                    != scope["pool_concurrency"]
+                )
+            ):
+                raise ActivityAdmissionDenied(
+                    "fleet_policy_conflict"
+                )
+            if active_scope["task_id"] == scope["task_id"]:
+                raise ActivityAdmissionDenied("fleet_task_active")
+            global_count += 1
+            if active_scope["tenant_id"] == scope["tenant_id"]:
+                tenant_count += 1
+            if active_scope["pool_id"] == scope["pool_id"]:
+                pool_count += 1
+
+        limits = (
+            (
+                "fleet_global_capacity",
+                global_count,
+                int(scope["max_active_tasks"]),
+            ),
+            (
+                "fleet_tenant_capacity",
+                tenant_count,
+                int(scope["tenant_concurrency"]),
+            ),
+            (
+                "fleet_pool_capacity",
+                pool_count,
+                int(scope["pool_concurrency"]),
+            ),
+        )
+        for reason_code, active_count, limit in limits:
+            if active_count >= limit:
+                raise ActivityAdmissionDenied(reason_code)
 
     def claim_activity(
         self,
@@ -4523,6 +4712,7 @@ class DurableRunStore:
         now: float | None = None,
         max_active_attempts: int | None = None,
         worker_capacity: int | None = None,
+        fleet_admission: Mapping[str, object] | None = None,
     ) -> tuple[
         IdempotencyClaim | None,
         EventRecord | None,
@@ -4614,6 +4804,9 @@ class DurableRunStore:
             raise ValueError("max_active_attempts must be positive")
         if worker_capacity is not None and worker_capacity < 1:
             raise ValueError("worker_capacity must be positive")
+        normalized_fleet_admission = _fleet_admission_metadata(
+            fleet_admission
+        )
 
         with self._write_transaction() as conn:
             # This check must run after BEGIN IMMEDIATE acquires the writer
@@ -4826,6 +5019,7 @@ class DurableRunStore:
                 owner_id=owner_id,
                 max_active_attempts=max_active_attempts,
                 worker_capacity=worker_capacity,
+                fleet_admission=normalized_fleet_admission,
             )
             schedule_deadline = _attempt_deadline(run, attempt)
             if (
@@ -4874,6 +5068,10 @@ class DurableRunStore:
                     "admission candidate lost the claim CAS"
                 )
             claimed_metadata = dict(attempt.metadata)
+            if normalized_fleet_admission is not None:
+                claimed_metadata["fleet_admission"] = (
+                    normalized_fleet_admission
+                )
             if start_deadline is not None:
                 claimed_metadata["start_deadline_at"] = min(
                     start_deadline,

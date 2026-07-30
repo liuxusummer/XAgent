@@ -81,6 +81,10 @@ class _NonProductionClaimer:
         raise AssertionError("must not be called")
 
 
+class _LegacyProductionClaimer(_NonProductionClaimer):
+    production_security_ready = True
+
+
 class _ExplodingTerminalProbe:
     production_security_ready = True
 
@@ -199,6 +203,18 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
         )
         self.assertEqual(poller.snapshot().active_assignments, 1)
         self.assertEqual(fleet.snapshot().active_assignments, 1)
+        attempt = self.harness.store.get_attempt(
+            assignment.claim.attempt_id
+        )
+        assert attempt is not None
+        self.assertEqual(
+            attempt.metadata["fleet_admission"]["tenant_id"],
+            "tenant-1",
+        )
+        self.assertEqual(
+            attempt.metadata["fleet_admission"]["pool_id"],
+            "pool-a",
+        )
         self.client.start(assignment.claim)
         self.client.complete(
             assignment.claim,
@@ -589,6 +605,12 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
         )[0]
         registration = control.get_registration("worker-1")
         assert registration is not None
+        admission_scope = (
+            DeterministicRemoteScheduler().durable_admission_scope(
+                binding.task,
+                routing_policy_digest=binding.routing_policy_digest,
+            )
+        )
 
         assignment = control.claim_for_fleet(
             binding.run_id,
@@ -599,10 +621,44 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             expected_session_binding_digest=(
                 registration.session_binding_digest
             ),
+            fleet_admission=admission_scope.to_metadata(),
         )
 
         self.assertEqual(assignment.claim.node_id, "tool")
         self.assertEqual(assignment.activity_kind, "tool")
+
+    def test_fleet_scope_cannot_charge_another_tenant(self) -> None:
+        binding = self._binding()
+        registration = self.harness.control.get_registration("worker-1")
+        assert registration is not None
+        scope = (
+            DeterministicRemoteScheduler().durable_admission_scope(
+                binding.task,
+                routing_policy_digest=binding.routing_policy_digest,
+            ).to_metadata()
+        )
+        scope["tenant_id"] = "tenant-other"
+
+        with self.assertRaisesRegex(
+            RemoteControlError,
+            "claim_conflict",
+        ):
+            self.harness.control.claim_for_fleet(
+                binding.run_id,
+                "worker-1",
+                lease_seconds=30.0,
+                node_id=binding.node_id,
+                activity_config_digest=binding.activity_config_digest,
+                expected_session_binding_digest=(
+                    registration.session_binding_digest
+                ),
+                fleet_admission=scope,
+            )
+
+        self.assertEqual(
+            self.harness.store.list_attempts("run-remote"),
+            [],
+        )
 
     def test_empty_fleet_poll_has_zero_durable_mutation(self) -> None:
         fleet, poller = self._compose()
@@ -881,6 +937,12 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
     def test_claimer_rechecks_exact_session_before_store_mutation(self) -> None:
         binding = self._binding()
         claimer = RemoteControlFleetClaimer(self.harness.control)
+        admission_scope = (
+            DeterministicRemoteScheduler().durable_admission_scope(
+                binding.task,
+                routing_policy_digest=binding.routing_policy_digest,
+            )
+        )
 
         with self.assertRaisesRegex(
             RemoteControlError,
@@ -890,6 +952,7 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
                 binding,
                 "worker-1",
                 "f" * 64,
+                admission_scope,
             )
 
         self.assertEqual(
@@ -920,6 +983,16 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
                 resolver,
                 _NonProductionClaimer(),
             )
+
+    def test_legacy_production_callback_without_durable_quota_is_rejected(
+        self,
+    ) -> None:
+        fleet = RemoteFleetCoordinator(
+            lambda: DeterministicRemoteScheduler(),
+            _LegacyProductionClaimer(),
+        )
+
+        self.assertFalse(fleet.production_security_ready)
 
     def test_fleet_poller_binding_is_one_time_and_readiness_is_explicit(self):
         _fleet, poller = self._compose()

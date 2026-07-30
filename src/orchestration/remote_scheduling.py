@@ -24,6 +24,8 @@ contents, credentials, and arbitrary labels are intentionally not accepted.
 from __future__ import annotations
 
 import bisect
+import hashlib
+import json
 import math
 import re
 import threading
@@ -40,6 +42,7 @@ from .runtime_compatibility import (
 )
 
 REMOTE_SCHEDULING_SCHEMA_VERSION = 1
+FLEET_ADMISSION_SCHEMA_VERSION = 1
 MAX_IDENTIFIER_CHARS = 64
 MAX_CAPABILITIES = 64
 MAX_TOOLS = 256
@@ -52,6 +55,7 @@ MAX_WORKER_IDLE_TTL_SECONDS = 7 * 24 * 60 * 60
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 _RESOURCE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
 class RemoteSchedulingError(RuntimeError):
@@ -378,6 +382,78 @@ class RemoteTask:
 
 
 @dataclass(frozen=True, slots=True)
+class FleetAdmissionScope:
+    """Secret-free durable quota binding for one selected Fleet task."""
+
+    task_id: str
+    tenant_id: str
+    pool_id: str
+    routing_policy_digest: str
+    quota_policy_digest: str
+    max_active_tasks: int
+    tenant_concurrency: int
+    pool_concurrency: int
+    schema_version: int = FLEET_ADMISSION_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != FLEET_ADMISSION_SCHEMA_VERSION:
+            raise RemoteSchedulingValidationError(
+                "unsupported FleetAdmissionScope schema version"
+            )
+        object.__setattr__(
+            self,
+            "task_id",
+            _identifier(self.task_id, "task_id"),
+        )
+        object.__setattr__(
+            self,
+            "tenant_id",
+            _identifier(self.tenant_id, "tenant_id"),
+        )
+        object.__setattr__(
+            self,
+            "pool_id",
+            _identifier(self.pool_id, "pool_id"),
+        )
+        for field_name in (
+            "routing_policy_digest",
+            "quota_policy_digest",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or _DIGEST.fullmatch(value) is None:
+                raise RemoteSchedulingValidationError(
+                    f"{field_name} must be a SHA-256 digest"
+                )
+        for field_name in (
+            "max_active_tasks",
+            "tenant_concurrency",
+            "pool_concurrency",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _positive_int(
+                    getattr(self, field_name),
+                    field_name,
+                    maximum=1_000_000,
+                ),
+            )
+
+    def to_metadata(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "task_id": self.task_id,
+            "tenant_id": self.tenant_id,
+            "pool_id": self.pool_id,
+            "routing_policy_digest": self.routing_policy_digest,
+            "quota_policy_digest": self.quota_policy_digest,
+            "max_active_tasks": self.max_active_tasks,
+            "tenant_concurrency": self.tenant_concurrency,
+            "pool_concurrency": self.pool_concurrency,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class AdmissionDecision:
     outcome: AdmissionOutcome
     queue_depth: int
@@ -541,6 +617,28 @@ class DeterministicRemoteScheduler:
             pool_concurrency_quotas,
             "pool_concurrency_quotas",
         )
+        self._quota_policy_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "schema": "durable_fleet_quota_policy_v1",
+                    "max_active_tasks": self.max_active_tasks,
+                    "default_tenant_concurrency": (
+                        self.default_tenant_concurrency
+                    ),
+                    "tenant_concurrency_quotas": sorted(
+                        self._tenant_quotas.items()
+                    ),
+                    "default_pool_concurrency": (
+                        self.default_pool_concurrency
+                    ),
+                    "pool_concurrency_quotas": sorted(
+                        self._pool_quotas.items()
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         if not callable(clock):
             raise RemoteSchedulingValidationError("clock must be callable")
         self._clock = clock
@@ -1048,6 +1146,29 @@ class DeterministicRemoteScheduler:
                 return len(queue)
             return sum(1 for item in queue if item.task.pool_id == pool_id)
 
+    def durable_admission_scope(
+        self,
+        task: RemoteTask,
+        *,
+        routing_policy_digest: str,
+    ) -> FleetAdmissionScope:
+        """Bind immutable routing policy and effective quotas for Store CAS."""
+
+        if not isinstance(task, RemoteTask):
+            raise RemoteSchedulingValidationError(
+                "task must be a RemoteTask"
+            )
+        return FleetAdmissionScope(
+            task_id=task.task_id,
+            tenant_id=task.tenant_id,
+            pool_id=task.pool_id,
+            routing_policy_digest=routing_policy_digest,
+            quota_policy_digest=self._quota_policy_digest,
+            max_active_tasks=self.max_active_tasks,
+            tenant_concurrency=self._tenant_quota(task.tenant_id),
+            pool_concurrency=self._pool_quota(task.pool_id),
+        )
+
     def _tenant_scan_order(self, pool_id: str) -> tuple[str, ...]:
         tenants = sorted(
             tenant_id
@@ -1122,6 +1243,8 @@ __all__ = [
     "AdmissionDecision",
     "AdmissionOutcome",
     "DeterministicRemoteScheduler",
+    "FLEET_ADMISSION_SCHEMA_VERSION",
+    "FleetAdmissionScope",
     "PollDecision",
     "PollOutcome",
     "ReleaseOutcome",

@@ -326,10 +326,19 @@ digest 漂移、节点/config 不一致、session supersession 或 durable assig
 routing 不一致均 fail closed。terminal projection 由 completion/replay/cancel
 释放；lease reaper 等带外终态通过 exact Store probe 的有界 reconciler 收敛。
 
-Fleet queue/active registry 仍是单进程、可重建 projection，不是共享消息 broker 或
-跨控制面共识。ready Run 发现、周期投影、策略变更后的 rebuild 和 terminal reconcile
-由部署控制循环显式驱动。claim callback 失败后 binding 可丢弃，并由 Store reconciler
-重新投影、重新准入。完整组合与审查证据见
+路由选中后会生成无密 `FleetAdmissionScope`。Store 在 durable candidate claim 的同一
+事务内验证 quota policy generation，并按 active Attempt 原子约束 global、tenant 和
+pool 配额；成功时将 scope 写回 Attempt metadata。因而共享一个 Store 的多个控制进程
+或重启后的新进程不会因内存 active 计数归零而超配。
+旧版本或 run-scoped remote active claim 没有 Fleet scope；新 Fleet admission 对
+`remote-session:` owner 的此类记录 fail closed，滚动升级必须先 drain，避免旧占用
+从 quota 统计中消失。
+
+Fleet queue、Worker registry、active routing 和公平游标仍是单进程、可重建
+projection，不是共享消息 broker 或跨控制面共识；不同 Store shard 的配额也彼此独立。
+ready Run 发现、周期投影、策略变更后的 rebuild 和 terminal reconcile 由部署控制循环
+显式驱动。claim callback 失败后 binding 可丢弃，并由 Store reconciler 重新投影、
+重新准入。完整组合与审查证据见
 [remote-fleet-data-plane.md](remote-fleet-data-plane.md) 和
 [remote-fleet-adversarial-review.md](remote-fleet-adversarial-review.md)。
 

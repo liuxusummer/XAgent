@@ -2,8 +2,9 @@
 
 本模块把 HTTPS Remote Worker 的 server/pull 请求接到跨 Run 的确定性调度器，
 同时保留 `DurableRunStore`、lease、fencing、Policy 和 Artifact broker 作为唯一
-执行事实。Fleet 的队列、Worker、容量和 active assignment 都只是有界、可重建
-projection。
+执行事实。Fleet 的队列、Worker 和 active assignment 都只是有界、可重建
+projection。执行中的 Fleet tenant/pool/global 配额占用则随 Attempt 持久化，并在
+同一个 Store claim 事务中线性化。
 
 ## 数据流与事实边界
 
@@ -130,13 +131,29 @@ session      = current durable RemoteControlJournal binding
 ## Claim 与终态
 
 Fleet 预留 routing capacity 后，`RemoteControlFleetClaimer` 用精确 binding 和当前
-session 调用 `RemoteControlPlane.claim_for_fleet()`。控制面再次检查：
+session 调用 `RemoteControlPlane.claim_for_fleet()`。Coordinator 同时生成
+`FleetAdmissionScope`，绑定 task/tenant/pool、Tool routing policy digest、完整 quota
+policy digest 和本次生效的 global/tenant/pool 上限。控制面再次检查：
 
 - run authorizer；
 - 当前 registration/session，包含 Store 线性化点前后的 supersession 检查；
 - 精确节点、config digest、resource keys 和 runtime compatibility；
 - production-ready two-phase admission；
-- Policy、Artifact、runtime attestation 和 durable candidate CAS。
+- Policy、Artifact、runtime attestation 和 durable candidate CAS；
+- 当前 Store 内 active Fleet Attempt 的 global/tenant/pool 配额与 quota policy
+  generation。
+
+scope 不含 token、参数、脚本、环境或 Artifact 内容。Store 在 `BEGIN IMMEDIATE`
+事务中扫描 active Attempt 的规范化 scope；策略 generation 漂移、重复 active task、
+畸形 scope 或任一容量已满都会在 schedule/claim/policy Event 一起提交前回滚。成功
+claim 把 exact scope 写入 Attempt metadata，因此新控制进程无需恢复旧的 Fleet
+active registry，也能继续计数；Attempt 终态后自然退出 active 集合。
+
+滚动升级必须先 drain 旧版远程 active claim。为防旧 Fleet Attempt 因缺少 scope 而从
+计数中消失，只要 Store 里仍有 `remote-session:` owner 的无 scope active Attempt，
+新 Fleet claim 就以 `fleet_unscoped_remote_active` 拒绝。run-scoped remote 与 Fleet
+需要并行时，应使用已携带统一 admission metadata 的版本或隔离 Store；不能用可用性
+换取静默超配。
 
 返回的 `WorkAssignment` 必须与 routing 的 Run、节点、config、Tool、capabilities 和
 resources 一致，否则不发送给 Worker；已经发生的 durable claim 由 lease recovery
@@ -158,14 +175,17 @@ resources 一致，否则不发送给 Worker；已经发生的 durable claim 由
    `admit()`；
 5. Worker 重新通过 mTLS register，session journal 恢复或 fencing 旧 instance；
 6. lease reaper 处理崩溃前的 durable claims；
-7. 新进程的 Fleet active projection 从空状态开始，不从 Worker 响应推断旧 authority。
+7. 新进程的 Fleet active projection 从空状态开始，不从 Worker 响应推断旧 authority；
+   新 claim 的配额检查直接读取 Store 中旧 active Attempt 的 durable scope。
    exact claim 的控制权限可由 `RemoteExecutionJournal` + Store + 新鲜 attestation
    重建；projection 随后由 completion 或周期 `reconcile_terminals()` 收敛。
 
 不要从 Fleet snapshot 推断 Attempt 状态，也不要把 `execution_truth=false` 的报告写回
 Domain Store。Artifact grant/finalization 已通过 token-digest-only journal 跨进程
-恢复，但 Fleet queue/active projection 仍非共享共识队列。跨进程共享 Fleet 队列、
-真实 TLS-extension server 和生产 Sandbox 仍是部署/后续实现边界。
+恢复。Fleet quota admission 在共享同一 Store 的控制进程间已经原子化，但 queue、
+Worker registry、公平游标和 active routing projection 仍非共享共识队列；不同 Store
+shard 之间也不共享 quota。跨进程共享 Fleet 队列或显式单写 shard ownership、真实
+TLS-extension server 和生产 Sandbox 仍是部署/后续实现边界。
 
 ## 验证
 
@@ -176,7 +196,8 @@ Domain Store。Artifact grant/finalization 已通过 token-digest-only journal �
   tests.test_orchestration_remote_scheduling \
   tests.test_orchestration_remote_protocol \
   tests.test_orchestration_remote_execution \
-  tests.test_orchestration_remote_journal
+  tests.test_orchestration_remote_journal \
+  tests.test_orchestration_scheduler
 ```
 
 对抗审查与残余边界见

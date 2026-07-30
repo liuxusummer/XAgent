@@ -31,6 +31,7 @@ from .remote_protocol import (
     canonical_digest,
 )
 from .remote_scheduling import (
+    FleetAdmissionScope,
     MAX_WORKER_CAPACITY,
     ReleaseOutcome,
     RemoteTask,
@@ -511,6 +512,8 @@ class DurableFleetProjector:
 class RemoteControlFleetClaimer:
     """Production-marked callback preserving control session authority."""
 
+    durable_fleet_admission_ready = True
+
     def __init__(
         self,
         control: RemoteControlPlane,
@@ -542,12 +545,19 @@ class RemoteControlFleetClaimer:
         binding: object,
         worker_id: str,
         worker_session_id: str,
+        admission_scope: FleetAdmissionScope,
     ) -> WorkAssignment:
         if (
             not isinstance(binding, FleetTaskBinding)
             or not binding.exact_for_production
             or binding.node_id is None
             or binding.activity_config_digest is None
+            or not isinstance(admission_scope, FleetAdmissionScope)
+            or admission_scope.task_id != binding.task.task_id
+            or admission_scope.tenant_id != binding.task.tenant_id
+            or admission_scope.pool_id != binding.task.pool_id
+            or admission_scope.routing_policy_digest
+            != binding.routing_policy_digest
         ):
             raise RemoteFleetControlConflict(
                 "Fleet claim requires an exact durable candidate binding"
@@ -559,6 +569,7 @@ class RemoteControlFleetClaimer:
             node_id=binding.node_id,
             activity_config_digest=binding.activity_config_digest,
             expected_session_binding_digest=worker_session_id,
+            fleet_admission=admission_scope.to_metadata(),
         )
 
     def is_terminal(self, claim: ClaimBinding) -> bool:

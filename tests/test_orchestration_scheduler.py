@@ -17,6 +17,10 @@ from src.orchestration.models import (
     NodeStatus,
     RunStatus,
 )
+from src.orchestration.remote_scheduling import (
+    DeterministicRemoteScheduler,
+    RemoteTask,
+)
 from src.orchestration.scheduler import (
     ActivityReceipt,
     ApprovalResolution,
@@ -27,6 +31,7 @@ from src.orchestration.scheduler import (
     SchedulerStateError,
 )
 from src.orchestration.store import (
+    ActivityAdmissionDenied,
     ConcurrentProjectionUpdate,
     DurableRunStore,
     ProjectionConflictError,
@@ -161,6 +166,66 @@ class DurableSchedulerTests(unittest.TestCase):
             approval_verifier=self.verify_approval,
         )
         return store, scheduler
+
+    @staticmethod
+    def _allow_policy(label: str) -> dict[str, str | None]:
+        return {
+            "outcome": "allow",
+            "reason_code": "fleet_admission_test",
+            "action_digest": hashlib.sha256(
+                f"action:{label}".encode()
+            ).hexdigest(),
+            "policy_digest": hashlib.sha256(
+                f"policy:{label}".encode()
+            ).hexdigest(),
+            "profile_digest": hashlib.sha256(
+                f"profile:{label}".encode()
+            ).hexdigest(),
+            "decision_digest": hashlib.sha256(
+                f"decision:{label}".encode()
+            ).hexdigest(),
+            "approval_grant_digest": None,
+        }
+
+    def _claim_with_fleet_scope(
+        self,
+        scheduler: DurableScheduler,
+        run_id: str,
+        worker_id: str,
+        *,
+        task_id: str,
+        tenant_id: str = "tenant-a",
+        pool_id: str = "pool-a",
+        quota_scheduler: DeterministicRemoteScheduler | None = None,
+    ):
+        candidate = scheduler.prepare_next_admission(
+            run_id,
+            worker_id,
+        )
+        assert candidate is not None
+        quotas = quota_scheduler or DeterministicRemoteScheduler(
+            default_tenant_concurrency=1,
+            default_pool_concurrency=8,
+        )
+        scope = quotas.durable_admission_scope(
+            RemoteTask(
+                task_id=task_id,
+                tenant_id=tenant_id,
+                pool_id=pool_id,
+                tool_name="agent",
+            ),
+            routing_policy_digest=hashlib.sha256(
+                b"routing-policy"
+            ).hexdigest(),
+        )
+        return scheduler.claim_admitted(
+            candidate,
+            lease_seconds=30.0,
+            capacity=8,
+            admission_expires_at=200.0,
+            policy_binding=self._allow_policy(task_id),
+            fleet_admission=scope.to_metadata(),
+        )
 
     def test_create_run_persists_definition_and_pending_nodes_fail_closed(self) -> None:
         store, scheduler = self.scheduler(
@@ -419,6 +484,323 @@ class DurableSchedulerTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             claims = list(pool.map(compete, range(2)))
         self.assertEqual(sum(claim is not None for claim in claims), 1)
+
+    def test_fleet_tenant_quota_is_atomic_across_control_projections(self) -> None:
+        workflow = _workflow([_agent("activity")])
+        store_path = self.root / "fleet-tenant-capacity.sqlite3"
+        schedulers = tuple(
+            DurableScheduler(
+                DurableRunStore(store_path),
+                workflow,
+                clock=self.clock,
+                id_factory=IdFactory(f"fleet-{index}"),
+                max_active_attempts=8,
+                result_writer=self.result_writer,
+                input_writer=self.input_writer,
+                artifact_verifier=self.artifacts.verify,
+                approval_verifier=self.verify_approval,
+            )
+            for index in range(2)
+        )
+        run_ids = ("fleet-run-a", "fleet-run-b")
+        for scheduler, run_id in zip(schedulers, run_ids, strict=True):
+            scheduler.create_run(run_id)
+            scheduler.reconcile(run_id)
+        barrier = threading.Barrier(2)
+
+        def compete(index: int):
+            candidate = schedulers[index].prepare_next_admission(
+                run_ids[index],
+                f"worker-{index}",
+            )
+            assert candidate is not None
+            quotas = DeterministicRemoteScheduler(
+                default_tenant_concurrency=1,
+                default_pool_concurrency=8,
+            )
+            scope = quotas.durable_admission_scope(
+                RemoteTask(
+                    task_id=f"fleet-task-{index}",
+                    tenant_id="tenant-shared",
+                    pool_id="pool-a",
+                    tool_name="agent",
+                ),
+                routing_policy_digest=hashlib.sha256(
+                    b"routing-policy"
+                ).hexdigest(),
+            )
+            barrier.wait()
+            try:
+                claim, _event = schedulers[index].claim_admitted(
+                    candidate,
+                    lease_seconds=30.0,
+                    capacity=8,
+                    admission_expires_at=200.0,
+                    policy_binding=self._allow_policy(
+                        f"fleet-task-{index}"
+                    ),
+                    fleet_admission=scope.to_metadata(),
+                )
+                return claim
+            except ActivityAdmissionDenied as exc:
+                return exc.reason_code
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(compete, range(2)))
+
+        self.assertEqual(
+            sum(not isinstance(outcome, str) for outcome in outcomes),
+            1,
+        )
+        self.assertEqual(
+            [outcome for outcome in outcomes if isinstance(outcome, str)],
+            ["fleet_tenant_capacity"],
+        )
+        winner = next(
+            index
+            for index, outcome in enumerate(outcomes)
+            if not isinstance(outcome, str)
+        )
+        loser = 1 - winner
+        winner_claim = outcomes[winner]
+        assert not isinstance(winner_claim, str)
+        stored = schedulers[winner].store.get_attempt(
+            winner_claim.attempt_id
+        )
+        assert stored is not None
+        self.assertEqual(
+            stored.metadata["fleet_admission"]["tenant_id"],
+            "tenant-shared",
+        )
+
+        restarted = DurableScheduler(
+            DurableRunStore(store_path),
+            workflow,
+            clock=self.clock,
+            id_factory=IdFactory("fleet-restart"),
+            max_active_attempts=8,
+            result_writer=self.result_writer,
+            input_writer=self.input_writer,
+            artifact_verifier=self.artifacts.verify,
+            approval_verifier=self.verify_approval,
+        )
+        with self.assertRaisesRegex(
+            ActivityAdmissionDenied,
+            "fleet_tenant_capacity",
+        ):
+            self._claim_with_fleet_scope(
+                restarted,
+                run_ids[loser],
+                "worker-restarted",
+                task_id=f"fleet-task-{loser}",
+                tenant_id="tenant-shared",
+            )
+
+        schedulers[winner].start_claim(winner_claim)
+        schedulers[winner].complete_claim(winner_claim, {"done": True})
+        released, _event = self._claim_with_fleet_scope(
+            restarted,
+            run_ids[loser],
+            "worker-restarted",
+            task_id=f"fleet-task-{loser}",
+            tenant_id="tenant-shared",
+        )
+        self.assertIsNotNone(released)
+
+    def test_fleet_quota_policy_drift_fails_closed_while_active(self) -> None:
+        _store, scheduler = self.scheduler(
+            [_agent("a"), _agent("b")],
+            max_active_attempts=8,
+        )
+        scheduler.create_run("fleet-policy-drift")
+        scheduler.reconcile("fleet-policy-drift")
+        first, _event = self._claim_with_fleet_scope(
+            scheduler,
+            "fleet-policy-drift",
+            "worker-a",
+            task_id="fleet-policy-a",
+            quota_scheduler=DeterministicRemoteScheduler(
+                default_tenant_concurrency=8,
+                default_pool_concurrency=8,
+            ),
+        )
+        self.assertIsNotNone(first)
+
+        with self.assertRaisesRegex(
+            ActivityAdmissionDenied,
+            "fleet_policy_conflict",
+        ):
+            self._claim_with_fleet_scope(
+                scheduler,
+                "fleet-policy-drift",
+                "worker-b",
+                task_id="fleet-policy-b",
+                tenant_id="tenant-b",
+                quota_scheduler=DeterministicRemoteScheduler(
+                    default_tenant_concurrency=8,
+                    default_pool_concurrency=7,
+                ),
+            )
+
+    def test_fleet_global_and_pool_quotas_use_durable_active_attempts(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "global",
+                "tenant-b",
+                "pool-b",
+                {
+                    "max_active_tasks": 1,
+                    "default_tenant_concurrency": 8,
+                    "default_pool_concurrency": 8,
+                },
+                "fleet_global_capacity",
+            ),
+            (
+                "pool",
+                "tenant-b",
+                "pool-a",
+                {
+                    "max_active_tasks": 8,
+                    "default_tenant_concurrency": 8,
+                    "default_pool_concurrency": 1,
+                },
+                "fleet_pool_capacity",
+            ),
+        )
+        for (
+            label,
+            second_tenant,
+            second_pool,
+            quota_options,
+            reason_code,
+        ) in cases:
+            with self.subTest(label=label):
+                store = DurableRunStore(
+                    self.root / f"fleet-{label}-capacity.sqlite3"
+                )
+                scheduler = DurableScheduler(
+                    store,
+                    _workflow([_agent("a"), _agent("b")]),
+                    clock=self.clock,
+                    id_factory=IdFactory(f"fleet-{label}"),
+                    max_active_attempts=8,
+                    result_writer=self.result_writer,
+                    input_writer=self.input_writer,
+                    artifact_verifier=self.artifacts.verify,
+                    approval_verifier=self.verify_approval,
+                )
+                run_id = f"fleet-{label}-capacity"
+                scheduler.create_run(run_id)
+                scheduler.reconcile(run_id)
+                quotas = DeterministicRemoteScheduler(
+                    **quota_options,
+                )
+                first, _event = self._claim_with_fleet_scope(
+                    scheduler,
+                    run_id,
+                    "worker-a",
+                    task_id=f"fleet-{label}-a",
+                    quota_scheduler=quotas,
+                )
+                self.assertIsNotNone(first)
+
+                with self.assertRaisesRegex(
+                    ActivityAdmissionDenied,
+                    reason_code,
+                ):
+                    self._claim_with_fleet_scope(
+                        scheduler,
+                        run_id,
+                        "worker-b",
+                        task_id=f"fleet-{label}-b",
+                        tenant_id=second_tenant,
+                        pool_id=second_pool,
+                        quota_scheduler=quotas,
+                    )
+
+    def test_invalid_fleet_scope_rolls_back_scheduling_mutation(self) -> None:
+        store, scheduler = self.scheduler([_agent("activity")])
+        scheduler.create_run("fleet-invalid-scope")
+        scheduler.reconcile("fleet-invalid-scope")
+        candidate = scheduler.prepare_next_admission(
+            "fleet-invalid-scope",
+            "worker-a",
+        )
+        assert candidate is not None
+        scope = DeterministicRemoteScheduler().durable_admission_scope(
+            RemoteTask(
+                task_id="fleet-invalid-task",
+                tenant_id="tenant-a",
+                pool_id="pool-a",
+                tool_name="agent",
+            ),
+            routing_policy_digest=hashlib.sha256(b"routing").hexdigest(),
+        ).to_metadata()
+        scope["schema_version"] = True
+
+        with self.assertRaises(ProjectionConflictError):
+            scheduler.claim_admitted(
+                candidate,
+                lease_seconds=30.0,
+                capacity=8,
+                admission_expires_at=200.0,
+                policy_binding=self._allow_policy(
+                    "fleet-invalid-task"
+                ),
+                fleet_admission=scope,
+            )
+
+        self.assertEqual(
+            store.list_attempts("fleet-invalid-scope"),
+            [],
+        )
+        self.assertFalse(
+            any(
+                event.event_type in {
+                    "attempt.scheduled",
+                    "attempt.claimed",
+                    "policy.decided",
+                }
+                for event in store.list_events("fleet-invalid-scope")
+            )
+        )
+
+    def test_fleet_claim_waits_for_unscoped_remote_upgrade_drain(self) -> None:
+        _store, scheduler = self.scheduler(
+            [_agent("legacy"), _agent("fleet")],
+            max_active_attempts=8,
+        )
+        scheduler.create_run("fleet-upgrade-drain")
+        scheduler.reconcile("fleet-upgrade-drain")
+        legacy = scheduler.claim_next(
+            "fleet-upgrade-drain",
+            "remote-session:" + ("a" * 64),
+            capacity=8,
+        )
+        assert legacy is not None
+
+        with self.assertRaisesRegex(
+            ActivityAdmissionDenied,
+            "fleet_unscoped_remote_active",
+        ):
+            self._claim_with_fleet_scope(
+                scheduler,
+                "fleet-upgrade-drain",
+                "remote-session:" + ("b" * 64),
+                task_id="fleet-after-upgrade",
+            )
+
+        scheduler.start_claim(legacy)
+        scheduler.complete_claim(legacy, {"done": True})
+        claimed, _event = self._claim_with_fleet_scope(
+            scheduler,
+            "fleet-upgrade-drain",
+            "remote-session:" + ("b" * 64),
+            task_id="fleet-after-upgrade",
+        )
+        self.assertIsNotNone(claimed)
 
     def test_concurrent_schedulers_atomically_enforce_resource_locks(self) -> None:
         cases = (

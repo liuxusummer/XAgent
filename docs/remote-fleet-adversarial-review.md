@@ -1,4 +1,4 @@
-# Remote Fleet 数据面四轮对抗审查
+# Remote Fleet 数据面五轮对抗审查
 
 审查对象：
 
@@ -103,10 +103,59 @@ Store 线性化 guard 内再次检查 current registration。poll body 为空，
 
 结论：P0=0，未关闭 P1=0。
 
+## 第五轮：多控制器 durable quota
+
+### 第一遍：并发、重启与终态释放
+
+旧 global/tenant/pool quota 只读取每个进程自己的 routing active map。两个控制器共享
+Store、或控制器重启后 active map 为空时，都可能同时通过本地检查。
+
+修复后 routing 生成固定字段的 `FleetAdmissionScope`，Store 在
+`claim_activity_with_policy()` 的同一 `BEGIN IMMEDIATE` 事务中按 active Attempt
+检查 global/tenant/pool 上限并写入 scope。两个独立 Scheduler 并发 claim 同一 tenant
+只能有一个成功；新 Store/Scheduler 实例仍读取旧 active scope，终态提交后容量才释放。
+
+### 第二遍：策略漂移、旧版本与保留域绕过
+
+quota policy 的 defaults、override map 和 global limit 形成 canonical digest。只要
+active Fleet Attempt 属于另一 policy generation，后续 claim 就 fail closed；同一
+generation 下 global limit、同 tenant limit 和同 pool limit 还必须逐字段一致。
+旧版本 `remote-session:` active Attempt 没有 scope 时，新 Fleet claim 以
+`fleet_unscoped_remote_active` 拒绝，要求先 drain。
+
+`fleet_admission` 是 Store 保留 metadata 域。已带 scope 的 SCHEDULED Attempt 不能由
+普通 run-scoped claim 跳过 quota CAS，也不能替换 scope；输入字段、类型、标识符、摘要
+和上限都严格验证，失败时 schedule/claim/policy Event 整体回滚。
+
+### 第三遍：authority、敏感信息与有界性
+
+生产 callback 要求 scope 的 task/tenant/pool/routing digest 与 exact Fleet binding
+一致；Control 再验证 scope tenant 等于认证 registration tenant，Worker 无法通过空
+`poll_fleet` body 选择或伪造 scope。持久内容只有标识、摘要和整数上限，不含 bearer、
+脚本、参数、环境或 Artifact 内容。Store 只扫描 status partial index 内的 active
+Attempt；终态历史不会增加 admission 扫描集合。
+
+证据：
+
+- `test_fleet_tenant_quota_is_atomic_across_control_projections`
+- `test_fleet_global_and_pool_quotas_use_durable_active_attempts`
+- `test_fleet_quota_policy_drift_fails_closed_while_active`
+- `test_fleet_claim_waits_for_unscoped_remote_upgrade_drain`
+- `test_invalid_fleet_scope_rolls_back_scheduling_mutation`
+- `test_fleet_scope_cannot_charge_another_tenant`
+- `test_legacy_production_callback_without_durable_quota_is_rejected`
+- `test_fleet_poll_claims_and_releases_real_durable_assignment`
+
+结论：同一 Store 的 quota P0/P1=0；共享 queue/fairness 和跨 Store quota 仍是明确残余
+边界。
+
 ## 残余边界
 
-- Fleet queue/active registry 是单进程 projection，不是跨控制面共识队列。多控制面
-  部署必须增加共享 broker 或按 shard 保证单写者。
+- Fleet queue、Worker registry、active routing 和公平游标是单进程 projection，
+  不是跨控制面共识队列。同一 Store 的 quota 已原子化，但多控制面仍须增加共享
+  broker 或按 shard 保证单写者；不同 Store shard 的 quota 不会自动合并。
+- 升级前存在的无 scope 远程 active claim 会阻塞新 Fleet admission；必须 drain 或
+  隔离 Store，不能绕过该安全门。
 - Store claim 已提交、assignment 返回前进程崩溃时，Worker 不获得执行权；lease
   recovery 会收敛该 claim。该窗口不能伪装成零 mutation。
 - ready Run 的发现、周期投影、策略变更后的 rebuild 和 terminal reconcile 由部署的

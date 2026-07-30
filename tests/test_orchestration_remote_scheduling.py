@@ -359,6 +359,42 @@ class RemoteSchedulingTests(unittest.TestCase):
             PollOutcome.POOL_AT_CAPACITY,
         )
 
+    def test_durable_quota_policy_digest_is_mapping_order_independent(
+        self,
+    ) -> None:
+        left = DeterministicRemoteScheduler(
+            tenant_concurrency_quotas={
+                "tenant-a": 1,
+                "tenant-b": 2,
+            },
+            pool_concurrency_quotas={
+                "pool-a": 3,
+                "pool-b": 4,
+            },
+        )
+        right = DeterministicRemoteScheduler(
+            tenant_concurrency_quotas={
+                "tenant-b": 2,
+                "tenant-a": 1,
+            },
+            pool_concurrency_quotas={
+                "pool-b": 4,
+                "pool-a": 3,
+            },
+        )
+        routing_digest = "a" * 64
+
+        self.assertEqual(
+            left.durable_admission_scope(
+                task("task-1"),
+                routing_policy_digest=routing_digest,
+            ).quota_policy_digest,
+            right.durable_admission_scope(
+                task("task-1"),
+                routing_policy_digest=routing_digest,
+            ).quota_policy_digest,
+        )
+
     def test_atomic_poll_never_oversubscribes_worker_capacity(self) -> None:
         scheduler = DeterministicRemoteScheduler(clock=_FakeClock())
         scheduler.register_worker(worker("worker-1", capacity=4))

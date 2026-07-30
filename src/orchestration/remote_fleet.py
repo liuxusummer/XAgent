@@ -23,6 +23,7 @@ from .remote_scheduling import (
     AdmissionDecision,
     AdmissionOutcome,
     DeterministicRemoteScheduler,
+    FleetAdmissionScope,
     PollOutcome,
     ReleaseOutcome,
     RemoteAssignment,
@@ -197,6 +198,12 @@ class RemoteFleetCoordinator:
                     None,
                 )
                 is True
+                and getattr(
+                    self._claim_run,
+                    "durable_fleet_admission_ready",
+                    None,
+                )
+                is True
             )
             with self._lock:
                 bindings_ready = all(
@@ -347,6 +354,16 @@ class RemoteFleetCoordinator:
                     raise RemoteFleetConflict(
                         "routing assignment has no trusted Run binding"
                     )
+                admission_scope = (
+                    scheduler.durable_admission_scope(
+                        routing.task,
+                        routing_policy_digest=(
+                            binding.routing_policy_digest
+                        ),
+                    )
+                    if binding.routing_policy_digest is not None
+                    else None
+                )
                 run_id = binding.run_id
                 self._inflight_durable_claims += 1
         self._observe("record_poll", pool_id, decision.outcome)
@@ -364,10 +381,29 @@ class RemoteFleetCoordinator:
                     )
                     is True
                 ):
+                    if (
+                        getattr(
+                            self._claim_run,
+                            "durable_fleet_admission_ready",
+                            None,
+                        )
+                        is not True
+                    ):
+                        raise RemoteFleetConflict(
+                            "production claim callback lacks durable Fleet admission"
+                        )
+                    if not isinstance(
+                        admission_scope,
+                        FleetAdmissionScope,
+                    ):
+                        raise RemoteFleetConflict(
+                            "production Fleet claim lacks durable admission scope"
+                        )
                     durable = self._claim_run(
                         binding,
                         worker_id,
                         routing.worker_session_id,
+                        admission_scope,
                     )
                 else:
                     durable = self._claim_run(run_id, worker_id)

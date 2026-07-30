@@ -942,6 +942,7 @@ class RemoteControlPlane:
         node_id: str,
         activity_config_digest: str,
         expected_session_binding_digest: str,
+        fleet_admission: Mapping[str, object],
     ) -> WorkAssignment:
         """Trusted Fleet callback that preserves current session authority."""
 
@@ -969,6 +970,11 @@ class RemoteControlPlane:
             tenant_id=registration.tenant_id,
             identity_digest=registration.identity_digest,
         )
+        if (
+            not isinstance(fleet_admission, Mapping)
+            or fleet_admission.get("tenant_id") != identity.tenant_id
+        ):
+            raise RemoteControlError("claim_conflict")
         assignment = self._claim_assignment(
             identity,
             registration,
@@ -976,6 +982,7 @@ class RemoteControlPlane:
             lease_seconds=lease_seconds,
             expected_node_id=node_id,
             expected_config_digest=activity_config_digest,
+            fleet_admission=fleet_admission,
         )
         if assignment is None:
             raise RemoteControlError("claim_conflict")
@@ -1007,6 +1014,7 @@ class RemoteControlPlane:
         lease_seconds: float,
         expected_node_id: str | None = None,
         expected_config_digest: str | None = None,
+        fleet_admission: Mapping[str, object] | None = None,
     ) -> WorkAssignment | None:
         if not self._authorize_run(identity, run_id):
             raise RemoteControlError("forbidden")
@@ -1043,6 +1051,8 @@ class RemoteControlPlane:
         secure_two_phase = (
             getattr(adapter, "secure_two_phase_admission", False) is True
         )
+        if fleet_admission is not None and not secure_two_phase:
+            raise RemoteControlError("security_not_ready")
         if secure_two_phase:
             prepare = getattr(adapter, "prepare_admission", None)
             begin = getattr(adapter, "begin_admission", None)
@@ -1158,6 +1168,7 @@ class RemoteControlPlane:
                     capacity=registration.max_concurrency,
                     admission_expires_at=admission_expires_at,
                     policy_binding=admission.policy_binding,
+                    fleet_admission=fleet_admission,
                     linearization_guard=lambda: (
                         self._worker_session_guard(identity.worker_id)
                     ),

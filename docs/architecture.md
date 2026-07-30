@@ -116,9 +116,12 @@
   `ArtifactRef`，但不保存 bearer 明文或 staged bytes。控制面重启后可从 exact Store
   policy Event、当前配置与新鲜 attestation 重建 start/heartbeat/取消/终态 authority；
   Worker 持有的原 read grant 可跨进程只兑换一次，原 output handle 可重放 exact final
-  ref，但控制面绝不重新发送 assignment 或自行复活 bearer。Fleet queue 仍为进程内
-  projection；fleet claim 准入后失败必须从 Store 重新投影，不能把内存队列或 journal
-  当作 Domain 事实源。完整边界见 `docs/distributed-execution-adr.md`、
+  ref，但控制面绝不重新发送 assignment 或自行复活 bearer。Fleet claim 会把无密的
+  task/tenant/pool、routing/quota policy digest 和生效配额写入 Attempt；共享同一
+  Store 的控制进程在 claim 事务内原子执行 global/tenant/pool quota CAS。Fleet queue、
+  Worker registry 与公平游标仍为进程内 projection；fleet claim 准入后失败必须从
+  Store 重新投影，不能把内存队列或 journal 当作 Domain 事实源。完整边界见
+  `docs/distributed-execution-adr.md`、
   `docs/remote-execution-recovery.md` 和 `docs/remote-fleet-data-plane.md`。
 
 ## 3. 核心数据流

@@ -830,6 +830,7 @@ class DurableScheduler:
         capacity: int,
         admission_expires_at: float,
         policy_binding: Mapping[str, str | None],
+        fleet_admission: Mapping[str, object] | None = None,
         linearization_guard: Callable[[], Any] | None = None,
         linearization_validator: Callable[[], bool] | None = None,
     ) -> tuple[ActivityClaim | None, EventRecord]:
@@ -907,6 +908,7 @@ class DurableScheduler:
                     now=self._now(),
                     max_active_attempts=self.max_active_attempts,
                     worker_capacity=capacity,
+                    fleet_admission=fleet_admission,
                 )
             )
             if policy_binding.get("outcome") == "require_approval":
