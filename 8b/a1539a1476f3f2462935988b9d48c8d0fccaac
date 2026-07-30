@@ -1,0 +1,49 @@
+docs/architecture.md
+  s_72af05a5dabd4c::t_92a2e08075216a 114-121
+docs/distributed-execution-adr.md
+  s_72af05a5dabd4c::t_a4b8a25e9612de 208-209,344-353
+docs/distributed-execution-fault-matrix.md
+  s_72af05a5dabd4c::t_736195a13cd997 40
+docs/distributed-execution-quickstart.md
+  s_72af05a5dabd4c::t_d62ceabd8cc84f 100-101,110-111,127-133
+docs/remote-execution-recovery.md
+  s_72af05a5dabd4c::t_9d913f2b596580 3,22-23,34-41,48,58-60,78-79,83-93,102-105,108-111,115-117,123-129,133,135-137,139,141-144,146,148-152,159,167-168,173-175
+docs/remote-fleet-adversarial-review.md
+  s_72af05a5dabd4c::t_f8e2c860c0c57d 115-117
+docs/remote-fleet-data-plane.md
+  s_72af05a5dabd4c::t_d44aeab2a022af 166-168
+examples/distributed_execution_demo.py
+  s_72af05a5dabd4c::t_6b8a8d09d6b226 529-531,535,547,816-818
+src/orchestration/artifact_broker.py
+  s_72af05a5dabd4c::t_8f539a71854c7c 30-38,112-137,493-621,643,655,697-704,710-731,809-813,821-832,834-857,870-879,881-906,909-910,913,915,1023-1026,1034-1046,1048-1071,1092-1101,1121-1124,1156-1165,1193-1202,1225-1234,1244-1249,1251,1253-1255,1273,1299-1307,1311-1317,1346-1350,1355-1359,1361-1401,1530-1670,1709,1712,1717-1736,1772-1778
+src/orchestration/remote_execution.py
+  s_72af05a5dabd4c::t_d0f668913d77fe 783,785-788
+src/orchestration/remote_execution_journal.py
+  s_72af05a5dabd4c::t_70414496b11f32 1,4-7,13-14,26,29-30,35,62-95,128-168,170-172,187-194,263-323,327-330,338-340,352-357,550-975,995,1010-1013,1015-1089,1161-1165,1225-1233,1235-1239,1241,1252-1263,1269,1285-1334,1425-1488,1502-1504,1524,1527-1530
+tests/test_orchestration_artifact_broker.py
+  s_72af05a5dabd4c::t_ffec85c157df52 5,29,105-117,1141-1551
+tests/test_orchestration_distributed_demo.py
+  s_72af05a5dabd4c::t_5700aef2ae8b5b 45-49
+tests/test_orchestration_remote_execution.py
+  s_72af05a5dabd4c::t_bc676dd24a6a00 460-462,467-469,491,962-964,1495-1497,1555,1592-1594,1604-1612,1615,1617-1625
+tests/test_orchestration_remote_execution_journal.py
+  s_72af05a5dabd4c::t_7191f35ecc6255 3-4,6,10,15-18,27-30,181-503
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8ba1539a1476f3f2462935988b9d48c8d0fccaac",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
