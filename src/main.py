@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from src.core.XAgent import XAgent, resolve_workspace_dir
+from src.core.agent_kernel import Principal
 from src.core.agent_profiles import load_agent_runtime_config
 from src.core.agent_teams import render_team_prompt
 from src.core.memory import load_boot_memory, load_effective_memory
@@ -61,6 +62,7 @@ def build_system_prompt(
     agent_soul: str = "",
     memory_mode: str = "project",
     team_config: dict[str, Any] | None = None,
+    principal: Principal | None = None,
 ) -> str:
     base_parts: list[str] = []
     if agent_prompt.strip() or agent_soul.strip():
@@ -72,8 +74,16 @@ def build_system_prompt(
         base_parts.append(read_text(assets_dir / "sys_prompt.txt"))
 
     workspace_path = Path(workspace_dir)
-    workspace_memory = load_workspace_memory_content(workspace_path, agent_name, memory_mode)
-    if str(memory_mode or "project").strip().lower() == "none":
+    can_read_memory = principal is None or "memory.read" in principal.scopes
+    workspace_memory = (
+        load_workspace_memory_content(workspace_path, agent_name, memory_mode)
+        if can_read_memory
+        else ""
+    )
+    if (
+        str(memory_mode or "project").strip().lower() == "none"
+        or not can_read_memory
+    ):
         memory_content = ""
     elif (workspace_path / "system").is_dir():
         memory_content = workspace_memory
@@ -107,7 +117,51 @@ def _append_unique_tool(allowed_tools: list[str] | None, tool_name: str) -> list
     return normalized
 
 
-def _inherit_parent_runtime(child: XAgent, parent_ctx: Any | None) -> None:
+def _same_identity_boundary(left: Principal, right: Principal) -> bool:
+    return (
+        left.subject == right.subject
+        and left.tenant_id == right.tenant_id
+        and left.scopes == right.scopes
+    )
+
+
+def _child_principal_template(
+    parent_ctx: Any | None,
+    fallback: Principal | None,
+    agent_name: str,
+) -> Principal | None:
+    parent_principal = getattr(parent_ctx, "principal", None)
+    source = parent_principal if isinstance(parent_principal, Principal) else fallback
+    if source is None:
+        return None
+    if not isinstance(source, Principal):
+        raise TypeError("child principal template must be a Principal")
+    return source.bind_run(
+        session_id="initializing",
+        run_id="initializing",
+        agent_id=agent_name or "main",
+    )
+
+
+def _inherit_parent_runtime(
+    child: XAgent,
+    parent_ctx: Any | None,
+    *,
+    expected_principal: Principal | None = None,
+) -> None:
+    if expected_principal is not None:
+        child_principal = getattr(
+            getattr(getattr(child, "handler", None), "ctx", None),
+            "principal",
+            None,
+        )
+        if (
+            not isinstance(child_principal, Principal)
+            or not _same_identity_boundary(child_principal, expected_principal)
+        ):
+            raise RuntimeError(
+                "child Agent did not preserve the parent Principal boundary"
+            )
     if parent_ctx is None:
         return
     child.handler.ctx.sink = parent_ctx.sink
@@ -132,6 +186,7 @@ def _build_delegate_runner(
     workspace: str,
     current_agent: str,
     team_config: dict[str, Any] | None,
+    principal_template: Principal | None = None,
 ):
     def _run_delegate(
         *,
@@ -169,24 +224,36 @@ def _build_delegate_runner(
         if expected_output.strip():
             child_prompt += f"\n\n[Expected Output]\n{expected_output.strip()}"
 
-        child = build_agent(
-            config_path=config_path,
-            observability_config_path=observability_config_path,
-            skills_dir=skills_dir,
-            workspace_dir=workspace,
-            agent_name=target,
-            agent_prompt=str(runtime_config.get("agent_prompt", "")),
-            agent_soul=str(runtime_config.get("agent_soul", "")),
-            tools_allowlist=runtime_config.get("tools_allowlist"),
-            skill_allowlist=runtime_config.get("skill_allowlist"),
-            model_override=str(runtime_config.get("model_override", "")),
-            max_turns=runtime_config.get("max_turns"),
-            memory_mode=str(runtime_config.get("memory_mode", "project")),
-            team_config=None,
+        child_principal = _child_principal_template(
+            parent_ctx,
+            principal_template,
+            target,
         )
-        original_child_sink = child.sink
-        _inherit_parent_runtime(child, parent_ctx)
+        child: XAgent | None = None
+        original_child_sink: EventSink | None = None
         try:
+            child = build_agent(
+                config_path=config_path,
+                observability_config_path=observability_config_path,
+                skills_dir=skills_dir,
+                workspace_dir=workspace,
+                agent_name=target,
+                agent_prompt=str(runtime_config.get("agent_prompt", "")),
+                agent_soul=str(runtime_config.get("agent_soul", "")),
+                tools_allowlist=runtime_config.get("tools_allowlist"),
+                skill_allowlist=runtime_config.get("skill_allowlist"),
+                model_override=str(runtime_config.get("model_override", "")),
+                max_turns=runtime_config.get("max_turns"),
+                memory_mode=str(runtime_config.get("memory_mode", "project")),
+                team_config=None,
+                principal=child_principal,
+            )
+            original_child_sink = child.sink
+            _inherit_parent_runtime(
+                child,
+                parent_ctx,
+                expected_principal=child_principal,
+            )
             result = child.run_task(child_prompt)
             exit_reason = str(result.get("exit_reason", ""))
             status = (
@@ -203,11 +270,18 @@ def _build_delegate_runner(
                 "response": result.get("response", ""),
                 "tool_result_count": len(result.get("tool_results", []) or []),
             }
-        except Exception as exc:  # noqa: BLE001
-            return {"status": "ERROR", "agent": target, "error": str(exc)}
+        except Exception:  # noqa: BLE001
+            return {
+                "status": "ERROR",
+                "agent": target,
+                "error": "delegated agent failed",
+                "reason_code": "DELEGATE_RUNTIME_FAILED",
+            }
         finally:
-            child.sink = original_child_sink
-            child.close()
+            if child is not None:
+                if original_child_sink is not None:
+                    child.sink = original_child_sink
+                child.close()
 
     return _run_delegate
 
@@ -219,6 +293,7 @@ def build_team_step_runner(
     skills_dir: str | None,
     workspace: str,
     team_config: dict[str, Any] | None,
+    principal_template: Principal | None = None,
 ):
     allowed_agents: set[str] = set()
     if isinstance(team_config, dict):
@@ -263,24 +338,36 @@ def build_team_step_runner(
         if expected_output.strip():
             step_prompt += f"\n\n[Expected Output]\n{expected_output.strip()}"
 
-        child = build_agent(
-            config_path=config_path,
-            observability_config_path=observability_config_path,
-            skills_dir=skills_dir,
-            workspace_dir=workspace,
-            agent_name=target,
-            agent_prompt=str(runtime_config.get("agent_prompt", "")),
-            agent_soul=str(runtime_config.get("agent_soul", "")),
-            tools_allowlist=runtime_config.get("tools_allowlist"),
-            skill_allowlist=runtime_config.get("skill_allowlist"),
-            model_override=str(runtime_config.get("model_override", "")),
-            max_turns=max_turns or runtime_config.get("max_turns"),
-            memory_mode=str(runtime_config.get("memory_mode", "project")),
-            team_config=None,
+        child_principal = _child_principal_template(
+            parent_ctx,
+            principal_template,
+            target,
         )
-        original_child_sink = child.sink
-        _inherit_parent_runtime(child, parent_ctx)
+        child: XAgent | None = None
+        original_child_sink: EventSink | None = None
         try:
+            child = build_agent(
+                config_path=config_path,
+                observability_config_path=observability_config_path,
+                skills_dir=skills_dir,
+                workspace_dir=workspace,
+                agent_name=target,
+                agent_prompt=str(runtime_config.get("agent_prompt", "")),
+                agent_soul=str(runtime_config.get("agent_soul", "")),
+                tools_allowlist=runtime_config.get("tools_allowlist"),
+                skill_allowlist=runtime_config.get("skill_allowlist"),
+                model_override=str(runtime_config.get("model_override", "")),
+                max_turns=max_turns or runtime_config.get("max_turns"),
+                memory_mode=str(runtime_config.get("memory_mode", "project")),
+                team_config=None,
+                principal=child_principal,
+            )
+            original_child_sink = child.sink
+            _inherit_parent_runtime(
+                child,
+                parent_ctx,
+                expected_principal=child_principal,
+            )
             result = child.run_task(step_prompt)
             exit_reason = str(result.get("exit_reason", ""))
             status = (
@@ -298,11 +385,19 @@ def build_team_step_runner(
                 "response": result.get("response", ""),
                 "tool_result_count": len(result.get("tool_results", []) or []),
             }
-        except Exception as exc:  # noqa: BLE001
-            return {"status": "ERROR", "agent": target, "step_id": step_id, "error": str(exc)}
+        except Exception:  # noqa: BLE001
+            return {
+                "status": "ERROR",
+                "agent": target,
+                "step_id": step_id,
+                "error": "workflow agent failed",
+                "reason_code": "WORKFLOW_AGENT_RUNTIME_FAILED",
+            }
         finally:
-            child.sink = original_child_sink
-            child.close()
+            if child is not None:
+                if original_child_sink is not None:
+                    child.sink = original_child_sink
+                child.close()
 
     return _run_step
 
@@ -357,6 +452,7 @@ def build_agent(
     max_turns: int | None = None,
     memory_mode: str = "project",
     team_config: dict[str, Any] | None = None,
+    principal: Principal | None = None,
 ) -> XAgent:
     project_root = Path(__file__).resolve().parent.parent
     assets_dir = Path(__file__).resolve().parent / "assets"
@@ -369,6 +465,17 @@ def build_agent(
         prompt_skill_registry = SkillRegistry(
             {name: manifest for name, manifest in skill_registry.skills.items() if name in allowed_skills}
         )
+    if principal is not None and not isinstance(principal, Principal):
+        raise TypeError("principal must be a Principal")
+    principal_template = (
+        principal.bind_run(
+            session_id="initializing",
+            run_id="initializing",
+            agent_id=agent_name or "main",
+        )
+        if isinstance(principal, Principal)
+        else None
+    )
 
     system_prompt = build_system_prompt(
         assets_dir,
@@ -380,11 +487,11 @@ def build_agent(
         agent_soul=agent_soul,
         memory_mode=memory_mode,
         team_config=team_config,
+        principal=principal_template,
     )
     if team_config is not None:
         tools_allowlist = _append_unique_tool(tools_allowlist, "agent_delegate")
     tools_schema = filter_tools_schema(load_tools_schema(assets_dir / "tools_schema.json"), tools_allowlist)
-
     api_key = os.environ.get("OPENAI_API_KEY", "")
     base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions")
     model = model_override
@@ -403,6 +510,7 @@ def build_agent(
         agent_name=agent_name,
         memory_mode=memory_mode,
         team_config=team_config,
+        principal_template=principal_template,
         delegate_runner=_build_delegate_runner(
             config_path=config_path,
             observability_config_path=observability_config_path,
@@ -410,6 +518,7 @@ def build_agent(
             workspace=workspace,
             current_agent=agent_name,
             team_config=team_config,
+            principal_template=principal_template,
         ),
     )
     allowed_tools = {item["function"]["name"] for item in tools_schema if item.get("type") == "function"}

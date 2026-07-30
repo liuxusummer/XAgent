@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import contextvars
+import hashlib
 import ipaddress
 import json
 import logging
@@ -20,18 +22,28 @@ import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from src.config import load_config
 from src.core.XAgent import XAgent
+from src.core.agent_kernel import Principal
 from src.core.agent_profiles import load_agent_runtime_config
+from src.core.web_identity import (
+    WebIdentity,
+    WebIdentityConfigurationError,
+    WebIdentityError,
+    WebIdentityProvider,
+    physical_directory_contains_path,
+)
 from src.core.checkpoint import load_task_checkpoint
+from src.core.memory_store import MEMORY_READ_SCOPE
 from src.core.agent_teams import (
     delete_team_config,
     list_team_configs,
@@ -74,6 +86,19 @@ _DEFAULT_WEB_ALLOWED_HOSTS = {
     "::1",
     "localhost",
 }
+
+
+def _workspace_index_principal(
+    ws: str,
+    identity: WebIdentity | None = None,
+) -> Principal:
+    """Bind index access to the authenticated Web caller without scope growth."""
+
+    caller = identity or _current_web_identity()
+    return caller.principal(
+        session_id=f"web-index-{ws}",
+        agent_id="main",
+    )
 
 
 def _normalize_web_origin(value: str) -> str | None:
@@ -141,12 +166,141 @@ app = FastAPI(title="XAgent Web UI")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(_WEB_ALLOWED_ORIGINS),
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Accept", "Content-Type"],
+    allow_headers=["Accept", "Authorization", "Content-Type"],
 )
 
 logger = logging.getLogger(__name__)
+_WEB_IDENTITY_CONTEXT: contextvars.ContextVar[WebIdentity | None] = (
+    contextvars.ContextVar("xagent_web_identity", default=None)
+)
+_web_identity_provider: WebIdentityProvider | None = None
+_web_identity_provider_signature = ""
+_web_identity_provider_lock = threading.Lock()
+
+
+def _get_web_identity_provider() -> WebIdentityProvider:
+    global _web_identity_provider, _web_identity_provider_signature
+    with _web_identity_provider_lock:
+        registry_path = os.environ.get("XAGENT_WEB_IDENTITY_REGISTRY", "").strip()
+        if registry_path:
+            try:
+                registry_stat = os.stat(registry_path)
+                signature = (
+                    f"secure:{os.path.realpath(registry_path)}:"
+                    f"{registry_stat.st_dev}:{registry_stat.st_ino}:"
+                    f"{registry_stat.st_size}:{registry_stat.st_mtime_ns}"
+                )
+            except OSError:
+                signature = f"secure-unavailable:{os.path.realpath(registry_path)}"
+        else:
+            signature = f"local:{os.path.realpath(_WORKSPACE_ROOT)}"
+        if (
+            _web_identity_provider is not None
+            and _web_identity_provider_signature == signature
+        ):
+            return _web_identity_provider
+        if registry_path:
+            registry_real = os.path.realpath(registry_path)
+            workspace_real = os.path.realpath(_WORKSPACE_ROOT)
+            try:
+                registry_in_workspace = (
+                    os.path.commonpath([workspace_real, registry_real])
+                    == workspace_real
+                )
+            except ValueError:
+                registry_in_workspace = False
+            if registry_in_workspace:
+                raise WebIdentityConfigurationError(
+                    "Web identity registry must be outside Agent workspaces"
+                )
+            provider = WebIdentityProvider.from_registry_file(registry_path)
+        else:
+            provider = WebIdentityProvider.local(_WORKSPACE_ROOT)
+        _web_identity_provider = provider
+        _web_identity_provider_signature = signature
+        return provider
+
+
+def _current_web_identity() -> WebIdentity:
+    identity = _WEB_IDENTITY_CONTEXT.get()
+    if isinstance(identity, WebIdentity):
+        return identity
+    provider = _get_web_identity_provider()
+    if provider.is_local:
+        return provider.authenticate()
+    raise WebIdentityError("authentication context is missing")
+
+
+def _web_error_message(
+    exc: BaseException,
+    fallback: str = "Operation failed",
+    *,
+    prefix_local: bool = False,
+) -> str:
+    """Keep host paths and backend details out of secure Web responses."""
+
+    try:
+        if _get_web_identity_provider().is_local:
+            detail = str(exc)
+            if prefix_local and detail:
+                return f"{fallback}: {detail}"
+            return detail or fallback
+    except WebIdentityConfigurationError:
+        pass
+    return fallback
+
+
+def _request_web_identity(request: Request) -> WebIdentity:
+    state = getattr(request, "state", None)
+    identity = getattr(state, "web_identity", None)
+    if not isinstance(identity, WebIdentity):
+        provider = _get_web_identity_provider()
+        if provider.is_local:
+            return _current_web_identity()
+        raise WebIdentityError("authentication context is missing")
+    return identity
+
+
+def _opaque_web_credential(request: Request) -> str | None:
+    authorization = request.headers.get("authorization", "")
+    if authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer" and value.strip():
+            return value.strip()
+    cookie = request.cookies.get("xagent_session")
+    return cookie if cookie else None
+
+
+def _required_web_scopes(request: Request) -> tuple[str, ...]:
+    path = request.url.path
+    method = request.method.upper()
+    if path == "/api/auth/session" or method == "OPTIONS":
+        return ()
+    if path.startswith(("/api/usage/", "/api/trace/")):
+        return ("workspace.read",)
+    if path == "/api/chat" or path.startswith("/api/chat/"):
+        return ("workspace.read",) if method == "GET" else ("user.interact",)
+    if path.startswith("/api/chats"):
+        if method == "GET":
+            return ("workspace.read",)
+        if method == "DELETE":
+            return ("state.write",)
+        return ("state.write",)
+    if path.startswith("/api/tasks"):
+        return ("workspace.read",) if method == "GET" else ("state.write",)
+    if path.startswith("/api/eval"):
+        return ("workspace.read",) if method == "GET" else ("state.write",)
+    if path.startswith("/api/workspace/index/refresh"):
+        return ("workspace.read", "state.write")
+    if path.startswith("/api/workspace"):
+        if method == "GET":
+            return ("workspace.read",)
+        if method == "DELETE":
+            return ("workspace.delete",)
+        return ("workspace.write",)
+    return ("workspace.read",)
 
 
 def _is_loopback_client(host: str | None) -> bool:
@@ -202,7 +356,65 @@ async def enforce_local_web_access(request: Request, call_next):
             status_code=403,
             content={"success": False, "error": "Origin is not allowed"},
         )
-    return await call_next(request)
+    if request.method.upper() == "OPTIONS":
+        return await call_next(request)
+    try:
+        provider = _get_web_identity_provider()
+        await _run_blocking(_revoke_invalid_web_activity, provider)
+        identity = provider.authenticate(_opaque_web_credential(request))
+    except WebIdentityConfigurationError:
+        logger.exception("Web identity provider configuration is invalid")
+        # A registry that disappears, becomes corrupt, or contains no enabled
+        # identities invalidates every previously trusted secure owner.  There
+        # is no provider from which a safe subset can be reconstructed, so
+        # active work must be stopped before returning the outage response.
+        await _run_blocking(_revoke_all_secure_web_activity)
+        return JSONResponse(
+            status_code=503,
+            content={"success": False, "error": "Web authentication is unavailable"},
+        )
+    except WebIdentityError:
+        return JSONResponse(
+            status_code=401,
+            content={"success": False, "error": "Authentication required"},
+        )
+    request.state.web_identity = identity
+    request.state.web_credential = _opaque_web_credential(request)
+    if any(scope not in identity.scopes for scope in _required_web_scopes(request)):
+        return JSONResponse(
+            status_code=403,
+            content={"success": False, "error": "Access denied"},
+        )
+    context_token = _WEB_IDENTITY_CONTEXT.set(identity)
+    try:
+        return await call_next(request)
+    finally:
+        _WEB_IDENTITY_CONTEXT.reset(context_token)
+
+
+@app.post("/api/auth/session")
+async def create_web_auth_session(
+    request: Request,
+    response: Response,
+):
+    """Exchange an authenticated bearer for an HttpOnly cookie used by SSE."""
+
+    provider = _get_web_identity_provider()
+    if provider.is_local:
+        return {"success": True, "data": {"mode": "local"}}
+    credential = getattr(request.state, "web_credential", None)
+    if not isinstance(credential, str) or not credential:
+        return {"success": False, "error": "Bearer credential is required"}
+    response.set_cookie(
+        "xagent_session",
+        credential,
+        httponly=True,
+        secure=os.environ.get("XAGENT_WEB_COOKIE_SECURE", "1").strip() != "0",
+        samesite="strict",
+        path="/",
+        max_age=8 * 60 * 60,
+    )
+    return {"success": True, "data": {"mode": "secure"}}
 
 
 class SubmitTaskRequest(BaseModel):
@@ -319,6 +531,8 @@ class ScheduledTaskRunRequest(BaseModel):
 
 @dataclass
 class UISession:
+    owner_digest: str = ""
+    web_identity: WebIdentity | None = field(default=None, repr=False)
     agent: object | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     event_sequence: int = 0
@@ -372,7 +586,7 @@ class UISession:
 # Global session storage
 _sessions: dict[str, UISession] = {}
 _session_lock = threading.Lock()
-_eval_cancel_events: dict[str, threading.Event] = {}
+_eval_cancel_events: dict[tuple[str, str], threading.Event] = {}
 _eval_lock = threading.Lock()
 
 _TURN_RE = re.compile(r"^\[Turn (\d+)\]$")
@@ -421,6 +635,10 @@ _SESSION_EVENT_MAX_COUNT = 2048
 _LLM_STREAM_BUFFER_MAX_CHARS = 64 * 1024
 _LLM_STREAM_TAG_MAX_CHARS = 4096
 _LLM_TOOL_PAYLOAD_MAX_CHARS = 64 * 1024
+_SECURE_HOST_PATH_RE = re.compile(
+    r"(?<![:\w])/(?:Users|private|var|tmp|home|root|opt|srv|etc|mnt|host)"
+    r"(?:/[^\s\"'<>]+)+"
+)
 _SESSION_CAPACITY_ERROR = "Session capacity reached; stop or close an existing session and retry"
 _SESSION_BUSY_ERROR = "Session is busy with another task"
 _SESSION_CLOSED_ERROR = "Session is closed"
@@ -493,6 +711,82 @@ def _add_usage(target: dict[str, int], source: dict[str, int]) -> None:
         target[field] = target.get(field, 0) + value
 
 
+def _secure_trace_payload(value: Any) -> Any:
+    if _get_web_identity_provider().is_local:
+        return value
+    if isinstance(value, dict):
+        return {
+            key: (
+                "Operation failed"
+                if str(key).casefold()
+                in {
+                    "detail",
+                    "error",
+                    "exception",
+                    "stack",
+                    "traceback",
+                }
+                else "<redacted-path>"
+                if key
+                in {
+                    "path",
+                    "dataset_path",
+                    "download_path",
+                    "log_path",
+                    "index_path",
+                    "latest_path",
+                }
+                else _secure_trace_payload(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_secure_trace_payload(item) for item in value]
+    if isinstance(value, str):
+        if os.path.isabs(value):
+            return "<redacted-path>"
+        return _SECURE_HOST_PATH_RE.sub("<redacted-path>", value)
+    return value
+
+
+def _secure_web_result(value: Any) -> Any:
+    if _get_web_identity_provider().is_local or not isinstance(value, dict):
+        return value
+    result = _secure_trace_payload(value)
+    if not isinstance(result, dict):
+        return result
+    response = str(result.get("response") or "")
+    if (
+        str(result.get("exit_reason") or "") == "ERROR"
+        or response.lstrip().startswith("[error]")
+    ):
+        result["response"] = "[error] Agent task failed"
+    return result
+
+
+def _secure_eval_run_payload(value: Any) -> Any:
+    if _get_web_identity_provider().is_local:
+        return value
+    result = _secure_trace_payload(value)
+    runs = result if isinstance(result, list) else [result]
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        cases = run.get("cases")
+        if not isinstance(cases, list):
+            continue
+        for case in cases:
+            if not isinstance(case, dict):
+                continue
+            if (
+                str(case.get("status") or "").casefold() == "error"
+                or str(case.get("exit_reason") or "").upper() == "ERROR"
+            ):
+                case["failures"] = ["Operation failed"]
+                case["response_excerpt"] = "[error] Agent task failed"
+    return result
+
+
 def _config_log_dir(observability_config_path: str = "") -> str:
     env_log_dir = os.environ.get("XAGENT_LOG_DIR", "").strip()
     if env_log_dir:
@@ -512,9 +806,11 @@ def _resolve_trace_log_dir(
     workspace_dir: str = "",
     ws: str = "default.ws",
 ) -> str:
-    configured_log_dir = _config_log_dir(observability_config_path)
-    if configured_log_dir:
-        return configured_log_dir
+    provider = _get_web_identity_provider()
+    if provider.is_local:
+        configured_log_dir = _config_log_dir(observability_config_path)
+        if configured_log_dir:
+            return configured_log_dir
 
     normalized_workspace_dir = _normalize_path_input(workspace_dir)
     if normalized_workspace_dir:
@@ -524,7 +820,16 @@ def _resolve_trace_log_dir(
 
     if not _is_workspace_name(ws):
         return ""
-    return os.path.join(_WORKSPACE_ROOT, ws, "runtime", "traces")
+    if provider.is_local:
+        return os.path.join(_WORKSPACE_ROOT, ws, "runtime", "traces")
+    workspace_root, error = _workspace_root(ws)
+    if error or workspace_root is None:
+        return ""
+    trace_root = os.path.join(workspace_root, "runtime", "traces")
+    identity = _current_web_identity()
+    if not provider.is_local:
+        trace_root = os.path.join(trace_root, "_owners", identity.owner_digest)
+    return trace_root
 
 
 def _trace_summary_from_events(events: list[dict[str, Any]], limit: int = 20) -> list[dict[str, Any]]:
@@ -632,6 +937,45 @@ class WebSessionUsageSink:
 
     def close(self) -> None:
         return None
+
+
+class WebIdentityStampingSink:
+    """Stamp Web trace records with non-secret authorization boundaries."""
+
+    def __init__(self, session: UISession, sink: Any) -> None:
+        self.session = session
+        self.sink = sink
+
+    def emit(self, event: Event) -> None:
+        with self.session.lock:
+            identity = self.session.web_identity
+            agent_name = self.session.agent_name or "main"
+        if not isinstance(identity, WebIdentity):
+            return
+        principal = identity.principal(
+            session_id=event.session_id or self.session.session_id,
+            agent_id=agent_name,
+        )
+        stamped = Event(
+            session_id=event.session_id,
+            turn=event.turn,
+            kind=event.kind,
+            name=event.name,
+            ts=event.ts,
+            duration_ms=event.duration_ms,
+            data={
+                **event.data,
+                "web_owner_digest": identity.owner_digest,
+                "principal_boundary_digest": principal.boundary_digest,
+                "tenant_digest": hashlib.sha256(
+                    identity.tenant_id.encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        self.sink.emit(stamped)
+
+    def close(self) -> None:
+        self.sink.close()
 
 
 def _tool_key(name: str, arguments: dict[str, Any]) -> str:
@@ -1007,17 +1351,68 @@ def _normalize_path_input(value: str | None) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def _resolve_workspace_dir_input(value: str) -> str:
+def _effective_web_config_paths(
+    config_path: str,
+    observability_config_path: str,
+) -> tuple[str, str, str | None]:
+    requested_config = _normalize_path_input(config_path)
+    requested_observability = _normalize_path_input(observability_config_path)
+    if _get_web_identity_provider().is_local:
+        return requested_config, requested_observability, None
+    if requested_config or requested_observability:
+        return "", "", "Client-selected configuration paths are not allowed"
+    configured = os.environ.get("XAGENT_WEB_CONFIG_PATH", "").strip()
+    if not configured:
+        return "", "", None
+    try:
+        resolved = os.path.realpath(configured)
+        if not os.path.isfile(resolved):
+            raise OSError
+    except OSError:
+        return "", "", "Trusted Web configuration is unavailable"
+
+    provider = _get_web_identity_provider()
+    workspace_roots = {os.path.realpath(_WORKSPACE_ROOT)}
+    for identity in provider.identities():
+        workspace_roots.update(
+            os.path.realpath(path)
+            for _alias, path in identity.workspace_aliases
+        )
+    for workspace_root in workspace_roots:
+        try:
+            inside_workspace = physical_directory_contains_path(
+                Path(workspace_root),
+                Path(resolved),
+            )
+        except OSError:
+            return "", "", "Trusted Web configuration is unavailable"
+        if inside_workspace:
+            return "", "", "Trusted Web configuration is unavailable"
+    return resolved, "", None
+
+
+def _resolve_workspace_dir_input(
+    value: str,
+    identity: WebIdentity | None = None,
+) -> str:
     normalized = _normalize_path_input(value)
     if not normalized:
         return ""
     if _is_workspace_name(normalized):
-        return os.path.join(_WORKSPACE_ROOT, normalized)
-    return normalized
+        if _get_web_identity_provider().is_local:
+            return os.path.join(_WORKSPACE_ROOT, normalized)
+        workspace_root, error = _workspace_root(normalized, identity=identity)
+        return workspace_root if error is None and workspace_root is not None else ""
+    if _get_web_identity_provider().is_local:
+        return normalized
+    return ""
 
 
-def _workspace_skills_dir_input(value: str) -> str | None:
-    workspace_root = _resolve_workspace_dir_input(value)
+def _workspace_skills_dir_input(
+    value: str,
+    identity: WebIdentity | None = None,
+) -> str | None:
+    workspace_root = _resolve_workspace_dir_input(value, identity=identity)
     if not workspace_root:
         return None
     skills_dir = os.path.join(workspace_root, "system", "skills")
@@ -1028,22 +1423,40 @@ def _valid_chat_id(chat_id: str) -> bool:
     return bool(chat_id) and _CHAT_ID_RE.fullmatch(chat_id) is not None and chat_id not in {".", ".."}
 
 
-def _chat_root(ws: str, agent: str) -> tuple[str | None, str | None]:
+def _chat_root(
+    ws: str,
+    agent: str,
+    identity: WebIdentity | None = None,
+) -> tuple[str | None, str | None]:
     if not _is_workspace_name(ws):
         return None, "Invalid workspace name"
     if not _is_child_name(agent):
         return None, "Invalid agent name"
-    ws_root = os.path.realpath(os.path.join(_WORKSPACE_ROOT, ws))
-    workspace_parent = os.path.realpath(_WORKSPACE_ROOT)
-    if os.path.commonpath([workspace_parent, ws_root]) != workspace_parent:
-        return None, "Path traversal not allowed"
-    return os.path.join(ws_root, "runtime", "chats", agent), None
+    caller = identity or _current_web_identity()
+    if _get_web_identity_provider().is_local:
+        ws_root = os.path.realpath(os.path.join(_WORKSPACE_ROOT, ws))
+        workspace_parent = os.path.realpath(_WORKSPACE_ROOT)
+        if os.path.commonpath([workspace_parent, ws_root]) != workspace_parent:
+            return None, "Path traversal not allowed"
+    else:
+        ws_root, workspace_error = _workspace_root(ws, identity=caller)
+        if workspace_error or ws_root is None:
+            return None, workspace_error
+    chat_root = os.path.join(ws_root, "runtime", "chats")
+    if not _get_web_identity_provider().is_local:
+        chat_root = os.path.join(chat_root, "_owners", caller.owner_digest)
+    return os.path.join(chat_root, agent), None
 
 
-def _chat_dir(ws: str, agent: str, chat_id: str) -> tuple[str | None, str | None]:
+def _chat_dir(
+    ws: str,
+    agent: str,
+    chat_id: str,
+    identity: WebIdentity | None = None,
+) -> tuple[str | None, str | None]:
     if not _valid_chat_id(chat_id):
         return None, "Invalid chat id"
-    root, error = _chat_root(ws, agent)
+    root, error = _chat_root(ws, agent, identity=identity)
     if error or root is None:
         return None, error
     real_root = os.path.realpath(root)
@@ -1053,21 +1466,37 @@ def _chat_dir(ws: str, agent: str, chat_id: str) -> tuple[str | None, str | None
     return chat_path, None
 
 
-def _chat_metadata_path(ws: str, agent: str, chat_id: str) -> tuple[str | None, str | None]:
-    chat_path, error = _chat_dir(ws, agent, chat_id)
+def _chat_metadata_path(
+    ws: str,
+    agent: str,
+    chat_id: str,
+    identity: WebIdentity | None = None,
+) -> tuple[str | None, str | None]:
+    chat_path, error = _chat_dir(ws, agent, chat_id, identity=identity)
     if error or chat_path is None:
         return None, error
     return os.path.join(chat_path, "metadata.json"), None
 
 
-def _chat_state_path(ws: str, agent: str, chat_id: str) -> tuple[str | None, str | None]:
-    chat_path, error = _chat_dir(ws, agent, chat_id)
+def _chat_state_path(
+    ws: str,
+    agent: str,
+    chat_id: str,
+    identity: WebIdentity | None = None,
+) -> tuple[str | None, str | None]:
+    chat_path, error = _chat_dir(ws, agent, chat_id, identity=identity)
     if error or chat_path is None:
         return None, error
     return os.path.join(chat_path, "state.json"), None
 
 
-def _default_chat_metadata(ws: str, agent: str, chat_id: str) -> dict[str, Any]:
+def _default_chat_metadata(
+    ws: str,
+    agent: str,
+    chat_id: str,
+    identity: WebIdentity | None = None,
+) -> dict[str, Any]:
+    caller = identity or _current_web_identity()
     now = time.time()
     return {
         "chat_id": chat_id,
@@ -1079,10 +1508,18 @@ def _default_chat_metadata(ws: str, agent: str, chat_id: str) -> dict[str, Any]:
         "last_message_preview": "",
         "message_count": 0,
         "status": "idle",
+        "owner_digest": caller.owner_digest,
     }
 
 
-def _default_chat_state(ws: str, agent: str, chat_id: str, session_id: str = "") -> dict[str, Any]:
+def _default_chat_state(
+    ws: str,
+    agent: str,
+    chat_id: str,
+    session_id: str = "",
+    identity: WebIdentity | None = None,
+) -> dict[str, Any]:
+    caller = identity or _current_web_identity()
     return {
         "chat_id": chat_id,
         "workspace": ws,
@@ -1098,27 +1535,52 @@ def _default_chat_state(ws: str, agent: str, chat_id: str, session_id: str = "")
         "ask_prompt": "",
         "status": "idle",
         "updated_at": time.time(),
+        "owner_digest": caller.owner_digest,
     }
 
 
-def _read_chat_metadata(ws: str, agent: str, chat_id: str) -> dict[str, Any] | None:
-    path, error = _chat_metadata_path(ws, agent, chat_id)
+def _chat_payload_owned_by(
+    payload: dict[str, Any],
+    identity: WebIdentity,
+) -> bool:
+    stored = str(payload.get("owner_digest") or "")
+    if stored:
+        return stored == identity.owner_digest
+    return _get_web_identity_provider().is_local
+
+
+def _read_chat_metadata(
+    ws: str,
+    agent: str,
+    chat_id: str,
+    identity: WebIdentity | None = None,
+) -> dict[str, Any] | None:
+    caller = identity or _current_web_identity()
+    path, error = _chat_metadata_path(ws, agent, chat_id, identity=caller)
     if error or path is None or not os.path.isfile(path):
         return None
     try:
-        return _read_json_file(path)
+        payload = _read_json_file(path)
     except (OSError, json.JSONDecodeError):
         return None
+    return payload if _chat_payload_owned_by(payload, caller) else None
 
 
-def _read_chat_state(ws: str, agent: str, chat_id: str) -> dict[str, Any] | None:
-    path, error = _chat_state_path(ws, agent, chat_id)
+def _read_chat_state(
+    ws: str,
+    agent: str,
+    chat_id: str,
+    identity: WebIdentity | None = None,
+) -> dict[str, Any] | None:
+    caller = identity or _current_web_identity()
+    path, error = _chat_state_path(ws, agent, chat_id, identity=caller)
     if error or path is None or not os.path.isfile(path):
         return None
     try:
-        return _read_json_file(path)
+        payload = _read_json_file(path)
     except (OSError, json.JSONDecodeError):
         return None
+    return payload if _chat_payload_owned_by(payload, caller) else None
 
 
 def _extract_llm_history(agent: object | None) -> list[dict[str, Any]]:
@@ -1221,7 +1683,41 @@ def _touch_session(session: UISession) -> bool:
         return True
 
 
-def _get_session(session_id: str, *, touch: bool = True) -> UISession | None:
+def _session_owned_by(session: UISession, identity: WebIdentity) -> bool:
+    if (
+        not session.owner_digest
+        and session.web_identity is None
+        and _get_web_identity_provider().is_local
+    ):
+        return _bind_session_identity(session, identity)
+    return (
+        bool(session.owner_digest)
+        and session.owner_digest == identity.owner_digest
+        and isinstance(session.web_identity, WebIdentity)
+        and session.web_identity.owner_digest == identity.owner_digest
+    )
+
+
+def _bind_session_identity(session: UISession, identity: WebIdentity) -> bool:
+    with session.lock:
+        if session.owner_digest and session.owner_digest != identity.owner_digest:
+            return False
+        if (
+            isinstance(session.web_identity, WebIdentity)
+            and session.web_identity.owner_digest != identity.owner_digest
+        ):
+            return False
+        session.owner_digest = identity.owner_digest
+        session.web_identity = identity
+        return True
+
+
+def _get_session(
+    session_id: str,
+    *,
+    touch: bool = True,
+    identity: WebIdentity | None = None,
+) -> UISession | None:
     with _session_lock:
         session = _sessions.get(session_id)
     if session is None:
@@ -1229,19 +1725,35 @@ def _get_session(session_id: str, *, touch: bool = True) -> UISession | None:
     with session.lock:
         if session.closing:
             return None
+        if identity is not None and not _session_owned_by(session, identity):
+            return None
         if touch:
             session.last_activity_at = time.time()
     with _session_lock:
         return session if _sessions.get(session_id) is session else None
 
 
-def _session_snapshot() -> list[UISession]:
+def _session_snapshot(identity: WebIdentity | None = None) -> list[UISession]:
     with _session_lock:
-        return list(_sessions.values())
+        sessions = list(_sessions.values())
+    if identity is None:
+        return sessions
+    return [session for session in sessions if _session_owned_by(session, identity)]
 
 
-def _register_session(session: UISession, *, max_sessions: int = _SESSION_MAX_COUNT) -> bool:
+def _register_session(
+    session: UISession,
+    *,
+    max_sessions: int = _SESSION_MAX_COUNT,
+    identity: WebIdentity | None = None,
+) -> bool:
     if _web_runtime_stopping.is_set():
+        return False
+    try:
+        caller = identity or session.web_identity or _current_web_identity()
+    except WebIdentityError:
+        return False
+    if not isinstance(caller, WebIdentity) or not _bind_session_identity(session, caller):
         return False
     limit = max(1, int(max_sessions))
     with _session_lock:
@@ -1310,14 +1822,42 @@ def _persist_chat_state(session: UISession, *, force: bool = False) -> bool:
             checkpoint_id = session.checkpoint_id
             ask_prompt = session.ask_prompt
             agent = session.agent
+            identity = session.web_identity
 
-        metadata_path, error = _chat_metadata_path(chat_ws, chat_agent, chat_id)
-        state_path, state_error = _chat_state_path(chat_ws, chat_agent, chat_id)
+        if not isinstance(identity, WebIdentity) and _get_web_identity_provider().is_local:
+            identity = _current_web_identity()
+            if not _bind_session_identity(session, identity):
+                return False
+        if not isinstance(identity, WebIdentity):
+            return False
+
+        metadata_path, error = _chat_metadata_path(
+            chat_ws,
+            chat_agent,
+            chat_id,
+            identity=identity,
+        )
+        state_path, state_error = _chat_state_path(
+            chat_ws,
+            chat_agent,
+            chat_id,
+            identity=identity,
+        )
         if error or state_error or metadata_path is None or state_path is None:
             return False
-        metadata = _read_chat_metadata(chat_ws, chat_agent, chat_id)
+        metadata = _read_chat_metadata(
+            chat_ws,
+            chat_agent,
+            chat_id,
+            identity=identity,
+        )
         if metadata is None:
-            metadata = _default_chat_metadata(chat_ws, chat_agent, chat_id)
+            metadata = _default_chat_metadata(
+                chat_ws,
+                chat_agent,
+                chat_id,
+                identity=identity,
+            )
         status = (
             "waiting_for_user"
             if waiting_for_user
@@ -1334,10 +1874,17 @@ def _persist_chat_state(session: UISession, *, force: bool = False) -> bool:
                 "last_message_preview": _chat_preview(messages),
                 "message_count": len(messages),
                 "status": status,
+                "owner_digest": identity.owner_digest,
             }
         )
         state = {
-            **_default_chat_state(chat_ws, chat_agent, chat_id, session_id),
+            **_default_chat_state(
+                chat_ws,
+                chat_agent,
+                chat_id,
+                session_id,
+                identity=identity,
+            ),
             "backend_session_id": session_id,
             "checkpoint_id": checkpoint_id,
             "resume_available": interrupted and resume_available,
@@ -1350,6 +1897,7 @@ def _persist_chat_state(session: UISession, *, force: bool = False) -> bool:
             "ask_prompt": ask_prompt,
             "status": status,
             "updated_at": now,
+            "owner_digest": identity.owner_digest,
         }
         try:
             _write_json_file(metadata_path, metadata)
@@ -1475,6 +2023,87 @@ def _cleanup_sessions(
     return [session_id for session_id, _, _ in removed]
 
 
+def _revoke_invalid_web_activity(
+    provider: WebIdentityProvider,
+) -> list[str]:
+    """Stop in-memory work whose trusted identity was removed or changed."""
+
+    if provider.is_local:
+        return []
+    return _revoke_web_activity_except(
+        {
+            identity.owner_digest
+            for identity in provider.identities()
+            if identity.workspace_boundaries_valid()
+        },
+        revoke_unowned=False,
+    )
+
+
+def _revoke_all_secure_web_activity() -> list[str]:
+    """Fail closed when the secure identity registry cannot be trusted."""
+
+    return _revoke_web_activity_except(set(), revoke_unowned=True)
+
+
+def _revoke_web_activity_except(
+    valid_owners: set[str],
+    *,
+    revoke_unowned: bool,
+) -> list[str]:
+    """Stop in-memory work outside an explicitly trusted owner set."""
+
+    # Eval workers are not UISessions, so revoke their cancellation handles
+    # independently. The worker owns final removal of the handle.
+    with _eval_lock:
+        for (owner_digest, _run_id), cancel_event in list(
+            _eval_cancel_events.items()
+        ):
+            if owner_digest not in valid_owners:
+                cancel_event.set()
+
+    removed: list[tuple[str, UISession]] = []
+    for session in _session_snapshot():
+        with session.lock:
+            if (
+                session.closing
+                or session.owner_digest in valid_owners
+                or (not session.owner_digest and not revoke_unowned)
+            ):
+                continue
+            _emit(
+                session,
+                "stop",
+                "session closed because its Web identity was revoked",
+            )
+            _set_session_runtime_state(session, "interrupted")
+            session.ask_prompt = ""
+            session.closing = True
+        with _session_lock:
+            if _sessions.get(session.session_id) is session:
+                _sessions.pop(session.session_id, None)
+                removed.append((session.session_id, session))
+
+    for _, session in removed:
+        # Do not persist through a revoked identity: its old workspace mapping
+        # is no longer an authorized write target.
+        try:
+            _stop_agent(session, unblock_reply=True)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to stop a session after identity revocation")
+        try:
+            _close_agent(session)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to close a session after identity revocation")
+        _queue_state(session, finished=True)
+    if removed:
+        logger.warning(
+            "Stopped %d Web session(s) after identity revocation",
+            len(removed),
+        )
+    return [session_id for session_id, _ in removed]
+
+
 def _shutdown_sessions() -> list[str]:
     removed: list[tuple[str, UISession, bool, bool]] = []
     for session in _session_snapshot():
@@ -1509,10 +2138,12 @@ def _load_bound_chat_checkpoint(
     ws: str,
     agent: str,
     checkpoint_id: str,
+    identity: WebIdentity | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
+    caller = identity or _current_web_identity()
     if not checkpoint_id:
         return None, "Chat has no checkpoint to resume"
-    workspace_root, workspace_error = _workspace_root(ws)
+    workspace_root, workspace_error = _workspace_root(ws, identity=caller)
     if workspace_error or workspace_root is None:
         return None, workspace_error
     loaded = load_task_checkpoint(workspace_root, checkpoint_id)
@@ -1526,6 +2157,15 @@ def _load_bound_chat_checkpoint(
     checkpoint_agent = str(checkpoint.get("agent_name") or "")
     if checkpoint_agent and checkpoint_agent != agent:
         return None, "checkpoint agent does not match this chat"
+    expected_boundary = caller.principal(
+        session_id="checkpoint-preflight",
+        agent_id=agent or "main",
+    ).boundary_digest
+    stored_boundary = str(checkpoint.get("principal_boundary_digest") or "")
+    if stored_boundary != expected_boundary and not (
+        not stored_boundary and _get_web_identity_provider().is_local
+    ):
+        return None, "checkpoint is not authorized for this identity"
     return checkpoint, None
 
 
@@ -1533,7 +2173,11 @@ def _recover_persisted_chat_runtime(
     ws: str,
     agent: str,
     state: dict[str, Any],
+    identity: WebIdentity | None = None,
 ) -> tuple[str, bool]:
+    caller = identity or _current_web_identity()
+    if not _chat_payload_owned_by(state, caller):
+        return "interrupted", False
     persisted_status = str(state.get("status") or "idle")
     was_active = bool(state.get("waiting_for_user")) or persisted_status in {
         "running",
@@ -1546,6 +2190,7 @@ def _recover_persisted_chat_runtime(
         ws,
         agent,
         str(state.get("checkpoint_id") or ""),
+        caller,
     )
     if checkpoint is None:
         return "interrupted", False
@@ -1554,15 +2199,28 @@ def _recover_persisted_chat_runtime(
     return "interrupted", True
 
 
-def _load_chat_into_session(ws: str, agent: str, chat_id: str, session: UISession | None = None) -> tuple[UISession | None, str | None]:
-    chat_path, error = _chat_dir(ws, agent, chat_id)
+def _load_chat_into_session(
+    ws: str,
+    agent: str,
+    chat_id: str,
+    session: UISession | None = None,
+    identity: WebIdentity | None = None,
+) -> tuple[UISession | None, str | None]:
+    caller = identity or _current_web_identity()
+    chat_path, error = _chat_dir(ws, agent, chat_id, identity=caller)
     if error or chat_path is None:
         return None, error
-    metadata = _read_chat_metadata(ws, agent, chat_id)
-    state = _read_chat_state(ws, agent, chat_id)
+    metadata = _read_chat_metadata(ws, agent, chat_id, identity=caller)
+    state = _read_chat_state(ws, agent, chat_id, identity=caller)
     if metadata is None or state is None:
         return None, "Chat not found"
-    session = session or UISession(session_id=str(state.get("backend_session_id") or uuid.uuid4().hex[:16]))
+    session = session or UISession(
+        session_id=str(state.get("backend_session_id") or uuid.uuid4().hex[:16]),
+        owner_digest=caller.owner_digest,
+        web_identity=caller,
+    )
+    if not _bind_session_identity(session, caller):
+        return None, "Chat not found"
     session.chat_id = chat_id
     session.chat_ws = ws
     session.chat_agent = agent
@@ -1573,23 +2231,34 @@ def _load_chat_into_session(ws: str, agent: str, chat_id: str, session: UISessio
     session.restored_llm_history = _safe_json_value(history) if isinstance(history, list) else []
     session.checkpoint_id = str(state.get("checkpoint_id") or "")
     persisted_status = str(state.get("status") or "idle")
-    recovered_status, resume_available = _recover_persisted_chat_runtime(ws, agent, state)
+    recovered_status, resume_available = _recover_persisted_chat_runtime(
+        ws,
+        agent,
+        state,
+        identity=caller,
+    )
     if recovered_status == "interrupted":
         _set_session_runtime_state(session, "interrupted")
         session.resume_available = resume_available
     else:
         _set_session_runtime_state(session, "idle")
     session.ask_prompt = ""
-    if not _register_session(session):
+    if not _register_session(session, identity=caller):
         return None, _SESSION_CAPACITY_ERROR
     if persisted_status in {"running", "waiting_for_user"} or bool(state.get("waiting_for_user")):
         _persist_chat_state(session, force=True)
     return session, None
 
 
-def _find_session_by_chat(ws: str, agent: str, chat_id: str) -> UISession | None:
+def _find_session_by_chat(
+    ws: str,
+    agent: str,
+    chat_id: str,
+    identity: WebIdentity | None = None,
+) -> UISession | None:
+    caller = identity or _current_web_identity()
     matched: UISession | None = None
-    for session in _session_snapshot():
+    for session in _session_snapshot(caller):
         with session.lock:
             if session.closing:
                 continue
@@ -1629,7 +2298,31 @@ def _ensure_agent(
     task_start_token: str = "",
 ):
     runtime_config = runtime_config or {}
-    runtime_key_data = {"agent": runtime_config, "team": team_config or {}, "workflow": team_workflow or {}}
+    with session.lock:
+        identity = session.web_identity
+    if not isinstance(identity, WebIdentity) and _get_web_identity_provider().is_local:
+        identity = _current_web_identity()
+        if not _bind_session_identity(session, identity):
+            raise WebIdentityError("session identity is invalid")
+    if not isinstance(identity, WebIdentity):
+        raise WebIdentityError("session identity is missing")
+    principal_template = identity.principal(
+        session_id=session.session_id,
+        agent_id=agent_name or "main",
+    )
+    resolved_workspace = _resolve_workspace_dir_input(
+        workspace_dir,
+        identity=identity,
+    )
+    if not resolved_workspace:
+        raise WebIdentityError("workspace is not authorized")
+    runtime_key_data = {
+        "agent": runtime_config,
+        "team": team_config or {},
+        "workflow": team_workflow or {},
+        "owner_digest": identity.owner_digest,
+        "principal_boundary_digest": principal_template.boundary_digest,
+    }
     runtime_config_key = json.dumps(runtime_key_data, ensure_ascii=False, sort_keys=True, default=str)
     with session.agent_init_lock:
         with session.lock:
@@ -1662,8 +2355,8 @@ def _ensure_agent(
         new_agent = build_agent(
             config_path=config_path or None,
             observability_config_path=observability_config_path or None,
-            skills_dir=_workspace_skills_dir_input(workspace_dir),
-            workspace_dir=_resolve_workspace_dir_input(workspace_dir) or None,
+            skills_dir=_workspace_skills_dir_input(workspace_dir, identity=identity),
+            workspace_dir=resolved_workspace,
             agent_name=agent_name,
             agent_prompt=str(runtime_config.get("agent_prompt", "")),
             agent_soul=str(runtime_config.get("agent_soul", "")),
@@ -1673,14 +2366,25 @@ def _ensure_agent(
             max_turns=runtime_config.get("max_turns"),
             memory_mode=str(runtime_config.get("memory_mode", "project")),
             team_config=team_config,
+            principal=principal_template,
         )
         try:
             web_usage_sink = WebSessionUsageSink(session)
-            trace_log_dir = ""
-            if not _config_log_dir(observability_config_path):
-                trace_log_dir = _resolve_trace_log_dir(workspace_dir=workspace_dir)
-            trace_sink = JsonlSink(trace_log_dir) if trace_log_dir else NullSink()
+            provider = _get_web_identity_provider()
+            trace_log_dir = _resolve_trace_log_dir(workspace_dir=workspace_dir)
+            raw_trace_sink = JsonlSink(trace_log_dir) if trace_log_dir else NullSink()
+            trace_sink = (
+                raw_trace_sink
+                if provider.is_local
+                else WebIdentityStampingSink(session, raw_trace_sink)
+            )
             existing_sink = getattr(new_agent, "sink", NullSink())
+            if not provider.is_local:
+                try:
+                    existing_sink.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                existing_sink = NullSink()
             new_agent.sink = MultiSink(existing_sink, trace_sink, web_usage_sink)
             new_agent.handler.ctx.sink = new_agent.sink
             new_agent.handler.ctx.verbose = True
@@ -1689,9 +2393,10 @@ def _ensure_agent(
             team_step_runner = build_team_step_runner(
                 config_path=config_path or None,
                 observability_config_path=observability_config_path or None,
-                skills_dir=_workspace_skills_dir_input(workspace_dir),
-                workspace=_resolve_workspace_dir_input(workspace_dir) or workspace_dir,
+                skills_dir=_workspace_skills_dir_input(workspace_dir, identity=identity),
+                workspace=resolved_workspace,
                 team_config=team_config,
+                principal_template=principal_template,
             )
         except Exception:
             new_agent.close()
@@ -1749,7 +2454,13 @@ def _drain_sync(session: UISession, wait: bool) -> bool:
             if session.closing:
                 return True
             if "progress" in msg:
-                _append_progress(session, msg["progress"])
+                progress = str(msg["progress"])
+                if (
+                    not _get_web_identity_provider().is_local
+                    and progress.startswith("[error] ")
+                ):
+                    progress = "[error] Agent task failed"
+                _append_progress(session, progress)
             elif "ask_user" in msg:
                 _set_session_runtime_state(session, "waiting")
                 session.ask_prompt = msg["ask_user"]
@@ -1757,7 +2468,7 @@ def _drain_sync(session: UISession, wait: bool) -> bool:
                 force_persist = True
                 stop_draining = True
             elif "done" in msg:
-                result = msg["done"]
+                result = _secure_web_result(msg["done"])
                 _emit(
                     session,
                     "done",
@@ -1896,7 +2607,12 @@ def _run_team_workflow_background(
                     workflow,
                 )
     except Exception as exc:  # noqa: BLE001
-        result = _workflow_error_result(f"[error] team workflow failed: {exc}", str(exc), workflow)
+        detail = _web_error_message(
+            exc,
+            "Team workflow failed",
+            prefix_local=True,
+        )
+        result = _workflow_error_result(f"[error] {detail}", detail, workflow)
 
     if agent is not None:
         agent.display_queue.put({"done": result})
@@ -1960,24 +2676,33 @@ def _run_task_background(
         agent = session.agent
     _persist_chat_state(session, force=True)
 
-    if not workflow and agent is not None:
-        agent.run_task_async(
-            task.strip() or "继续执行 checkpoint 中未完成的任务。",
-            resume_checkpoint=resume_checkpoint or None,
-            checkpoint_id=checkpoint_id or None,
-            reset_stop_event=False,
-        )
-
-    if workflow:
-        _new_daemon_thread(
-            target=_run_team_workflow_background,
-            args=(session, workflow, task, step_runner, parent_ctx, agent),
-        ).start()
-
     try:
+        if not workflow and agent is not None:
+            agent.run_task_async(
+                task.strip() or "继续执行 checkpoint 中未完成的任务。",
+                resume_checkpoint=resume_checkpoint or None,
+                checkpoint_id=checkpoint_id or None,
+                reset_stop_event=False,
+            )
+
+        if workflow:
+            _new_daemon_thread(
+                target=_run_team_workflow_background,
+                args=(session, workflow, task, step_runner, parent_ctx, agent),
+            ).start()
+
         _drain_background(session)
     except Exception as exc:  # noqa: BLE001
-        result = _workflow_error_result(f"[error] failed to drain task result: {exc}", str(exc), workflow)
+        try:
+            _stop_agent(session, unblock_reply=True)
+        except Exception:  # noqa: BLE001
+            pass
+        detail = _web_error_message(
+            exc,
+            "Failed to drain task result",
+            prefix_local=True,
+        )
+        result = _workflow_error_result(f"[error] {detail}", detail, workflow)
         with session.lock:
             _emit(
                 session,
@@ -1999,12 +2724,19 @@ def _run_task_background(
 @app.post("/api/chat")
 async def submit_task(request: SubmitTaskRequest):
     """Submit a new task"""
+    identity = _current_web_identity()
     task = request.task.strip()
     if not request.resume and not task:
         return {"success": False, "error": "Task is required"}
     requested_session_id = _normalize_path_input(request.session_id)
     chat_id = _normalize_path_input(request.chat_id)
     workspace_dir = _normalize_path_input(request.workspace_dir)
+    if (
+        workspace_dir
+        and not _is_workspace_name(workspace_dir)
+        and not _get_web_identity_provider().is_local
+    ):
+        return {"success": False, "error": "Workspace not found"}
     agent_name = _normalize_path_input(request.agent)
     team_name = _normalize_path_input(request.team)
     chat_ws = workspace_dir if _is_workspace_name(workspace_dir) else "default.ws"
@@ -2029,27 +2761,47 @@ async def submit_task(request: SubmitTaskRequest):
             agent_name = str(team_config.get("leader") or "").strip()
     if chat_id and not agent_name:
         return {"success": False, "error": "Agent is required for persistent chat"}
-    session = _get_session(requested_session_id) if requested_session_id else None
+    session = (
+        _get_session(requested_session_id, identity=identity)
+        if requested_session_id
+        else None
+    )
     if session is None and chat_id:
-        session = _find_session_by_chat(chat_ws, agent_name, chat_id)
+        session = _find_session_by_chat(
+            chat_ws,
+            agent_name,
+            chat_id,
+            identity=identity,
+        )
     if session is None and chat_id:
         loaded_session, load_error = await _run_blocking(
             _load_chat_into_session,
             chat_ws,
             agent_name,
             chat_id,
+            None,
+            identity,
         )
         session = loaded_session
         if session is None and load_error == _SESSION_CAPACITY_ERROR:
-            session = _find_session_by_chat(chat_ws, agent_name, chat_id)
+            session = _find_session_by_chat(
+                chat_ws,
+                agent_name,
+                chat_id,
+                identity=identity,
+            )
         if load_error and session is None:
             return {"success": False, "error": load_error}
         if session is None:
             return {"success": False, "error": "Chat session could not be loaded"}
     if session is None:
         session_id = uuid.uuid4().hex[:16]
-        session = UISession(session_id=session_id)
-        if not _register_session(session):
+        session = UISession(
+            session_id=session_id,
+            owner_digest=identity.owner_digest,
+            web_identity=identity,
+        )
+        if not _register_session(session, identity=identity):
             return {"success": False, "error": _SESSION_CAPACITY_ERROR}
     else:
         session_id = session.session_id
@@ -2075,6 +2827,7 @@ async def submit_task(request: SubmitTaskRequest):
             checkpoint_ws,
             checkpoint_agent,
             checkpoint_id,
+            identity,
         )
         if checkpoint_error:
             return {"success": False, "error": f"Checkpoint is not resumable: {checkpoint_error}"}
@@ -2092,8 +2845,14 @@ async def submit_task(request: SubmitTaskRequest):
 
     handed_off = False
     try:
-        config_path = _normalize_path_input(request.config_path)
-        observability_config_path = _normalize_path_input(request.observability_config_path)
+        config_path, observability_config_path, config_error = (
+            _effective_web_config_paths(
+                request.config_path,
+                request.observability_config_path,
+            )
+        )
+        if config_error:
+            return {"success": False, "error": config_error}
         if chat_id:
             with session.lock:
                 session.chat_id = chat_id
@@ -2101,7 +2860,7 @@ async def submit_task(request: SubmitTaskRequest):
                 session.chat_agent = agent_name
         runtime_config, runtime_error = await _run_blocking(
             _agent_runtime_config,
-            workspace_dir,
+            workspace_dir or chat_ws,
             agent_name,
         )
         if runtime_error:
@@ -2114,7 +2873,7 @@ async def submit_task(request: SubmitTaskRequest):
                 session,
                 config_path,
                 observability_config_path,
-                workspace_dir,
+                workspace_dir or chat_ws,
                 agent_name,
                 runtime_config,
                 team_name,
@@ -2123,7 +2882,14 @@ async def submit_task(request: SubmitTaskRequest):
                 task_start_token,
             )
         except Exception as exc:  # noqa: BLE001
-            return {"success": False, "error": f"Failed to initialize Agent: {exc}"}
+            return {
+                "success": False,
+                "error": _web_error_message(
+                    exc,
+                    "Failed to initialize Agent",
+                    prefix_local=True,
+                ),
+            }
         if agent is None:
             return {"success": False, "error": "Session became unavailable while initializing Agent"}
 
@@ -2140,7 +2906,14 @@ async def submit_task(request: SubmitTaskRequest):
             )
             thread.start()
         except Exception as exc:  # noqa: BLE001
-            return {"success": False, "error": f"Failed to start task: {exc}"}
+            return {
+                "success": False,
+                "error": _web_error_message(
+                    exc,
+                    "Failed to start task",
+                    prefix_local=True,
+                ),
+            }
 
         handed_off = True
         return {
@@ -2159,12 +2932,15 @@ async def submit_task(request: SubmitTaskRequest):
 @app.post("/api/chat/reply")
 async def send_reply(request: ReplyRequest):
     """Send reply to agent's ask_user"""
+    identity = _current_web_identity()
     requested_session_id = _normalize_path_input(request.session_id)
     if requested_session_id:
-        active_session = _get_session(requested_session_id)
+        active_session = _get_session(requested_session_id, identity=identity)
     else:
+        if not _get_web_identity_provider().is_local:
+            return {"success": False, "error": "session_id is required"}
         active_session = None
-        for candidate in _session_snapshot():
+        for candidate in _session_snapshot(identity):
             with candidate.lock:
                 if candidate.waiting_for_user:
                     active_session = candidate
@@ -2198,6 +2974,7 @@ async def send_reply(request: ReplyRequest):
 @app.post("/api/chat/stop")
 async def stop_task(request: Request):
     """Stop current task"""
+    identity = _request_web_identity(request)
     try:
         payload = await request.json()
     except (json.JSONDecodeError, RuntimeError):
@@ -2207,12 +2984,14 @@ async def stop_task(request: Request):
     )
 
     if requested_session_id:
-        session = _get_session(requested_session_id)
+        session = _get_session(requested_session_id, identity=identity)
         if session is None:
             return {"success": False, "error": "Session not found"}
         sessions = [session]
     else:
-        sessions = _session_snapshot()
+        if not _get_web_identity_provider().is_local:
+            return {"success": False, "error": "session_id is required"}
+        sessions = _session_snapshot(identity)
     for session in sessions:
         with session.lock:
             if session.closing:
@@ -2246,8 +3025,9 @@ async def stop_task(request: Request):
 @app.get("/api/chat/stream")
 async def stream_chat(request: Request):
     """SSE stream for chat events"""
+    identity = _request_web_identity(request)
     session_id = request.query_params.get("session_id", "")
-    session = _get_session(session_id)
+    session = _get_session(session_id, identity=identity)
 
     if session is None:
         # Return empty stream
@@ -2352,7 +3132,8 @@ async def stream_chat(request: Request):
 
 
 def _list_chats_sync(ws: str, agent: str) -> dict[str, Any]:
-    root, error = _chat_root(ws, agent)
+    identity = _current_web_identity()
+    root, error = _chat_root(ws, agent, identity=identity)
     if error or root is None:
         return {"success": False, "error": error}
     if not os.path.isdir(root):
@@ -2362,19 +3143,39 @@ def _list_chats_sync(ws: str, agent: str) -> dict[str, Any]:
         for entry in os.scandir(root):
             if not entry.is_dir(follow_symlinks=False) or not _valid_chat_id(entry.name):
                 continue
-            metadata = _read_chat_metadata(ws, agent, entry.name)
+            metadata = _read_chat_metadata(
+                ws,
+                agent,
+                entry.name,
+                identity=identity,
+            )
             if metadata is not None:
                 if (
                     str(metadata.get("status") or "") in {"running", "waiting_for_user"}
-                    and _find_session_by_chat(ws, agent, entry.name) is None
+                    and _find_session_by_chat(
+                        ws,
+                        agent,
+                        entry.name,
+                        identity=identity,
+                    ) is None
                 ):
-                    state = _read_chat_state(ws, agent, entry.name)
+                    state = _read_chat_state(
+                        ws,
+                        agent,
+                        entry.name,
+                        identity=identity,
+                    )
                     if state is not None:
-                        recovered_status, _ = _recover_persisted_chat_runtime(ws, agent, state)
+                        recovered_status, _ = _recover_persisted_chat_runtime(
+                            ws,
+                            agent,
+                            state,
+                            identity=identity,
+                        )
                         metadata = {**metadata, "status": recovered_status}
                 rows.append(metadata)
     except OSError as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
     rows.sort(key=lambda item: float(item.get("updated_at", 0.0) or 0.0), reverse=True)
     return {"success": True, "data": rows}
 
@@ -2385,15 +3186,32 @@ async def list_chats(ws: str = "default.ws", agent: str = ""):
 
 
 def _create_chat_sync(ws: str, agent: str) -> dict[str, Any]:
-    root, error = _chat_root(ws, agent)
+    identity = _current_web_identity()
+    root, error = _chat_root(ws, agent, identity=identity)
     if error or root is None:
         return {"success": False, "error": error}
     chat_id = uuid.uuid4().hex[:16]
-    metadata = _default_chat_metadata(ws, agent, chat_id)
+    metadata = _default_chat_metadata(ws, agent, chat_id, identity=identity)
     session_id = uuid.uuid4().hex[:16]
-    state = _default_chat_state(ws, agent, chat_id, session_id=session_id)
-    metadata_path, metadata_error = _chat_metadata_path(ws, agent, chat_id)
-    state_path, state_error = _chat_state_path(ws, agent, chat_id)
+    state = _default_chat_state(
+        ws,
+        agent,
+        chat_id,
+        session_id=session_id,
+        identity=identity,
+    )
+    metadata_path, metadata_error = _chat_metadata_path(
+        ws,
+        agent,
+        chat_id,
+        identity=identity,
+    )
+    state_path, state_error = _chat_state_path(
+        ws,
+        agent,
+        chat_id,
+        identity=identity,
+    )
     if metadata_error or state_error or metadata_path is None or state_path is None:
         return {"success": False, "error": metadata_error or state_error}
     session = UISession(
@@ -2401,15 +3219,17 @@ def _create_chat_sync(ws: str, agent: str) -> dict[str, Any]:
         chat_id=chat_id,
         chat_ws=ws,
         chat_agent=agent,
+        owner_digest=identity.owner_digest,
+        web_identity=identity,
     )
-    if not _register_session(session):
+    if not _register_session(session, identity=identity):
         return {"success": False, "error": _SESSION_CAPACITY_ERROR}
     try:
         _write_json_file(metadata_path, metadata)
         _write_json_file(state_path, state)
     except OSError as exc:
         _remove_session(session)
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
     return {"success": True, "data": {"metadata": metadata, "state": state}}
 
 
@@ -2423,13 +3243,19 @@ async def create_chat(request: ChatCreateRequest):
 
 
 def _read_chat_sync(chat_id: str, ws: str, agent: str) -> dict[str, Any]:
-    session = _find_session_by_chat(ws, agent, chat_id)
+    identity = _current_web_identity()
+    session = _find_session_by_chat(ws, agent, chat_id, identity=identity)
     if session is None:
-        session, error = _load_chat_into_session(ws, agent, chat_id)
+        session, error = _load_chat_into_session(
+            ws,
+            agent,
+            chat_id,
+            identity=identity,
+        )
         if error or session is None:
             return {"success": False, "error": error}
-    metadata = _read_chat_metadata(ws, agent, chat_id)
-    state = _read_chat_state(ws, agent, chat_id)
+    metadata = _read_chat_metadata(ws, agent, chat_id, identity=identity)
+    state = _read_chat_state(ws, agent, chat_id, identity=identity)
     if metadata is None or state is None:
         return {"success": False, "error": "Chat not found"}
     with session.lock:
@@ -2472,12 +3298,13 @@ async def read_chat(chat_id: str, ws: str = "default.ws", agent: str = ""):
 
 
 def _delete_chat_sync(chat_id: str, ws: str, agent: str) -> dict[str, Any]:
-    session = _find_session_by_chat(ws, agent, chat_id)
+    identity = _current_web_identity()
+    session = _find_session_by_chat(ws, agent, chat_id, identity=identity)
     if session is not None:
         with session.lock:
             if session.starting or session.running:
                 return {"success": False, "error": "Chat is running; stop the task before deleting it"}
-    chat_path, error = _chat_dir(ws, agent, chat_id)
+    chat_path, error = _chat_dir(ws, agent, chat_id, identity=identity)
     if error or chat_path is None:
         return {"success": False, "error": error}
     if not os.path.isdir(chat_path):
@@ -2487,14 +3314,14 @@ def _delete_chat_sync(chat_id: str, ws: str, agent: str) -> dict[str, Any]:
             try:
                 shutil.rmtree(chat_path)
             except OSError as exc:
-                return {"success": False, "error": str(exc)}
+                return {"success": False, "error": _web_error_message(exc)}
             _remove_session(session)
         _close_agent(session)
     else:
         try:
             shutil.rmtree(chat_path)
         except OSError as exc:
-            return {"success": False, "error": str(exc)}
+            return {"success": False, "error": _web_error_message(exc)}
     return {"success": True}
 
 
@@ -2513,6 +3340,12 @@ async def read_usage_summary(
     limit: int = 20,
     ws: str = "default.ws",
 ):
+    _, observability_config_path, config_error = _effective_web_config_paths(
+        "",
+        observability_config_path,
+    )
+    if config_error:
+        return {"success": False, "error": config_error}
     log_dir = _resolve_trace_log_dir(observability_config_path=observability_config_path, ws=ws)
     if not log_dir:
         return {"success": False, "error": "Invalid workspace name"}
@@ -2522,7 +3355,7 @@ async def read_usage_summary(
             "success": True,
             "data": {
                 "configured": True,
-                "log_dir": log_dir,
+                **({"log_dir": log_dir} if _get_web_identity_provider().is_local else {}),
                 "message": "Trace log directory does not exist yet. Run a task to create it.",
                 "totals": _empty_usage(),
                 "sessions": [],
@@ -2534,14 +3367,14 @@ async def read_usage_summary(
         events = await _run_blocking(load_dir, log_dir)
         summary = await _run_blocking(_usage_summary_from_events, events, limit=limit)
     except Exception as exc:  # noqa: BLE001
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
 
     sessions = summary["sessions"]
     return {
         "success": True,
         "data": {
             "configured": True,
-            "log_dir": log_dir,
+            **({"log_dir": log_dir} if _get_web_identity_provider().is_local else {}),
             "message": "" if sessions else "No token usage events found yet.",
             "totals": summary["totals"],
             "sessions": sessions,
@@ -2556,6 +3389,12 @@ async def read_trace_sessions(
     limit: int = 20,
     ws: str = "default.ws",
 ):
+    _, observability_config_path, config_error = _effective_web_config_paths(
+        "",
+        observability_config_path,
+    )
+    if config_error:
+        return {"success": False, "error": config_error}
     log_dir = _resolve_trace_log_dir(observability_config_path=observability_config_path, ws=ws)
     if not log_dir:
         return {"success": False, "error": "Invalid workspace name"}
@@ -2564,7 +3403,7 @@ async def read_trace_sessions(
             "success": True,
             "data": {
                 "configured": True,
-                "log_dir": log_dir,
+                **({"log_dir": log_dir} if _get_web_identity_provider().is_local else {}),
                 "message": "Trace log directory does not exist yet. Run a task to create it.",
                 "sessions": [],
                 "updated_at": time.time(),
@@ -2575,13 +3414,13 @@ async def read_trace_sessions(
         events = await _run_blocking(load_dir, log_dir)
         sessions = await _run_blocking(_trace_summary_from_events, events, limit=limit)
     except Exception as exc:  # noqa: BLE001
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
 
     return {
         "success": True,
         "data": {
             "configured": True,
-            "log_dir": log_dir,
+            **({"log_dir": log_dir} if _get_web_identity_provider().is_local else {}),
             "message": "" if sessions else "No trace sessions recorded yet.",
             "sessions": sessions,
             "updated_at": time.time(),
@@ -2595,6 +3434,12 @@ async def read_trace_session_detail(
     observability_config_path: str = "",
     ws: str = "default.ws",
 ):
+    _, observability_config_path, config_error = _effective_web_config_paths(
+        "",
+        observability_config_path,
+    )
+    if config_error:
+        return {"success": False, "error": config_error}
     log_dir = _resolve_trace_log_dir(observability_config_path=observability_config_path, ws=ws)
     if not log_dir:
         return {"success": False, "error": "Invalid workspace name"}
@@ -2606,7 +3451,7 @@ async def read_trace_session_detail(
     try:
         events = await _run_blocking(load_events, file_path)
     except Exception as exc:  # noqa: BLE001
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
 
     summaries = await _run_blocking(_trace_summary_from_events, events, limit=1)
     summary = summaries[0] if summaries else {
@@ -2623,8 +3468,8 @@ async def read_trace_session_detail(
         "success": True,
         "data": {
             "summary": summary,
-            "events": events,
-            "log_path": file_path,
+            "events": _secure_trace_payload(events),
+            **({"log_path": file_path} if _get_web_identity_provider().is_local else {}),
         },
     }
 
@@ -2658,19 +3503,71 @@ def _is_workspace_name(ws: str) -> bool:
     )
 
 
-def _workspace_root(ws: str) -> tuple[str | None, str | None]:
+def _workspace_root(
+    ws: str,
+    identity: WebIdentity | None = None,
+) -> tuple[str | None, str | None]:
     if not _is_workspace_name(ws):
         return None, "Invalid workspace name"
-    root = os.path.realpath(os.path.join(_WORKSPACE_ROOT, ws))
-    workspace_parent = os.path.realpath(_WORKSPACE_ROOT)
-    if os.path.commonpath([workspace_parent, root]) != workspace_parent:
-        return None, "Path traversal not allowed"
+    try:
+        caller = identity or _current_web_identity()
+        authorized_root = caller.resolve_workspace(ws)
+        root = os.path.realpath(authorized_root)
+    except (WebIdentityError, WebIdentityConfigurationError, OSError):
+        return None, "Workspace not found"
+    if _get_web_identity_provider().is_local:
+        workspace_parent = os.path.realpath(_WORKSPACE_ROOT)
+        if os.path.commonpath([workspace_parent, root]) != workspace_parent:
+            return None, "Path traversal not allowed"
     if not os.path.isdir(root):
         return None, "Workspace not found"
     return root, None
 
 
-def _resolve_system_file_path(ws: str, path: str) -> tuple[str | None, str | None, str | None]:
+def _secure_workspace_path_error(
+    ws_root: str,
+    real_path: str,
+    *,
+    identity: WebIdentity,
+    write: bool,
+) -> str | None:
+    if _get_web_identity_provider().is_local:
+        return None
+    try:
+        relative = os.path.relpath(real_path, ws_root).replace("\\", "/")
+    except (OSError, ValueError):
+        return "Path traversal not allowed"
+    parts = tuple(part.casefold() for part in relative.split("/") if part)
+    if not parts or ".." in parts:
+        return "Path traversal not allowed"
+    if parts[0] == "runtime" or (
+        len(parts) == 1
+        and parts[0].casefold() in {"_intervene", "_keyinfo", "plan.md"}
+    ):
+        return "Protected workspace state is unavailable via the file API"
+    managed_memory = (
+        parts[0] == "memory"
+        or parts[:2] == ("system", "memory")
+        or (
+            len(parts) >= 4
+            and parts[:2] == ("system", "agents")
+            and parts[-1].casefold() == "memory.md"
+        )
+    )
+    if managed_memory and write:
+        return "Managed memory requires the memory candidate workflow"
+    if managed_memory and MEMORY_READ_SCOPE not in identity.scopes:
+        return "Memory read scope is required"
+    return None
+
+
+def _resolve_system_file_path(
+    ws: str,
+    path: str,
+    *,
+    identity: WebIdentity | None = None,
+    write: bool = False,
+) -> tuple[str | None, str | None, str | None]:
     if not path:
         return None, None, "Path is required"
     if os.path.isabs(path):
@@ -2679,7 +3576,8 @@ def _resolve_system_file_path(ws: str, path: str) -> tuple[str | None, str | Non
     if not normalized_path.startswith("system/"):
         return None, None, "Only system/ files can be managed via this endpoint"
 
-    ws_root, error = _workspace_root(ws)
+    caller = identity or _current_web_identity()
+    ws_root, error = _workspace_root(ws, identity=caller)
     if error or ws_root is None:
         return None, None, error
 
@@ -2689,27 +3587,55 @@ def _resolve_system_file_path(ws: str, path: str) -> tuple[str | None, str | Non
     system_root = os.path.realpath(os.path.join(ws_root, "system"))
     if os.path.commonpath([system_root, real_path]) != system_root:
         return None, None, "Only system/ files can be managed via this endpoint"
+    protected_error = _secure_workspace_path_error(
+        ws_root,
+        real_path,
+        identity=caller,
+        write=write,
+    )
+    if protected_error:
+        return None, None, protected_error
     return real_path, normalized_path, None
 
 
-def _resolve_workspace_preview_path(ws: str, path: str) -> tuple[str | None, str | None, str | None]:
+def _resolve_workspace_preview_path(
+    ws: str,
+    path: str,
+    *,
+    identity: WebIdentity | None = None,
+) -> tuple[str | None, str | None, str | None]:
     if not path:
         return None, None, "Path is required"
     if os.path.isabs(path):
         return None, None, "Absolute paths are not allowed"
     normalized_path = path.replace("\\", "/")
 
-    ws_root, error = _workspace_root(ws)
+    caller = identity or _current_web_identity()
+    ws_root, error = _workspace_root(ws, identity=caller)
     if error or ws_root is None:
         return None, None, error
 
     real_path = os.path.realpath(os.path.join(ws_root, normalized_path))
     if os.path.commonpath([ws_root, real_path]) != ws_root:
         return None, None, "Path traversal not allowed"
+    protected_error = _secure_workspace_path_error(
+        ws_root,
+        real_path,
+        identity=caller,
+        write=False,
+    )
+    if protected_error:
+        return None, None, protected_error
     return real_path, normalized_path, None
 
 
-def _build_dir_tree(root_path: str, current_path: str = "") -> dict[str, Any]:
+def _build_dir_tree(
+    root_path: str,
+    current_path: str = "",
+    *,
+    include_memory: bool = True,
+    include_runtime: bool = True,
+) -> dict[str, Any]:
     name = os.path.basename(current_path) if current_path else os.path.basename(root_path)
     node: dict[str, Any] = {
         "name": name,
@@ -2730,8 +3656,37 @@ def _build_dir_tree(root_path: str, current_path: str = "") -> dict[str, Any]:
         if entry.name == ".DS_Store" or entry.is_symlink():
             continue
         child_path = f"{current_path}/{entry.name}" if current_path else entry.name
+        child_parts = tuple(
+            part.casefold() for part in child_path.split("/") if part
+        )
+        if not include_runtime and (
+            child_parts[0] == "runtime"
+            or (
+                len(child_parts) == 1
+                and child_parts[0].casefold()
+                in {"_intervene", "_keyinfo", "plan.md"}
+            )
+        ):
+            continue
+        if not include_memory and (
+            child_parts[0] == "memory"
+            or child_parts[:2] == ("system", "memory")
+            or (
+                len(child_parts) >= 4
+                and child_parts[:2] == ("system", "agents")
+                and child_parts[-1].casefold() == "memory.md"
+            )
+        ):
+            continue
         if entry.is_dir(follow_symlinks=False):
-            children.append(_build_dir_tree(entry.path, child_path))
+            children.append(
+                _build_dir_tree(
+                    entry.path,
+                    child_path,
+                    include_memory=include_memory,
+                    include_runtime=include_runtime,
+                )
+            )
         elif entry.is_file(follow_symlinks=False):
             children.append(
                 {
@@ -2990,7 +3945,14 @@ def _task_store_path(ws: str) -> tuple[str | None, str | None]:
     ws_root, error = _workspace_root(ws)
     if error or ws_root is None:
         return None, error
-    return os.path.join(ws_root, "runtime", "tasks", "tasks.json"), None
+    task_root = os.path.join(ws_root, "runtime", "tasks")
+    if not _get_web_identity_provider().is_local:
+        task_root = os.path.join(
+            task_root,
+            "_owners",
+            _current_web_identity().owner_digest,
+        )
+    return os.path.join(task_root, "tasks.json"), None
 
 
 def _scheduled_task_store_lock(ws: str):
@@ -3014,7 +3976,7 @@ def _read_scheduled_tasks(ws: str) -> tuple[list[dict[str, Any]], str | None]:
     try:
         payload = _read_json_file(path)
     except (OSError, json.JSONDecodeError) as exc:
-        return [], str(exc)
+        return [], _web_error_message(exc)
     raw_tasks = payload.get("tasks", [])
     if not isinstance(raw_tasks, list):
         return [], "Invalid task store"
@@ -3028,12 +3990,16 @@ def _write_scheduled_tasks(ws: str, tasks: list[dict[str, Any]]) -> str | None:
     try:
         atomic_write_json(path, {"tasks": tasks, "updated_at": time.time()})
     except OSError as exc:
-        return str(exc)
+        return _web_error_message(exc)
     return None
 
 
 def _should_seed_default_tasks(ws: str) -> bool:
-    return ws == "default.ws" and os.path.realpath(_WORKSPACE_ROOT) == os.path.realpath(_DEFAULT_WORKSPACE_ROOT)
+    return (
+        _get_web_identity_provider().is_local
+        and ws == "default.ws"
+        and os.path.realpath(_WORKSPACE_ROOT) == os.path.realpath(_DEFAULT_WORKSPACE_ROOT)
+    )
 
 
 def _parse_task_datetime(date_value: str, time_value: str) -> float | None:
@@ -3115,6 +4081,7 @@ def _normalize_scheduled_task(
     task_id: str | None = None,
     existing: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
+    identity = _current_web_identity()
     ws = _normalize_path_input(request.ws) or "default.ws"
     if not _is_workspace_name(ws):
         return None, "Invalid workspace name"
@@ -3146,6 +4113,19 @@ def _normalize_scheduled_task(
     interval_minutes = int(request.interval_minutes or 0)
     if repeat == "custom" and interval_minutes <= 0:
         interval_minutes = 60
+    config_path, observability_config_path, config_error = (
+        _effective_web_config_paths(
+            request.config_path,
+            request.observability_config_path,
+        )
+    )
+    if config_error:
+        return None, config_error
+    if existing and str(existing.get("owner_digest") or "") not in {
+        "",
+        identity.owner_digest,
+    }:
+        return None, "Task not found"
 
     now = time.time()
     task = {
@@ -3162,8 +4142,9 @@ def _normalize_scheduled_task(
         "interval_minutes": interval_minutes,
         "keep_one_chat": bool(request.keep_one_chat),
         "status": status,
-        "config_path": _normalize_path_input(request.config_path),
-        "observability_config_path": _normalize_path_input(request.observability_config_path),
+        "config_path": config_path,
+        "observability_config_path": observability_config_path,
+        "owner_digest": identity.owner_digest,
         "updated_at": now,
     }
     task.setdefault("created_at", now)
@@ -3178,7 +4159,7 @@ def _normalize_scheduled_task(
     try:
         next_run = _next_task_run(task, after_ts=now, first=True)
     except ValueError as exc:
-        return None, str(exc)
+        return None, _web_error_message(exc)
     task["next_run"] = next_run
     if not next_run:
         task["status"] = "paused"
@@ -3268,6 +4249,9 @@ def _default_scheduled_tasks(now_ts: float | None = None) -> list[dict[str, Any]
 
 
 def _create_or_load_task_chat(task: dict[str, Any]) -> tuple[UISession | None, str | None]:
+    identity = _current_web_identity()
+    if str(task.get("owner_digest") or "") not in {"", identity.owner_digest}:
+        return None, "Task not found"
     ws = str(task.get("workspace") or "default.ws")
     agent = str(task.get("agent") or "")
     if not agent:
@@ -3275,36 +4259,67 @@ def _create_or_load_task_chat(task: dict[str, Any]) -> tuple[UISession | None, s
 
     chat_id = str(task.get("chat_id") or "")
     if chat_id:
-        session = _find_session_by_chat(ws, agent, chat_id)
+        session = _find_session_by_chat(ws, agent, chat_id, identity=identity)
         if session is None:
-            session, error = _load_chat_into_session(ws, agent, chat_id)
+            session, error = _load_chat_into_session(
+                ws,
+                agent,
+                chat_id,
+                identity=identity,
+            )
             if error or session is None:
                 return None, error
         return session, None
 
     chat_id = uuid.uuid4().hex[:16]
-    metadata = _default_chat_metadata(ws, agent, chat_id)
+    metadata = _default_chat_metadata(ws, agent, chat_id, identity=identity)
     metadata["title"] = str(task.get("name") or "Scheduled Task")[:40]
     session_id = uuid.uuid4().hex[:16]
-    state = _default_chat_state(ws, agent, chat_id, session_id=session_id)
-    metadata_path, metadata_error = _chat_metadata_path(ws, agent, chat_id)
-    state_path, state_error = _chat_state_path(ws, agent, chat_id)
+    state = _default_chat_state(
+        ws,
+        agent,
+        chat_id,
+        session_id=session_id,
+        identity=identity,
+    )
+    metadata_path, metadata_error = _chat_metadata_path(
+        ws,
+        agent,
+        chat_id,
+        identity=identity,
+    )
+    state_path, state_error = _chat_state_path(
+        ws,
+        agent,
+        chat_id,
+        identity=identity,
+    )
     if metadata_error or state_error or metadata_path is None or state_path is None:
         return None, metadata_error or state_error
-    session = UISession(session_id=session_id, chat_id=chat_id, chat_ws=ws, chat_agent=agent)
-    if not _register_session(session):
+    session = UISession(
+        session_id=session_id,
+        chat_id=chat_id,
+        chat_ws=ws,
+        chat_agent=agent,
+        owner_digest=identity.owner_digest,
+        web_identity=identity,
+    )
+    if not _register_session(session, identity=identity):
         return None, _SESSION_CAPACITY_ERROR
     try:
         _write_json_file(metadata_path, metadata)
         _write_json_file(state_path, state)
     except OSError as exc:
         _remove_session(session)
-        return None, str(exc)
+        return None, _web_error_message(exc)
     task["chat_id"] = chat_id
     return session, None
 
 
 def _dispatch_scheduled_task(task: dict[str, Any]) -> tuple[str | None, str | None]:
+    identity = _current_web_identity()
+    if str(task.get("owner_digest") or "") not in {"", identity.owner_digest}:
+        return None, "Task not found"
     ws = str(task.get("workspace") or "default.ws")
     agent_name = str(task.get("agent") or "")
     runtime_config, runtime_error = _agent_runtime_config(ws, agent_name)
@@ -3316,8 +4331,12 @@ def _dispatch_scheduled_task(task: dict[str, Any]) -> tuple[str | None, str | No
         if chat_error or session is None:
             return None, chat_error
     else:
-        session = UISession(session_id=uuid.uuid4().hex[:16])
-        if not _register_session(session):
+        session = UISession(
+            session_id=uuid.uuid4().hex[:16],
+            owner_digest=identity.owner_digest,
+            web_identity=identity,
+        )
+        if not _register_session(session, identity=identity):
             return None, _SESSION_CAPACITY_ERROR
 
     task_start_token, reservation_error = _reserve_task_start(session)
@@ -3337,7 +4356,11 @@ def _dispatch_scheduled_task(task: dict[str, Any]) -> tuple[str | None, str | No
                 task_start_token=task_start_token,
             )
         except Exception as exc:  # noqa: BLE001
-            return None, f"Failed to initialize Agent: {exc}"
+            return None, _web_error_message(
+                exc,
+                "Failed to initialize Agent",
+                prefix_local=True,
+            )
         if agent is None:
             return None, "Session became unavailable while initializing Agent"
 
@@ -3348,7 +4371,11 @@ def _dispatch_scheduled_task(task: dict[str, Any]) -> tuple[str | None, str | No
             )
             thread.start()
         except Exception as exc:  # noqa: BLE001
-            return None, f"Failed to start task: {exc}"
+            return None, _web_error_message(
+                exc,
+                "Failed to start task",
+                prefix_local=True,
+            )
 
         handed_off = True
         return session.session_id, None
@@ -3371,7 +4398,7 @@ def _claim_scheduled_task_record(task: dict[str, Any], now_ts: float) -> None:
         task["next_run"] = _next_task_run(task, after_ts=now_ts, first=False)
     except ValueError as exc:
         task["next_run"] = None
-        task["last_error"] = str(exc)
+        task["last_error"] = _web_error_message(exc)
     if not task.get("next_run"):
         task["status"] = "paused"
 
@@ -3412,60 +4439,85 @@ def _debug_scheduled_task_record(task: dict[str, Any], now_ts: float | None = No
 
 def _run_due_scheduled_tasks(now_ts: float | None = None) -> None:
     now_ts = time.time() if now_ts is None else now_ts
-    if not os.path.isdir(_WORKSPACE_ROOT):
-        return
-    for ws in sorted(os.listdir(_WORKSPACE_ROOT)):
-        if not _is_workspace_name(ws):
-            continue
-        with _scheduled_task_store_lock(ws):
-            tasks, error = _read_scheduled_tasks(ws)
-            if error:
+    try:
+        provider = _get_web_identity_provider()
+    except WebIdentityConfigurationError:
+        _revoke_all_secure_web_activity()
+        raise
+    _revoke_invalid_web_activity(provider)
+    for identity in provider.identities():
+        token = _WEB_IDENTITY_CONTEXT.set(identity)
+        try:
+            if provider.is_local:
+                if not os.path.isdir(_WORKSPACE_ROOT):
+                    continue
+                workspace_names = sorted(os.listdir(_WORKSPACE_ROOT))
+            else:
+                workspace_names = sorted(
+                    alias for alias, _path in identity.workspace_aliases
+                )
+            for ws in workspace_names:
+                if _is_workspace_name(ws):
+                    _run_due_scheduled_tasks_in_workspace(ws, now_ts)
+        finally:
+            _WEB_IDENTITY_CONTEXT.reset(token)
+
+
+def _run_due_scheduled_tasks_in_workspace(ws: str, now_ts: float) -> None:
+    with _scheduled_task_store_lock(ws):
+        tasks, error = _read_scheduled_tasks(ws)
+        if error:
+            return
+        changed = False
+        for task in tasks:
+            if str(task.get("owner_digest") or "") not in {
+                "",
+                _current_web_identity().owner_digest,
+            }:
                 continue
-            changed = False
-            for task in tasks:
-                next_run = str(task.get("next_run") or "")
-                if task.get("status") != "running" or not next_run:
-                    continue
-                try:
-                    due_ts = datetime.strptime(next_run, "%Y-%m-%d %H:%M").timestamp()
-                except ValueError:
-                    task["last_error"] = "Invalid next_run"
-                    task["status"] = "paused"
-                    changed = True
-                    continue
-                if due_ts <= now_ts:
-                    _claim_scheduled_task_record(task, now_ts)
-                    claim_error = _write_scheduled_tasks(ws, tasks)
-                    if claim_error:
-                        logger.error(
-                            "Failed to persist scheduled task claim for workspace %s: %s",
-                            ws,
-                            claim_error,
-                        )
-                        changed = False
-                        break
-                    session_id, dispatch_error = _dispatch_scheduled_task(task)
-                    _record_scheduled_task_dispatch_result(
-                        task,
-                        session_id,
-                        dispatch_error,
-                    )
-                    result_error = _write_scheduled_tasks(ws, tasks)
-                    if result_error:
-                        logger.error(
-                            "Failed to persist scheduled task result for workspace %s: %s",
-                            ws,
-                            result_error,
-                        )
-                    changed = False
-            if changed:
-                write_error = _write_scheduled_tasks(ws, tasks)
-                if write_error:
+            next_run = str(task.get("next_run") or "")
+            if task.get("status") != "running" or not next_run:
+                continue
+            try:
+                due_ts = datetime.strptime(next_run, "%Y-%m-%d %H:%M").timestamp()
+            except ValueError:
+                task["last_error"] = "Invalid next_run"
+                task["status"] = "paused"
+                changed = True
+                continue
+            if due_ts <= now_ts:
+                _claim_scheduled_task_record(task, now_ts)
+                claim_error = _write_scheduled_tasks(ws, tasks)
+                if claim_error:
                     logger.error(
-                        "Failed to persist scheduled task validation for workspace %s: %s",
+                        "Failed to persist scheduled task claim for workspace %s: %s",
                         ws,
-                        write_error,
+                        claim_error,
                     )
+                    changed = False
+                    break
+                session_id, dispatch_error = _dispatch_scheduled_task(task)
+                _record_scheduled_task_dispatch_result(
+                    task,
+                    session_id,
+                    dispatch_error,
+                )
+                result_error = _write_scheduled_tasks(ws, tasks)
+                if result_error:
+                    logger.error(
+                        "Failed to persist scheduled task result for workspace %s: %s",
+                        ws,
+                        result_error,
+                    )
+                changed = False
+        if changed:
+            write_error = _write_scheduled_tasks(ws, tasks)
+            if write_error:
+                logger.error(
+                    "Failed to persist scheduled task validation for workspace %s: %s",
+                    ws,
+                    write_error,
+                )
 
 
 def _task_scheduler_loop() -> None:
@@ -3593,7 +4645,10 @@ def _set_scheduled_task_status_sync(
                 try:
                     task["next_run"] = _next_task_run(task, after_ts=time.time(), first=True)
                 except ValueError as exc:
-                    return {"success": False, "error": str(exc)}
+                    return {
+                        "success": False,
+                        "error": _web_error_message(exc),
+                    }
             write_error = _write_scheduled_tasks(ws, tasks)
             if write_error:
                 return {"success": False, "error": write_error}
@@ -3657,6 +4712,12 @@ async def run_scheduled_task_now(task_id: str, request: ScheduledTaskRunRequest)
 @app.get("/api/workspace/list")
 async def list_workspaces():
     """List all .ws workspace folders"""
+    identity = _current_web_identity()
+    if not _get_web_identity_provider().is_local:
+        return {
+            "success": True,
+            "data": [alias for alias, _ in identity.workspace_aliases],
+        }
     workspaces = []
     if os.path.isdir(_WORKSPACE_ROOT):
         for name in sorted(os.listdir(_WORKSPACE_ROOT)):
@@ -3674,6 +4735,11 @@ async def list_workspace_template_options():
 @app.post("/api/workspace")
 async def create_workspace(request: WorkspaceCreateRequest):
     """Create a new workspace from a template."""
+    if not _get_web_identity_provider().is_local:
+        return {
+            "success": False,
+            "error": "Workspace creation requires server-side provisioning",
+        }
     try:
         data = await _run_blocking(
             create_workspace_from_template,
@@ -3682,11 +4748,11 @@ async def create_workspace(request: WorkspaceCreateRequest):
             request.template_id or "blank",
         )
     except ValueError as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
     except FileExistsError as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
     except OSError as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
     return {"success": True, "data": data}
 
 
@@ -3726,7 +4792,7 @@ async def read_agent_profile(ws: str = "default.ws", agent: str = ""):
     try:
         return {"success": True, "data": _read_agent_profile(agent_path, agent)}
     except (OSError, UnicodeDecodeError) as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
 
 
 @app.put("/api/workspace/agent-profile")
@@ -3755,7 +4821,7 @@ async def write_agent_profile(request: AgentProfileWriteRequest):
             },
         }
     except OSError as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
 
 
 @app.get("/api/workspace/teams")
@@ -3846,15 +4912,27 @@ async def list_skills(ws: str = "default.ws"):
 @app.get("/api/workspace/tree")
 async def read_workspace_tree(ws: str = "default.ws"):
     """Return the workspace directory tree for the frontend editor."""
-    ws_root, error = _workspace_root(ws)
+    identity = _current_web_identity()
+    ws_root, error = _workspace_root(ws, identity=identity)
     if error or ws_root is None:
         return {"success": False, "error": error}
     if not os.path.isdir(ws_root):
         return {"success": True, "data": {"name": ws, "path": ws, "type": "dir", "children": []}}
     try:
-        return {"success": True, "data": await _run_blocking(_build_dir_tree, ws_root)}
+        secure = not _get_web_identity_provider().is_local
+        return {
+            "success": True,
+            "data": await _run_blocking(
+                _build_dir_tree,
+                ws_root,
+                include_memory=(
+                    not secure or MEMORY_READ_SCOPE in identity.scopes
+                ),
+                include_runtime=not secure,
+            ),
+        }
     except OSError as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
 
 
 @app.get("/api/workspace/index/stats")
@@ -3863,7 +4941,11 @@ async def read_workspace_index_stats(ws: str = "default.ws"):
     ws_root, error = _workspace_root(ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
-    result = await _run_blocking(get_file_index_stats, cwd=ws_root)
+    result = await _run_blocking(
+        get_file_index_stats,
+        cwd=ws_root,
+        principal=_workspace_index_principal(ws),
+    )
     if result.get("status") != "OK":
         return {"success": False, "error": result.get("error", "failed to read index stats")}
     return {"success": True, "data": result}
@@ -3875,9 +4957,15 @@ async def refresh_workspace_index(request: WorkspaceIndexRefreshRequest):
     ws_root, error = _workspace_root(request.ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
+    config_path, _, config_error = _effective_web_config_paths(
+        request.config_path,
+        "",
+    )
+    if config_error:
+        return {"success": False, "error": config_error}
     embedding_config = await _run_blocking(
         _file_index_embedding_config_from_path,
-        request.config_path,
+        config_path,
     )
     result = await _run_blocking(
         refresh_file_index,
@@ -3885,6 +4973,7 @@ async def refresh_workspace_index(request: WorkspaceIndexRefreshRequest):
         cwd=ws_root,
         semantic=request.semantic,
         embedding_config=embedding_config,
+        principal=_workspace_index_principal(request.ws),
     )
     if result.get("status") != "OK":
         return {"success": False, "error": result.get("error", "failed to refresh index"), "data": result}
@@ -3906,6 +4995,12 @@ async def search_workspace_index(
     ws_root, error = _workspace_root(ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
+    config_path, _, config_error = _effective_web_config_paths(
+        config_path,
+        "",
+    )
+    if config_error:
+        return {"success": False, "error": config_error}
     embedding_config = await _run_blocking(
         _file_index_embedding_config_from_path,
         config_path,
@@ -3920,14 +5015,23 @@ async def search_workspace_index(
         path_only=path_only,
         mode=mode,
         embedding_config=embedding_config,
+        principal=_workspace_index_principal(ws),
     )
     if result.get("status") != "OK":
         return {"success": False, "error": result.get("error", "failed to search index"), "data": result}
     return {"success": True, "data": result}
 
 
-def _preview_workspace_file_sync(ws: str, path: str) -> dict[str, Any]:
-    real_path, normalized_path, error = _resolve_workspace_preview_path(ws, path)
+def _preview_workspace_file_sync(
+    ws: str,
+    path: str,
+    identity: WebIdentity | None = None,
+) -> dict[str, Any]:
+    real_path, normalized_path, error = _resolve_workspace_preview_path(
+        ws,
+        path,
+        identity=identity,
+    )
     if error or real_path is None or normalized_path is None:
         return {"success": False, "error": error}
     if os.path.islink(real_path):
@@ -3957,13 +5061,18 @@ def _preview_workspace_file_sync(ws: str, path: str) -> dict[str, Any]:
     except UnicodeDecodeError:
         return {"success": False, "error": "File is not valid UTF-8 text"}
     except OSError as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
 
 
 @app.get("/api/workspace/preview")
 async def preview_workspace_file(ws: str = "default.ws", path: str = ""):
     """Read a workspace text file for read-only preview."""
-    return await _run_blocking(_preview_workspace_file_sync, ws, path)
+    return await _run_blocking(
+        _preview_workspace_file_sync,
+        ws,
+        path,
+        _current_web_identity(),
+    )
 
 
 # Built-in tools from schema
@@ -3998,8 +5107,16 @@ async def list_tools():
     return {"success": True, "data": _load_builtin_tools()}
 
 
-def _read_workspace_file_sync(ws: str, path: str) -> dict[str, Any]:
-    real_path, normalized_path, error = _resolve_system_file_path(ws, path)
+def _read_workspace_file_sync(
+    ws: str,
+    path: str,
+    identity: WebIdentity | None = None,
+) -> dict[str, Any]:
+    real_path, normalized_path, error = _resolve_system_file_path(
+        ws,
+        path,
+        identity=identity,
+    )
     if error or real_path is None or normalized_path is None:
         return {"success": False, "error": error}
     if not os.path.isfile(real_path):
@@ -4009,23 +5126,38 @@ def _read_workspace_file_sync(ws: str, path: str) -> dict[str, Any]:
             content = f.read()
         return {"success": True, "data": {"path": normalized_path, "content": content}}
     except (OSError, UnicodeDecodeError) as e:
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": _web_error_message(e)}
 
 
 @app.get("/api/workspace/file")
 async def read_workspace_file(ws: str = "default.ws", path: str = ""):
     """Read a file from workspace system/ directory"""
-    return await _run_blocking(_read_workspace_file_sync, ws, path)
+    return await _run_blocking(
+        _read_workspace_file_sync,
+        ws,
+        path,
+        _current_web_identity(),
+    )
 
 
-def _write_workspace_file_sync(ws: str, path: str, content: str) -> dict[str, Any]:
-    real_path, normalized_path, error = _resolve_system_file_path(ws, path)
+def _write_workspace_file_sync(
+    ws: str,
+    path: str,
+    content: str,
+    identity: WebIdentity | None = None,
+) -> dict[str, Any]:
+    real_path, normalized_path, error = _resolve_system_file_path(
+        ws,
+        path,
+        identity=identity,
+        write=True,
+    )
     if error or real_path is None or normalized_path is None:
         return {"success": False, "error": error}
     if os.path.isdir(real_path):
         return {"success": False, "error": "Path is a directory"}
 
-    ws_root, workspace_error = _workspace_root(ws)
+    ws_root, workspace_error = _workspace_root(ws, identity=identity)
     if workspace_error or ws_root is None:
         return {"success": False, "error": workspace_error}
     try:
@@ -4042,7 +5174,7 @@ def _write_workspace_file_sync(ws: str, path: str, content: str) -> dict[str, An
             },
         }
     except (OSError, UnicodeError) as e:
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": _web_error_message(e)}
 
 
 @app.put("/api/workspace/file")
@@ -4053,15 +5185,25 @@ async def write_workspace_file(request: WorkspaceFileWriteRequest):
         request.ws,
         request.path,
         request.content,
+        _current_web_identity(),
     )
 
 
-def _delete_workspace_file_sync(ws: str, path: str) -> dict[str, Any]:
-    real_path, normalized_path, error = _resolve_system_file_path(ws, path)
+def _delete_workspace_file_sync(
+    ws: str,
+    path: str,
+    identity: WebIdentity | None = None,
+) -> dict[str, Any]:
+    real_path, normalized_path, error = _resolve_system_file_path(
+        ws,
+        path,
+        identity=identity,
+        write=True,
+    )
     if error or real_path is None or normalized_path is None:
         return {"success": False, "error": error}
 
-    ws_root, workspace_error = _workspace_root(ws)
+    ws_root, workspace_error = _workspace_root(ws, identity=identity)
     if workspace_error or ws_root is None:
         return {"success": False, "error": workspace_error}
     lexical_path = os.path.abspath(os.path.join(ws_root, normalized_path))
@@ -4086,10 +5228,31 @@ def _delete_workspace_file_sync(ws: str, path: str) -> dict[str, Any]:
 @app.delete("/api/workspace/file")
 async def delete_workspace_file(ws: str = "default.ws", path: str = ""):
     """Delete a regular file from workspace system/ directory."""
-    return await _run_blocking(_delete_workspace_file_sync, ws, path)
+    return await _run_blocking(
+        _delete_workspace_file_sync,
+        ws,
+        path,
+        _current_web_identity(),
+    )
 
 
 # === Eval API ===
+
+
+def _web_eval_storage_root(
+    ws_root: str,
+    identity: WebIdentity | None = None,
+) -> str | None:
+    if _get_web_identity_provider().is_local:
+        return None
+    caller = identity or _current_web_identity()
+    return os.path.join(
+        ws_root,
+        "runtime",
+        "eval",
+        "_owners",
+        caller.owner_digest,
+    )
 
 
 def _eval_agent_factory(
@@ -4100,6 +5263,7 @@ def _eval_agent_factory(
     config_path: str,
     observability_config_path: str,
     runtime_config: dict[str, Any] | None,
+    principal_template: Principal | None = None,
 ):
     runtime_config = runtime_config or {}
 
@@ -4116,6 +5280,7 @@ def _eval_agent_factory(
             model_override=str(runtime_config.get("model_override", "")),
             max_turns=runtime_config.get("max_turns"),
             memory_mode=str(runtime_config.get("memory_mode", "project")),
+            principal=principal_template,
         )
         if hasattr(agent, "handler") and hasattr(agent.handler, "ctx"):
             agent.handler.ctx.verbose = True
@@ -4129,6 +5294,9 @@ def _run_eval_background(
     *,
     ws_root: str,
     run_id: str,
+    owner_digest: str,
+    storage_root: str | None,
+    redact_errors: bool,
     cancel_event: threading.Event,
     agent_factory,
 ) -> None:
@@ -4138,19 +5306,26 @@ def _run_eval_background(
             run_id,
             agent_factory=agent_factory,
             cancel_event=cancel_event,
+            storage_root=storage_root,
+            redact_errors=redact_errors,
         )
     finally:
         with _eval_lock:
-            _eval_cancel_events.pop(run_id, None)
+            _eval_cancel_events.pop((owner_digest, run_id), None)
 
 
 @app.get("/api/eval/datasets")
 async def api_list_eval_datasets(ws: str = "default.ws"):
+    identity = _current_web_identity()
     ws_root, error = _workspace_root(ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
     imported_items, workspace_datasets = await asyncio.gather(
-        _run_blocking(list_datasets, ws_root),
+        _run_blocking(
+            list_datasets,
+            ws_root,
+            storage_root=_web_eval_storage_root(ws_root, identity),
+        ),
         _run_blocking(list_workspace_eval_datasets, ws_root),
     )
     imported = [{**item, "imported": True} for item in imported_items]
@@ -4175,11 +5350,17 @@ async def api_list_eval_datasets(ws: str = "default.ws"):
         for item in workspace_datasets
         if str(item.get("source", {}).get("path") or "") not in fresh_imported_paths
     ]
-    return {"success": True, "data": visible_imported + visible_workspace_datasets}
+    return {
+        "success": True,
+        "data": _secure_trace_payload(
+            visible_imported + visible_workspace_datasets
+        ),
+    }
 
 
 @app.post("/api/eval/datasets/import")
 async def api_import_eval_dataset(request: EvalDatasetImportRequest):
+    identity = _current_web_identity()
     ws_root, error = _workspace_root(request.ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
@@ -4191,6 +5372,8 @@ async def api_import_eval_dataset(request: EvalDatasetImportRequest):
                 rel_path=request.path,
                 name=request.name,
                 fmt=request.format,
+                storage_root=_web_eval_storage_root(ws_root, identity),
+                owner_digest=identity.owner_digest,
             )
         else:
             if not request.content:
@@ -4202,14 +5385,17 @@ async def api_import_eval_dataset(request: EvalDatasetImportRequest):
                 content=request.content,
                 fmt=request.format,
                 source={"type": "content"},
+                storage_root=_web_eval_storage_root(ws_root, identity),
+                owner_digest=identity.owner_digest,
             )
-        return {"success": True, "data": data}
+        return {"success": True, "data": _secure_trace_payload(data)}
     except (EvalError, OSError, UnicodeError) as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
 
 
 @app.post("/api/eval/datasets/download")
 async def api_download_eval_dataset(request: EvalDatasetDownloadRequest):
+    identity = _current_web_identity()
     ws_root, error = _workspace_root(request.ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
@@ -4220,34 +5406,49 @@ async def api_download_eval_dataset(request: EvalDatasetDownloadRequest):
             url=request.url,
             name=request.name,
             fmt=request.format,
+            storage_root=_web_eval_storage_root(ws_root, identity),
+            owner_digest=identity.owner_digest,
         )
-        return {"success": True, "data": data}
+        return {"success": True, "data": _secure_trace_payload(data)}
     except (EvalError, OSError, UnicodeError) as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
 
 
 @app.get("/api/eval/datasets/{dataset_id}")
 async def api_get_eval_dataset(dataset_id: str, ws: str = "default.ws"):
+    identity = _current_web_identity()
     ws_root, error = _workspace_root(ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
     try:
-        data = await _run_blocking(get_dataset_detail, ws_root, dataset_id)
-        return {"success": True, "data": data}
+        data = await _run_blocking(
+            get_dataset_detail,
+            ws_root,
+            dataset_id,
+            storage_root=_web_eval_storage_root(ws_root, identity),
+        )
+        return {"success": True, "data": _secure_trace_payload(data)}
     except (EvalError, OSError, json.JSONDecodeError) as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
 
 
 @app.get("/api/eval/runs")
 async def api_list_eval_runs(ws: str = "default.ws"):
+    identity = _current_web_identity()
     ws_root, error = _workspace_root(ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
-    return {"success": True, "data": await _run_blocking(list_eval_runs, ws_root)}
+    data = await _run_blocking(
+        list_eval_runs,
+        ws_root,
+        storage_root=_web_eval_storage_root(ws_root, identity),
+    )
+    return {"success": True, "data": _secure_eval_run_payload(data)}
 
 
 @app.post("/api/eval/runs")
 async def api_create_eval_run(request: EvalRunCreateRequest):
+    identity = _current_web_identity()
     ws_root, error = _workspace_root(request.ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
@@ -4264,6 +5465,14 @@ async def api_create_eval_run(request: EvalRunCreateRequest):
     case_limit = request.case_limit if request.case_limit > 0 else None
     if case_limit is not None and case_limit > 500:
         return {"success": False, "error": "case_limit cannot exceed 500"}
+    config_path, observability_config_path, config_error = (
+        _effective_web_config_paths(
+            request.config_path,
+            request.observability_config_path,
+        )
+    )
+    if config_error:
+        return {"success": False, "error": config_error}
 
     try:
         result = await _run_blocking(
@@ -4273,66 +5482,92 @@ async def api_create_eval_run(request: EvalRunCreateRequest):
             dataset_id=request.dataset_id,
             agent=agent_name,
             case_limit=case_limit,
+            storage_root=_web_eval_storage_root(ws_root, identity),
+            owner_digest=identity.owner_digest,
         )
     except (EvalError, OSError, json.JSONDecodeError) as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
 
     cancel_event = threading.Event()
     with _eval_lock:
-        _eval_cancel_events[result["id"]] = cancel_event
+        _eval_cancel_events[(identity.owner_digest, result["id"])] = cancel_event
 
     agent_factory = _eval_agent_factory(
         ws=request.ws,
         ws_root=ws_root,
         agent_name=agent_name,
-        config_path=_normalize_path_input(request.config_path),
-        observability_config_path=_normalize_path_input(request.observability_config_path),
+        config_path=config_path,
+        observability_config_path=observability_config_path,
         runtime_config=runtime_config,
+        principal_template=identity.principal(
+            session_id=f"eval-{result['id']}",
+            agent_id=agent_name or "main",
+        ),
     )
     thread = _new_daemon_thread(
         target=_run_eval_background,
         kwargs={
             "ws_root": ws_root,
             "run_id": result["id"],
+            "owner_digest": identity.owner_digest,
+            "storage_root": _web_eval_storage_root(ws_root, identity),
+            "redact_errors": not _get_web_identity_provider().is_local,
             "cancel_event": cancel_event,
             "agent_factory": agent_factory,
         },
     )
     thread.start()
-    return {"success": True, "data": result}
+    return {"success": True, "data": _secure_eval_run_payload(result)}
 
 
 @app.get("/api/eval/runs/{run_id}")
 async def api_get_eval_run(run_id: str, ws: str = "default.ws"):
+    identity = _current_web_identity()
     ws_root, error = _workspace_root(ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
     try:
-        data = await _run_blocking(read_eval_run, ws_root, run_id)
-        return {"success": True, "data": data}
+        data = await _run_blocking(
+            read_eval_run,
+            ws_root,
+            run_id,
+            storage_root=_web_eval_storage_root(ws_root, identity),
+        )
+        return {"success": True, "data": _secure_eval_run_payload(data)}
     except (EvalError, OSError, json.JSONDecodeError) as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
 
 
 @app.post("/api/eval/runs/{run_id}/cancel")
 async def api_cancel_eval_run(run_id: str, ws: str = "default.ws"):
+    identity = _current_web_identity()
     ws_root, error = _workspace_root(ws)
     if error or ws_root is None:
         return {"success": False, "error": error}
     try:
-        result = await _run_blocking(read_eval_run, ws_root, run_id)
+        result = await _run_blocking(
+            read_eval_run,
+            ws_root,
+            run_id,
+            storage_root=_web_eval_storage_root(ws_root, identity),
+        )
     except (EvalError, OSError, json.JSONDecodeError) as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": _web_error_message(exc)}
 
     with _eval_lock:
-        cancel_event = _eval_cancel_events.get(run_id)
+        cancel_event = _eval_cancel_events.get((identity.owner_digest, run_id))
         if cancel_event is not None:
             cancel_event.set()
 
     if result.get("status") in {"pending", "running"}:
         result["status"] = "canceling"
-        await _run_blocking(write_eval_run, ws_root, result)
-    return {"success": True, "data": result}
+        await _run_blocking(
+            write_eval_run,
+            ws_root,
+            result,
+            storage_root=_web_eval_storage_root(ws_root, identity),
+        )
+    return {"success": True, "data": _secure_eval_run_payload(result)}
 
 
 # Serve static files (frontend build)

@@ -19,7 +19,7 @@
 │  Workflow / Scheduler / Event Log│
 ├──────────────────────────────────┤
 │  AgentCore（核心引擎层）          │
-│  XAgent → agent_loop → handler   │
+│  XAgent → Agent Kernel → handler │
 ├──────────────────────────────────┤
 │  LLM Layer（模型接入层）          │
 │  Session / ToolClient / SSE      │
@@ -38,7 +38,7 @@
 |---|---|---|---|
 | Frontends | 用户 IO、消息渲染 | 用户输入 → task_queue | display_queue |
 | Durable Orchestration | 长任务状态机、DAG/父子 Run、策略门禁、恢复与回放 | Run/Event/Artifact 引用 | AgentCore adapter + Tool adapter + SQLite |
-| AgentCore | 循环调度、状态管理 | ActionResult（含 flags）/ 退出信号 | LLM Layer + Tool Layer |
+| AgentCore | 循环调度、Principal/Policy、知识与上下文控制 | ActionResult（含 flags）/ 退出信号 | LLM Layer + Tool Layer |
 | LLM Layer | API 调用、历史裁剪、SSE 解析 | ChatResponse（统一格式） | API Key / Endpoint |
 | Tool Layer | 工具执行、结果封装 | ActionResult | 文件系统 / 浏览器 / 子进程 |
 | Infrastructure | 底层能力封装 | 原始数据 | OS / 网络 |
@@ -50,10 +50,30 @@
 - 会话准入：任务提交在 Agent 构建前用一次性令牌原子预占会话；`starting`、`running`、`waiting_for_user` 均拒绝重复提交，初始化或线程启动失败时释放预占
 - 会话恢复：Web 持久化聊天对应的任务级 checkpoint ID；服务重启后将遗留的运行态标记为 `interrupted`，仅允许按该聊天绑定的 checkpoint 恢复，禁止回退到工作区级 `latest`
 - Web 访问边界：除校验 TCP 对端为 loopback 外，还必须校验 `Host` 属于本地或显式配置的 allowlist；不得用任意 `Origin == Host` 作为准入依据
+- Web 身份入口：未配置注册表时只提供 loopback 单用户兼容模式；多用户部署必须设置
+  `XAGENT_WEB_IDENTITY_REGISTRY`。安全模式只接受 opaque Bearer/HttpOnly Cookie，subject、
+  tenant、scope 和 workspace 映射全部来自工作区外的受信注册表，忽略客户端身份声明头；
+  映射的 workspace 必须预先存在，加载时绑定规范路径及 device/inode identity；跨 owner
+  重叠和注册表 containment 通过物理祖先 identity 校验，不依赖路径大小写拼写
+- Web 授权传播：认证得到的不可变 `WebIdentity` 必须原样转换为 `Principal` 并传播到
+  Agent Loop、子 Agent、Team、Memory、Retrieval、Checkpoint、Eval 和 Telemetry；
+  任一内部组件不得自行补 scope 或退回固定 `local-user`
+- Web 所有权隔离：同名 workspace alias 由服务端映射到不同物理根；chat、task、trace、
+  Eval dataset/run 的物理存储、eval cancel handle 和内存 session 均绑定非秘密 owner
+  digest。跨 owner 的 ID 查询只返回 not-found/denied，安全响应同时隐藏宿主绝对路径
+- Web 身份生命周期：注册表按文件 identity 热加载。身份被禁用、删除或边界发生变化时，
+  下一次请求或 30 秒调度巡检会取消其 Eval、停止并移除其所有会话，且不会再通过旧映射
+  写盘；workspace 被替换或改为符号链接时同样撤销对应运行态。注册表缺失、损坏或没有
+  有效身份时撤销全部安全 Web 运行态并返回 503
+- Web scope 边界：HTTP 路由先做粗粒度 `workspace.read/write/delete`、`state.write`、
+  `user.interact` 检查，内层 Tool Policy 再校验具体 capability；两层都 fail closed。
+  本地 operator 的 `host.read` 不得由安全 Web 注册表授予，租户确认不能读取 workspace 外文件
 - Web 出口边界：浏览器和 Eval URL 下载统一通过仅允许公网目标的本地代理；代理将 DNS 校验结果绑定到实际 TCP 连接，所有重定向和页面脚本发起的请求都重复执行该约束
 - Web 流式状态：LLM XML 包装按 chunk 增量解析，原始诊断尾部与单个工具载荷均设 65,536 字符上限；会话事件日志最多保留 2048 条，落后于保留窗口的 SSE 客户端通过 `session_snapshot` 恢复当前消息状态
 - 共享存储：Runbook、Memory、定时任务等工作区级“读—改—写”必须持有统一工作区锁；写盘使用同目录唯一临时文件并原子替换，禁止直接覆盖
 - 数据格式：层间只传 `ActionResult` 或 `ChatResponse`，禁止跨层直接访问内部状态
+- Agent Kernel：默认路径的工具授权、Memory 候选、EvidenceBundle 和 ContextManifest
+  使用统一的有界元数据契约；完整边界见 `docs/agent-kernel.md`
 - Durable Orchestration 是显式启用的外层控制面：它只持久化 Run、Node、Attempt、Domain
   Event 和 Artifact 引用，不持久化 Agent Loop 的 provider 内部状态，也不允许原始工具输出越过
   Artifact 边界。未启用时，现有 CLI、Web 单 Agent 和 Team Workflow 行为保持不变。完整协议见
@@ -112,7 +132,8 @@
 
 只传当前轮：`messages = [{"role": "user", "content": next_prompt, "tool_results": ...}]`
 
-完整历史由 `Session.history` 维护，主循环不感知历史裁剪。
+完整历史由 `Session.history` 维护；Agent Loop 在 LLM 调用前通过 `ContextBuilder`
+按组件 token 预算重建当前可见输入，Session 再对协议相关历史执行 token 级压缩。
 
 ### 退出条件
 
@@ -146,7 +167,8 @@
 
 **背景**：主循环需要感知历史长度吗？
 
-**决策**：主循环只关心当前轮，历史裁剪/缓存策略由 Session 层统一处理。
+**决策**：主循环通过协议无关的 `ContextManifest` 约束当前可见组件；Session 层负责
+协议相关历史的 token 裁剪和 tool-result 配对修复。
 
 **理由**：裁剪策略与模型协议强耦合（Claude content-block vs OpenAI message），放在主循环会导致协议泄漏。
 
@@ -242,7 +264,7 @@ XAgent/
 | 指标 | 限制 |
 |---|---|
 | 单次对话最大轮次 | 40（可配置） |
-| 历史裁剪阈值 | `context_win * 3` 字符 |
+| 历史裁剪阈值 | `context_window_chars / 3` 的保守 token 预算，另按组件分配 |
 | 单工具返回截断 | 20000 字符（file_read）/ 8000 字符（web） |
 | 代码执行超时 | 60s（可配置） |
 | 超长行截断 | `min(max(100, 256000//行数), 8000)` |

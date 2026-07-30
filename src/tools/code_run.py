@@ -5,29 +5,24 @@ import os
 import queue
 import signal
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Generator
+
+from src.tools.code_sandbox import (
+    CodeExecutionPlan,
+    CodeSandboxError,
+    cleanup_execution_plan,
+    prepare_code_execution,
+    validate_execution_plan,
+)
 
 
 HEADER_FILE = Path(__file__).resolve().parent.parent / "assets" / "code_run_header.py"
 STREAM_POLL_INTERVAL = 0.05
 STREAM_READ_BYTE_SIZE = 8192
 CODE_OUTPUT_CHAR_LIMIT = 200_000
-SAFE_SUBPROCESS_ENV_KEYS = {
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "PATH",
-    "PATHEXT",
-    "PYTHONIOENCODING",
-    "PYTHONUTF8",
-    "SYSTEMROOT",
-    "TERM",
-    "TZ",
-}
 
 
 def run_code(
@@ -37,6 +32,7 @@ def run_code(
     cwd: str | None = None,
     *,
     allow_unsafe: bool = False,
+    isolation_mode: str | None = None,
 ) -> dict[str, Any]:
     stdout_chunks: list[str] = []
     result: dict[str, Any] = {
@@ -49,6 +45,7 @@ def run_code(
         timeout=timeout,
         cwd=cwd,
         allow_unsafe=allow_unsafe,
+        isolation_mode=isolation_mode,
     ):
         event_type = event.get("type")
         data = event.get("data")
@@ -69,69 +66,25 @@ def _inject_header(script: str) -> str:
     return header + "\n" + script
 
 
-def _build_command(script: str, language: str) -> tuple[list[str], str | None]:
-    if language == "python":
-        return [sys.executable, "-c", _inject_header(script)], None
-    if language in {"shell", "bash", "sh"}:
-        return ["/bin/bash", "-lc", script], None
-    return [], f"unsupported language: {language}"
-
-
-def _start_process(command: list[str], cwd: str | None) -> subprocess.Popen[str]:
-    if cwd:
-        cwd_path = Path(cwd)
-        if not cwd_path.exists():
-            raise ValueError(f"cwd does not exist: {cwd}")
-        if not cwd_path.is_dir():
-            raise ValueError(f"cwd is not a directory: {cwd}")
+def _start_process(plan: CodeExecutionPlan) -> subprocess.Popen[str]:
     return subprocess.Popen(
-        command,
+        list(plan.launch_command),
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        cwd=cwd or None,
-        env=_sanitized_subprocess_env(cwd),
+        cwd=plan.workspace_path,
+        env=dict(plan.environment),
         start_new_session=True,
+        close_fds=True,
     )
 
-
-def _sanitized_subprocess_env(cwd: str | None) -> dict[str, str]:
-    """Build a minimal environment without forwarding host credentials."""
-
-    workspace = Path(cwd or Path.cwd()).resolve()
-    env = {
-        key: value
-        for key in SAFE_SUBPROCESS_ENV_KEYS
-        if (value := os.environ.get(key))
-    }
-    env["PATH"] = _sanitized_path(env.get("PATH", os.defpath))
-    env["HOME"] = str(workspace)
-    env["TMPDIR"] = str(workspace)
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["XAGENT_CODE_RUN_WORKSPACE"] = str(workspace)
-    return env
-
-
-def _sanitized_path(value: str) -> str:
-    entries: list[str] = []
-    for entry in value.split(os.pathsep):
-        if not entry:
-            continue
-        candidate = Path(entry).expanduser()
-        if not candidate.is_absolute():
-            continue
-        normalized = str(candidate.resolve())
-        if normalized not in entries:
-            entries.append(normalized)
-    return os.pathsep.join(entries) or os.defpath
-
-
 def _kill_process_tree(process: subprocess.Popen[Any]) -> None:
-    if process.poll() is not None:
-        return
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (OSError, ProcessLookupError):
+        pass
+    if process.poll() is None:
         try:
             process.kill()
         except OSError:
@@ -141,9 +94,33 @@ def _kill_process_tree(process: subprocess.Popen[Any]) -> None:
 def _command_preview(command: list[str]) -> list[str]:
     if len(command) >= 3 and command[1] == "-c":
         return [command[0], command[1], f"<script:{len(command[2])} chars>"]
-    if len(command) >= 3 and command[0] == "/bin/bash" and command[1] == "-lc":
-        return [command[0], command[1], f"<script:{len(command[2])} chars>"]
+    if (
+        len(command) >= 5
+        and command[0] == "/bin/bash"
+        and command[1:4] == ["--noprofile", "--norc", "-c"]
+    ):
+        return [*command[:4], f"<script:{len(command[4])} chars>"]
     return command
+
+
+def prepare_code_run_execution(
+    *,
+    script: str,
+    language: str,
+    timeout: int,
+    cwd: str | None,
+    backend: str | None = None,
+    unsafe_authorized: bool = False,
+) -> CodeExecutionPlan:
+    executed_script = _inject_header(script) if language == "python" else script
+    return prepare_code_execution(
+        script=executed_script,
+        language=language,
+        timeout=timeout,
+        cwd=cwd,
+        backend=backend,
+        unsafe_authorized=unsafe_authorized,
+    )
 
 
 def _close_popen_streams(process: subprocess.Popen[Any]) -> None:
@@ -166,6 +143,39 @@ def _read_stream_chunks(stream: Any) -> Generator[str, None, None]:
         yield tail
 
 
+def _scratch_limit_exceeded(plan: CodeExecutionPlan) -> bool:
+    if plan.backend not in {"bubblewrap", "sandbox-exec"}:
+        return False
+    scratch = Path(str(getattr(plan.scratch_handle, "name", "") or ""))
+    if not scratch.is_dir():
+        return True
+    total_bytes = 0
+    entries = 0
+    pending = [scratch]
+    try:
+        while pending:
+            current = pending.pop()
+            with os.scandir(current) as iterator:
+                for entry in iterator:
+                    entries += 1
+                    if entries > plan.limits.scratch_entries:
+                        return True
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total_bytes += entry.stat(
+                                follow_symlinks=False
+                            ).st_size
+                            if total_bytes > plan.limits.scratch_bytes:
+                                return True
+                    except FileNotFoundError:
+                        continue
+    except OSError:
+        return True
+    return False
+
+
 def run_code_stream(
     script: str,
     language: str = "python",
@@ -174,6 +184,8 @@ def run_code_stream(
     stop_signal: threading.Event | None = None,
     *,
     allow_unsafe: bool = False,
+    isolation_mode: str | None = None,
+    execution_plan: CodeExecutionPlan | None = None,
 ) -> Generator[dict[str, Any], None, None]:
     if not script.strip():
         yield {"type": "error", "data": {"status": "ERROR", "error": "script is empty"}}
@@ -184,25 +196,80 @@ def run_code_stream(
             "data": {"status": "ERROR", "error": f"timeout must be positive: {timeout}"},
         }
         return
-    if not allow_unsafe:
+    if execution_plan is None and not allow_unsafe and isolation_mode is None:
         yield {
             "type": "error",
             "data": {
                 "status": "ERROR",
                 "error": "unsafe code execution requires explicit authorization",
+                "reason_code": "EXECUTION_AUTHORIZATION_REQUIRED",
             },
         }
         return
 
-    command, error = _build_command(script, language)
-    if error:
-        yield {"type": "error", "data": {"status": "ERROR", "error": f"unsupported language: {language}"}}
+    executed_script = _inject_header(script) if language == "python" else script
+    plan: CodeExecutionPlan | None = None
+    plan_created_here = execution_plan is None
+    try:
+        if execution_plan is not None and not isinstance(
+            execution_plan,
+            CodeExecutionPlan,
+        ):
+            raise CodeSandboxError(
+                "EXECUTION_PLAN_MISMATCH",
+                "execution plan is invalid",
+            )
+        if execution_plan is not None and execution_plan.unsafe and not allow_unsafe:
+            raise CodeSandboxError(
+                "EXECUTION_AUTHORIZATION_REQUIRED",
+                "unsafe code execution requires explicit authorization",
+            )
+        plan = execution_plan or prepare_code_execution(
+            script=executed_script,
+            language=language,
+            timeout=timeout,
+            cwd=cwd,
+            backend=("unsafe" if allow_unsafe and isolation_mode is None else isolation_mode),
+            unsafe_authorized=allow_unsafe,
+        )
+        validate_execution_plan(
+            plan,
+            script=executed_script,
+            language=language,
+            timeout=timeout,
+            cwd=cwd,
+        )
+    except CodeSandboxError as exc:
+        if plan_created_here:
+            cleanup_execution_plan(plan)
+        yield {
+            "type": "error",
+            "data": {
+                "status": "ERROR",
+                "error": str(exc),
+                "reason_code": exc.reason_code,
+                "security": {
+                    "security_level": "unavailable",
+                    "unsafe": False,
+                },
+            },
+        }
         return
 
     try:
-        process = _start_process(command, cwd)
+        process = _start_process(plan)
     except (OSError, ValueError) as exc:
-        yield {"type": "error", "data": {"status": "ERROR", "error": str(exc)}}
+        if plan_created_here:
+            cleanup_execution_plan(plan)
+        yield {
+            "type": "error",
+            "data": {
+                "status": "ERROR",
+                "error": "failed to start the authorized execution plan",
+                "reason_code": "EXECUTION_START_FAILED",
+                "security": plan.security_receipt(),
+            },
+        }
         return
 
     assert process.stdout is not None
@@ -214,6 +281,7 @@ def run_code_stream(
     stderr_chars = 0
     stdout_truncated = False
     stderr_truncated = False
+    output_limit_reached = threading.Event()
 
     def read_stdout() -> None:
         nonlocal stdout_chars, stdout_truncated
@@ -225,6 +293,7 @@ def run_code_stream(
                 stdout_queue.put(retained)
             if len(chunk) > remaining:
                 stdout_truncated = True
+                output_limit_reached.set()
 
     def read_stderr() -> None:
         nonlocal stderr_chars, stderr_truncated
@@ -236,35 +305,87 @@ def run_code_stream(
                 stderr_chunks.append(retained)
             if len(chunk) > remaining:
                 stderr_truncated = True
+                output_limit_reached.set()
 
     stdout_thread = threading.Thread(target=read_stdout, daemon=True)
     stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-    stdout_thread.start()
-    stderr_thread.start()
-
     deadline = time.monotonic() + timeout
     interrupted = False
     timed_out = False
+    output_limited = False
+    scratch_limited = False
+    reader_start_failed = False
+    stdout_thread_started = False
+    stderr_thread_started = False
     try:
-        while True:
-            if stop_signal is not None and stop_signal.is_set():
-                interrupted = True
-                _kill_process_tree(process)
-                break
-            if time.monotonic() >= deadline:
-                timed_out = True
-                _kill_process_tree(process)
-                break
-            try:
-                line = stdout_queue.get(timeout=STREAM_POLL_INTERVAL)
-            except queue.Empty:
-                if process.poll() is not None:
+        try:
+            stdout_thread.start()
+            stdout_thread_started = True
+            stderr_thread.start()
+            stderr_thread_started = True
+        except RuntimeError:
+            reader_start_failed = True
+        if not reader_start_failed:
+            while True:
+                if _scratch_limit_exceeded(plan):
+                    scratch_limited = True
+                    _kill_process_tree(process)
                     break
-                continue
-            yield {"type": "stdout", "data": line}
-    except Exception:
+                if output_limit_reached.is_set():
+                    output_limited = True
+                    _kill_process_tree(process)
+                    break
+                if stop_signal is not None and stop_signal.is_set():
+                    interrupted = True
+                    _kill_process_tree(process)
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    _kill_process_tree(process)
+                    break
+                try:
+                    line = stdout_queue.get(timeout=STREAM_POLL_INTERVAL)
+                except queue.Empty:
+                    if process.poll() is not None:
+                        break
+                    continue
+                yield {"type": "stdout", "data": line}
+    finally:
+        # ``Generator.close()`` injects GeneratorExit at a suspended stdout
+        # yield.  Cleanup must therefore live in ``finally`` rather than an
+        # ``except Exception`` block, otherwise abandoning a stream can leave
+        # its process group running.
         _kill_process_tree(process)
-        raise
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_process_tree(process)
+            try:
+                process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        except OSError:
+            pass
+        if stdout_thread_started:
+            stdout_thread.join(timeout=5)
+        if stderr_thread_started:
+            stderr_thread.join(timeout=5)
+        _close_popen_streams(process)
+        if plan_created_here:
+            cleanup_execution_plan(plan)
+
+    if reader_start_failed:
+        yield {
+            "type": "error",
+            "data": {
+                "status": "ERROR",
+                "error": "failed to initialize execution output supervision",
+                "reason_code": "EXECUTION_SUPERVISOR_START_FAILED",
+                "security": plan.security_receipt(),
+            },
+        }
+        return
 
     while True:
         try:
@@ -273,29 +394,23 @@ def run_code_stream(
             break
         yield {"type": "stdout", "data": line}
 
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _kill_process_tree(process)
-        process.wait()
-
-    stdout_thread.join(timeout=5)
-    stderr_thread.join(timeout=5)
+    output_limited = output_limited or output_limit_reached.is_set()
     while True:
         try:
             line = stdout_queue.get_nowait()
         except queue.Empty:
             break
         yield {"type": "stdout", "data": line}
-    _close_popen_streams(process)
-
     stderr_text = "".join(stderr_chunks)
 
     if interrupted:
         status = "INTERRUPTED"
     elif timed_out:
         status = "TIMEOUT"
+    elif output_limited:
+        status = "ERROR"
+    elif scratch_limited:
+        status = "ERROR"
     elif process.returncode == 0:
         status = "OK"
     else:
@@ -306,12 +421,34 @@ def run_code_stream(
         "data": {
             "status": status,
             "language": language,
-            "command": _command_preview(command),
+            "command": _command_preview(list(plan.payload_command)),
             "stderr": stderr_text,
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
             "output_char_limit": CODE_OUTPUT_CHAR_LIMIT,
             "exit_code": process.returncode,
-            **({"error": f"process exceeded timeout: {timeout}s"} if timed_out else {}),
+            "security": plan.security_receipt(),
+            **(
+                {
+                    "error": f"process exceeded timeout: {timeout}s",
+                    "reason_code": "TIMEOUT",
+                }
+                if timed_out
+                else (
+                    {
+                        "error": "process exceeded output limit",
+                        "reason_code": "OUTPUT_LIMIT_EXCEEDED",
+                    }
+                    if output_limited
+                    else (
+                        {
+                            "error": "process exceeded scratch space limit",
+                            "reason_code": "SCRATCH_LIMIT_EXCEEDED",
+                        }
+                        if scratch_limited
+                        else {}
+                    )
+                )
+            ),
         },
     }

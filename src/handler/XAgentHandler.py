@@ -1,21 +1,36 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from src.core.agent_kernel import ContextManifest, DataSensitivity, Principal, TrustLevel
 from src.core.agent_loop import ActionResult, AgentContext, BaseHandler, TurnEndHook
-from src.core.memory import load_effective_memory, load_global_memory, record_self_evolution_lesson
+from src.core.local_policy import (
+    HOST_READ_SCOPE,
+    LOCAL_PRINCIPAL_SCOPES,
+    LocalPolicyGate,
+)
+from src.core.memory import load_effective_memory, load_global_memory
+from src.core.memory_store import MEMORY_READ_SCOPE, MemoryKind, MemoryStore
 from src.core.skills import SkillRegistry, dedupe_skill_names, render_active_skills
 from src.core.telemetry import Event
 from src.tools import ask_user, create_browser_driver, delete_file, patch_file, plan_update, read_file, search_file_index, start_long_term_update, update_working_checkpoint, web_execute_js, web_scan, write_file
 from src.tools.browser_driver import BrowserDriver
+from src.tools.code_sandbox import (
+    CodeExecutionPlan,
+    CodeSandboxError,
+    cleanup_execution_plan,
+)
+from src.tools.code_run import prepare_code_run_execution, run_code_stream
 from src.tools.file_ops import resolve_path_for_operation
-from src.tools.code_run import run_code_stream
+from src.orchestration.policy import PolicyDecision, PolicyOutcome
 
 
 SUMMARY_PATTERN = re.compile(r"<summary>\s*(.*?)\s*</summary>", re.DOTALL)
@@ -58,6 +73,22 @@ def _is_outside_read_authorized(user_reply: str) -> bool:
     return normalized in {"yes", "y", "ok", "confirm", "confirmed", "read", "确认", "授权", "同意", "读取"}
 
 
+def _is_kernel_approval_authorized(user_reply: str) -> bool:
+    normalized = user_reply.strip().lower()
+    return normalized in {
+        "yes",
+        "y",
+        "ok",
+        "confirm",
+        "confirmed",
+        "确认",
+        "授权",
+        "同意",
+        "执行",
+        "删除",
+    }
+
+
 class XAgentHandler(BaseHandler):
     run_code_stream = staticmethod(run_code_stream)
 
@@ -74,6 +105,23 @@ class XAgentHandler(BaseHandler):
         self._browser_driver_factory = browser_driver_factory
         self._browser_driver_lock = threading.Lock()
         self._browser_driver_closed = False
+        principal = self.ctx.principal
+        if not isinstance(principal, Principal):
+            session_id = self.ctx.session_id or "local-session"
+            principal = Principal(
+                subject="local-user",
+                tenant_id="local",
+                session_id=session_id,
+                run_id=session_id,
+                agent_id=self.ctx.agent_name or "main",
+                scopes=LOCAL_PRINCIPAL_SCOPES,
+            )
+            self.ctx.principal = principal
+        self._policy_gate = LocalPolicyGate(
+            self.ctx.cwd or Path.cwd(),
+            actor=principal.subject,
+        )
+        self._kernel_authorization_state = threading.local()
         self._turn_end_hooks.extend([
             TurnEndHook(name="external_intervene", fn=self._external_intervene_hook, priority=30),
             TurnEndHook(name="plan_reminder", fn=self._plan_reminder_hook, priority=25),
@@ -81,6 +129,338 @@ class XAgentHandler(BaseHandler):
             TurnEndHook(name="periodic_inject", fn=self._periodic_inject_hook, priority=20),
             TurnEndHook(name="summary_extract", fn=self._summary_extract_hook, priority=10),
         ])
+
+    def tool_before_callback(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> ActionResult | None:
+        self._clear_kernel_authorization()
+        principal = self.ctx.principal
+        if not isinstance(principal, Principal):
+            return ActionResult(
+                data={
+                    "status": "SKIP",
+                    "error": "tool authorization requires an authenticated principal",
+                    "reason_code": "principal_missing",
+                },
+                next_prompt="工具未执行：当前运行缺少经过验证的调用者身份。",
+            )
+        effective_args = self._kernel_action_args(tool_name, args)
+        if tool_name == "code_run":
+            try:
+                execution_plan = self._prepare_code_run_plan(effective_args)
+            except CodeSandboxError as exc:
+                self._emit_code_sandbox_failure(exc.reason_code)
+                return ActionResult(
+                    data={
+                        "status": "ERROR",
+                        "error": str(exc),
+                        "reason_code": exc.reason_code,
+                        "security": {
+                            "security_level": "unavailable",
+                            "unsafe": False,
+                        },
+                    },
+                    next_prompt=(
+                        "代码未执行：经过验证的隔离后端不可用或配置无效；"
+                        "安全模式不会回退到宿主进程。"
+                    ),
+                )
+            self._kernel_authorization_state.execution_plan = execution_plan
+            effective_args["execution_plan"] = execution_plan.approval_binding()
+        authorization = self._policy_gate.evaluate(
+            principal=principal,
+            tool_name=tool_name,
+            args=effective_args,
+            turn=self.ctx.current_turn,
+        )
+        decision = authorization.decision
+        self._emit_policy_decision(tool_name, decision)
+        if decision.outcome is PolicyOutcome.DENY:
+            return self._policy_denial_result(decision)
+        if decision.outcome is PolicyOutcome.REQUIRE_APPROVAL:
+            requested_at = time.time()
+            preview = self._approval_preview(effective_args)
+            request_id = hashlib.sha256(
+                (
+                    f"{decision.action_digest}\0{principal.principal_digest}\0"
+                    f"{requested_at}"
+                ).encode("utf-8")
+            ).hexdigest()[:32]
+            self.ctx.pending_approval = {
+                "request_id": request_id,
+                "tool_name": tool_name,
+                "status": "pending",
+                "reason_code": decision.reason_code,
+                "action_digest": decision.action_digest,
+                "policy_version": decision.policy_version,
+                "principal_digest": principal.principal_digest,
+                "requested_at": requested_at,
+                "expires_at": requested_at + 300,
+                "parameter_preview": preview,
+            }
+            self._checkpoint_approval_state("waiting_approval")
+            reply = ask_user(
+                self._approval_prompt(
+                    tool_name,
+                    preview,
+                    decision,
+                    args=effective_args,
+                ),
+                input_fn=self.ctx.user_input_fn,
+            )
+            if not _is_kernel_approval_authorized(reply.get("user_reply", "")):
+                self.ctx.pending_approval.update(
+                    status="rejected",
+                    reason_code="approval_rejected",
+                    resolved_at=time.time(),
+                )
+                self._checkpoint_approval_state("running")
+                self.ctx.pending_approval = None
+                return ActionResult(
+                    data={
+                        "status": "SKIP",
+                        "error": "tool action not authorized by user",
+                        "reason_code": "approval_rejected",
+                        "action_digest": decision.action_digest,
+                        "policy_version": decision.policy_version,
+                    },
+                    next_prompt="工具未执行：用户未授权这一组精确参数。",
+                )
+            decision = self._policy_gate.approve(
+                authorization,
+                principal=principal,
+                now=time.time(),
+            )
+            self._emit_policy_decision(tool_name, decision)
+            if decision.outcome is not PolicyOutcome.ALLOW:
+                self.ctx.pending_approval.update(
+                    status="denied",
+                    reason_code=decision.reason_code,
+                    resolved_at=time.time(),
+                )
+                self._checkpoint_approval_state("running")
+                self.ctx.pending_approval = None
+                return self._policy_denial_result(decision)
+            self.ctx.pending_approval.update(
+                status="approved",
+                reason_code=decision.reason_code,
+                approval_id=decision.approval_id or "",
+                resolved_at=time.time(),
+            )
+            self._checkpoint_approval_state("running")
+        self._kernel_authorization_state.tool_name = tool_name
+        self._kernel_authorization_state.action_digest = decision.action_digest
+        return None
+
+    def tool_after_callback(self, tool_name: str, result: ActionResult) -> ActionResult:
+        del tool_name
+        self.ctx.pending_approval = None
+        return result
+
+    def tool_finally_callback(self, tool_name: str) -> None:
+        del tool_name
+        self._clear_kernel_authorization()
+
+    def _kernel_action_args(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        effective = dict(args)
+        if tool_name in {"code_run", "web_execute_js"}:
+            effective["script"] = self._extract_code_script(args)
+            effective.pop("code", None)
+        elif tool_name == "file_write":
+            effective["content"] = self._extract_file_content(args)
+        return effective
+
+    def _emit_policy_decision(
+        self,
+        tool_name: str,
+        decision: PolicyDecision,
+    ) -> None:
+        principal = self.ctx.principal
+        self.ctx.last_policy_decision = {
+            "tool_name": tool_name,
+            "outcome": decision.outcome.value,
+            "reason_code": decision.reason_code,
+            "action_digest": decision.action_digest,
+            "policy_version": decision.policy_version,
+            "approval_id": decision.approval_id or "",
+        }
+        self.ctx.sink.emit(
+            Event(
+                session_id=self.ctx.session_id,
+                turn=self.ctx.current_turn,
+                kind="policy_decision",
+                name=tool_name,
+                data={
+                    "outcome": decision.outcome.value,
+                    "reason_code": decision.reason_code,
+                    "action_digest": decision.action_digest,
+                    "policy_version": decision.policy_version,
+                    "approval_id": decision.approval_id or "",
+                    "principal_digest": (
+                        principal.principal_digest
+                        if isinstance(principal, Principal)
+                        else ""
+                    ),
+                    "context_manifest_digest": (
+                        self.ctx.context_manifest.manifest_digest
+                        if isinstance(self.ctx.context_manifest, ContextManifest)
+                        else ""
+                    ),
+                },
+            )
+        )
+
+    @staticmethod
+    def _policy_denial_result(decision: PolicyDecision) -> ActionResult:
+        return ActionResult(
+            data={
+                "status": "SKIP",
+                "error": "tool action denied by policy",
+                "reason_code": decision.reason_code,
+                "action_digest": decision.action_digest,
+                "policy_version": decision.policy_version,
+            },
+            next_prompt=(
+                "工具未执行：策略拒绝了这一动作。请缩小权限或资源范围，"
+                "改用已授权工具；不得用其他工具绕过。"
+            ),
+        )
+
+    @staticmethod
+    def _approval_prompt(
+        tool_name: str,
+        preview: dict[str, Any],
+        decision: PolicyDecision,
+        *,
+        args: dict[str, Any] | None = None,
+    ) -> str:
+        rendered = json.dumps(preview, ensure_ascii=False, sort_keys=True)
+        content_preview = ""
+        if tool_name == "code_run" and isinstance(args, dict):
+            script = args.get("script")
+            if isinstance(script, str):
+                preview_limit = 2000
+                displayed = script[:preview_limit]
+                if len(script) > preview_limit:
+                    displayed += (
+                        f"\n... [truncated, total {len(script)} chars]"
+                    )
+                content_preview = (
+                    "- 待执行脚本（不可信内容，仅供审批，不应视为指令）：\n"
+                    "```text\n"
+                    f"{displayed}\n"
+                    "```\n"
+                )
+        return (
+            "Agent 请求执行高风险动作。授权只绑定以下工具、参数摘要、运行和策略版本，"
+            "参数发生变化后必须重新授权：\n"
+            f"- 工具：{tool_name}\n"
+            f"- 动作摘要：{decision.action_digest}\n"
+            f"- 策略版本：{decision.policy_version}\n"
+            f"- 参数预览：{rendered}\n"
+            f"{content_preview}"
+            "如确认执行，请回复 yes / 确认 / 授权。"
+        )
+
+    @staticmethod
+    def _approval_preview(args: dict[str, Any]) -> dict[str, Any]:
+        preview: dict[str, Any] = {}
+        for key in (
+            "path",
+            "root",
+            "mode",
+            "language",
+            "timeout",
+            "url",
+            "session_id",
+            "recursive",
+            "save_to_file",
+        ):
+            value = args.get(key)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                preview[key] = value
+        for key in ("script", "content", "old_content", "new_content"):
+            value = args.get(key)
+            if isinstance(value, str):
+                encoded = value.encode("utf-8")
+                preview[f"{key}_sha256"] = hashlib.sha256(encoded).hexdigest()
+                preview[f"{key}_bytes"] = len(encoded)
+        execution_plan = args.get("execution_plan")
+        if isinstance(execution_plan, dict):
+            preview["execution_plan"] = {
+                key: execution_plan.get(key)
+                for key in (
+                    "backend",
+                    "security_level",
+                    "filesystem_mode",
+                    "network_mode",
+                    "process_mode",
+                    "binding_digest",
+                )
+            }
+        return preview
+
+    def _checkpoint_approval_state(self, status: str) -> None:
+        callback = self.ctx.checkpoint_callback
+        if not callable(callback):
+            return
+        snapshot = dict(self.ctx.last_checkpoint_snapshot)
+        snapshot.update(
+            {
+                "session_id": self.ctx.session_id,
+                "turn": self.ctx.current_turn,
+                "status": status,
+                "pending_approval": (
+                    dict(self.ctx.pending_approval)
+                    if isinstance(self.ctx.pending_approval, dict)
+                    else None
+                ),
+                "principal_digest": (
+                    self.ctx.principal.principal_digest
+                    if isinstance(self.ctx.principal, Principal)
+                    else ""
+                ),
+                "principal_boundary_digest": (
+                    self.ctx.principal.boundary_digest
+                    if isinstance(self.ctx.principal, Principal)
+                    else ""
+                ),
+                "context_manifest_digest": (
+                    self.ctx.context_manifest.manifest_digest
+                    if self.ctx.context_manifest is not None
+                    else ""
+                ),
+                "context_state": dict(self.ctx.context_state),
+            }
+        )
+        callback(snapshot)
+
+    def _is_kernel_authorized(self, tool_name: str) -> bool:
+        return (
+            getattr(self._kernel_authorization_state, "tool_name", "") == tool_name
+            and bool(
+                getattr(self._kernel_authorization_state, "action_digest", "")
+            )
+        )
+
+    def _kernel_action_digest(self) -> str:
+        return str(
+            getattr(self._kernel_authorization_state, "action_digest", "") or ""
+        )
+
+    def _clear_kernel_authorization(self) -> None:
+        cleanup_execution_plan(
+            getattr(self._kernel_authorization_state, "execution_plan", None)
+        )
+        self._kernel_authorization_state.tool_name = ""
+        self._kernel_authorization_state.action_digest = ""
+        self._kernel_authorization_state.execution_plan = None
 
     def close(self) -> None:
         with self._browser_driver_lock:
@@ -158,17 +538,26 @@ class XAgentHandler(BaseHandler):
                 "若无有效进展，必须切换策略或调用 ask_user 请求用户指导。"
             )
         if turn % 10 == 0 and turn > 0:
-            memory_root = Path(ctx.memory_root) if ctx.memory_root else PROJECT_ROOT / "workspace" / "default.ws"
-            if (memory_root / "system").is_dir():
-                mem_content = load_effective_memory(
-                    memory_root,
-                    getattr(ctx, "agent_name", ""),
-                    getattr(ctx, "memory_mode", "project"),
-                ).content
-            else:
-                mem_content = load_global_memory(memory_root).content
-            if mem_content:
-                parts.append(f"[Memory Refresh]\n{mem_content}")
+            principal = ctx.principal
+            if (
+                isinstance(principal, Principal)
+                and MEMORY_READ_SCOPE in principal.scopes
+            ):
+                memory_root = (
+                    Path(ctx.memory_root)
+                    if ctx.memory_root
+                    else PROJECT_ROOT / "workspace" / "default.ws"
+                )
+                if (memory_root / "system").is_dir():
+                    mem_content = load_effective_memory(
+                        memory_root,
+                        getattr(ctx, "agent_name", ""),
+                        getattr(ctx, "memory_mode", "project"),
+                    ).content
+                else:
+                    mem_content = load_global_memory(memory_root).content
+                if mem_content:
+                    parts.append(f"[Memory Refresh]\n{mem_content}")
         if turn % 65 == 0 and turn > 0:
             parts.append(
                 f"[DANGER] 已连续执行第 {turn} 轮。必须总结当前情况并调用 ask_user 请求用户确认。"
@@ -187,21 +576,43 @@ class XAgentHandler(BaseHandler):
             return None
 
         memory_root_value = ctx.memory_root or ctx.cwd
-        if memory_root_value:
-            record = record_self_evolution_lesson(
-                Path(memory_root_value),
-                issue["lesson"],
-                agent_name=getattr(ctx, "agent_name", ""),
-            )
-            record_status = str(record.get("status", "UNKNOWN"))
+        principal = ctx.principal
+        if memory_root_value and isinstance(principal, Principal):
+            try:
+                candidate = MemoryStore(Path(memory_root_value)).propose(
+                    principal=principal,
+                    content=issue["lesson"],
+                    namespace=(
+                        "tenant",
+                        principal.tenant_id,
+                        "agent",
+                        principal.agent_id,
+                    ),
+                    kind=MemoryKind.PROCEDURAL,
+                    source_refs=(
+                        self._turn_source_ref(principal, ctx.current_turn),
+                        self._issue_source_ref(issue),
+                    ),
+                    trust=TrustLevel.TOOL_UNTRUSTED,
+                    confidence=0.5,
+                    sensitivity=DataSensitivity.SENSITIVE,
+                    acl=(f"subject:{principal.subject}",),
+                    ttl_seconds=7 * 24 * 60 * 60,
+                )
+                record_status = "OK"
+                candidate_id = candidate.candidate_id
+            except (OSError, RuntimeError, ValueError, PermissionError):
+                record_status = "ERROR"
+                candidate_id = ""
         else:
             record_status = "SKIP"
+            candidate_id = ""
         if record_status == "OK":
-            memory_note = "经验已写入或已存在于自我进化记忆。"
+            memory_note = f"经验已提交待审核候选（{candidate_id}），尚未进入生效记忆。"
         elif record_status == "SKIP":
             memory_note = "当前未配置记忆根目录，本轮仅注入策略修正。"
         else:
-            memory_note = "经验写入失败，本轮仍必须按该经验调整策略。"
+            memory_note = "经验候选提交失败，本轮仍必须按该经验调整策略。"
 
         return (
             "[Self Evolution]\n"
@@ -211,6 +622,21 @@ class XAgentHandler(BaseHandler):
             "下一轮必须先判断根因并选择最优路径：优先补充探测信息、换更小验证步骤或切换方案；"
             "不要重复同一失败动作。只有缺少外部决策时才调用 ask_user。"
         )
+
+    @staticmethod
+    def _turn_source_ref(principal: Principal, turn: int) -> str:
+        run_digest = hashlib.sha256(principal.run_id.encode("utf-8")).hexdigest()
+        return f"run-sha256:{run_digest}:turn:{max(0, int(turn))}"
+
+    @staticmethod
+    def _issue_source_ref(issue: dict[str, str]) -> str:
+        encoded = json.dumps(
+            issue,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return f"tool-result-sha256:{hashlib.sha256(encoded).hexdigest()}"
 
     def _select_self_evolution_issue(self, tool_results: list[dict[str, Any]]) -> dict[str, str] | None:
         for result in tool_results:
@@ -377,7 +803,43 @@ class XAgentHandler(BaseHandler):
                     data={"status": "ERROR", "error": f"unsupported language: {language}"},
                     next_prompt="代码未执行：language 仅支持 python 或 shell。",
                 )
-            authorization_error = self._authorize_code_run(script, language, timeout)
+            plan = getattr(
+                self._kernel_authorization_state,
+                "execution_plan",
+                None,
+            )
+            if not isinstance(plan, CodeExecutionPlan):
+                try:
+                    plan = self._prepare_code_run_plan(
+                        {
+                            "script": script,
+                            "language": language,
+                            "timeout": timeout,
+                        }
+                    )
+                except CodeSandboxError as exc:
+                    self._emit_code_sandbox_failure(exc.reason_code)
+                    return ActionResult(
+                        data={
+                            "status": "ERROR",
+                            "error": str(exc),
+                            "reason_code": exc.reason_code,
+                            "security": {
+                                "security_level": "unavailable",
+                                "unsafe": False,
+                            },
+                        },
+                        next_prompt=(
+                            "代码未执行：经过验证的隔离后端不可用或配置无效；"
+                            "安全模式不会回退到宿主进程。"
+                        ),
+                    )
+            authorization_error = self._authorize_code_run(
+                script,
+                language,
+                timeout,
+                plan,
+            )
             if authorization_error is not None:
                 return authorization_error
             stdout_chunks: list[str] = []
@@ -393,7 +855,9 @@ class XAgentHandler(BaseHandler):
                 timeout=timeout,
                 cwd=self.ctx.cwd or None,
                 stop_signal=stop_signal,
-                allow_unsafe=True,
+                allow_unsafe=plan.unsafe,
+                isolation_mode=("unsafe" if plan.unsafe else plan.backend),
+                execution_plan=plan,
             ):
                 chunk_type = chunk.get("type", "")
                 chunk_data = chunk.get("data")
@@ -415,6 +879,7 @@ class XAgentHandler(BaseHandler):
         script: str,
         language: str,
         timeout: int,
+        plan: CodeExecutionPlan,
     ) -> ActionResult | None:
         stop_signal = self._stop_signal()
         if stop_signal is not None and stop_signal.is_set():
@@ -423,32 +888,49 @@ class XAgentHandler(BaseHandler):
                 next_prompt="",
                 should_exit=True,
             )
-
         policy = os.environ.get("XAGENT_CODE_RUN_POLICY", "confirm").strip().lower()
-        if policy == "allow":
-            return None
         if policy == "deny":
             return ActionResult(
                 data={"status": "SKIP", "error": "code execution is disabled by policy"},
                 next_prompt="代码未执行：当前策略禁止 code_run。请改用其他工具或请用户调整策略。",
             )
         if policy != "confirm":
-            return ActionResult(
-                data={"status": "ERROR", "error": f"invalid XAGENT_CODE_RUN_POLICY: {policy!r}"},
-                next_prompt="代码未执行：code_run 安全策略配置无效。",
-            )
+            if policy != "allow":
+                return ActionResult(
+                    data={"status": "ERROR", "error": f"invalid XAGENT_CODE_RUN_POLICY: {policy!r}"},
+                    next_prompt="代码未执行：code_run 安全策略配置无效。",
+                )
+        # The kernel grant is already a single-use approval for this exact
+        # immutable plan. It may satisfy confirm, but it can never override an
+        # operator-level deny or invalid configuration.
+        if self._is_kernel_authorized("code_run"):
+            return None
+        if policy == "allow" and not plan.unsafe:
+            return None
+        if policy == "allow" and plan.unsafe:
+            policy = "confirm"
 
         digest = hashlib.sha256(script.encode("utf-8")).hexdigest()[:16]
         preview_limit = 2000
         preview = script[:preview_limit]
         if len(script) > preview_limit:
             preview += f"\n... [truncated, total {len(script)} chars]"
+        security_warning = (
+            "Agent 请求在显式启用的开发级非隔离宿主进程中执行代码。"
+            "它可能访问宿主文件、网络和其他同 UID 资源；本次仍需单独授权。\n"
+            if plan.unsafe
+            else
+            "Agent 请求在已通过功能探测的 OS 隔离后端中执行只读代码。"
+            "工作区控制面被隐藏、网络被禁止，持久写入需使用文件工具。\n"
+        )
         auth = ask_user(
             (
-                "Agent 请求执行未使用 OS 沙箱的代码。该代码仍可能访问工作区外文件或网络，"
-                "但进程不会继承 API key 等宿主敏感环境变量。\n"
+                security_warning
+                +
                 f"- 语言：{language}\n"
                 f"- 超时：{timeout}s\n"
+                f"- 隔离后端：{plan.backend}\n"
+                f"- 安全级别：{plan.security_level}\n"
                 f"- SHA256：{digest}\n"
                 "```text\n"
                 f"{preview}\n"
@@ -466,6 +948,56 @@ class XAgentHandler(BaseHandler):
                 "script_sha256": digest,
             },
             next_prompt="代码未执行：用户未授权本次 code_run。请改用其他工具或停止。",
+        )
+
+    def _prepare_code_run_plan(
+        self,
+        args: dict[str, Any],
+    ) -> CodeExecutionPlan:
+        script = self._extract_code_script(args)
+        language = str(args.get("language", "python"))
+        try:
+            timeout = int(args.get("timeout", 60))
+        except (TypeError, ValueError) as exc:
+            raise CodeSandboxError(
+                "TIMEOUT_INVALID",
+                "timeout must be an integer",
+            ) from exc
+        configured = os.environ.get(
+            "XAGENT_CODE_RUN_BACKEND",
+            os.environ.get("XAGENT_CODE_RUN_ISOLATION", "auto"),
+        )
+        unsafe_enabled = str(configured or "").strip().lower() in {
+            "unsafe",
+            "development_unsafe",
+        }
+        return prepare_code_run_execution(
+            script=script,
+            language=language,
+            timeout=timeout,
+            cwd=self.ctx.cwd or None,
+            backend=configured,
+            unsafe_authorized=unsafe_enabled,
+        )
+
+    def _emit_code_sandbox_failure(self, reason_code: str) -> None:
+        principal = self.ctx.principal
+        self.ctx.sink.emit(
+            Event(
+                session_id=self.ctx.session_id,
+                turn=self.ctx.current_turn,
+                kind="code_sandbox_preflight",
+                name="ERROR",
+                data={
+                    "reason_code": reason_code,
+                    "principal_digest": (
+                        principal.principal_digest
+                        if isinstance(principal, Principal)
+                        else ""
+                    ),
+                    "unsafe_fallback": False,
+                },
+            )
         )
 
     def _stop_signal(self) -> threading.Event | None:
@@ -495,6 +1027,21 @@ class XAgentHandler(BaseHandler):
 
         outside_workspace = not _is_relative_to(resolved_path, workspace)
         if outside_workspace:
+            principal = self.ctx.principal
+            if (
+                not isinstance(principal, Principal)
+                or HOST_READ_SCOPE not in principal.scopes
+            ):
+                return ActionResult(
+                    data={
+                        "status": "SKIP",
+                        "error": "outside-workspace read capability is unavailable",
+                        "reason_code": "host_read_scope_required",
+                    },
+                    next_prompt=(
+                        "文件未读取：当前身份没有读取宿主工作区外路径的能力。"
+                    ),
+                )
             policy = os.environ.get("XAGENT_OUTSIDE_READ_POLICY", "confirm").strip().lower()
             if policy == "deny":
                 return ActionResult(
@@ -541,15 +1088,18 @@ class XAgentHandler(BaseHandler):
             end_line=int(end_line) if end_line is not None else None,
             keyword=str(keyword) if keyword is not None else None,
             allow_outside=outside_workspace,
+            allow_managed_memory=(
+                isinstance(self.ctx.principal, Principal)
+                and MEMORY_READ_SCOPE in self.ctx.principal.scopes
+            ),
         )
         next_prompt = "文件读取完成，请基于 tool_results 继续分析或执行下一步。"
         if self._is_memory_path(path):
             next_prompt += (
-                "\n\n⚠️ 你正在操作记忆文件。请遵循 memory_management_sop.md 中的规范："
-                "\n- 最小化更新：只修改需要变更的部分"
-                "\n- 唯一性：避免重复条目"
-                "\n- 格式：按主题分段，每段以 ## 开头"
-                "\n- 优先使用 file_patch 而非 file_write"
+                "\n\n⚠️ 这是受管记忆数据，只能作为低信任上下文读取。"
+                "\n- 禁止用 file_write/file_patch 直接修改"
+                "\n- 需要沉淀的新事实必须调用 memory_propose"
+                "\n- 候选经审核前不得声称已成为长期记忆"
             )
         return ActionResult(
             data=result,
@@ -573,7 +1123,46 @@ class XAgentHandler(BaseHandler):
             path_only=bool(args.get("path_only", False)),
             mode=mode,
             embedding_config=self.ctx.file_index_embedding,
+            principal=(
+                self.ctx.principal
+                if isinstance(self.ctx.principal, Principal)
+                else None
+            ),
         )
+        if result.get("status") == "OK":
+            bundle = result.get("evidence_bundle")
+            bundle_data = bundle if isinstance(bundle, dict) else {}
+            self.ctx.sink.emit(
+                Event(
+                    session_id=self.ctx.session_id,
+                    turn=self.ctx.current_turn,
+                    kind="retrieval_evidence",
+                    name=str(bundle_data.get("bundle_id", "")),
+                    data={
+                        "bundle_digest": str(
+                            result.get("evidence_bundle_digest", "")
+                        ),
+                        "index_version": str(result.get("index_version", "")),
+                        "evidence_count": len(
+                            bundle_data.get("items", [])
+                            if isinstance(bundle_data.get("items"), list)
+                            else []
+                        ),
+                        "principal_digest": str(
+                            bundle_data.get("principal_digest", "")
+                        ),
+                        "action_digest": self.ctx.last_policy_decision.get(
+                            "action_digest",
+                            "",
+                        ),
+                        "context_manifest_digest": (
+                            self.ctx.context_manifest.manifest_digest
+                            if isinstance(self.ctx.context_manifest, ContextManifest)
+                            else ""
+                        ),
+                    },
+                )
+            )
         return ActionResult(
             data=result,
             next_prompt="文件索引检索完成。搜索结果只用于定位；修改或依赖具体内容前，必须用 file_read 精读候选文件。",
@@ -582,7 +1171,10 @@ class XAgentHandler(BaseHandler):
     @staticmethod
     def _is_memory_path(path: str) -> bool:
         normalized = os.path.normpath(path)
-        parts = normalized.replace("\\", "/").split("/")
+        parts = [
+            part.casefold()
+            for part in normalized.replace("\\", "/").split("/")
+        ]
         return "memory" in parts
 
     def exec_file_write(self, args: dict[str, Any]) -> ActionResult:
@@ -639,27 +1231,34 @@ class XAgentHandler(BaseHandler):
                 next_prompt="文件删除未执行，请基于错误信息决定是否修正路径或停止。",
             )
 
-        auth = ask_user(
-            (
-                "请确认是否授权删除以下路径：\n"
-                f"- 路径：{target}\n"
-                f"- 位置：{location}\n"
-                f"- 递归删除：{'是' if recursive else '否'}\n"
-                "- 注意：删除后系统无法自动回滚。\n"
-                "如确认删除，请回复 yes / 确认 / 授权。"
-            ),
-            input_fn=self.ctx.user_input_fn,
-        )
-        if not _is_delete_authorized(auth.get("user_reply", "")):
-            return ActionResult(
-                data={
-                    "status": "SKIP",
-                    "error": "delete not authorized by user",
-                    "path": str(target),
-                    "authorization": auth,
-                },
-                next_prompt="用户未授权删除，文件删除未执行。请基于已有信息继续或停止。",
+        if self._is_kernel_authorized("file_delete"):
+            auth = {
+                "status": "OK",
+                "source": "policy_engine",
+                "action_digest": self._kernel_action_digest(),
+            }
+        else:
+            auth = ask_user(
+                (
+                    "请确认是否授权删除以下路径：\n"
+                    f"- 路径：{target}\n"
+                    f"- 位置：{location}\n"
+                    f"- 递归删除：{'是' if recursive else '否'}\n"
+                    "- 注意：删除后系统无法自动回滚。\n"
+                    "如确认删除，请回复 yes / 确认 / 授权。"
+                ),
+                input_fn=self.ctx.user_input_fn,
             )
+            if not _is_delete_authorized(auth.get("user_reply", "")):
+                return ActionResult(
+                    data={
+                        "status": "SKIP",
+                        "error": "delete not authorized by user",
+                        "path": str(target),
+                        "authorization": auth,
+                    },
+                    next_prompt="用户未授权删除，文件删除未执行。请基于已有信息继续或停止。",
+                )
 
         if location == "工作区外":
             return ActionResult(
@@ -747,13 +1346,22 @@ class XAgentHandler(BaseHandler):
             key_info=str(key_info) if key_info is not None else None,
             related_sop=str(related_sop) if related_sop is not None else None,
         )
-        if key_info is not None:
-            self.ctx.working["key_info"] = str(key_info)
-        if related_sop is not None:
-            self.ctx.working["related_sop"] = str(related_sop)
+        if result.get("status") == "OK":
+            if key_info is not None:
+                self.ctx.working["key_info"] = str(key_info)
+            if related_sop is not None:
+                self.ctx.working["related_sop"] = str(related_sop)
+            next_prompt = (
+                "工作记忆已更新，后续轮次将自动注入最新 key_info。"
+            )
+        else:
+            next_prompt = (
+                "工作记忆未更新：内容超过有界上下文限制。"
+                "请只保留目标、约束、已验证事实和下一步。"
+            )
         return ActionResult(
             data=result,
-            next_prompt="工作记忆已更新，后续轮次将自动注入最新 key_info。",
+            next_prompt=next_prompt,
         )
 
     def exec_skill_activate(self, args: dict[str, Any]) -> ActionResult:
@@ -845,10 +1453,101 @@ class XAgentHandler(BaseHandler):
         if sop_content:
             prompt = f"{instruction}\n\n--- SOP ---\n{sop_content}"
         else:
-            prompt = "长期记忆结算：请总结当前对话中的关键发现和决策，写入 global_mem.txt。"
+            prompt = (
+                "长期记忆结算：请总结当前对话中有来源的关键发现和决策，"
+                "调用 memory_propose 提交待审核候选；禁止直接修改长期记忆文件。"
+            )
         return ActionResult(
             data=result,
             next_prompt=prompt,
+        )
+
+    def exec_memory_propose(self, args: dict[str, Any]) -> ActionResult:
+        principal = self.ctx.principal
+        memory_root = self.ctx.memory_root or self.ctx.cwd
+        if not isinstance(principal, Principal) or not memory_root:
+            return ActionResult(
+                data={
+                    "status": "SKIP",
+                    "error": "memory proposal requires a principal and memory root",
+                },
+                next_prompt="记忆候选未提交：当前运行缺少身份或记忆工作区。",
+            )
+        content = str(args.get("content", "")).strip()
+        raw_refs = args.get("source_refs", ())
+        if not isinstance(raw_refs, (list, tuple)):
+            raw_refs = ()
+        source_refs = tuple(str(item).strip() for item in raw_refs if str(item).strip())
+        try:
+            confidence = float(args.get("confidence", 0.5))
+            candidate = MemoryStore(Path(memory_root)).propose(
+                principal=principal,
+                content=content,
+                namespace=(
+                    "tenant",
+                    principal.tenant_id,
+                    "agent",
+                    principal.agent_id,
+                ),
+                kind=MemoryKind(str(args.get("kind", MemoryKind.SEMANTIC.value))),
+                source_refs=(
+                    self._turn_source_ref(principal, self.ctx.current_turn),
+                    *source_refs,
+                ),
+                trust=TrustLevel.AGENT_DERIVED,
+                confidence=confidence,
+                sensitivity=DataSensitivity.SENSITIVE,
+                acl=(f"subject:{principal.subject}",),
+                ttl_seconds=7 * 24 * 60 * 60,
+            )
+        except (OSError, RuntimeError, ValueError, PermissionError) as exc:
+            return ActionResult(
+                data={
+                    "status": "ERROR",
+                    "error": str(exc),
+                    "reason_code": "memory_candidate_rejected",
+                },
+                next_prompt=(
+                    "记忆候选未提交。请缩短内容、提供可验证来源并修正类型或置信度；"
+                    "不得改用文件工具绕过。"
+                ),
+            )
+        self.ctx.sink.emit(
+            Event(
+                session_id=self.ctx.session_id,
+                turn=self.ctx.current_turn,
+                kind="memory_candidate_created",
+                name=candidate.kind.value,
+                data={
+                    "candidate_id": candidate.candidate_id,
+                    "content_sha256": candidate.content_sha256,
+                    "review_status": candidate.review_status.value,
+                    "trust": candidate.trust.value,
+                    "principal_digest": principal.principal_digest,
+                    "action_digest": self.ctx.last_policy_decision.get(
+                        "action_digest",
+                        "",
+                    ),
+                    "context_manifest_digest": (
+                        self.ctx.context_manifest.manifest_digest
+                        if isinstance(self.ctx.context_manifest, ContextManifest)
+                        else ""
+                    ),
+                },
+            )
+        )
+        return ActionResult(
+            data={
+                "status": "OK",
+                "candidate_id": candidate.candidate_id,
+                "content_sha256": candidate.content_sha256,
+                "review_status": candidate.review_status.value,
+                "trust": candidate.trust.value,
+            },
+            next_prompt=(
+                "记忆候选已隔离保存，尚未生效。继续任务即可；"
+                "不得声称它已成为长期记忆。"
+            ),
         )
 
     def exec_plan_update(self, args: dict[str, Any]) -> ActionResult:

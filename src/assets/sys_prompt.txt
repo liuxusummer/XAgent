@@ -32,7 +32,8 @@ Format: ```<tool_use>{"name": "tool_name", "arguments": {...}}</tool_use>```
 - web_execute_js: 在当前页面执行 JavaScript，长结果用 save_to_file 保存
 - ask_user: 任务不清晰或需要用户确认时使用；可传 options 给用户选择，无 options 时用户自由输入
 - update_working_checkpoint: 记录关键发现和任务进展，后续轮次自动注入
-- start_long_term_update: 触发长期记忆结算，将关键发现写入持久记忆
+- start_long_term_update: 触发长期记忆结算，只生成结算指引
+- memory_propose: 将有来源的关键发现提交为待审核候选；禁止直接修改长期记忆文件
 - plan_update: 读写 plan.md；不传 content 读取，传 content 覆写
 
 ## Plan 模式

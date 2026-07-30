@@ -8,7 +8,8 @@ XAgent already tells the model not to retry blindly, but the runtime does not tu
 
 - Detect runtime problems at the turn boundary from existing tool results.
 - Inject a concise self-evolution prompt on the next turn that forces the agent to choose a better strategy instead of repeating the failed action.
-- Persist a small, de-duplicated lesson into workspace memory so future tasks can reuse the correction.
+- Submit a small, de-duplicated lesson as a pending MemoryCandidate; future
+  tasks can use it only after separate review.
 - Keep the feature inside Handler/memory infrastructure; tools remain pure functions and the loop remains generic.
 
 ## Non-goals
@@ -26,7 +27,7 @@ XAgent already tells the model not to retry blindly, but the runtime does not tu
 - `status` in `ERROR`, `SKIP`, `TIMEOUT`, `EMPTY_RESPONSE`, `RETRYABLE_RESPONSE_ERROR`, `CODE_BLOCK_WITHOUT_TOOL`
 - missing `status` with an `error` field
 
-For each problem turn, the hook selects one best lesson from a deterministic rule table, persists it, and injects:
+For each problem turn, the hook selects one best lesson from a deterministic rule table, proposes it, and injects:
 
 ```text
 [Self Evolution]
@@ -35,35 +36,38 @@ For each problem turn, the hook selects one best lesson from a deterministic rul
 下一轮必须先判断根因并选择最优路径...
 ```
 
-The hook writes only one lesson per turn to avoid noisy memory growth.
+The hook proposes only one lesson per turn to avoid noisy candidate growth.
 
 ## Persistence Contract
 
-`src.core.memory.record_self_evolution_lesson(workspace_root, lesson, agent_name="")` writes a bullet under `## 自我进化经验`.
+The production hook calls `MemoryStore.propose(...)` with
+`trust=tool_untrusted`, a seven-day TTL, Principal-derived namespace/ACL and
+source digests. It never writes `MEMORY.md`.
 
-- Runtime calls this only when `memory_root` or `cwd` identifies a workspace.
-- If `agent_name` is safe and non-empty, write to `system/agents/<agent>/MEMORY.md`.
-- Otherwise, write to `system/memory/self_evolution.md`, which is already read by workspace memory loading.
-- Preserve unrelated file content.
-- De-duplicate identical lessons.
-- Keep only the latest 20 self-evolution lessons.
-- Return structured status; memory write failures must not block the agent loop.
+- Runtime calls this only when `memory_root` or `cwd` identifies a workspace
+  and an authenticated Principal has `memory.propose`.
+- Candidate and record state share the workspace lock and atomic replacement.
+- Exact candidate fingerprints de-duplicate repeated proposals.
+- Proposal failures must not block the Agent Loop.
+- The legacy `record_self_evolution_lesson` helper remains only for direct
+  compatibility tests and is not called by the production hook.
 
 ## Boundaries
 
 - The main loop only passes current no-tool results into `turn_end_callback`; it does not know self-evolution policy.
 - `XAgentHandler` owns problem classification and prompt injection because it already owns turn-level hooks and `AgentContext`.
-- `src.core.memory` owns memory file mutation because it already owns workspace memory path rules.
+- `src.core.memory_store` owns candidate validation, review and atomic state.
 
 ## Tests
 
 - Memory provider tests cover global fallback, agent-private writes, de-duplication, and cap behavior.
-- Handler tests cover error detection, prompt injection, and memory persistence.
+- Handler tests cover error detection, prompt injection, candidate quarantine and no direct memory write.
 - Agent loop tests cover no-tool retry results being visible to turn-end hooks.
 
 ## Acceptance Criteria
 
 - A failed tool turn receives a self-evolution prompt before the next LLM call.
 - A no-tool retry problem can also trigger self-evolution.
-- A reusable lesson is persisted without storing raw prompts or tool payloads.
+- A reusable lesson is quarantined without storing raw prompts or tool payloads,
+  and remains inactive until separate review.
 - Focused tests pass.

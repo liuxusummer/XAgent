@@ -1,6 +1,8 @@
 # Memory 模块体系优化思路
 
-> 对现有 `memory/`、`AgentContext`、`turn_end_hooks`、`Session.history` 的记忆能力做体系化梳理。本文只定义优化方向和边界，不改变当前运行时代码。
+> 对 `memory/`、`AgentContext`、`turn_end_hooks`、`Session.history` 和两阶段
+> Memory Store 的能力做体系化梳理。当前运行时安全契约见
+> [Agent Kernel 第一阶段](../agent-kernel.md)。
 
 相关文档：
 
@@ -19,7 +21,7 @@ XAgent 的定位是物理级执行 Agent。它的 memory 不是聊天产品里�
 | 启动洞察 | `memory/global_mem_insight.txt`、`memory/insight_fixed_structure.txt` | `src/main.py::build_system_prompt()` 拼入 system prompt | 固化身份、行为模式、当前状态 |
 | 短期工作记忆 | `AgentContext.working["key_info"]`、`["related_sop"]` | `update_working_checkpoint` 更新，`get_anchor_prompt()` 每轮注入 | 保存当前任务关键事实、约束、SOP 提示 |
 | 轮次摘要 | `AgentContext.history_info` | `<summary>` 提取，`get_anchor_prompt()` 注入最近 30 条 | 维持跨轮语义连续性 |
-| 长期记忆 | `memory/global_mem.txt`、`memory/memory_management_sop.md` | 每 10 轮刷新；`start_long_term_update` 触发结算 | 保存跨任务复用的事实和经验 |
+| 长期记忆 | `MemoryStore` active records；旧文件为管理员兼容层 | 启动时只加载当前 Principal 有权读取的 approved record | 保存跨任务复用且已审核的事实和经验 |
 
 优化目标：
 
@@ -48,7 +50,8 @@ XAgent 的定位是物理级执行 Agent。它的 memory 不是聊天产品里�
 
 ### 2.3 写入质量依赖模型自觉
 
-`start_long_term_update` 当前只是读取 SOP 并要求模型总结、修改记忆文件。系统有最小化更新提示，但缺少机器可检查的准入条件，例如重复检测、证据来源、主题段定位、更新后校验。
+`start_long_term_update` 只读取 SOP 并要求模型调用 `memory_propose`。候选带来源、trust、
+confidence、ACL、TTL 和 review status；未经过独立 reviewer 前不会进入 active memory。
 
 ### 2.4 注入预算较粗
 
@@ -75,7 +78,7 @@ L4 Procedural Knowledge  遇到某类任务应遵循什么 SOP？
 | L0 Identity Insight | `global_mem_insight.txt`、`insight_fixed_structure.txt` | Agent 启动 | 低频结算 | 少变、结构固定，保留身份、行为模式、当前状态 |
 | L1 Working Memory | `AgentContext.working` | 每轮 `get_anchor_prompt()` | `update_working_checkpoint` | 面向当前任务，任务结束可丢弃 |
 | L2 Turn Summary | `AgentContext.history_info` | 每轮 `get_anchor_prompt()` | 每轮 `<summary>` 提取 | 短句、按轮追加、可折叠 |
-| L3 Long-term Memory | `global_mem.txt` | 当前每 10 轮全量刷新；目标为相关性命中 | `start_long_term_update` 后按 SOP patch | 可复用、有证据、去重 |
+| L3 Long-term Memory | `MemoryRecord`；旧 `global_mem.txt` 为管理员兼容层 | approved + ACL + TTL | `memory_propose` 后独立 review | 可复用、有证据、去重 |
 | L4 Procedural Knowledge | `*_sop.md`、`memory_management_sop.md` | 显式相关或 `related_sop` 命中 | 人工或结算后低频更新 | 稳定流程，不混入临时事实 |
 
 核心原则：L1/L2 负责“本次任务连续性”，L3/L4 负责“跨任务复用”，L0 负责“系统自我约束”。不同层不要互相代偿。
@@ -196,7 +199,7 @@ Memory 行为应该能在事件流里解释清楚。建议在已有 telemetry �
 
 ### Phase 4：长期记忆结算护栏
 
-- 将 `start_long_term_update` 扩展为结算提案。
+- `start_long_term_update` 已收敛为结算提案入口，真正持久提交走 `memory_propose`。
 - 增加重复检测、长度检测、主题段检测。
 - 写后强制验证，失败时把诊断信息返回给 Agent。
 

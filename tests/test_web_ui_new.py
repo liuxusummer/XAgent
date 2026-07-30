@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import tempfile
 import threading
@@ -13,7 +14,8 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from src.core.eval import create_eval_run, import_dataset_content
+from src.core.eval import create_eval_run, import_dataset_content, write_eval_run
+from src.core.agent_kernel import Principal
 from src.core.agent_loop import ActionResult, AgentContext, BaseHandler, exhaust, run_agent_loop
 from src.core.checkpoint import build_task_checkpoint, write_task_checkpoint
 from src.core.llm import ChatResponse, ToolCall, ToolClient
@@ -22,6 +24,7 @@ from src.core.telemetry import Event, JsonlSink, MultiSink, NullSink
 from src.core.XAgent import XAgent
 from src.core.runbook import RUNBOOK_TASK_ID, upsert_runbook_review_task
 from src.core.skills import SkillRegistry
+from src.core.web_identity import WebIdentityProvider
 from src.handler import XAgentHandler
 from src.main import build_system_prompt, build_team_step_runner, filter_tools_schema
 from src.tools.file_ops import write_file
@@ -49,15 +52,18 @@ from src.web_ui_new import (
     _agent_runtime_config,
     _cleanup_sessions,
     _drain_background,
+    _effective_web_config_paths,
     _emit,
     _ensure_agent,
     _eval_cancel_events,
+    _current_web_identity,
     _find_session_by_chat,
     _get_session,
     _persist_chat_state,
     _queue_state,
     _register_session,
     _run_blocking,
+    _run_task_background,
     _run_due_scheduled_tasks,
     _write_scheduled_tasks,
     _resolve_workspace_dir_input,
@@ -355,7 +361,8 @@ class WebUINewSecurityTests(unittest.TestCase):
             allow_unsafe=True,
         )
 
-        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["reason_code"], "OUTPUT_LIMIT_EXCEEDED")
         self.assertEqual(len(result["stdout"]), CODE_OUTPUT_CHAR_LIMIT)
         self.assertTrue(result["stdout_truncated"])
         self.assertEqual(result["output_char_limit"], CODE_OUTPUT_CHAR_LIMIT)
@@ -409,6 +416,87 @@ class WebUINewSecurityTests(unittest.TestCase):
         self.assertEqual(result.data["path"], str(outside.resolve()))
         self.assertEqual(result.data["content"], "authorized")
 
+    def test_secure_principal_cannot_confirm_outside_workspace_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "workspace"
+            workspace.mkdir()
+            outside = Path(tmp_dir) / "host.txt"
+            outside.write_text("host-owned", encoding="utf-8")
+            principal = Principal(
+                subject="tenant-user",
+                tenant_id="tenant-a",
+                session_id="session-a",
+                run_id="run-a",
+                scopes=("user.interact", "workspace.read"),
+            )
+            handler = XAgentHandler(
+                ctx=AgentContext(
+                    cwd=str(workspace),
+                    principal=principal,
+                    user_input_fn=lambda _prompt: "yes",
+                )
+            )
+
+            preflight = handler.tool_before_callback(
+                "file_read",
+                {"path": str(outside)},
+            )
+            direct = handler.exec_file_read({"path": str(outside)})
+
+        self.assertIsNotNone(preflight)
+        self.assertEqual(preflight.data["status"], "SKIP")
+        self.assertNotIn("content", preflight.data)
+        self.assertEqual(direct.data["status"], "SKIP")
+        self.assertEqual(
+            direct.data["reason_code"],
+            "host_read_scope_required",
+        )
+        self.assertNotIn("content", direct.data)
+
+    def test_secure_web_config_uses_physical_workspace_containment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "Tenant.ws"
+            workspace.mkdir()
+            config = workspace / "agent.json"
+            config.write_text("{}", encoding="utf-8")
+            payload = {
+                "schema_version": 1,
+                "identities": [
+                    {
+                        "token_sha256": hashlib.sha256(b"token").hexdigest(),
+                        "subject": "tenant-user",
+                        "tenant_id": "tenant-a",
+                        "scopes": ["workspace.read"],
+                        "workspaces": {"default.ws": str(workspace)},
+                    }
+                ],
+            }
+            provider = WebIdentityProvider.from_trusted_config(payload)
+
+            with (
+                patch(
+                    "src.web_ui_new._get_web_identity_provider",
+                    return_value=provider,
+                ),
+                patch(
+                    "src.web_ui_new.physical_directory_contains_path",
+                    return_value=True,
+                ),
+                patch.dict(
+                    "os.environ",
+                    {"XAGENT_WEB_CONFIG_PATH": str(config)},
+                    clear=False,
+                ),
+            ):
+                resolved, observability, error = _effective_web_config_paths(
+                    "",
+                    "",
+                )
+
+        self.assertEqual(resolved, "")
+        self.assertEqual(observability, "")
+        self.assertEqual(error, "Trusted Web configuration is unavailable")
+
     def test_agent_loop_marks_tool_results_as_untrusted(self) -> None:
         captured_messages: list[dict] = []
 
@@ -457,13 +545,19 @@ class WebUINewSecurityTests(unittest.TestCase):
         )
 
         with (
-            patch.dict("os.environ", {"XAGENT_CODE_RUN_POLICY": "confirm"}),
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_CODE_RUN_POLICY": "confirm",
+                    "XAGENT_CODE_RUN_BACKEND": "unsafe",
+                },
+            ),
             patch("src.handler.XAgentHandler.XAgentHandler.run_code_stream") as run_stream,
         ):
             result = handler.exec_code_run({"script": "print(1)", "timeout": 5})
 
         self.assertEqual(result.data["status"], "SKIP")
-        self.assertIn("未使用 OS 沙箱", prompts[0])
+        self.assertIn("开发级非隔离宿主进程", prompts[0])
         run_stream.assert_not_called()
 
     def test_frontend_file_resolution_rejects_paths_outside_build_root(self) -> None:
@@ -546,7 +640,10 @@ class WebUINewSecurityTests(unittest.TestCase):
             response.headers.get("access-control-allow-origin"),
             "http://127.0.0.1:5173",
         )
-        self.assertIsNone(response.headers.get("access-control-allow-credentials"))
+        self.assertEqual(
+            response.headers.get("access-control-allow-credentials"),
+            "true",
+        )
 
     def test_web_app_rejects_non_loopback_client(self) -> None:
         client = TestClient(app, base_url="http://127.0.0.1", client=("192.0.2.10", 50000))
@@ -1623,6 +1720,39 @@ class WebUINewAgentTeamTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(session.starting)
         self.assertFalse(session.running)
         self.assertEqual(session.task_start_token, "")
+
+    def test_inner_worker_start_failure_finishes_running_session(self) -> None:
+        class _FailingAgent:
+            def __init__(self) -> None:
+                self.stop_count = 0
+
+            def run_task_async(self, *_args, **_kwargs) -> None:
+                raise RuntimeError("thread quota")
+
+            def stop(self) -> None:
+                self.stop_count += 1
+
+        agent = _FailingAgent()
+        session = UISession(
+            session_id="inner-start-failure",
+            agent=agent,
+            starting=True,
+            task_start_token="token",
+        )
+
+        _run_task_background(
+            session,
+            "task",
+            task_start_token="token",
+        )
+
+        self.assertFalse(session.running)
+        self.assertFalse(session.starting)
+        self.assertEqual(agent.stop_count, 1)
+        done = [event for event in session.events if event["type"] == "done"]
+        self.assertEqual(len(done), 1)
+        self.assertEqual(done[0]["data"]["exit_reason"], "ERROR")
+        self.assertTrue(session.event_queue.get_nowait()["finished"])
 
     async def test_running_agent_cannot_be_replaced(self) -> None:
         existing_agent = _FakeAgent(running=True)
@@ -3776,17 +3906,116 @@ class WebUINewScheduledTaskTests(unittest.IsolatedAsyncioTestCase):
                 content='{"task":"say ok"}\n',
             )
             run = create_eval_run(ws_root, workspace="default.ws", dataset_id=metadata["id"], agent="")
-            event = threading.Event()
-            _eval_cancel_events[run["id"]] = event
-
             with patch("src.web_ui_new._WORKSPACE_ROOT", str(tmp_dir)):
+                identity = _current_web_identity()
+                event = threading.Event()
+                cancel_key = (identity.owner_digest, run["id"])
+                _eval_cancel_events[cancel_key] = event
                 result = await api_cancel_eval_run(run["id"], ws="default.ws")
                 stored = await api_get_eval_run(run["id"], ws="default.ws")
 
             self.assertTrue(result["success"])
             self.assertTrue(event.is_set())
             self.assertEqual(stored["data"]["status"], "canceling")
-            _eval_cancel_events.pop(run["id"], None)
+            _eval_cancel_events.pop(cancel_key, None)
+
+    async def test_secure_eval_run_responses_redact_persisted_runtime_details(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "default.ws"
+            workspace.mkdir()
+            payload = {
+                "schema_version": 1,
+                "identities": [
+                    {
+                        "token_sha256": hashlib.sha256(b"token").hexdigest(),
+                        "subject": "tenant-user",
+                        "tenant_id": "tenant-a",
+                        "scopes": ["workspace.read"],
+                        "workspaces": {"default.ws": str(workspace)},
+                    }
+                ],
+            }
+            provider = WebIdentityProvider.from_trusted_config(payload)
+            identity = provider.authenticate("token")
+            storage_root = (
+                workspace
+                / "runtime"
+                / "eval"
+                / "_owners"
+                / identity.owner_digest
+            )
+            host_path = "/private/tmp/xagent-eval-host-canary/secret"
+            backend_detail = "backend-driver-detail-canary"
+            write_eval_run(
+                workspace,
+                {
+                    "id": "run-redaction",
+                    "workspace": "default.ws",
+                    "dataset_id": "dataset",
+                    "dataset_name": "dataset",
+                    "agent": "main",
+                    "status": "running",
+                    "created_at": 1.0,
+                    "started_at": 1.0,
+                    "finished_at": None,
+                    "case_limit": 1,
+                    "summary": {},
+                    "error": f"{backend_detail} at {host_path}",
+                    "owner_digest": identity.owner_digest,
+                    "cases": [
+                        {
+                            "id": "case-1",
+                            "task": f"inspect {host_path}",
+                            "status": "error",
+                            "exit_reason": "ERROR",
+                            "failures": [
+                                f"{backend_detail} at {host_path}"
+                            ],
+                            "response_excerpt": (
+                                f"[error] {backend_detail} at {host_path}"
+                            ),
+                        }
+                    ],
+                },
+                storage_root=storage_root,
+            )
+
+            with (
+                patch(
+                    "src.web_ui_new._get_web_identity_provider",
+                    return_value=provider,
+                ),
+                patch(
+                    "src.web_ui_new._current_web_identity",
+                    return_value=identity,
+                ),
+            ):
+                listed = await api_list_eval_runs("default.ws")
+                detail = await api_get_eval_run(
+                    "run-redaction",
+                    ws="default.ws",
+                )
+                canceled = await api_cancel_eval_run(
+                    "run-redaction",
+                    ws="default.ws",
+                )
+
+        for response in (listed, detail, canceled):
+            serialized = json.dumps(response, ensure_ascii=False)
+            self.assertTrue(response["success"])
+            self.assertNotIn(host_path, serialized)
+            self.assertNotIn(backend_detail, serialized)
+        self.assertEqual(
+            detail["data"]["cases"][0]["response_excerpt"],
+            "[error] Agent task failed",
+        )
+        self.assertEqual(
+            detail["data"]["cases"][0]["failures"],
+            ["Operation failed"],
+        )
+        self.assertIn("<redacted-path>", detail["data"]["cases"][0]["task"])
 
     async def test_eval_api_rejects_invalid_workspace_and_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

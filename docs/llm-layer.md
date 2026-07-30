@@ -128,14 +128,18 @@ Claude 和 OpenAI 的 SSE 事件结构完全不同，各自独立实现，不抽
 
 ### 4.3 历史裁剪
 
-裁剪时机：每次 `ask()` 前。
+裁剪时机：Agent Loop 先按组件构建当前输入；Session 再在每次 `ask()` 前处理协议历史。
 
 裁剪顺序（由轻到重）：
 
 1. **内容截断**：thinking / tool_use / tool_result 内容超过 `max_len` 时截断
 2. **标签折叠**：`<history>` / `<key_info>` / `<earlier_context>` 替换为 `[...]`
-3. **消息删除**：从头部删除整条消息，直到总量低于 `context_win * 3` 字符
+3. **消息删除**：按保守 token 估算从头部删除整条消息，直到低于 Session 输入预算
 4. **引用修复**：删除消息后，首条 user 消息中的孤立 `tool_result` 改写为纯文本
+
+被删除消息只向 `history_compaction` 写入 role、token 数、原因和 SHA-256，不保存原文。
+当前轮的 system、task、history、retrieval、memory 和 tool result 另由
+`ContextBuilder` 独立预算，详见 [agent-kernel.md](agent-kernel.md)。
 
 关键约束：裁剪只在 Session 内部发生，上层通过 `ask(prompt)` 传入的内容不会被裁剪——只有历史中的旧消息会被动刀。
 

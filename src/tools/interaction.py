@@ -8,6 +8,7 @@ from src.core.memory import load_memory_sop
 
 
 MEMORY_DIR = Path(__file__).resolve().parent.parent.parent / "memory"
+MAX_WORKING_CHECKPOINT_CHARS = 8_000
 
 _default_input_fn: Callable[[str], str] = lambda prompt: input(prompt)
 
@@ -91,6 +92,18 @@ def update_working_checkpoint(
     key_info: str | None = None,
     related_sop: str | None = None,
 ) -> dict[str, str]:
+    for field_name, value in (
+        ("key_info", key_info),
+        ("related_sop", related_sop),
+    ):
+        if value is not None and len(value) > MAX_WORKING_CHECKPOINT_CHARS:
+            return {
+                "status": "ERROR",
+                "error": (
+                    f"{field_name} exceeds "
+                    f"{MAX_WORKING_CHECKPOINT_CHARS} characters"
+                ),
+            }
     result: dict[str, str] = {"status": "OK"}
     if key_info is not None:
         result["key_info"] = key_info
@@ -104,7 +117,11 @@ def start_long_term_update() -> dict[str, str]:
     return {
         "status": "OK",
         "sop_content": sop_content,
-        "instruction": "请根据以上 SOP 对当前对话进行记忆结算：提取关键信息，判断更新类型，执行最小化更新。",
+        "instruction": (
+            "请根据以上 SOP 对当前对话进行记忆结算：提取有来源的关键信息，"
+            "判断记忆类型，并调用 memory_propose 创建待审核候选。"
+            "禁止使用 file_write/file_patch 直接修改长期记忆。"
+        ),
     }
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 import time
@@ -8,6 +9,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Generator
+
+from src.core.context_builder import estimate_tokens
 
 
 TOOL_USE_PATTERN = re.compile(r"<tool_use>\s*(.*?)\s*</tool_use>", re.DOTALL)
@@ -48,6 +51,24 @@ def _message_content_len(message: dict[str, Any]) -> int:
         return len(json.dumps(content, ensure_ascii=False))
     except (TypeError, ValueError):
         return len(str(content))
+
+
+def _message_context_text(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    try:
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError):
+        return str(content)
 
 
 @dataclass
@@ -150,11 +171,13 @@ class BaseSession:
     context_window_chars: int = 24000
     stream_callback: StreamCallback | None = None
     history: list[dict[str, Any]] = field(default_factory=list)
+    history_compaction: list[dict[str, Any]] = field(default_factory=list)
     last_usage: TokenUsage | None = None
     _ask_count: int = field(default=0, init=False)
 
     def ask(self, prompt: str) -> str:
         history_snapshot = copy.deepcopy(self.history)
+        compaction_snapshot = copy.deepcopy(self.history_compaction)
         try:
             self._ask_count += 1
             self.history.append({"role": "user", "content": prompt})
@@ -165,6 +188,7 @@ class BaseSession:
             return assistant_text
         except Exception:
             self.history = history_snapshot
+            self.history_compaction = compaction_snapshot
             raise
 
     def emit_stream(self, event: dict[str, Any]) -> None:
@@ -185,16 +209,40 @@ class BaseSession:
         return messages
 
     def _trim_history(self) -> None:
-        threshold = self.context_window_chars * 3
+        total_budget = max(1, self.context_window_chars // 3)
+        token_budget = max(
+            1,
+            total_budget - estimate_tokens(str(self.system or "")),
+        )
         if self._ask_count % 5 == 0:
             self._compress_history_tags(keep_recent=4, max_len=600)
-        total_chars = sum(_message_content_len(msg) for msg in self.history)
-        if total_chars > threshold:
+        total_tokens = sum(
+            estimate_tokens(_message_context_text(message))
+            for message in self.history
+        )
+        if total_tokens > token_budget:
             self._compress_history_tags(keep_recent=4, max_len=600)
-            total_chars = sum(_message_content_len(msg) for msg in self.history)
-        while self.history and total_chars > threshold:
+            total_tokens = sum(
+                estimate_tokens(_message_context_text(message))
+                for message in self.history
+            )
+        while self.history and total_tokens > token_budget:
             removed = self.history.pop(0)
-            total_chars -= _message_content_len(removed)
+            removed_text = _message_context_text(removed)
+            removed_tokens = estimate_tokens(removed_text)
+            total_tokens -= removed_tokens
+            self.history_compaction.append(
+                {
+                    "role": str(removed.get("role", ""))[:40],
+                    "source_sha256": hashlib.sha256(
+                        removed_text.encode("utf-8")
+                    ).hexdigest(),
+                    "token_count": removed_tokens,
+                    "reason": "history_token_budget",
+                }
+            )
+            if len(self.history_compaction) > 128:
+                self.history_compaction = self.history_compaction[-128:]
         if self.history:
             self._sanitize_leading_user_msg()
 
@@ -840,6 +888,7 @@ class ClaudeNativeSession(ClaudeTextSession):
 
     def ask(self, prompt: str | dict[str, Any]) -> ChatResponse:
         history_snapshot = copy.deepcopy(self.history)
+        compaction_snapshot = copy.deepcopy(self.history_compaction)
         try:
             if isinstance(prompt, dict):
                 self.history.append(prompt)
@@ -854,6 +903,7 @@ class ClaudeNativeSession(ClaudeTextSession):
             return response
         except Exception:
             self.history = history_snapshot
+            self.history_compaction = compaction_snapshot
             raise
 
     @staticmethod
@@ -997,6 +1047,7 @@ class OpenAINativeSession(OpenAITextSession):
 
     def ask(self, prompt: str | dict[str, Any]) -> ChatResponse:
         history_snapshot = copy.deepcopy(self.history)
+        compaction_snapshot = copy.deepcopy(self.history_compaction)
         try:
             if isinstance(prompt, dict):
                 self.history.append(prompt)
@@ -1011,6 +1062,7 @@ class OpenAINativeSession(OpenAITextSession):
             return response
         except Exception:
             self.history = history_snapshot
+            self.history_compaction = compaction_snapshot
             raise
 
     @staticmethod
@@ -1248,6 +1300,15 @@ class MixinSession:
             session.history = copy.deepcopy(value)
 
     @property
+    def history_compaction(self) -> list[dict[str, Any]]:
+        return self.sessions[self._current_index].history_compaction
+
+    @history_compaction.setter
+    def history_compaction(self, value: list[dict[str, Any]]) -> None:
+        for session in self.sessions:
+            session.history_compaction = copy.deepcopy(value)
+
+    @property
     def system(self) -> str:
         return self.sessions[self._current_index].system
 
@@ -1265,6 +1326,9 @@ class MixinSession:
                 result = session.ask(prompt)
                 self.last_usage = session.last_usage
                 self.history = copy.deepcopy(session.history)
+                self.history_compaction = copy.deepcopy(
+                    session.history_compaction
+                )
                 return result
             except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, RuntimeError) as exc:
                 last_error = exc

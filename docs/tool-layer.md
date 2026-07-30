@@ -51,16 +51,27 @@ class AgentContext:
 
 代码执行和浏览器操作都有不可控的一面。隔离原则：
 
-- **代码执行**：子进程，不在线程。超时即 kill，不等待优雅退出
+- **代码执行**：先生成并验证不可变隔离计划，再启动独立进程组；超时、取消或输出超限均终止整个进程组
 - **浏览器操作**：独立 WebDriver session，不共享主进程的浏览器状态；导航只允许解析到公网地址的 HTTP(S) URL
-- **文件操作**：路径必须转换为绝对路径；相对路径一律基于 `ctx.cwd`（当前 Agent 工作区）解析，工作区外读取默认逐次确认
+- **文件操作**：路径必须转换为绝对路径；相对路径一律基于 `ctx.cwd`（当前 Agent 工作区）解析。工作区外读取需要本地 operator 专用的 `host.read`，并默认逐次确认；安全 Web 注册表不能授予该 scope
 
-`code_run` 仍不是 OS 文件系统沙箱，因此必须经过独立的执行策略门禁：
+`code_run` 默认要求真实 OS 隔离，独立策略门禁不能替代隔离：
 
 - 默认 `XAGENT_CODE_RUN_POLICY=confirm`，每次执行前向用户展示脚本摘要、哈希、语言和超时并等待明确授权
 - `deny` 完全禁用代码执行
-- `allow` 仅用于用户明确接受未沙箱化风险的受控环境
-- 无论策略为何，子进程只继承最小运行环境；API key、代理、SSH agent 等宿主敏感变量不得透传，`HOME` / `TMPDIR` 固定到当前工作区
+- 默认 `XAGENT_CODE_RUN_BACKEND=auto`：Linux 只接受受信系统路径中的
+  Bubblewrap，macOS 只接受系统 `sandbox-exec`；启动前必须通过读、写、控制面、
+  loopback 网络和私有临时目录的功能探测，失败即拒绝执行，不回退到宿主进程
+- 审批 digest 绑定实际脚本哈希、语言、超时、工作区规范路径摘要、后端二进制
+  identity、probe、资源限制和安全模式；隔离计划另行捕获工作区目录的
+  device/inode identity，并在进程启动前重新校验，任一边界变化都拒绝启动
+- 安全模式只读挂载业务工作区，隐藏 `system/`、`runtime/`、`memory/` 以及
+  `_intervene`、`_keyinfo`、`plan.md`，只允许写入私有临时目录，禁止网络，并限制
+  CPU、地址空间、文件大小、打开文件数、进程数；私有临时目录的总字节数和目录项数
+  由 sandbox 外的父进程监督，超限即终止整个进程组
+- `XAGENT_CODE_RUN_BACKEND=unsafe` 仅是显式开发兼容模式，安全回执固定标记
+  `development_unsafe`；即使策略配置为 `allow`，每次调用仍需用户单独确认
+- 无论模式为何，子进程只继承最小运行环境；API key、代理、SSH agent 等宿主敏感变量不得透传
 
 工作区约定：
 
@@ -72,9 +83,11 @@ class AgentContext:
 
 - 文件类：20000 字符硬上限
 - 浏览器类：8000 字符硬上限
-- 代码执行：stdout、stderr 各保留最多 200000 字符，读取线程继续排空并丢弃超限内容
+- 代码执行：stdout、stderr 各保留最多 200000 字符；任一流超限立即终止进程组并返回
+  `OUTPUT_LIMIT_EXCEEDED`
 
-文件与浏览器结果截断时保留首尾；流式代码输出只保留最先到达的上限内容，并通过 `stdout_truncated` / `stderr_truncated` 明确标记后续内容已丢弃。
+文件与浏览器结果截断时保留首尾；流式代码输出只保留最先到达的上限内容，并通过
+`stdout_truncated` / `stderr_truncated` 明确标记终止原因。
 
 ### 失败要可诊断，不要静默吞错
 
@@ -115,7 +128,8 @@ LLM 生成的内容不是总能干净地放进参数里。比如 `file_write` �
 │   └── web_execute_js    # 注入 JS 执行
 ├── 记忆管理域
 │   ├── update_working_checkpoint  # 短期工作记忆
-│   ├── start_long_term_update     # 触发长期记忆结算
+│   ├── start_long_term_update     # 读取结算 SOP，不直接写长期记忆
+│   ├── memory_propose             # 创建隔离的待审核 MemoryCandidate
 │   └── plan_update                # 读写 workspace/plan.md（读：不传 content；写：传 content 覆盖）
 └── 交互域
     └── ask_user          # 中断循环，等待用户输入；可附带选项
@@ -124,11 +138,13 @@ LLM 生成的内容不是总能干净地放进参数里。比如 `file_write` �
 ### 域间关系
 
 - 代码执行域和文件操作域是独立的，互不依赖
-- 文件索引检索域由 `file_search` 暴露，索引文件落在当前 workspace 的 `runtime/file_index.sqlite3`，属于运行时元数据；工具只返回候选路径和短片段，依赖精确内容或修改文件前仍必须使用 `file_read` 验证
+- 文件索引检索域由 `file_search` 暴露，索引文件落在当前 workspace 的 `runtime/file_index.sqlite3`，属于运行时元数据；受管 Memory 路径永不进入通用索引；工具只返回候选路径和短片段，依赖精确内容或修改文件前仍必须使用 `file_read` 验证
 - 浏览器操作域依赖 `BrowserDriver` 接口，默认使用 Selenium fallback；工具只暴露 `web_scan` / `web_execute_js`，底层可替换为 WebSocket / HTTP Long-Poll 浏览器桥
-- 记忆管理域只操作 Handler 内部状态和 memory 目录文件，不依赖其他域
-- 交互域（ask_user）是特殊的——它不执行任何物理操作，只产生中断信号；可提供 `options` 供用户选择，未提供选项时用户自由输入；当前桥接为进程级单例（`_bridge_display_queue` / `_bridge_reply_queue`），多 Agent 场景需在上层串行化
-- Plan 模式、外部干预文件（如 `_keyinfo`、`_intervene`）与相对路径文件操作统一落在工作区内
+- 记忆管理域只允许工作状态直接更新；长期记忆必须经过
+  MemoryCandidate → review → MemoryRecord，普通文件工具不能作为旁路
+- 交互域（ask_user）是特殊的——它不执行任何物理操作，只产生中断信号；可提供 `options` 供用户选择，未提供选项时用户自由输入；每个 Agent 使用实例级 display/reply bridge，不共享进程级队列
+- Plan 模式、外部干预文件（如 `_keyinfo`、`_intervene`）与相对路径文件操作统一落在工作区内；
+  这些根级控制文件只能由专用控制通道访问，普通文件工具读写均 fail closed
 
 ### 浏览器操作闭环
 
@@ -148,7 +164,8 @@ web_execute_js → BrowserDriver.execute_js → exec_id + ACK/结果诊断
 - 浏览器的导航、页面脚本网络请求、iframe 与 WebSocket 统一经过本地过滤代理；代理在每次实际连接时解析目标、拒绝任一非公网地址，并直接连接该次校验得到的 IP，避免 DNS rebinding 的校验—使用间隙
 - 导航 URL 仅允许无凭证的 HTTP/HTTPS；页面加载默认 30 秒且最多 120 秒
 - Chrome 沙箱默认启用；只有受控部署显式设置 `XAGENT_CHROME_NO_SANDBOX=1` 时才添加 `--no-sandbox`
-- 长结果通过 `save_to_file` 落盘，tool_result 只返回路径、字节数和摘要
+- 长结果通过 `save_to_file` 落盘，tool_result 只返回路径、字节数和摘要；该参数额外要求
+  `workspace.write`，且只能写业务路径，不能写 `system/`、`runtime/` 或受管 `memory/`
 - 默认扫描模式为 `summary`，只返回语义压缩内容；需要精确状态时应执行局部 JS 查询
 
 ### 共享工具
@@ -163,24 +180,30 @@ web_execute_js → BrowserDriver.execute_js → exec_id + ACK/结果诊断
 ```
 LLM 输出代码
   → 提取代码（script 参数 / 回复代码块）
-  → code_run 策略检查（默认逐次用户确认）
   → 注入 code_run_header.py（公共 import）
-  → subprocess.Popen(cwd=ctx.cwd, env=最小环境) 执行
+  → 功能探测并生成不可变 CodeExecutionPlan（失败即停止）
+  → PolicyEngine + code_run 策略检查（默认逐次用户确认）
+  → 再验证脚本 / 工作区 / 后端 identity 与审批计划完全一致
+  → Bubblewrap / sandbox-exec 启动资源限制 launcher 和 payload
   → stream_reader 线程流式读取 stdout
   → 超时 / 停止信号 → 独立进程组 TERM → 有界等待 → KILL → wait
-  → 返回 {status, stdout, exit_code}
+  → 返回 {status, stdout, exit_code, security receipt}
 ```
 
 关键约束：
 
 - **不用 eval/exec**：除非 `inline_eval` 显式开启（仅内部使用），一律走子进程
-- **默认禁止静默执行**：未设置策略时按 `confirm` 处理；无明确授权不启动子进程
+- **默认双重失败关闭**：未设置策略时按 `confirm`，未设置后端时按 `auto`；无明确授权或
+  无通过功能探测的 OS 隔离后端都不启动 payload
 - **底层 API 同样 fail closed**：`run_code` / `run_code_stream` 必须由完成策略检查的 Handler 显式传入内部授权标记
 - **宿主环境最小化**：不向脚本透传模型密钥、代理、云凭证或 SSH agent 环境
 - **流式读取**：stdout 不等进程结束才返回，边读边 yield，前端可实时展示
-- **有界保留**：stdout/stderr 达到硬上限后仍持续排空子进程管道，但不再进入队列或结果对象
+- **有界保留**：stdout/stderr 达到硬上限后终止整个进程组，避免无限输出继续消耗 CPU
 - **双信号停止**：`code_stop_signal`（Handler 级）+ `stop_sig`（全局级），每个循环轮次检查
-- **工作目录固定**：代码执行的进程 `cwd` 固定为 `ctx.cwd`，因此脚本内相对路径也默认落在工作区
+- **持久写入分离**：安全代码执行看到只读工作区；需要持久修改时必须使用受策略约束的文件工具
+- **后代收口**：payload 使用独立进程组；即使组长先正常退出，也会清理其余后代
+- **macOS 限制**：当前 Seatbelt profile 禁止 fork；复杂 shell 任务可能失败，应改用 Python
+  或部署 Linux Bubblewrap/生产容器后端，不能因此切换到 unsafe
 
 Durable Orchestration 的 `TrustedActivityExecutor` 在 approval/policy 提交前
 还会计算完整 execution binding：非秘密 argv 摘要、规范化 cwd 摘要、
@@ -290,9 +313,12 @@ patch 是最危险的操作——改错一行可能破坏整个文件。唯一�
 
 关键契约：
 
-- 索引文件位于 `<ctx.cwd>/runtime/file_index.sqlite3`，`runtime/` 视为 workspace 运行时元数据，不参与业务文件读写语义
+- 索引文件位于 `<ctx.cwd>/runtime/file_index.sqlite3`，`runtime/` 视为 workspace 运行时元数据，只读可观测、不可由 Agent 文件/浏览器工具写入
 - 首次搜索或 `refresh=true` 时扫描并增量更新索引；增量依据 `relative_path + mtime_ns + size`
-- 只索引 UTF-8 文本文件；默认单文件上限为 5 MiB，并跳过 symlink、二进制、常见依赖/构建目录和 `runtime/**`
+- 只索引 UTF-8 文本文件；默认单文件上限为 5 MiB，并跳过 symlink、二进制、常见
+  依赖/构建目录、`runtime/**`、`memory/**`、`system/memory/**` 和 Agent `MEMORY.md`
+- 索引 schema v4 打开旧 schema 时会先清空旧内容并重新扫描，防止升级排除规则后继续
+  返回历史受管 Memory 条目
 - `root` 必须位于当前 workspace 内，避免检索工作区外路径
 - `mode=keyword|semantic|hybrid` 控制检索模式；`path_only=true` 强制只走路径/关键词检索
 - 语义检索默认关闭，仅在 `file_index_embedding.enabled=true` 或 `XAGENT_FILE_INDEX_EMBEDDING=1` 且 embedding 配置完整时启用

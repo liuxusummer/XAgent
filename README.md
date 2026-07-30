@@ -136,6 +136,7 @@ Design docs live in [`docs/`](docs/):
 
 - [`docs/architecture.md`](docs/architecture.md)
 - [`docs/agent-loop.md`](docs/agent-loop.md)
+- [`docs/agent-kernel.md`](docs/agent-kernel.md)
 - [`docs/llm-layer.md`](docs/llm-layer.md)
 - [`docs/tool-layer.md`](docs/tool-layer.md)
 - [`docs/observability.md`](docs/observability.md)
@@ -326,11 +327,29 @@ export OPENAI_MODEL="gpt-4o"
 
 ```bash
 export XAGENT_CODE_RUN_POLICY="confirm"  # confirm | deny | allow
+export XAGENT_CODE_RUN_BACKEND="auto"  # auto | bubblewrap | sandbox-exec | deny
 export XAGENT_OUTSIDE_READ_POLICY="confirm"  # confirm | deny | allow
 export XAGENT_CHROME_PAGE_LOAD_TIMEOUT="30"  # 1..120 seconds
 ```
 
-`allow` for code execution accepts the risk of running without an OS filesystem sandbox. Outside-workspace reads require per-read confirmation by default. Regardless of policy, child processes do not inherit host secrets such as model API keys. Chrome keeps its sandbox enabled unless a controlled deployment explicitly sets `XAGENT_CHROME_NO_SANDBOX=1`. The Web service accepts local Host values only; add custom local hostnames explicitly with the comma-separated `XAGENT_WEB_ALLOWED_HOSTS` setting.
+`auto` requires a functionally verified OS sandbox (`/usr/bin/bwrap` on Linux or
+system `sandbox-exec` on macOS) and fails closed when it is unavailable; it never
+falls back to a host process. Safe execution sees a read-only workspace with
+`system/`, `runtime/`, `memory/`, `_intervene`, `_keyinfo`, and `plan.md` hidden,
+a private writable temporary directory, no network, and bounded CPU, memory,
+process, file-descriptor, and output-file resources. The parent supervisor
+terminates the process group when private scratch bytes or entries exceed their
+configured bounds. Persistent changes must use file tools.
+
+For development compatibility only, `XAGENT_CODE_RUN_BACKEND=unsafe` enables a
+host process. It is always labeled `development_unsafe` and still requires
+per-call confirmation even when `XAGENT_CODE_RUN_POLICY=allow`. Regardless of
+backend, child processes do not inherit host secrets such as model API keys.
+Outside-workspace reads are a local-operator capability and require per-read
+confirmation by default. Secure registry identities cannot receive that
+capability, so multi-user Web sessions fail closed before confirmation. Chrome keeps
+its sandbox enabled unless a controlled deployment explicitly sets
+`XAGENT_CHROME_NO_SANDBOX=1`.
 
 You can also provide a JSON config file with one or more named sessions (OpenAI text, Claude text, OpenAI native tools, Claude native tools, failover mixins).
 
@@ -386,6 +405,43 @@ XAGENT_WEB_ALLOWED_ORIGINS=http://127.0.0.1:4173 \
 Wildcard origins are ignored. For remote use, keep the backend on loopback and use
 an SSH tunnel.
 
+For multi-user Web operation, configure a trusted identity registry outside all
+Agent workspaces:
+
+```json
+{
+  "schema_version": 1,
+  "identities": [
+    {
+      "token_sha256": "<sha256-of-a-high-entropy-opaque-token>",
+      "subject": "user-id",
+      "tenant_id": "tenant-id",
+      "scopes": ["workspace.read", "state.write", "user.interact"],
+      "workspaces": {
+        "default.ws": "/srv/xagent/tenants/tenant-id/default.ws"
+      },
+      "enabled": true
+    }
+  ]
+}
+```
+
+Start with `XAGENT_WEB_IDENTITY_REGISTRY=/trusted/web-identities.json`. Clients
+authenticate with `Authorization: Bearer <opaque-token>` and may exchange it at
+`POST /api/auth/session` for an HttpOnly, SameSite=Strict cookie used by SSE.
+The cookie is Secure by default; terminate TLS in production. Setting
+`XAGENT_WEB_COOKIE_SECURE=0` is only for loopback HTTP development. Do not commit
+the registry or opaque tokens. Every mapped workspace must already exist; its
+canonical path and filesystem identity are bound when the registry is loaded.
+Cross-owner workspace overlap and registry containment are checked through
+physical device/inode ancestry, including case-insensitive path aliases.
+Replacing, deleting, or redirecting it through a symlink revokes that owner's
+runtime work. Removing/disabling an identity stops its live
+sessions and eval work on the next request or scheduler sweep. A missing,
+corrupt, or empty registry revokes all secure Web runtime activity and returns
+503. Secure Eval datasets and runs are physically partitioned by owner, and Web
+responses redact host paths and backend exception details.
+
 ### Dev mode (Vite)
 
 ```bash
@@ -414,7 +470,7 @@ Tool behavior is declared in [`src/assets/tools_schema.json`](src/assets/tools_s
 | File operations | `file_read`, `file_write`, `file_patch` |
 | Browser operations | `web_scan`, `web_execute_js` |
 | User interaction | `ask_user` |
-| Memory and planning | `update_working_checkpoint`, `start_long_term_update`, `plan_update` |
+| Memory and planning | `update_working_checkpoint`, `start_long_term_update`, `memory_propose`, `plan_update` |
 | Prompt skills | `skill_activate` |
 
 ---
