@@ -282,9 +282,17 @@ class XAgentHandler(BaseHandler):
         decision: PolicyDecision,
     ) -> None:
         principal = self.ctx.principal
+        previous_outcomes = (
+            list(self.ctx.last_policy_decision.get("outcomes", []))
+            if self.ctx.last_policy_decision.get("tool_name") == tool_name
+            and isinstance(self.ctx.last_policy_decision.get("outcomes"), list)
+            else []
+        )
+        previous_outcomes.append(decision.outcome.value)
         self.ctx.last_policy_decision = {
             "tool_name": tool_name,
             "outcome": decision.outcome.value,
+            "outcomes": previous_outcomes,
             "reason_code": decision.reason_code,
             "action_digest": decision.action_digest,
             "policy_version": decision.policy_version,

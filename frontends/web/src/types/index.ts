@@ -408,8 +408,26 @@ export interface EvalRunSummary {
   failed: number;
   error: number;
   pass_rate: number;
+  failure_rate?: number;
+  error_rate?: number;
   avg_duration: number;
+  p95_duration?: number;
   avg_turns: number;
+  tool_attempts?: number;
+  avg_tool_attempts?: number;
+  successful_tool_attempts?: number;
+  failed_tool_attempts?: number;
+  unknown_tool_attempts?: number;
+  tool_success_rate?: number;
+  recovery_opportunities?: number;
+  recovered?: number;
+  recovery_rate?: number;
+  policy_outcomes?: Record<'allow' | 'deny' | 'require_approval', number>;
+  token_usage?: Record<string, number>;
+  token_coverage?: number;
+  total_token_coverage?: number;
+  avg_total_tokens?: number;
+  tags?: Record<string, EvalRunSummary>;
 }
 
 export interface EvalCaseResult {
@@ -422,6 +440,13 @@ export interface EvalCaseResult {
   turns: number;
   exit_reason: string;
   tool_calls: string[];
+  tool_attempts?: number;
+  successful_tool_attempts?: number;
+  failed_tool_attempts?: number;
+  unknown_tool_attempts?: number;
+  recovered?: boolean;
+  policy_outcomes?: Record<'allow' | 'deny' | 'require_approval', number>;
+  token_usage?: Record<string, number>;
   failures: string[];
   response_excerpt: string;
 }
@@ -432,6 +457,10 @@ export interface EvalRunResult {
   workspace: string;
   dataset_id: string;
   dataset_name: string;
+  dataset_digest?: string;
+  dataset_source_digest?: string;
+  dataset_schema_version?: number;
+  dataset_case_count?: number;
   agent: string;
   status: 'pending' | 'running' | 'canceling' | 'canceled' | 'completed' | 'error' | string;
   created_at: number;

@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import threading
@@ -26,7 +27,19 @@ from src.core.network_guard import (
 MAX_DATASET_BYTES = 20 * 1024 * 1024
 MAX_CASES = 500
 DOWNLOAD_TIMEOUT_SEC = 15
-RUN_RESULT_VERSION = 1
+DATASET_SCHEMA_VERSION = 1
+RUN_RESULT_VERSION = 2
+MAX_TAGS_PER_CASE = 20
+MAX_TAG_LENGTH = 80
+MAX_SUMMARY_TAGS = 100
+TOKEN_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "reasoning_tokens",
+)
 
 ASSERTION_LIST_KEYS = {"contains", "contains_any", "not_contains", "exit_reason", "tool_called", "file_exists"}
 ASSERTION_KEYS = ASSERTION_LIST_KEYS | {"file_contains", "max_turns", "max_duration_sec"}
@@ -186,11 +199,18 @@ def normalize_assertions(raw: Any) -> dict[str, Any]:
                 assertions[key] = int(value)
             except (TypeError, ValueError) as exc:
                 raise EvalError("max_turns must be an integer") from exc
+            if assertions[key] <= 0:
+                raise EvalError("max_turns must be positive")
         elif key == "max_duration_sec":
             try:
                 assertions[key] = float(value)
             except (TypeError, ValueError) as exc:
                 raise EvalError("max_duration_sec must be a number") from exc
+            if (
+                not math.isfinite(assertions[key])
+                or assertions[key] <= 0
+            ):
+                raise EvalError("max_duration_sec must be a positive finite number")
     return assertions
 
 
@@ -203,7 +223,16 @@ def normalize_case(raw: dict[str, Any], index: int) -> EvalCase:
     case_id = str(raw.get("id") or "").strip() or _stable_case_id(task, index)
     case_id = sanitize_name(case_id, fallback=f"case-{index + 1:03d}")
     name = str(raw.get("name") or case_id).strip()
-    tags = _string_list(raw.get("tags"))
+    tags = list(dict.fromkeys(_string_list(raw.get("tags"))))
+    if len(tags) > MAX_TAGS_PER_CASE:
+        raise EvalError(f"case #{index + 1} exceeds {MAX_TAGS_PER_CASE} tags")
+    if any(len(tag) > MAX_TAG_LENGTH for tag in tags):
+        raise EvalError(f"case #{index + 1} tag exceeds {MAX_TAG_LENGTH} characters")
+    if any(
+        any(ord(character) < 32 or ord(character) == 127 for character in tag)
+        for tag in tags
+    ):
+        raise EvalError(f"case #{index + 1} tag contains control characters")
     assertions = normalize_assertions(raw.get("assertions", {}))
     return EvalCase(id=case_id, name=name, task=task, tags=tags, assertions=assertions)
 
@@ -266,6 +295,9 @@ def parse_dataset(content: str, fmt: str) -> list[EvalCase]:
         raise EvalError("Dataset contains no cases")
     if len(cases) > MAX_CASES:
         raise EvalError("Dataset exceeds 500 case limit")
+    case_ids = [case.id for case in cases]
+    if len(case_ids) != len(set(case_ids)):
+        raise EvalError("Dataset case ids must be unique")
     return cases
 
 
@@ -281,6 +313,21 @@ def _write_dataset_jsonl(path: Path, cases: list[EvalCase]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for case in cases:
             f.write(json.dumps(case.to_dict(), ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _dataset_digest(cases: list[dict[str, Any]] | list[EvalCase]) -> str:
+    canonical_cases = [
+        case.to_dict() if isinstance(case, EvalCase) else case
+        for case in cases
+    ]
+    encoded = json.dumps(
+        canonical_cases,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def read_dataset_cases(
@@ -351,11 +398,13 @@ def import_dataset_content(
     _write_dataset_jsonl(dataset_path, cases)
     metadata = {
         "id": dataset_id,
+        "schema_version": DATASET_SCHEMA_VERSION,
         "name": str(name or base),
         "format": fmt,
         "source": source or {"type": "content"},
         "created_at": now,
         "case_count": len(cases),
+        "content_sha256": _dataset_digest(cases),
         "size_bytes": dataset_path.stat().st_size,
         "dataset_path": str(dataset_path),
         **({"owner_digest": owner_digest} if owner_digest else {}),
@@ -632,6 +681,67 @@ def _tool_names(result: dict[str, Any]) -> set[str]:
     return names
 
 
+def _nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _token_usage(result: dict[str, Any]) -> dict[str, int]:
+    raw = result.get("usage")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        key: normalized
+        for key in TOKEN_USAGE_KEYS
+        if (normalized := _nonnegative_int(raw.get(key))) is not None
+    }
+
+
+def _tool_attempt_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    attempts = 0
+    successes = 0
+    failures = 0
+    unknown = 0
+    policy_outcomes = {"allow": 0, "deny": 0, "require_approval": 0}
+    for item in result.get("tool_results", []) or []:
+        if not isinstance(item, dict):
+            continue
+        attempts += 1
+        data = item.get("data")
+        status = (
+            str(data.get("status") or "").strip().upper()
+            if isinstance(data, dict)
+            else ""
+        )
+        if status in {"OK", "SUCCESS"}:
+            successes += 1
+        elif status:
+            failures += 1
+        else:
+            unknown += 1
+
+        policy = item.get("policy")
+        if isinstance(policy, dict) and isinstance(policy.get("outcomes"), list):
+            outcomes = policy["outcomes"]
+        elif isinstance(policy, dict):
+            outcomes = [policy.get("outcome")]
+        else:
+            outcomes = []
+        for raw_outcome in outcomes:
+            outcome = str(raw_outcome or "").strip().lower()
+            if outcome in policy_outcomes:
+                policy_outcomes[outcome] += 1
+
+    return {
+        "tool_attempts": attempts,
+        "successful_tool_attempts": successes,
+        "failed_tool_attempts": failures,
+        "unknown_tool_attempts": unknown,
+        "policy_outcomes": policy_outcomes,
+    }
+
+
 def _file_contains_items(value: Any) -> list[tuple[str, list[str]]]:
     items: list[tuple[str, list[str]]] = []
     if isinstance(value, dict):
@@ -722,13 +832,70 @@ def evaluate_assertions(
     return ("failed" if failures else "passed"), failures
 
 
-def summarize_cases(case_results: list[dict[str, Any]], total: int | None = None) -> dict[str, Any]:
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * percentile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * weight
+
+
+def _summarize_case_group(
+    case_results: list[dict[str, Any]],
+    *,
+    total: int,
+) -> dict[str, Any]:
     total_count = total if total is not None else len(case_results)
     passed = sum(1 for item in case_results if item.get("status") == "passed")
     failed = sum(1 for item in case_results if item.get("status") == "failed")
     error = sum(1 for item in case_results if item.get("status") == "error")
     durations = [float(item.get("duration_sec") or 0) for item in case_results]
     turns = [int(item.get("turns") or 0) for item in case_results]
+    tool_attempts = sum(int(item.get("tool_attempts") or 0) for item in case_results)
+    successful_tool_attempts = sum(
+        int(item.get("successful_tool_attempts") or 0)
+        for item in case_results
+    )
+    failed_tool_attempts = sum(
+        int(item.get("failed_tool_attempts") or 0)
+        for item in case_results
+    )
+    unknown_tool_attempts = sum(
+        int(item.get("unknown_tool_attempts") or 0)
+        for item in case_results
+    )
+    known_tool_attempts = successful_tool_attempts + failed_tool_attempts
+    recovery_opportunities = sum(
+        1 for item in case_results if int(item.get("failed_tool_attempts") or 0) > 0
+    )
+    recovered = sum(
+        1
+        for item in case_results
+        if int(item.get("failed_tool_attempts") or 0) > 0
+        and item.get("status") == "passed"
+    )
+    policy_outcomes = {"allow": 0, "deny": 0, "require_approval": 0}
+    token_usage = {key: 0 for key in TOKEN_USAGE_KEYS}
+    token_cases = 0
+    total_token_cases = 0
+    for item in case_results:
+        raw_policy = item.get("policy_outcomes")
+        if isinstance(raw_policy, dict):
+            for outcome in policy_outcomes:
+                policy_outcomes[outcome] += int(raw_policy.get(outcome) or 0)
+        raw_usage = item.get("token_usage")
+        if isinstance(raw_usage, dict) and raw_usage:
+            token_cases += 1
+            for key in TOKEN_USAGE_KEYS:
+                token_usage[key] += int(raw_usage.get(key) or 0)
+            if "total_tokens" in raw_usage:
+                total_token_cases += 1
+
     completed = passed + failed + error
     return {
         "total": total_count,
@@ -737,9 +904,63 @@ def summarize_cases(case_results: list[dict[str, Any]], total: int | None = None
         "failed": failed,
         "error": error,
         "pass_rate": passed / completed if completed else 0.0,
+        "failure_rate": (failed + error) / completed if completed else 0.0,
+        "error_rate": error / completed if completed else 0.0,
         "avg_duration": sum(durations) / len(durations) if durations else 0.0,
+        "p95_duration": _percentile(durations, 0.95),
         "avg_turns": sum(turns) / len(turns) if turns else 0.0,
+        "tool_attempts": tool_attempts,
+        "avg_tool_attempts": tool_attempts / completed if completed else 0.0,
+        "tool_success_rate": (
+            successful_tool_attempts / known_tool_attempts
+            if known_tool_attempts
+            else 0.0
+        ),
+        "successful_tool_attempts": successful_tool_attempts,
+        "failed_tool_attempts": failed_tool_attempts,
+        "unknown_tool_attempts": unknown_tool_attempts,
+        "recovery_opportunities": recovery_opportunities,
+        "recovered": recovered,
+        "recovery_rate": (
+            recovered / recovery_opportunities
+            if recovery_opportunities
+            else 0.0
+        ),
+        "policy_outcomes": policy_outcomes,
+        "token_usage": {
+            key: value
+            for key, value in token_usage.items()
+            if value
+        },
+        "token_coverage": token_cases / completed if completed else 0.0,
+        "total_token_coverage": (
+            total_token_cases / completed if completed else 0.0
+        ),
+        "avg_total_tokens": (
+            token_usage["total_tokens"] / total_token_cases
+            if total_token_cases
+            else 0.0
+        ),
     }
+
+
+def summarize_cases(case_results: list[dict[str, Any]], total: int | None = None) -> dict[str, Any]:
+    summary = _summarize_case_group(
+        case_results,
+        total=total if total is not None else len(case_results),
+    )
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in case_results:
+        for raw_tag in item.get("tags", []) or []:
+            tag = str(raw_tag)
+            if tag not in grouped and len(grouped) >= MAX_SUMMARY_TAGS:
+                continue
+            grouped.setdefault(tag, []).append(item)
+    summary["tags"] = {
+        tag: _summarize_case_group(items, total=len(items))
+        for tag, items in sorted(grouped.items())
+    }
+    return summary
 
 
 def create_eval_run(
@@ -752,6 +973,14 @@ def create_eval_run(
     storage_root: str | Path | None = None,
     owner_digest: str = "",
 ) -> dict[str, Any]:
+    if isinstance(case_limit, bool):
+        raise EvalError("case_limit must be an integer")
+    if case_limit is not None and (
+        not isinstance(case_limit, int)
+        or case_limit < 0
+        or case_limit > MAX_CASES
+    ):
+        raise EvalError(f"case_limit must be between 0 and {MAX_CASES}")
     metadata = read_dataset_metadata(
         workspace_root,
         dataset_id,
@@ -772,6 +1001,12 @@ def create_eval_run(
         "workspace": workspace,
         "dataset_id": dataset_id,
         "dataset_name": metadata.get("name", dataset_id),
+        "dataset_digest": _dataset_digest(cases),
+        "dataset_source_digest": str(metadata.get("content_sha256") or ""),
+        "dataset_case_count": len(cases),
+        "dataset_schema_version": int(
+            metadata.get("schema_version") or DATASET_SCHEMA_VERSION
+        ),
         "agent": agent,
         "status": "pending",
         "created_at": now,
@@ -849,6 +1084,10 @@ def list_eval_runs(
                         "workspace",
                         "dataset_id",
                         "dataset_name",
+                        "dataset_digest",
+                        "dataset_source_digest",
+                        "dataset_schema_version",
+                        "dataset_case_count",
                         "agent",
                         "status",
                         "created_at",
@@ -964,6 +1203,7 @@ def execute_eval_run(
                         pass
 
             response = str(raw_result.get("response") or "")
+            tool_metrics = _tool_attempt_metrics(raw_result)
             case_result = {
                 "id": case.get("id", ""),
                 "name": case.get("name", case.get("id", "")),
@@ -974,6 +1214,12 @@ def execute_eval_run(
                 "turns": int(raw_result.get("turns") or 0),
                 "exit_reason": str(raw_result.get("exit_reason") or ""),
                 "tool_calls": sorted(_tool_names(raw_result)),
+                **tool_metrics,
+                "recovered": (
+                    status == "passed"
+                    and int(tool_metrics["failed_tool_attempts"]) > 0
+                ),
+                "token_usage": _token_usage(raw_result),
                 "failures": failures,
                 "response_excerpt": response[:1200],
             }

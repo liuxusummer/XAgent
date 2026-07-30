@@ -10,7 +10,7 @@ from src.core.agent_loop import (
     exhaust,
     run_agent_loop,
 )
-from src.core.llm import ChatResponse, ToolCall
+from src.core.llm import ChatResponse, TokenUsage, ToolCall
 from src.handler import XAgentHandler
 
 
@@ -73,7 +73,18 @@ class AgentLoopTests(unittest.TestCase):
 
     def test_run_agent_loop_exits_on_plain_text_response(self) -> None:
         client = DummyClient(
-            [ChatResponse(thinking="", content="任务完成", tool_calls=[])]
+            [
+                ChatResponse(
+                    thinking="",
+                    content="任务完成",
+                    tool_calls=[],
+                    usage=TokenUsage(
+                        input_tokens=4,
+                        output_tokens=2,
+                        total_tokens=6,
+                    ),
+                )
+            ]
         )
         handler = DummyHandler()
 
@@ -88,6 +99,10 @@ class AgentLoopTests(unittest.TestCase):
 
         self.assertEqual(result["exit_reason"], "CURRENT_TASK_DONE")
         self.assertEqual(result["response"], "任务完成")
+        self.assertEqual(
+            result["usage"],
+            {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+        )
 
     def test_run_agent_loop_resets_tools_on_unknown_tool(self) -> None:
         client = DummyClient(
@@ -190,6 +205,43 @@ class AgentLoopTests(unittest.TestCase):
 
         self.assertEqual(result["tool_results"][0]["data"]["echo"], "ok")
         self.assertEqual(result["response"], "done")
+
+    def test_recorded_policy_metadata_does_not_enter_model_context(self) -> None:
+        class _PolicyHandler(DummyHandler):
+            def exec_echo(self, args):  # noqa: ANN001
+                self.ctx.last_policy_decision = {
+                    "tool_name": "echo",
+                    "outcome": "allow",
+                    "outcomes": ["require_approval", "allow"],
+                    "reason_code": "approved",
+                }
+                return super().exec_echo(args)
+
+        client = DummyClient(
+            [
+                ChatResponse(
+                    thinking="",
+                    content="",
+                    tool_calls=[ToolCall(name="echo", args={"value": "ok"}, id="1")],
+                ),
+                ChatResponse(thinking="", content="done", tool_calls=[]),
+            ]
+        )
+
+        result = run_agent_loop(
+            client=client,
+            system_prompt="sys",
+            user_input="go",
+            handler=_PolicyHandler(),
+            tools_schema=[],
+            max_turns=5,
+        )
+
+        self.assertEqual(
+            result["tool_results"][0]["policy"]["outcomes"],
+            ["require_approval", "allow"],
+        )
+        self.assertNotIn("policy", client.messages_seen[1][0]["tool_results"][0])
 
     def test_run_agent_loop_emits_progress_messages(self) -> None:
         client = DummyClient(

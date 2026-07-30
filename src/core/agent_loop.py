@@ -89,7 +89,7 @@ class AgentContext:
     principal: Principal | None = None
     context_manifest: ContextManifest | None = None
     context_state: dict[str, Any] = field(default_factory=dict)
-    last_policy_decision: dict[str, str] = field(default_factory=dict)
+    last_policy_decision: dict[str, Any] = field(default_factory=dict)
     pending_approval: dict[str, Any] | None = None
     last_checkpoint_snapshot: dict[str, Any] = field(default_factory=dict)
 
@@ -1027,8 +1027,20 @@ def run_agent_loop(
                 "tool_call_id": tool_call.id,
                 "data": result.data,
             }
+            recorded_tool_result = dict(tool_result)
+            policy_trace = (
+                dict(handler.ctx.last_policy_decision)
+                if handler.ctx.last_policy_decision.get("tool_name") == tool_call.name
+                else {}
+            )
+            if policy_trace:
+                recorded_tool_result["policy"] = {
+                    key: policy_trace[key]
+                    for key in ("outcome", "outcomes", "reason_code")
+                    if policy_trace.get(key)
+                }
             turn_tool_results.append(tool_result)
-            all_tool_results.append(tool_result)
+            all_tool_results.append(recorded_tool_result)
 
             if result.next_prompt not in (None, ""):
                 next_prompts.append(result.next_prompt)
@@ -1082,4 +1094,5 @@ def run_agent_loop(
         "exit_reason": exit_reason,
         "tool_results": all_tool_results,
         "turns": handler.ctx.current_turn,
+        "usage": handler.ctx.token_usage.to_event_data(),
     }

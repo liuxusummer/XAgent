@@ -871,6 +871,36 @@ export function EvalPanel({ workspace, configPath = '', observabilityConfigPath 
                         <Metric label="Pass Rate" value={`${Math.round((summary?.pass_rate ?? 0) * 100)}%`} />
                         <Metric label="Avg Turns" value={(summary?.avg_turns ?? 0).toFixed(1)} />
                       </div>
+                      {selectedRun.version >= 2 && (
+                        <div className="mt-3 grid grid-cols-6 gap-3">
+                          <Metric label="P95 Latency" value={formatDuration(summary?.p95_duration ?? 0)} />
+                          <Metric label="Tool Attempts" value={summary?.tool_attempts ?? 0} />
+                          <Metric
+                            label="Tool Success"
+                            value={`${Math.round((summary?.tool_success_rate ?? 0) * 100)}%`}
+                          />
+                          <Metric
+                            label="Recovery"
+                            value={
+                              (summary?.recovery_opportunities ?? 0) > 0
+                                ? `${Math.round((summary?.recovery_rate ?? 0) * 100)}%`
+                                : '--'
+                            }
+                          />
+                          <Metric
+                            label="Avg Tokens"
+                            value={
+                              (summary?.total_token_coverage ?? 0) > 0
+                                ? Math.round(summary?.avg_total_tokens ?? 0)
+                                : '--'
+                            }
+                          />
+                          <Metric
+                            label="Token Coverage"
+                            value={`${Math.round((summary?.total_token_coverage ?? 0) * 100)}%`}
+                          />
+                        </div>
+                      )}
                     </div>
 
                     {/* Cases grid */}

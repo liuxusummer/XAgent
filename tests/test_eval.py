@@ -24,6 +24,7 @@ from src.core.eval import (
     list_datasets,
     parse_dataset,
     read_eval_run,
+    summarize_cases,
 )
 
 
@@ -92,6 +93,32 @@ class EvalDatasetTests(unittest.TestCase):
     def test_parse_rejects_case_without_task(self) -> None:
         with self.assertRaises(EvalError):
             parse_dataset('[{"id": "bad"}]', "json")
+
+    def test_parse_rejects_non_positive_or_non_finite_limits(self) -> None:
+        invalid_assertions = [
+            '{"max_turns":0}',
+            '{"max_duration_sec":0}',
+            '{"max_duration_sec":NaN}',
+        ]
+        for assertions in invalid_assertions:
+            with self.subTest(assertions=assertions), self.assertRaises(EvalError):
+                parse_dataset(
+                    f'[{{"task":"bad","assertions":{assertions}}}]',
+                    "json",
+                )
+
+    def test_parse_rejects_duplicate_ids_and_deduplicates_tags(self) -> None:
+        with self.assertRaises(EvalError):
+            parse_dataset(
+                '[{"id":"same","task":"one"},{"id":"same","task":"two"}]',
+                "json",
+            )
+
+        cases = parse_dataset(
+            '[{"id":"one","task":"one","tags":["recovery","recovery"]}]',
+            "json",
+        )
+        self.assertEqual(cases[0].tags, ["recovery"])
 
     def test_import_path_stays_inside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -278,8 +305,116 @@ class EvalAssertionTests(unittest.TestCase):
         self.assertEqual(status, "error")
         self.assertEqual(failures, ["[error] LLM request failed: HTTP Error 401: Unauthorized"])
 
+    def test_summary_records_recovery_tokens_policy_and_tags(self) -> None:
+        summary = summarize_cases(
+            [
+                {
+                    "status": "passed",
+                    "duration_sec": 1,
+                    "turns": 2,
+                    "tags": ["recovery"],
+                    "tool_attempts": 2,
+                    "successful_tool_attempts": 1,
+                    "failed_tool_attempts": 1,
+                    "unknown_tool_attempts": 0,
+                    "policy_outcomes": {
+                        "allow": 1,
+                        "deny": 0,
+                        "require_approval": 1,
+                    },
+                    "token_usage": {"input_tokens": 7, "total_tokens": 10},
+                },
+                {
+                    "status": "failed",
+                    "duration_sec": 3,
+                    "turns": 4,
+                    "tags": ["recovery"],
+                    "tool_attempts": 1,
+                    "successful_tool_attempts": 0,
+                    "failed_tool_attempts": 1,
+                    "unknown_tool_attempts": 0,
+                    "policy_outcomes": {
+                        "allow": 0,
+                        "deny": 1,
+                        "require_approval": 0,
+                    },
+                    "token_usage": {"input_tokens": 13, "total_tokens": 20},
+                },
+            ]
+        )
+
+        self.assertEqual(summary["pass_rate"], 0.5)
+        self.assertEqual(summary["p95_duration"], 2.9)
+        self.assertEqual(summary["tool_attempts"], 3)
+        self.assertAlmostEqual(summary["tool_success_rate"], 1 / 3)
+        self.assertEqual(summary["recovery_opportunities"], 2)
+        self.assertEqual(summary["recovery_rate"], 0.5)
+        self.assertEqual(summary["policy_outcomes"]["require_approval"], 1)
+        self.assertEqual(summary["token_usage"]["total_tokens"], 30)
+        self.assertEqual(summary["avg_total_tokens"], 15)
+        self.assertEqual(summary["total_token_coverage"], 1)
+        self.assertEqual(summary["tags"]["recovery"]["completed"], 2)
+
+    def test_total_token_average_excludes_partial_usage(self) -> None:
+        summary = summarize_cases(
+            [
+                {
+                    "status": "passed",
+                    "token_usage": {"input_tokens": 8},
+                },
+                {
+                    "status": "passed",
+                    "token_usage": {"input_tokens": 5, "total_tokens": 7},
+                },
+            ]
+        )
+
+        self.assertEqual(summary["token_coverage"], 1)
+        self.assertEqual(summary["total_token_coverage"], 0.5)
+        self.assertEqual(summary["avg_total_tokens"], 7)
+
 
 class EvalRunTests(unittest.TestCase):
+    def test_run_digest_covers_only_the_evaluated_case_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            metadata = import_dataset_content(
+                tmp_dir,
+                name="suite.jsonl",
+                fmt="jsonl",
+                content='{"task":"one"}\n{"task":"two"}\n',
+            )
+            full = create_eval_run(
+                tmp_dir,
+                workspace="default.ws",
+                dataset_id=metadata["id"],
+                agent="main",
+            )
+            limited = create_eval_run(
+                tmp_dir,
+                workspace="default.ws",
+                dataset_id=metadata["id"],
+                agent="main",
+                case_limit=1,
+            )
+
+            self.assertEqual(metadata["schema_version"], 1)
+            self.assertEqual(len(metadata["content_sha256"]), 64)
+            self.assertEqual(full["dataset_case_count"], 2)
+            self.assertEqual(limited["dataset_case_count"], 1)
+            self.assertNotEqual(full["dataset_digest"], limited["dataset_digest"])
+            self.assertEqual(
+                full["dataset_source_digest"],
+                limited["dataset_source_digest"],
+            )
+            with self.assertRaises(EvalError):
+                create_eval_run(
+                    tmp_dir,
+                    workspace="default.ws",
+                    dataset_id=metadata["id"],
+                    agent="main",
+                    case_limit=501,
+                )
+
     def test_explicit_storage_root_physically_partitions_owner_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             storage_root = Path(tmp_dir) / "private-owner"
@@ -388,6 +523,83 @@ class EvalRunTests(unittest.TestCase):
             self.assertTrue(all(agent.closed for agent in built))
             stored = read_eval_run(tmp_dir, run["id"])
             self.assertEqual(stored["cases"][0]["status"], "passed")
+
+    def test_execute_eval_run_captures_bounded_case_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            metadata = import_dataset_content(
+                tmp_dir,
+                name="suite.jsonl",
+                fmt="jsonl",
+                content=(
+                    '{"task":"recover","tags":["capability"],'
+                    '"assertions":{"contains":["ok"]}}\n'
+                    '{"task":"deny","tags":["capability"],'
+                    '"assertions":{"contains":["ok"]}}\n'
+                ),
+            )
+            run = create_eval_run(
+                tmp_dir,
+                workspace="default.ws",
+                dataset_id=metadata["id"],
+                agent="main",
+            )
+            raw_results = iter(
+                [
+                    {
+                        "response": "ok",
+                        "exit_reason": "CURRENT_TASK_DONE",
+                        "turns": 2,
+                        "usage": {"input_tokens": 7, "total_tokens": 10},
+                        "tool_results": [
+                            {
+                                "tool_name": "file_read",
+                                "data": {"status": "ERROR"},
+                                "policy": {
+                                    "outcomes": ["require_approval", "allow"]
+                                },
+                            },
+                            {
+                                "tool_name": "file_search",
+                                "data": {"status": "OK"},
+                                "policy": {"outcome": "allow"},
+                            },
+                        ],
+                    },
+                    {
+                        "response": "not the expected response",
+                        "exit_reason": "CURRENT_TASK_DONE",
+                        "turns": 1,
+                        "usage": {"input_tokens": 13, "total_tokens": 20},
+                        "tool_results": [
+                            {
+                                "tool_name": "file_write",
+                                "data": {"status": "SKIP"},
+                                "policy": {"outcome": "deny"},
+                            }
+                        ],
+                    },
+                ]
+            )
+
+            result = execute_eval_run(
+                tmp_dir,
+                run["id"],
+                agent_factory=lambda: _FakeAgent(next(raw_results)),
+            )
+
+            self.assertTrue(result["cases"][0]["recovered"])
+            self.assertEqual(result["summary"]["tool_attempts"], 3)
+            self.assertAlmostEqual(result["summary"]["tool_success_rate"], 1 / 3)
+            self.assertEqual(result["summary"]["recovery_rate"], 0.5)
+            self.assertEqual(
+                result["summary"]["policy_outcomes"],
+                {"allow": 2, "deny": 1, "require_approval": 1},
+            )
+            self.assertEqual(result["summary"]["token_usage"]["total_tokens"], 30)
+            self.assertEqual(
+                result["summary"]["tags"]["capability"]["pass_rate"],
+                0.5,
+            )
 
     def test_cancel_stops_unstarted_cases(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

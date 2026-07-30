@@ -65,6 +65,12 @@ a clean checkout.
 Exit evidence: one command produces a bounded, machine-readable report and
 fails when a protected metric regresses.
 
+Foundation delivered: Eval result schema v2 records dataset-subset digests,
+tagged capability metrics, tool recovery, policy decisions, and token coverage.
+`python -m src.eval_report` compares completed runs against an explicit,
+versioned regression budget without emitting prompts or tool payloads. Scenario
+pack coverage remains the next Phase 1 increment.
+
 ### Phase 2 — Retrieval and context quality
 
 - Add query decomposition and hybrid retrieval diagnostics without weakening

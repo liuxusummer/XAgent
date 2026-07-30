@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "require_same_dataset": true,
+  "checks": [
+    {
+      "id": "pass-rate",
+      "path": "/summary/pass_rate",
+      "direction": "higher",
+      "threshold": 0.9,
+      "max_regression": 0.02
+    },
+    {
+      "id": "error-rate",
+      "path": "/summary/error_rate",
+      "direction": "lower",
+      "threshold": 0.0,
+      "max_regression": 0.0
+    },
+    {
+      "id": "p95-latency",
+      "path": "/summary/p95_duration",
+      "direction": "lower",
+      "max_regression_ratio": 0.2
+    }
+  ]
+}

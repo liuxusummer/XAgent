@@ -480,7 +480,8 @@ npm run lint
 - 🌐 超越 reference adapter 的可部署持久 Worker 传输
 - 📦 可复现的打包、升级与 showcase 流程
 
-详见证据驱动的 [Agent Platform Roadmap](docs/agent-platform-roadmap.md)。
+详见证据驱动的 [Agent Platform Roadmap](docs/agent-platform-roadmap.md)
+与离线 [Eval 回归门禁契约](docs/eval-regression-gates.md)。
 
 ---
 
