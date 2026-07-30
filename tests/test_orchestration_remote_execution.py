@@ -26,6 +26,9 @@ from src.orchestration.remote_control import (
     WorkerRegistration,
 )
 from src.orchestration.remote_journal import RemoteControlJournal
+from src.orchestration.remote_execution_journal import (
+    RemoteExecutionJournal,
+)
 from src.orchestration.remote_execution import (
     RemoteExecutionPreparation,
     RemoteOutputPayload,
@@ -478,6 +481,9 @@ class SecureRemoteExecutionTests(unittest.TestCase):
             "runtime_proof_verifier": self.runtime_verifier,
             "preflight_authorizer": _PreflightAuthorizer(),
             "pool_resolver": lambda registration: "pool-a",
+            "recovery_journal": RemoteExecutionJournal(
+                self.control_root / "remote-execution.sqlite3"
+            ),
             "clock": self.clock,
         }
         values.update(overrides)
@@ -858,6 +864,121 @@ class SecureRemoteExecutionTests(unittest.TestCase):
                 conflicting_claim,
                 conflicting_outcome,
             )
+
+    def test_control_restart_accepts_exact_running_failure(self):
+        control_journal_path = (
+            self.control_root / "active-recovery-control.sqlite3"
+        )
+        original = RemoteControlPlane(
+            lambda run_id: self.scheduler,
+            authorize_run=lambda identity, run_id: (
+                identity == self.identity
+                and run_id == "active-recovery-run"
+            ),
+            assignment_admitter=self._admitter(),
+            clock=self.clock,
+            journal=RemoteControlJournal(control_journal_path),
+        )
+        self.assertTrue(original.production_recovery_ready)
+        client = RemoteWorkerClient(
+            lambda request: original.handle(self.identity, request),
+            worker_id=self.identity.worker_id,
+            instance_id="active-recovery-instance",
+        )
+        client.register(
+            runtime_version="runsc-1.2",
+            capabilities=("activity.tool",),
+            resource_keys=("workspace:/project",),
+            activity_kinds=("tool",),
+            max_concurrency=1,
+        )
+        self.scheduler.create_run("active-recovery-run")
+        self.scheduler.reconcile("active-recovery-run")
+        assignment = client.poll("active-recovery-run")
+        assert assignment is not None
+        client.start(assignment.claim)
+
+        receipt = {
+            "schema_version": 2,
+            "backend_id": "attested-gvisor",
+            "security_level": "container",
+            "profile_id": assignment.execution_plan.profile_id,
+            "profile_digest": assignment.claim.profile_digest,
+            "action_digest": assignment.claim.action_digest,
+            "policy_version": assignment.execution_plan.policy_version,
+            "request_digest": assignment.claim.request_digest,
+            "outcome": SandboxOutcome.FAILED.value,
+            "exit_code": 1,
+            "timed_out": False,
+            "output_artifact_refs": [],
+            "error_code": "execution_failed",
+        }
+        proof = self.runtime_verifier.make_proof(
+            assignment.claim,
+            receipt,
+            output_handles=(),
+            outcome=AttemptStatus.FAILED.value,
+        )
+        outcome = RemoteExecutionOutcome(
+            AttemptStatus.FAILED.value,
+            (),
+            proof,
+            error_class="sandbox",
+            error_code="execution_failed",
+        )
+
+        fresh_gate = WorkerAuthorizationGate(
+            _Attestor(self.clock),
+            (
+                WorkerAccessRule(
+                    "exec-read",
+                    "tenant-a",
+                    "pool-a",
+                    ("exec",),
+                    (),
+                    (EffectClass.READ_ONLY,),
+                ),
+            ),
+            clock=self.clock,
+        )
+        restarted = RemoteControlPlane(
+            lambda run_id: self.scheduler,
+            authorize_run=lambda identity, run_id: (
+                identity == self.identity
+                and run_id == "active-recovery-run"
+            ),
+            assignment_admitter=self._admitter(
+                worker_authorization_gate=fresh_gate,
+                artifact_broker=ArtifactGrantBroker(
+                    self.artifacts,
+                    authorization_verifier=fresh_gate,
+                    clock=self.clock,
+                ),
+            ),
+            clock=self.clock,
+            journal=RemoteControlJournal(control_journal_path),
+        )
+        restarted_client = RemoteWorkerClient(
+            lambda request: restarted.handle(self.identity, request),
+            worker_id=self.identity.worker_id,
+            instance_id="active-recovery-instance",
+        )
+        restarted_client.register(
+            runtime_version="runsc-1.2",
+            capabilities=("activity.tool",),
+            resource_keys=("workspace:/project",),
+            activity_kinds=("tool",),
+            max_concurrency=1,
+        )
+        accepted = restarted_client.complete(
+            assignment.claim,
+            outcome,
+        )
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(
+            self.store.get_attempt(assignment.claim.attempt_id).status,
+            AttemptStatus.FAILED,
+        )
 
     def test_forged_runtime_signature_cannot_commit(self):
         claim = self._claim()
@@ -1297,6 +1418,184 @@ class SecureRemoteExecutionTests(unittest.TestCase):
                 candidate.runtime_proof,
             )
 
+        self.assertEqual(
+            self.store.get_attempt(claim.attempt_id).status,
+            AttemptStatus.RUNNING,
+        )
+
+    def test_restart_rebuilds_digest_only_authority_and_commits_failure(self):
+        claim = self._claim("recover-failure")
+        original = self._admitter()
+        authorization = original.admit(
+            self.identity,
+            self.registration,
+            self.scheduler,
+            claim,
+        )
+        expected = self._binding(claim, authorization)
+        self.scheduler.start_claim(claim)
+        receipt = {
+            "schema_version": 2,
+            "backend_id": "attested-gvisor",
+            "security_level": "container",
+            "profile_id": self.profile.profile_id,
+            "profile_digest": authorization.profile_digest,
+            "action_digest": authorization.action_digest,
+            "policy_version": self.executor.policy.policy_version,
+            "request_digest": authorization.request_digest,
+            "outcome": SandboxOutcome.FAILED.value,
+            "exit_code": 1,
+            "timed_out": False,
+            "output_artifact_refs": [],
+            "error_code": "execution_failed",
+        }
+        proof = self.runtime_verifier.make_proof(
+            expected,
+            receipt,
+            output_handles=(),
+            outcome=AttemptStatus.FAILED.value,
+        )
+        candidate = RemoteCompletionCandidate(
+            outcome=AttemptStatus.FAILED,
+            output_handles=(),
+            runtime_proof=proof,
+            error_class="sandbox",
+            error_code="execution_failed",
+        )
+
+        fresh_gate = WorkerAuthorizationGate(
+            _Attestor(self.clock),
+            (
+                WorkerAccessRule(
+                    "exec-read",
+                    "tenant-a",
+                    "pool-a",
+                    ("exec",),
+                    (),
+                    (EffectClass.READ_ONLY,),
+                ),
+            ),
+            clock=self.clock,
+        )
+        restarted = self._admitter(
+            worker_authorization_gate=fresh_gate,
+            artifact_broker=ArtifactGrantBroker(
+                self.artifacts,
+                authorization_verifier=fresh_gate,
+                clock=self.clock,
+            ),
+        )
+        with self.assertRaisesRegex(
+            SecureRemoteExecutionError,
+            "recovery_binding_mismatch",
+        ):
+            restarted.restore_authorization(
+                self.identity,
+                self.registration,
+                self.scheduler,
+                claim,
+                replace(expected, grant_binding_digest="f" * 64),
+            )
+        recovered = restarted.restore_authorization(
+            self.identity,
+            self.registration,
+            self.scheduler,
+            claim,
+            expected,
+        )
+        durable_record = restarted.recovery_journal.get(
+            claim.run_id,
+            claim.attempt_id,
+            claim.fencing_token,
+        )
+        assert durable_record is not None
+        self.assertEqual(
+            recovered.authorization_digest,
+            authorization.authorization_digest,
+        )
+        self.assertFalse(hasattr(recovered, "input_grants"))
+        restarted.complete(
+            self.identity,
+            self.registration,
+            self.scheduler,
+            claim,
+            recovered,
+            candidate,
+            proof,
+        )
+        self.assertEqual(
+            self.store.get_attempt(claim.attempt_id).status,
+            AttemptStatus.FAILED,
+        )
+        self.assertIsNone(
+            restarted.recovery_journal.get(
+                claim.run_id,
+                claim.attempt_id,
+                claim.fencing_token,
+            )
+        )
+        restarted.recovery_journal.record(durable_record)
+        report = restarted.reconcile_recovery_journal()
+        self.assertEqual(report.scanned, 1)
+        self.assertEqual(report.retained, 0)
+        self.assertEqual(report.discarded, 1)
+
+    def test_digest_recovery_never_resurrects_output_bearer(self):
+        claim = self._claim("recover-output")
+        original = self._admitter()
+        authorization = original.admit(
+            self.identity,
+            self.registration,
+            self.scheduler,
+            claim,
+        )
+        expected = self._binding(claim, authorization)
+        self.scheduler.start_claim(claim)
+        candidate = self._success_candidate(
+            original,
+            claim,
+            authorization,
+        )
+
+        fresh_gate = WorkerAuthorizationGate(
+            _Attestor(self.clock),
+            (
+                WorkerAccessRule(
+                    "exec-read",
+                    "tenant-a",
+                    "pool-a",
+                    ("exec",),
+                    (),
+                    (EffectClass.READ_ONLY,),
+                ),
+            ),
+            clock=self.clock,
+        )
+        restarted = self._admitter(
+            worker_authorization_gate=fresh_gate,
+            artifact_broker=ArtifactGrantBroker(
+                self.artifacts,
+                authorization_verifier=fresh_gate,
+                clock=self.clock,
+            ),
+        )
+        recovered = restarted.restore_authorization(
+            self.identity,
+            self.registration,
+            self.scheduler,
+            claim,
+            expected,
+        )
+        with self.assertRaisesRegex(Exception, "write_grant_unavailable"):
+            restarted.complete(
+                self.identity,
+                self.registration,
+                self.scheduler,
+                claim,
+                recovered,
+                candidate,
+                candidate.runtime_proof,
+            )
         self.assertEqual(
             self.store.get_attempt(claim.attempt_id).status,
             AttemptStatus.RUNNING,

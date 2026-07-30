@@ -357,16 +357,19 @@ class WorkerAuthorization:
     def authorization_digest(self) -> str:
         """Stable identity of one exact authorization lineage.
 
-        ``issued_at`` and ``expires_at`` are credential freshness, not durable
-        execution identity.  A trusted gate may renew those timestamps after
-        re-attesting the same workload/session without changing the digest
-        already bound into an active remote claim.
+        Credential ids, exact attestation timestamps, ``issued_at`` and
+        ``expires_at`` are freshness, not durable execution identity.  A
+        trusted gate may re-attest the same workload/session after a control
+        restart without changing the digest already bound into an active
+        remote claim.
         """
 
+        identity_lineage = (
+            self._identity_lineage or self.identity_binding_digest
+        )
         return _canonical_digest(
             {
-                "schema": "worker_authorization_lineage_v1",
-                "authorization_id": self.authorization_id,
+                "schema": "worker_authorization_lineage_v2",
                 "worker_id": self.worker_id,
                 "tenant_id": self.tenant_id,
                 "pool_id": self.pool_id,
@@ -374,7 +377,7 @@ class WorkerAuthorization:
                 "node_id": self.node_id,
                 "attempt_id": self.attempt_id,
                 "action_digest": self.action_digest,
-                "identity_binding_digest": self.identity_binding_digest,
+                "identity_lineage_digest": identity_lineage,
                 "transport_binding_digest": self.transport_binding_digest,
                 "rule_id": self.rule_id,
                 "maximum_artifact_sensitivity": (

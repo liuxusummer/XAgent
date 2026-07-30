@@ -142,6 +142,7 @@ Design docs live in [`docs/`](docs/):
 - [`docs/outlines.md`](docs/outlines.md)
 - [`docs/distributed-execution-adr.md`](docs/distributed-execution-adr.md)
 - [`docs/distributed-execution-quickstart.md`](docs/distributed-execution-quickstart.md)
+- [`docs/remote-execution-recovery.md`](docs/remote-execution-recovery.md)
 - [`docs/remote-fleet-data-plane.md`](docs/remote-fleet-data-plane.md)
 
 ---

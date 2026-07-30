@@ -398,6 +398,54 @@ class ExecutionAuthorization:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionAuthorizationBinding:
+    """Control-local recovery view with no replayable Artifact bearer.
+
+    This type is never serialized into a new assignment.  It lets a restarted
+    control plane validate and complete an already-published claim from a
+    durable digest-only record without persisting or recreating grant tokens.
+    """
+
+    action_digest: str
+    authorization_digest: str
+    profile_digest: str
+    request_digest: str
+    session_binding_digest: str
+    grant_binding_digest: str
+    execution_plan_digest: str
+    runtime_attestation_digest: str
+    execution_plan: RemoteExecutionPlan
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "action_digest",
+            "authorization_digest",
+            "profile_digest",
+            "request_digest",
+            "session_binding_digest",
+            "grant_binding_digest",
+            "execution_plan_digest",
+            "runtime_attestation_digest",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _digest(getattr(self, field_name), field_name),
+            )
+        if not isinstance(self.execution_plan, RemoteExecutionPlan):
+            raise RemoteProtocolError("invalid_execution_plan")
+        if (
+            self.execution_plan.profile_digest != self.profile_digest
+            or self.execution_plan.request_digest != self.request_digest
+            or self.execution_plan.plan_digest != self.execution_plan_digest
+        ):
+            raise RemoteProtocolError("authorization_plan_mismatch")
+
+
+ExecutionAuthority = ExecutionAuthorization | ExecutionAuthorizationBinding
+
+
+@dataclass(frozen=True, slots=True)
 class ClaimBinding:
     """Complete durable identity required for every claim mutation."""
 
@@ -1829,7 +1877,9 @@ def _bounded_unique_texts(
 __all__ = [
     "AuthenticatedWorker",
     "ClaimBinding",
+    "ExecutionAuthority",
     "ExecutionAuthorization",
+    "ExecutionAuthorizationBinding",
     "MAX_REMOTE_MESSAGE_BYTES",
     "REMOTE_PROTOCOL",
     "REMOTE_PROTOCOL_VERSION",

@@ -336,13 +336,15 @@ Fleet queue/active registry 仍是单进程、可重建 projection，不是共�
 `allow_reference_admission=true` 且 adapter 同时声明 `reference_admission_only=true`
 时才可进入开发兼容路径；任一条件缺失均在 Store mutation 前 fail closed。
 
-`SecureRemoteAssignmentAdmitter` 的 prepared execution registry 与 reference
-Artifact broker 的 staged/finalized registry 仍是进程内状态。session epoch/request
-identity journal 已持久化，但其 SQLite 必须位于独立 control-plane isolation root；
-进程内 `:memory:` journal 明确是 `development_unsafe`，secure poll/complete 路径
-fail closed。控制面崩溃后，不得仅凭 untrusted completion 重建 prepared authority；
-已写但未被 Domain Event 引用的 Artifact 由保守 GC 处理。生产化仍必须提供可恢复
-prepared/staging registry、真实 transport 和独立隔离 backend。
+`SecureRemoteAssignmentAdmitter` 在 assignment 返回前把 non-secret exact binding
+写入独立 `RemoteExecutionJournal`。其 SQLite 与 session journal 一样必须位于隔离的
+control-plane root；记录不含 bearer、claim token 原文、脚本、环境值、Artifact 内容
+或 raw plan。重启后只能结合 Store 中既有 policy Event、当前可信 resolver、重新
+attest 的相同 workload/session/runtime lineage 重建 digest-only authority。该路径可
+恢复 start/heartbeat/取消和无输出终态，不能生成新 assignment 或复活 Artifact grant。
+reference Artifact broker 的 grant/finalized registry 仍为进程内状态，所以成功输出在
+broker 重启后 fail closed；已写但未被 Domain Event 引用的 Artifact 由保守 GC 处理。
+完整契约见 [remote-execution-recovery.md](remote-execution-recovery.md)。
 
 ## 8. Observability
 

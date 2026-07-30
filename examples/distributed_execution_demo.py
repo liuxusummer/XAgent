@@ -43,6 +43,9 @@ from src.orchestration.remote_control import (  # noqa: E402
     WorkerRegistration,
 )
 from src.orchestration.remote_journal import RemoteControlJournal  # noqa: E402
+from src.orchestration.remote_execution_journal import (  # noqa: E402
+    RemoteExecutionJournal,
+)
 from src.orchestration.remote_execution import (  # noqa: E402
     RemoteExecutionPreparation,
     SecureRemoteAssignmentAdmitter,
@@ -537,6 +540,9 @@ class _ReferenceDistributedPlane:
             self.runtime_verifier,
             _ReferencePreflightAuthorizer(),
             pool_resolver=lambda _registration: POOL_ID,
+            recovery_journal=RemoteExecutionJournal(
+                control_root / "remote-execution.sqlite3"
+            ),
         )
         self.identities = {
             worker_id: AuthenticatedWorker(
@@ -802,6 +808,9 @@ def run_demo(
             "transport": "in_process_reference",
             "identity": "deterministic_reference_attestor",
             "runtime_proof": "hmac_binding_reference",
+            "digest_only_execution_recovery": (
+                plane.control.production_recovery_ready
+            ),
             "mtls_deployed": False,
             "spiffe_deployed": False,
             "gvisor_deployed": False,

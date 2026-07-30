@@ -44,13 +44,20 @@ from .remote_protocol import (
     MAX_OUTPUT_HANDLES,
     AuthenticatedWorker,
     ClaimBinding,
+    ExecutionAuthority,
     ExecutionAuthorization,
+    ExecutionAuthorizationBinding,
     RemoteExecutionPlan,
     RemoteProtocolError,
     RemoteRuntimeProof,
     canonical_digest,
     grant_binding_digest,
     runtime_binding_digest,
+)
+from .remote_execution_journal import (
+    RemoteExecutionBindingRecord,
+    RemoteExecutionJournal,
+    RemoteExecutionJournalError,
 )
 from .remote_worker import (
     RemoteExecutionContext,
@@ -261,7 +268,7 @@ class RuntimeProofVerifier(Protocol):
         identity: AuthenticatedWorker,
         registration: WorkerRegistration,
         claim: ClaimBinding,
-        authorization: ExecutionAuthorization,
+        authorization: ExecutionAuthority,
         attestation: VerifiedRemoteRuntimeAttestation,
         now: float,
     ) -> bool: ...
@@ -291,7 +298,7 @@ class _PreparedRemoteExecution:
     prepared: PreparedActivityExecution
     worker_authorization: WorkerAuthorization
     runtime_attestation: VerifiedRemoteRuntimeAttestation
-    authorization: ExecutionAuthorization
+    authorization: ExecutionAuthority
     identity: AuthenticatedWorker
     registration: WorkerRegistration
     idle_expires_at: float
@@ -324,6 +331,15 @@ class StagedRemoteOutput:
 
     handle: ArtifactOutputHandle
     descriptor: ArtifactDescriptor
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteExecutionRecoveryReport:
+    """Bounded maintenance result for digest-only recovery evidence."""
+
+    scanned: int
+    retained: int
+    discarded: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -687,6 +703,7 @@ class SecureRemoteAssignmentAdmitter:
         preflight_authorizer: WorkerPreflightAuthorizer,
         *,
         pool_resolver: Callable[[WorkerRegistration], str],
+        recovery_journal: RemoteExecutionJournal | None = None,
         clock: Callable[[], float] = time.time,
         prepared_ttl_seconds: float = MAX_PREPARED_TTL_SECONDS,
         maximum_prepared: int = 1_024,
@@ -707,6 +724,13 @@ class SecureRemoteAssignmentAdmitter:
             raise TypeError("preflight_authorizer is invalid")
         if not callable(pool_resolver) or not callable(clock):
             raise TypeError("pool_resolver and clock must be callable")
+        if recovery_journal is not None and not isinstance(
+            recovery_journal,
+            RemoteExecutionJournal,
+        ):
+            raise TypeError(
+                "recovery_journal must be a RemoteExecutionJournal"
+            )
         ttl = _timestamp(prepared_ttl_seconds)
         if ttl <= 0 or ttl > MAX_PREPARED_TTL_SECONDS:
             raise ValueError("prepared_ttl_seconds exceeds policy")
@@ -724,6 +748,9 @@ class SecureRemoteAssignmentAdmitter:
         self.runtime_proof_verifier = runtime_proof_verifier
         self.preflight_authorizer = preflight_authorizer
         self.pool_resolver = pool_resolver
+        self.recovery_journal = (
+            recovery_journal or RemoteExecutionJournal()
+        )
         self._clock = clock
         self._prepared_ttl_seconds = ttl
         self._maximum_prepared = maximum_prepared
@@ -749,6 +776,74 @@ class SecureRemoteAssignmentAdmitter:
                 None,
             )
             is True
+        )
+
+    @property
+    def durable_recovery_ready(self) -> bool:
+        """Whether issued claim authority survives a control-plane restart."""
+
+        return self.recovery_journal.durable
+
+    def reconcile_recovery_journal(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> RemoteExecutionRecoveryReport:
+        """Delete only terminal, missing, or durably fenced generations."""
+
+        try:
+            records = self.recovery_journal.list_records(limit=limit)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except RemoteExecutionJournalError:
+            raise SecureRemoteExecutionError(
+                "recovery_journal_unavailable"
+            ) from None
+        retained = 0
+        discarded = 0
+        for record in records:
+            attempt = self.executor.store.get_attempt(record.attempt_id)
+            idempotency = (
+                None
+                if attempt is None
+                else self.executor.store.get_idempotency(
+                    record.run_id,
+                    attempt.idempotency_key,
+                )
+            )
+            live = (
+                attempt is not None
+                and attempt.run_id == record.run_id
+                and attempt.node_id == record.node_id
+                and attempt.status
+                in {AttemptStatus.CLAIMED, AttemptStatus.RUNNING}
+                and idempotency is not None
+                and idempotency.claim_count == record.fencing_token
+                and hashlib.sha256(
+                    idempotency.claim_token.encode("utf-8")
+                ).hexdigest()
+                == record.claim_token_digest
+            )
+            if live:
+                retained += 1
+                continue
+            try:
+                removed = self.recovery_journal.discard(
+                    record.run_id,
+                    record.attempt_id,
+                    record.fencing_token,
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except RemoteExecutionJournalError:
+                raise SecureRemoteExecutionError(
+                    "recovery_journal_unavailable"
+                ) from None
+            discarded += int(removed)
+        return RemoteExecutionRecoveryReport(
+            scanned=len(records),
+            retained=retained,
+            discarded=discarded,
         )
 
     def preflight(
@@ -1196,6 +1291,14 @@ class SecureRemoteAssignmentAdmitter:
                 reservation_id=record.reservation_id,
                 materialized_bytes=record.materialized_bytes,
             )
+            self._record_recovery_binding(
+                identity,
+                registration,
+                claim,
+                authorization,
+                record.runtime_attestation,
+                now=now,
+            )
             with self._lock:
                 current = self._admission_tickets.get(ticket_digest)
                 if current is not record or current.state != "committing":
@@ -1279,6 +1382,308 @@ class SecureRemoteAssignmentAdmitter:
             except BaseException:
                 self._release_registry_reservation(reservation_id)
                 raise
+
+    def restore_authorization(
+        self,
+        identity: AuthenticatedWorker,
+        registration: WorkerRegistration,
+        scheduler: DurableScheduler,
+        claim: ActivityClaim,
+        expected: ClaimBinding,
+    ) -> ExecutionAuthority:
+        """Restore exact issued authority without recreating bearer grants."""
+
+        self._require_ready()
+        if not isinstance(expected, ClaimBinding):
+            raise SecureRemoteExecutionError(
+                "invalid_recovery_binding"
+            )
+        self._validate_control_context(
+            identity,
+            registration,
+            scheduler,
+            claim,
+        )
+        self._purge_registry(self._now())
+        with self._claim_guard(claim.attempt_id):
+            now = self._now()
+            existing = self._get_prepared(claim.attempt_id)
+            if existing is not None:
+                refreshed = self._refresh_record(
+                    existing,
+                    identity,
+                    registration,
+                    scheduler,
+                    claim,
+                    existing.authorization,
+                    now=now,
+                )
+                self._require_expected_authority(
+                    refreshed.authorization,
+                    expected,
+                )
+                return refreshed.authorization
+            return self._recover_authorization_under_guard(
+                identity,
+                registration,
+                scheduler,
+                claim,
+                expected,
+                now=now,
+            )
+
+    def _recover_authorization_under_guard(
+        self,
+        identity: AuthenticatedWorker,
+        registration: WorkerRegistration,
+        scheduler: DurableScheduler,
+        claim: ActivityClaim,
+        expected: ClaimBinding,
+        *,
+        now: float,
+    ) -> ExecutionAuthorizationBinding:
+        try:
+            durable = self.recovery_journal.get(
+                claim.run_id,
+                claim.attempt_id,
+                claim.fencing_token,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except RemoteExecutionJournalError:
+            raise SecureRemoteExecutionError(
+                "recovery_journal_unavailable"
+            ) from None
+        if durable is None:
+            raise SecureRemoteExecutionError("prepared_registry_miss")
+        if (
+            durable.node_id != claim.node_id
+            or durable.worker_id != identity.worker_id
+            or durable.tenant_id != identity.tenant_id
+            or durable.identity_digest != identity.identity_digest
+            or durable.session_binding_digest
+            != registration.session_binding_digest
+            or durable.claim_token_digest
+            != hashlib.sha256(
+                claim.claim_token.encode("utf-8")
+            ).hexdigest()
+        ):
+            raise SecureRemoteExecutionError(
+                "recovery_binding_mismatch"
+            )
+        self._require_expected_record(durable, expected)
+
+        resolved = self.plan_resolver.resolve(scheduler, claim)
+        if not isinstance(resolved, RemoteExecutionPreparation):
+            raise SecureRemoteExecutionError("invalid_execution_plan")
+        script_ref = resolved.script_artifact_ref
+        if script_ref is not None and not isinstance(script_ref, ArtifactRef):
+            raise SecureRemoteExecutionError("invalid_execution_plan")
+        materialized_bytes = 0 if script_ref is None else script_ref.size
+        reservation_id = self._reserve_registry(materialized_bytes)
+        worker_authorization: WorkerAuthorization | None = None
+        try:
+            prepared = self.executor.restore_prepared_execution(
+                claim,
+                argv=resolved.argv,
+                cwd=resolved.cwd,
+                profile=resolved.profile,
+                capabilities=resolved.capabilities,
+                resource_locks=resolved.resource_locks,
+                sensitive_keys=resolved.sensitive_keys,
+                limits=resolved.limits,
+                input_artifact_refs=resolved.input_artifact_refs,
+                script_artifact_ref=resolved.script_artifact_ref,
+                environment=resolved.environment,
+            )
+            if (
+                len(prepared.request.materialized_script or b"")
+                != materialized_bytes
+            ):
+                raise SecureRemoteExecutionError(
+                    "invalid_materialized_script"
+                )
+            presentation = self.presentation_resolver.resolve(
+                identity,
+                registration,
+            )
+            worker_authorization = (
+                self.worker_authorization_gate.authorize(
+                    presentation,
+                    tenant_id=identity.tenant_id,
+                    pool_id=self.pool_resolver(registration),
+                    action=prepared.action,
+                    expected_transport_binding_digest=(
+                        registration.session_binding_digest
+                    ),
+                    expected_worker_id=identity.worker_id,
+                )
+            )
+            if (
+                worker_authorization.authorization_digest
+                != durable.authorization_digest
+            ):
+                raise SecureRemoteExecutionError(
+                    "authorization_lineage_changed"
+                )
+            runtime_attestation = self.runtime_proof_verifier.attest(
+                identity,
+                registration,
+                now=now,
+            )
+            if not isinstance(
+                runtime_attestation,
+                VerifiedRemoteRuntimeAttestation,
+            ):
+                raise SecureRemoteExecutionError(
+                    "runtime_attestation_unverified"
+                )
+            runtime_attestation.validate_for(
+                identity,
+                registration,
+                now=now,
+            )
+            if (
+                runtime_attestation.runtime_attestation_digest
+                != durable.runtime_attestation_digest
+                or runtime_attestation.verifier_id
+                != durable.runtime_verifier_id
+                or runtime_attestation.security_level.value
+                != durable.runtime_security_level
+            ):
+                raise SecureRemoteExecutionError(
+                    "runtime_attestation_lineage_changed"
+                )
+            execution_plan = RemoteExecutionPlan(
+                argv=prepared.request.argv,
+                container_cwd=resolved.container_cwd,
+                limits=prepared.request.limits.to_dict(),
+                profile_id=prepared.profile.profile_id,
+                profile_digest=prepared.profile.profile_digest,
+                policy_version=self.executor.policy.policy_version,
+                request_digest=prepared.request.request_digest,
+                capabilities=tuple(
+                    capability.name
+                    for capability in prepared.action.capabilities
+                ),
+            )
+            authorization = ExecutionAuthorizationBinding(
+                action_digest=prepared.action.action_digest,
+                authorization_digest=(
+                    worker_authorization.authorization_digest
+                ),
+                profile_digest=prepared.profile.profile_digest,
+                request_digest=prepared.request.request_digest,
+                session_binding_digest=(
+                    registration.session_binding_digest
+                ),
+                grant_binding_digest=durable.grant_binding_digest,
+                execution_plan_digest=execution_plan.plan_digest,
+                runtime_attestation_digest=(
+                    runtime_attestation.runtime_attestation_digest
+                ),
+                execution_plan=execution_plan,
+            )
+            self._require_expected_authority(authorization, expected)
+            if (
+                authorization.action_digest != durable.action_digest
+                or authorization.profile_digest != durable.profile_digest
+                or authorization.request_digest != durable.request_digest
+                or authorization.execution_plan_digest
+                != durable.execution_plan_digest
+            ):
+                raise SecureRemoteExecutionError(
+                    "recovery_binding_mismatch"
+                )
+            record = _PreparedRemoteExecution(
+                scheduler=scheduler,
+                prepared=prepared,
+                worker_authorization=worker_authorization,
+                runtime_attestation=runtime_attestation,
+                authorization=authorization,
+                identity=identity,
+                registration=registration,
+                idle_expires_at=(
+                    durable.created_at + self._prepared_ttl_seconds
+                ),
+                reservation_id=reservation_id,
+                materialized_bytes=materialized_bytes,
+            )
+            attempt = scheduler.store.get_attempt(claim.attempt_id)
+            if (
+                attempt is not None
+                and attempt.status is AttemptStatus.CLAIMED
+                and now >= record.idle_expires_at
+            ):
+                raise SecureRemoteExecutionError(
+                    "prepared_execution_idle_expired"
+                )
+            with self._lock:
+                if claim.attempt_id in self._prepared:
+                    raise SecureRemoteExecutionError(
+                        "prepared_execution_conflict"
+                    )
+                self._prepared[claim.attempt_id] = record
+            return authorization
+        except BaseException:
+            if worker_authorization is not None:
+                self.worker_authorization_gate.discard(
+                    worker_authorization
+                )
+            self._release_registry_reservation(reservation_id)
+            raise
+
+    @staticmethod
+    def _require_expected_record(
+        record: RemoteExecutionBindingRecord,
+        expected: ClaimBinding,
+    ) -> None:
+        if (
+            record.run_id != expected.run_id
+            or record.node_id != expected.node_id
+            or record.attempt_id != expected.attempt_id
+            or record.fencing_token != expected.fencing_token
+            or record.action_digest != expected.action_digest
+            or record.authorization_digest
+            != expected.authorization_digest
+            or record.profile_digest != expected.profile_digest
+            or record.request_digest != expected.request_digest
+            or record.session_binding_digest
+            != expected.session_binding_digest
+            or record.grant_binding_digest
+            != expected.grant_binding_digest
+            or record.execution_plan_digest
+            != expected.execution_plan_digest
+            or record.runtime_attestation_digest
+            != expected.runtime_attestation_digest
+        ):
+            raise SecureRemoteExecutionError(
+                "recovery_binding_mismatch"
+            )
+
+    @staticmethod
+    def _require_expected_authority(
+        authorization: ExecutionAuthority,
+        expected: ClaimBinding,
+    ) -> None:
+        if (
+            authorization.action_digest != expected.action_digest
+            or authorization.authorization_digest
+            != expected.authorization_digest
+            or authorization.profile_digest != expected.profile_digest
+            or authorization.request_digest != expected.request_digest
+            or authorization.session_binding_digest
+            != expected.session_binding_digest
+            or authorization.grant_binding_digest
+            != expected.grant_binding_digest
+            or authorization.execution_plan_digest
+            != expected.execution_plan_digest
+            or authorization.runtime_attestation_digest
+            != expected.runtime_attestation_digest
+        ):
+            raise SecureRemoteExecutionError(
+                "recovery_binding_mismatch"
+            )
 
     def _admit_reserved(
         self,
@@ -1400,6 +1805,14 @@ class SecureRemoteAssignmentAdmitter:
                 reservation_id=reservation_id,
                 materialized_bytes=materialized_bytes,
             )
+            self._record_recovery_binding(
+                identity,
+                registration,
+                claim,
+                authorization,
+                runtime_attestation,
+                now=now,
+            )
             with self._lock:
                 if claim.attempt_id in self._prepared:
                     raise SecureRemoteExecutionError(
@@ -1502,7 +1915,7 @@ class SecureRemoteAssignmentAdmitter:
         registration: WorkerRegistration,
         scheduler: DurableScheduler,
         claim: ActivityClaim,
-        authorization: ExecutionAuthorization,
+        authorization: ExecutionAuthority,
         candidate: RemoteCompletionCandidate,
         runtime_proof: RemoteRuntimeProof,
     ) -> None:
@@ -1595,7 +2008,7 @@ class SecureRemoteAssignmentAdmitter:
         registration: WorkerRegistration,
         scheduler: DurableScheduler,
         claim: ActivityClaim,
-        authorization: ExecutionAuthorization,
+        authorization: ExecutionAuthority,
         runtime_proof: RemoteRuntimeProof,
     ) -> None:
         """Confirm cancellation only with a signed, bound CANCELLED receipt."""
@@ -1651,6 +2064,63 @@ class SecureRemoteAssignmentAdmitter:
             )
         self._drop_prepared(claim.attempt_id)
 
+    def _record_recovery_binding(
+        self,
+        identity: AuthenticatedWorker,
+        registration: WorkerRegistration,
+        claim: ActivityClaim,
+        authorization: ExecutionAuthorization,
+        attestation: VerifiedRemoteRuntimeAttestation,
+        *,
+        now: float,
+    ) -> None:
+        """Publish only non-secret recovery evidence before assignment return."""
+
+        try:
+            self.recovery_journal.record(
+                RemoteExecutionBindingRecord(
+                    run_id=claim.run_id,
+                    attempt_id=claim.attempt_id,
+                    node_id=claim.node_id,
+                    worker_id=identity.worker_id,
+                    tenant_id=identity.tenant_id,
+                    identity_digest=identity.identity_digest,
+                    session_binding_digest=(
+                        registration.session_binding_digest
+                    ),
+                    claim_token_digest=hashlib.sha256(
+                        claim.claim_token.encode("utf-8")
+                    ).hexdigest(),
+                    fencing_token=claim.fencing_token,
+                    action_digest=authorization.action_digest,
+                    authorization_digest=(
+                        authorization.authorization_digest
+                    ),
+                    profile_digest=authorization.profile_digest,
+                    request_digest=authorization.request_digest,
+                    grant_binding_digest=(
+                        authorization.grant_binding_digest
+                    ),
+                    execution_plan_digest=(
+                        authorization.execution_plan_digest
+                    ),
+                    runtime_attestation_digest=(
+                        authorization.runtime_attestation_digest
+                    ),
+                    runtime_verifier_id=attestation.verifier_id,
+                    runtime_security_level=(
+                        attestation.security_level.value
+                    ),
+                    created_at=now,
+                )
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except RemoteExecutionJournalError:
+            raise SecureRemoteExecutionError(
+                "recovery_journal_unavailable"
+            ) from None
+
     def _issue_input_grants(
         self,
         authorization: WorkerAuthorization,
@@ -1692,7 +2162,7 @@ class SecureRemoteAssignmentAdmitter:
         identity: AuthenticatedWorker,
         registration: WorkerRegistration,
         claim: ClaimBinding,
-        authorization: ExecutionAuthorization,
+        authorization: ExecutionAuthority,
         record: _PreparedRemoteExecution,
         now: float,
     ) -> None:
@@ -1733,7 +2203,7 @@ class SecureRemoteAssignmentAdmitter:
         registration: WorkerRegistration,
         scheduler: DurableScheduler,
         claim: ActivityClaim,
-        authorization: ExecutionAuthorization,
+        authorization: ExecutionAuthority,
         *,
         now: float,
     ) -> _PreparedRemoteExecution:
@@ -1753,7 +2223,7 @@ class SecureRemoteAssignmentAdmitter:
         registration: WorkerRegistration,
         scheduler: DurableScheduler,
         claim: ActivityClaim,
-        authorization: ExecutionAuthorization,
+        authorization: ExecutionAuthority,
         *,
         now: float,
     ) -> _PreparedRemoteExecution:
@@ -1777,7 +2247,7 @@ class SecureRemoteAssignmentAdmitter:
         registration: WorkerRegistration,
         scheduler: DurableScheduler,
         claim: ActivityClaim,
-        authorization: ExecutionAuthorization,
+        authorization: ExecutionAuthority,
         *,
         now: float,
     ) -> _PreparedRemoteExecution:
@@ -2037,6 +2507,17 @@ class SecureRemoteAssignmentAdmitter:
             self.worker_authorization_gate.discard(
                 record.worker_authorization
             )
+            try:
+                self.recovery_journal.discard(
+                    record.prepared.claim.run_id,
+                    record.prepared.claim.attempt_id,
+                    record.prepared.claim.fencing_token,
+                )
+            except RemoteExecutionJournalError:
+                # The durable terminal Receipt is execution truth.  A stale
+                # digest-only recovery row is harmless and may be reconciled
+                # later; cleanup failure must not roll back completion.
+                pass
 
     def _remove_record_if_current(
         self,
@@ -2155,7 +2636,7 @@ class SecureRemoteAssignmentAdmitter:
 
 def _claim_binding(
     claim: ActivityClaim,
-    authorization: ExecutionAuthorization,
+    authorization: ExecutionAuthority,
 ) -> ClaimBinding:
     return ClaimBinding(
         run_id=claim.run_id,
@@ -2276,7 +2757,7 @@ def _attempt_status_for_receipt(
 
 def _completion_evidence(
     proof: RemoteRuntimeProof,
-    authorization: ExecutionAuthorization,
+    authorization: ExecutionAuthority,
 ) -> dict[str, str]:
     return {
         "authorization_digest": authorization.authorization_digest,
@@ -2371,6 +2852,7 @@ def _timestamp(value: Any) -> float:
 __all__ = [
     "RemoteExecutionPlanResolver",
     "RemoteExecutionPreparation",
+    "RemoteExecutionRecoveryReport",
     "RemoteOutputPayload",
     "RemoteSandboxExecution",
     "RemoteWorkerSandboxAdapter",

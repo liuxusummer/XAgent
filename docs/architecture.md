@@ -110,9 +110,14 @@
   integrity 校验，禁止缺表时自动重建。
   Fleet routing 使用服务端版本化 Tool/Worker policy，并把 capabilities、resource
   keys、runtime 和精确节点/config 纳入匹配；Worker register 声明只能缩小权限。
-  prepared/staging registry 与 Fleet queue 仍为进程内状态，fleet claim 准入后失败
-  必须从 Store 重新投影，不能把内存队列或 journal 当作 Domain 事实源。完整边界见
-  `docs/distributed-execution-adr.md` 和 `docs/remote-fleet-data-plane.md`。
+  assignment 返回前还会写入独立的 digest-only `RemoteExecutionJournal`；它不保存
+  claim/grant token、脚本、环境值、Artifact 内容或 raw plan。控制面重启后可从 exact
+  Store policy Event、当前配置与新鲜 attestation 重建 start/heartbeat/取消和无输出
+  终态 authority，但绝不重新发送 assignment 或复活 bearer。Artifact grant/finalized
+  handle registry 与 Fleet queue 仍为进程内状态；成功输出 completion 在 broker 重启后
+  继续 fail closed。fleet claim 准入后失败必须从 Store 重新投影，不能把内存队列或
+  journal 当作 Domain 事实源。完整边界见 `docs/distributed-execution-adr.md`、
+  `docs/remote-execution-recovery.md` 和 `docs/remote-fleet-data-plane.md`。
 
 ## 3. 核心数据流
 

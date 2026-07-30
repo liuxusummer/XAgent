@@ -165,7 +165,12 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
     ".oci_backend": ("OciGvisorSandboxBackend",),
     ".remote_control": ("RemoteControlPlane",),
     ".remote_journal": ("RemoteControlJournal",),
+    ".remote_execution_journal": (
+        "RemoteExecutionBindingRecord",
+        "RemoteExecutionJournal",
+    ),
     ".remote_execution": (
+        "RemoteExecutionRecoveryReport",
         "SecureRemoteAssignmentAdmitter",
         "SecureRemoteExecutionAdapter",
     ),

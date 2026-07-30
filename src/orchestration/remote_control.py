@@ -32,7 +32,9 @@ from .remote_protocol import (
     MIN_LEASE_SECONDS,
     AuthenticatedWorker,
     ClaimBinding,
+    ExecutionAuthority,
     ExecutionAuthorization,
+    ExecutionAuthorizationBinding,
     RemoteActivityDescriptor,
     RemoteRuntimeProof,
     RemoteOperation,
@@ -89,7 +91,7 @@ class RemoteAssignmentAdmitter(Protocol):
         registration: "WorkerRegistration",
         scheduler: DurableScheduler,
         claim: ActivityClaim,
-    ) -> ExecutionAuthorization: ...
+    ) -> ExecutionAuthority: ...
 
     def complete(
         self,
@@ -97,7 +99,7 @@ class RemoteAssignmentAdmitter(Protocol):
         registration: "WorkerRegistration",
         scheduler: DurableScheduler,
         claim: ActivityClaim,
-        authorization: ExecutionAuthorization,
+        authorization: ExecutionAuthority,
         candidate: "RemoteCompletionCandidate",
         runtime_proof: RemoteRuntimeProof,
     ) -> None: ...
@@ -108,9 +110,25 @@ class RemoteAssignmentAdmitter(Protocol):
         registration: "WorkerRegistration",
         scheduler: DurableScheduler,
         claim: ActivityClaim,
-        authorization: ExecutionAuthorization,
+        authorization: ExecutionAuthority,
         runtime_proof: RemoteRuntimeProof,
     ) -> None: ...
+
+
+@runtime_checkable
+class RemoteAssignmentRecoveryAdmitter(Protocol):
+    """Optional durable recovery extension for already-published claims."""
+
+    durable_recovery_ready: bool
+
+    def restore_authorization(
+        self,
+        identity: AuthenticatedWorker,
+        registration: "WorkerRegistration",
+        scheduler: DurableScheduler,
+        claim: ActivityClaim,
+        expected: ClaimBinding,
+    ) -> ExecutionAuthority: ...
 
 
 class RemoteControlError(RuntimeError):
@@ -358,6 +376,25 @@ class RemoteControlPlane:
         except BaseException:
             return False
 
+    @property
+    def production_recovery_ready(self) -> bool:
+        """Whether non-terminal remote authority survives process restart."""
+
+        adapter = self._assignment_admitter
+        try:
+            return (
+                self.production_security_ready
+                and isinstance(
+                    adapter,
+                    RemoteAssignmentRecoveryAdmitter,
+                )
+                and adapter.durable_recovery_ready is True
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            return False
+
     def bind_fleet_poller(self, poller: RemoteFleetPoller) -> None:
         """Bind one production fleet selector before serving fleet polls."""
 
@@ -532,6 +569,7 @@ class RemoteControlPlane:
             registration,
             scheduler,
             handle,
+            expected_binding=claim,
         )
         if (
             claim.action_digest != authorization.action_digest
@@ -1285,7 +1323,7 @@ class RemoteControlPlane:
         request: RemoteRequest,
         scheduler: DurableScheduler,
         claim: ActivityClaim,
-        authorization: ExecutionAuthorization,
+        authorization: ExecutionAuthority,
     ) -> dict[str, Any]:
         outcome = AttemptStatus(str(request.body["outcome"]))
         proof = RemoteRuntimeProof.from_wire(request.body["runtime_proof"])
@@ -1340,7 +1378,7 @@ class RemoteControlPlane:
         request: RemoteRequest,
         scheduler: DurableScheduler,
         claim: ActivityClaim,
-        authorization: ExecutionAuthorization,
+        authorization: ExecutionAuthority,
     ) -> dict[str, Any]:
         run = scheduler.store.get_run(claim.run_id)
         if run is None or run.status is not RunStatus.CANCELLING:
@@ -1413,6 +1451,10 @@ class RemoteControlPlane:
         authorization: ExecutionAuthorization,
         registration: WorkerRegistration,
     ) -> WorkAssignment:
+        if not isinstance(authorization, ExecutionAuthorization):
+            # A digest-only recovery view may validate an existing claim but
+            # must never mint or re-deliver Artifact bearer grants.
+            raise RemoteControlError("authorization_conflict")
         config = dict(claim.config)
         activity_name = config.get(claim.activity_kind)
         if not isinstance(activity_name, str) or not activity_name.strip():
@@ -1467,15 +1509,29 @@ class RemoteControlPlane:
         registration: WorkerRegistration,
         scheduler: DurableScheduler,
         claim: ActivityClaim,
-    ) -> ExecutionAuthorization:
+        *,
+        expected_binding: ClaimBinding | None = None,
+    ) -> ExecutionAuthority:
         adapter = self._require_security_admitter()
         try:
-            authorization = adapter.admit(
-                identity,
-                registration,
-                scheduler,
-                claim,
-            )
+            if expected_binding is not None and isinstance(
+                adapter,
+                RemoteAssignmentRecoveryAdmitter,
+            ):
+                authorization = adapter.restore_authorization(
+                    identity,
+                    registration,
+                    scheduler,
+                    claim,
+                    expected_binding,
+                )
+            else:
+                authorization = adapter.admit(
+                    identity,
+                    registration,
+                    scheduler,
+                    claim,
+                )
         except RemoteControlError:
             raise
         except BaseException as exc:
@@ -1494,9 +1550,12 @@ class RemoteControlPlane:
         identity: AuthenticatedWorker,
         registration: WorkerRegistration,
         claim: ActivityClaim,
-        authorization: ExecutionAuthorization,
-    ) -> ExecutionAuthorization:
-        if not isinstance(authorization, ExecutionAuthorization):
+        authorization: ExecutionAuthority,
+    ) -> ExecutionAuthority:
+        if not isinstance(
+            authorization,
+            (ExecutionAuthorization, ExecutionAuthorizationBinding),
+        ):
             raise RemoteControlError("authorization_conflict")
         if (
             authorization.session_binding_digest
@@ -1506,7 +1565,17 @@ class RemoteControlPlane:
             )
         ):
             raise RemoteControlError("authorization_conflict")
-        for grant in (*authorization.input_grants, *authorization.output_grants):
+        input_grants = (
+            authorization.input_grants
+            if isinstance(authorization, ExecutionAuthorization)
+            else ()
+        )
+        output_grants = (
+            authorization.output_grants
+            if isinstance(authorization, ExecutionAuthorization)
+            else ()
+        )
+        for grant in (*input_grants, *output_grants):
             if (
                 grant.tenant_id != identity.tenant_id
                 or grant.worker_id != identity.worker_id
@@ -1517,7 +1586,7 @@ class RemoteControlPlane:
                 != authorization.authorization_digest
             ):
                 raise RemoteControlError("authorization_conflict")
-        for grant in authorization.output_grants:
+        for grant in output_grants:
             if grant.node_id != claim.node_id:
                 raise RemoteControlError("authorization_conflict")
         return authorization

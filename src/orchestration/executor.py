@@ -983,6 +983,117 @@ class TrustedActivityExecutor:
             _executor_binding=self._preparation_binding,
         )
 
+    def restore_prepared_execution(
+        self,
+        claim: ActivityClaim,
+        *,
+        argv: tuple[str, ...],
+        cwd: str,
+        profile: SandboxProfile,
+        capabilities: Iterable[Capability | str] = (),
+        resource_locks: Iterable[str] = (),
+        sensitive_keys: Iterable[str] = (),
+        limits: ResourceLimits | None = None,
+        input_artifact_refs: tuple[ArtifactRef, ...] = (),
+        script_artifact_ref: ArtifactRef | None = None,
+        environment: tuple[EnvironmentBinding, ...] = (),
+    ) -> PreparedActivityExecution:
+        """Rebuild process-local state from one exact durable authorization.
+
+        Recovery does not issue policy authority.  It reconstructs the Action
+        and ExecutionRequest from trusted configuration, verifies the existing
+        Store policy Event byte-for-byte through its digests, and accepts only
+        the same active claim generation.
+        """
+
+        self._validate_claim_binding(claim)
+        effective_limits = limits or profile.limits
+        (
+            action,
+            verified_inputs,
+            verified_script_ref,
+            materialized_script,
+        ) = self._build_execution_intent(
+            claim,
+            argv=tuple(argv),
+            cwd=cwd,
+            profile=profile,
+            capabilities=tuple(capabilities),
+            resource_locks=tuple(resource_locks),
+            sensitive_keys=tuple(sensitive_keys),
+            limits=effective_limits,
+            input_artifact_refs=tuple(input_artifact_refs),
+            script_artifact_ref=script_artifact_ref,
+            environment=tuple(environment),
+        )
+        attempt = self.store.get_attempt(claim.attempt_id)
+        if attempt is None or attempt.status not in {
+            AttemptStatus.CLAIMED,
+            AttemptStatus.RUNNING,
+        }:
+            raise ActivityExecutionConflict(
+                "recovery requires an active Activity Attempt"
+            )
+        policy_digest = _policy_digest(self.policy.policy_version)
+        policy_event = self.store.get_activity_policy_event(
+            claim.run_id,
+            claim.attempt_id,
+        )
+        if policy_event is None:
+            raise ActivityExecutionConflict(
+                "active Activity has no durable policy authorization"
+            )
+        self._validate_policy_binding(
+            policy_event,
+            claim=claim,
+            action=action,
+            policy_digest=policy_digest,
+            profile_digest=profile.profile_digest,
+            require_allow=True,
+        )
+        current = self.policy.evaluate(action)
+        if current.outcome is PolicyOutcome.DENY:
+            raise ActivityExecutionConflict(
+                "current policy no longer recognizes durable authorization"
+            )
+        decision = PolicyDecision(
+            outcome=PolicyOutcome.ALLOW,
+            action_digest=action.action_digest,
+            policy_version=self.policy.policy_version,
+            reason_code=str(policy_event.payload["reason_code"]),
+            matched_rule_ids=current.matched_rule_ids,
+        )
+        if (
+            policy_event.payload.get("decision_digest")
+            != _decision_digest(decision)
+        ):
+            raise ActivityExecutionConflict(
+                "durable policy decision cannot be reconstructed"
+            )
+        request = ExecutionRequest(
+            action=action,
+            policy_decision=decision,
+            argv=tuple(argv),
+            operation_key=claim.operation_key,
+            idempotency_key=claim.idempotency_key,
+            cwd=cwd,
+            limits=effective_limits,
+            input_artifact_refs=verified_inputs,
+            script_artifact_ref=verified_script_ref,
+            materialized_script=materialized_script,
+            environment=tuple(environment),
+            cancellation_probe=self._durable_cancellation_probe(claim),
+        ).validated_for_profile(profile)
+        return PreparedActivityExecution(
+            claim=claim,
+            action=action,
+            request=request,
+            profile=profile,
+            policy_event=policy_event,
+            policy_digest=policy_digest,
+            _executor_binding=self._preparation_binding,
+        )
+
     def activate_preauthorized(
         self,
         preview: PreauthorizedActivityExecution,

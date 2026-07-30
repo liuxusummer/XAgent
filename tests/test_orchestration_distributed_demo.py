@@ -37,6 +37,11 @@ class DistributedExecutionDemoTests(unittest.TestCase):
         )
         self.assertFalse(summary["security_boundary"]["mtls_deployed"])
         self.assertFalse(summary["security_boundary"]["gvisor_deployed"])
+        self.assertTrue(
+            summary["security_boundary"][
+                "digest_only_execution_recovery"
+            ]
+        )
 
     def test_soak_reports_workload_separately_from_wall_time(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

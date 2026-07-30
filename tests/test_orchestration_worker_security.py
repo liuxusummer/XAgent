@@ -364,6 +364,52 @@ class WorkerSecurityTests(unittest.TestCase):
         self.assertGreater(renewed.expires_at, self.clock.value)
         self.assertTrue(self.gate.verify(renewed, now=self.clock.value))
 
+    def test_fresh_gate_reissues_same_durable_lineage_after_restart(self):
+        action = _action()
+        original = self.gate.authorize(
+            object(),
+            tenant_id="tenant-1",
+            pool_id="pool-code",
+            action=action,
+            expected_transport_binding_digest=TRANSPORT_DIGEST,
+            expected_worker_id="worker-1",
+        )
+        self.clock.value += 1
+        self.attestor.identity = _identity(
+            issued_at=self.clock.value,
+            not_before=self.clock.value,
+            expires_at=self.clock.value + 100,
+            attestation_id="attestation-2",
+        )
+        restarted = WorkerAuthorizationGate(
+            self.attestor,
+            (_rule(),),
+            clock=self.clock,
+        )
+        recovered = restarted.authorize(
+            object(),
+            tenant_id="tenant-1",
+            pool_id="pool-code",
+            action=action,
+            expected_transport_binding_digest=TRANSPORT_DIGEST,
+            expected_worker_id="worker-1",
+        )
+        self.assertNotEqual(
+            recovered.authorization_id,
+            original.authorization_id,
+        )
+        self.assertNotEqual(
+            recovered.identity_binding_digest,
+            original.identity_binding_digest,
+        )
+        self.assertEqual(
+            recovered.authorization_digest,
+            original.authorization_digest,
+        )
+        self.assertTrue(
+            restarted.verify(recovered, now=self.clock.value)
+        )
+
     def test_renewal_rejects_changed_workload_lineage(self):
         action = _action()
         authorization = self.gate.authorize(

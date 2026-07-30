@@ -158,12 +158,12 @@ resources 一致，否则不发送给 Worker；已经发生的 durable claim 由
    `admit()`；
 5. Worker 重新通过 mTLS register，session journal 恢复或 fencing 旧 instance；
 6. lease reaper 处理崩溃前的 durable claims；
-7. 新进程的 Fleet active projection 从空状态开始，不尝试从 Worker 响应重建旧
-   authority；随后创建的 active projection 由 completion 或周期
-   `reconcile_terminals()` 收敛。
+7. 新进程的 Fleet active projection 从空状态开始，不从 Worker 响应推断旧 authority。
+   exact claim 的控制权限可由 `RemoteExecutionJournal` + Store + 新鲜 attestation
+   重建；projection 随后由 completion 或周期 `reconcile_terminals()` 收敛。
 
 不要从 Fleet snapshot 推断 Attempt 状态，也不要把 `execution_truth=false` 的报告写回
-Domain Store。跨进程共享 Fleet 队列、持久 prepared/staging registry、真实
+Domain Store。跨进程共享 Fleet 队列、持久 Artifact grant/finalization registry、真实
 TLS-extension server 和生产 Sandbox 仍是部署/后续实现边界。
 
 ## 验证

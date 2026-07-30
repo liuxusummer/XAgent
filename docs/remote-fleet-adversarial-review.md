@@ -111,8 +111,9 @@ Store 线性化 guard 内再次检查 current registration。poll body 为空，
   recovery 会收敛该 claim。该窗口不能伪装成零 mutation。
 - ready Run 的发现、周期投影、策略变更后的 rebuild 和 terminal reconcile 由部署的
   可信控制循环调用；本模块不隐式启动后台线程。
-- prepared execution 与 Artifact staging registry 仍是进程内状态，控制面重启不能
-  从 Worker 候选结果恢复这些 authority。
+- digest-only execution binding 已可跨重启从 Store/当前配置/新鲜 attestation 重建，
+  且不会从 Worker 候选结果恢复 bearer。Artifact grant/finalization registry 仍是
+  进程内状态，因此成功输出 completion 在 broker 重启后继续 fail closed。
 - 生产声明仍依赖真实 TLS-extension server、PKI/Workload Identity 和经过验证的
   Sandbox 部署。
 
