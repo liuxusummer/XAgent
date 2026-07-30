@@ -1,0 +1,209 @@
+README.md
+  s_13e1562985f726::t_fa248a3f836ef5 143-144,169-171,204-209,249-252
+README_zh.md
+  s_13e1562985f726::t_3828b4075f6275 143-144,166-167,191-194,222-223
+docs/architecture.md
+  s_72af05a5dabd4c::t_e5fa4ce7f4711a 72-87,225-227
+docs/distributed-execution-adr.md
+  s_72af05a5dabd4c::t_fa4d766a29f188 1-436
+docs/distributed-execution-adversarial-review.md
+  s_72af05a5dabd4c::t_c457d5d52214af 1-248
+docs/distributed-execution-fault-matrix.md
+  s_51dc7b3a94deca::t_4525b5f138bd60 1-65
+docs/distributed-execution-quickstart.md
+  s_72af05a5dabd4c::t_1be46bc660ef61 1-137
+docs/durable-orchestration-quickstart.md
+  s_91b89fbcfbf41e::t_b562ddcf8d8e0e 32-51
+docs/durable-orchestration-spec.md
+  s_13e1562985f726::t_d1787bc7ab8455 3-5,50-52,86,88-89,1184,1186-1192
+docs/tool-layer.md
+  s_b2c657234858ff::t_47c0eef8b7d5aa 220-225,250-265
+examples/distributed_execution_demo.py
+  s_5aedccbfd142a0::t_beb87db6472d4c 1-880
+examples/workflows/distributed_execution_demo.json
+  s_13e1562985f726::t_95c27174ee99a0 1-45
+src/orchestration/__init__.py
+  s_51dc7b3a94deca::t_be86d087f659b0 32,127-144,176,201,302-316
+src/orchestration/artifact_broker.py
+  s_b2c657234858ff::t_7eb6133af63f03 1-1260
+src/orchestration/executor.py
+  s_5aedccbfd142a0::t_3c82ed6b255717 15,378-432,518,704,719-725,900-1078,1082,1086-1088,1097-1099,1103-1121,1124-1128,1130-1171,1173-1183,1560,1579,1593,1615,1641,1677,1689,1713,1787,1825,1916,1918,1935-1937,2007-2075,2123
+src/orchestration/models.py
+  s_5aedccbfd142a0::t_e8520ef83a2ecc 462,485-495,561,695,711-720
+src/orchestration/oci_backend.py
+  s_0c2821b14852c8::t_f7bdaed33f273b 1-817
+src/orchestration/remote_control.py
+  s_91b89fbcfbf41e::t_16481351cc38c5 1-1632
+src/orchestration/remote_execution.py
+  s_7ceb6216bcbc6f::t_39389c943055dc 1-2387
+src/orchestration/remote_fleet.py
+  s_72af05a5dabd4c::t_562ba98e58182b 1-540
+src/orchestration/remote_journal.py
+  s_72af05a5dabd4c::t_7e3b5c39cec4e8 1-906
+src/orchestration/remote_observability.py
+  s_80f840da753532::t_13b779019d21a0 1-368
+src/orchestration/remote_protocol.py
+  s_72af05a5dabd4c::t_8f72e3b014dbd4 1-1847
+src/orchestration/remote_scheduling.py
+  s_72af05a5dabd4c::t_bdc15c000cd3d7 1-1089
+src/orchestration/remote_worker.py
+  s_51dc7b3a94deca::t_2dab4258597146 1-482
+src/orchestration/runtime_compatibility.py
+  s_72af05a5dabd4c::t_ea2812b698e65f 1-98
+src/orchestration/scheduler.py
+  s_72af05a5dabd4c::t_39113550d849ee 16,25,27,45,154,178-245,643-917,932-1029,2941-2945,2948
+src/orchestration/store.py
+  s_5aedccbfd142a0::t_52a144b8b51237 27,153-157,3691-3692,3695,3703-3722,3724-3727,4299-4784
+src/orchestration/worker_security.py
+  s_5aedccbfd142a0::t_a4d7bc32ef391f 1-851
+src/orchestration/workflow.py
+  s_91b89fbcfbf41e::t_21598f39ee8a0a 14-18,44,186,456-463,504,515-542
+tests/test_orchestration_artifact_broker.py
+  s_72af05a5dabd4c::t_d2e243f0bfaebe 1-1128
+tests/test_orchestration_distributed_demo.py
+  s_13e1562985f726::t_aa09d58159b95b 1-79
+tests/test_orchestration_distributed_fault_matrix.py
+  s_5aedccbfd142a0::t_e4acd2350a21bf 1-1317
+tests/test_orchestration_oci_backend.py
+  s_0c2821b14852c8::t_7e8c99d3b6f978 1-389
+tests/test_orchestration_preclaim_admission.py
+  s_5aedccbfd142a0::t_bb716781f48f21 1-471
+tests/test_orchestration_public_api.py
+  s_51dc7b3a94deca::t_864ad04a30a683 54-68,95-100,122-128
+tests/test_orchestration_remote_execution.py
+  s_72af05a5dabd4c::t_9ce1efb21740ca 1-1613
+tests/test_orchestration_remote_fleet.py
+  s_72af05a5dabd4c::t_758cd4ebcd80ad 1-573
+tests/test_orchestration_remote_journal.py
+  s_72af05a5dabd4c::t_817a6dbcd48218 1-351
+tests/test_orchestration_remote_observability.py
+  s_80f840da753532::t_accdffc6189178 1-290
+tests/test_orchestration_remote_protocol.py
+  s_72af05a5dabd4c::t_7582a12645cef7 1-1327
+tests/test_orchestration_remote_scheduling.py
+  s_72af05a5dabd4c::t_e9c23396a32140 1-813
+tests/test_orchestration_review_round1.py
+  s_5aedccbfd142a0::t_02d7ce60aad2d2 1-498
+tests/test_orchestration_review_round2.py
+  s_c9db6f55bb611d::t_6fa0149f387fa6 1-284
+tests/test_orchestration_review_round2_postfix.py
+  s_72af05a5dabd4c::t_dc8316d601a4b7 1-500
+tests/test_orchestration_review_round3.py
+  s_72af05a5dabd4c::t_34bc5d0bf124d9 1-423
+tests/test_orchestration_review_round3_postfix.py
+  s_cf044e0e7e2e1e::t_caeaa6c6cc89e9 1-572
+tests/test_orchestration_round2_postfix_regressions.py
+  s_7ceb6216bcbc6f::t_801a15e99a0a50 1-287
+tests/test_orchestration_round2_redaction_budget.py
+  s_72af05a5dabd4c::t_23b0fe0da13401 1-275
+tests/test_orchestration_round3_runtime_regressions.py
+  s_91b89fbcfbf41e::t_12b5a755154ecb 1-116
+tests/test_orchestration_worker_security.py
+  s_e0132455f108a8::t_f66e2c0031eea9 1-396
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c91e25b36798049298debbe7f6a938d0b4aa692d",
+  "prompts": {},
+  "sessions": {
+    "s_0c2821b14852c8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fae88-4849-7cd0-b660-bb6b050fddc5",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    },
+    "s_13e1562985f726": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019faec0-ed0a-7013-bf0f-55422198b7f1",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    },
+    "s_51dc7b3a94deca": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019faede-bbf0-7703-b89a-fa7078294084",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    },
+    "s_5aedccbfd142a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019faefc-b492-7a30-9f49-3f88c4824fd9",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    },
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    },
+    "s_7ceb6216bcbc6f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019faf27-9c2f-79e3-ada2-90114653e492",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    },
+    "s_80f840da753532": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fae88-73fe-73d2-907d-61c890d871ec",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    },
+    "s_91b89fbcfbf41e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019faca4-beb6-79a3-9c47-7e0f2597791a",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    },
+    "s_b2c657234858ff": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fae0f-a721-7c11-bd2d-1f58e173bf4f",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    },
+    "s_c9db6f55bb611d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019faef0-b735-7251-b4f5-4c32dcc6f7f6",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    },
+    "s_cf044e0e7e2e1e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fae9d-eb2d-7191-b8a0-ddfa74308182",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    },
+    "s_e0132455f108a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019faede-ea0d-7f33-bc5b-6eddadaa3f9c",
+        "model": "unknown"
+      },
+      "human_author": "liuxu <liuxu.2027@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
