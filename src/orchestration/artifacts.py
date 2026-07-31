@@ -55,6 +55,7 @@ class ArtifactWriteError(ArtifactError):
 
 
 class ArtifactKind(StrEnum):
+    AGENT_REQUEST = "agent_request"
     MODEL_RESPONSE = "model_response"
     TOOL_RESULT = "tool_result"
     FILE_SNAPSHOT = "file_snapshot"

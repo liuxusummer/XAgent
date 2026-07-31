@@ -81,6 +81,11 @@
 - Agent Activity 终态以 `AgentActivityReceipt` 绑定 request digest、规范 NodeResult 和
   Artifact digest；它只证明运行时观察到整个 Loop 边界，不会把内部未回执的工具副作用
   提升为 verified 或 exactly-once。完整契约见 `docs/agent-activity-receipt.md`
+- Agent Activity 的 task/context 可由 `AgentActivityRequest` 物化为至少 sensitive
+  （并继承 context 最高分类）的 content-addressed Artifact，绑定稳定
+  Attempt/request/definition/config/input descriptor，但不绑定 Worker/lease/grant。
+  当前仅提供输入契约与 Broker 单次读取闭环，安全远程 adapter 仍为 Tool-only；见
+  `docs/agent-activity-request.md`
 - Durable Store、Artifact、GC 和锁必须放在 Agent workspace 外，由独立控制面
   service/OS identity 持有，且不挂载给 legacy 文件、代码或浏览器工具。默认 Web UI 不会
   自动发现数据库；投影服务必须显式注入受信 tenant→database 映射。同 UID 隐藏路径不构成

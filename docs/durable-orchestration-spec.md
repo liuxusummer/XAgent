@@ -9,6 +9,7 @@
 > 相关文档：[architecture.md](architecture.md)、[agent-loop.md](agent-loop.md)、
 > [tool-layer.md](tool-layer.md)、[agent-teams-spec.md](agent-teams-spec.md)、
 > [resumable-long-tasks-spec.md](resumable-long-tasks-spec.md)、
+> [agent-activity-request.md](agent-activity-request.md)、
 > [agent-activity-receipt.md](agent-activity-receipt.md)、
 > [observability.md](observability.md)
 
@@ -67,6 +68,7 @@ Durable Orchestration
 | Domain Event | 影响执行正确性、必须可靠持久化的领域事件 |
 | Projection | 由 Domain Event 推导的当前状态查询表 |
 | ToolReceipt | 一次工具调用的输入摘要、结果摘要和副作用证明 |
+| AgentActivityRequest | 一次 Agent Activity 的 task/context 敏感 Artifact envelope |
 | AgentActivityReceipt | 一次完整 Agent Loop Attempt 的边界观察与持久结果绑定 |
 | Artifact | 大型输出、文件快照、模型响应或报告的持久化对象 |
 | Outcome Unknown | Activity 可能已产生副作用，但运行时没有可靠完成收据 |
@@ -336,7 +338,7 @@ lease.acquired / lease.expired / lease.released
 
 ```text
 artifact_id
-kind                 model_response | tool_result | file_snapshot |
+kind                 agent_request | model_response | tool_result | file_snapshot |
                      report | log | generic
 uri                  运行时管理的相对 URI，不是任意用户路径
 sha256
@@ -423,7 +425,27 @@ Attempt，但只要 receipt 存在就必须先验证；新提交在“提交成�
 完整字段、不变量和兼容边界见
 [Agent Activity Receipt 契约](agent-activity-receipt.md)。
 
-### 5.11 Lease
+### 5.11 AgentActivityRequest
+
+Agent Activity 的 task/context 禁止通过 Event、Attempt metadata、argv 或普通远程 JSON
+传输。控制面可以从精确 `ActivityAdmissionCandidate` 确定性构造
+`AgentActivityRequest`，写入 `kind=agent_request` 的 canonical JSON Artifact；分类以
+`sensitive` 为最低值并继承所有上下文 Artifact 的最高 sensitivity。Artifact 内容绑定
+Run/Node/Attempt、Scheduler request digest、
+definition digest、Agent config 和有序 path-free input descriptors；不绑定 Worker、
+lease、fencing、session 或 grant。
+
+请求总大小最多 256 KiB；远程协议 64 个 input grant 中预留一个给 request Artifact，
+因此上下文 Artifact 最多 63 个。Broker 必须要求显式允许推导后的 sensitivity、一次性
+consume，并让 Worker 同时校验 Assignment binding 与 request/context grant descriptor
+全集。未加密的 `secret` 即使具备读取权限也必须拒绝。LocalArtifactStore 不因
+sensitivity 标签宣称加密，credential 禁止内联。
+
+该契约目前只提供 staging/load 和 Broker 读取基础，不会把生产 remote adapter 从
+Tool-only 改成 Agent-capable。完整约束见
+[Agent Activity Request Artifact 契约](agent-activity-request.md)。
+
+### 5.12 Lease
 
 ```text
 lease_id
