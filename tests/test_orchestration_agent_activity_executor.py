@@ -5,8 +5,10 @@ import json
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
+from src.core.agent_loop import AgentContext
 from src.orchestration.agent_activity_executor import (
     AgentActivityExecutionError,
     DurableAgentActivityExecutor,
@@ -15,6 +17,9 @@ from src.orchestration.agent_provider_client import (
     DurableAgentProviderClient,
 )
 from src.orchestration.agent_tool_handler import AgentToolSpec
+from src.orchestration.agent_turn_checkpoint import (
+    AgentTurnCheckpointArtifactStore,
+)
 from src.orchestration.artifacts import (
     ArtifactRef,
     ArtifactSensitivity,
@@ -29,7 +34,10 @@ from src.orchestration.remote_execution_journal import (
     RemoteExecutionJournal,
 )
 from src.orchestration.scheduler import DurableScheduler, RunInputReceipt
-from src.orchestration.store import DurableRunStore
+from src.orchestration.store import (
+    AgentTurnCheckpointConflict,
+    DurableRunStore,
+)
 from src.orchestration.worker_security import WorkerAuthorization
 from src.orchestration.workflow import compile_workflow
 
@@ -111,6 +119,17 @@ class _FailingInvoker(_Invoker):
     def invoke(self, route, payload: bytes, *, request_id: str) -> bytes:
         self.calls += 1
         raise RuntimeError(_LEAK)
+
+
+class _SequenceInvoker(_Invoker):
+    def __init__(self, responses: list[bytes]) -> None:
+        super().__init__(responses[-1])
+        self.responses = list(responses)
+
+    def invoke(self, route, payload: bytes, *, request_id: str) -> bytes:
+        response = self.responses[self.calls]
+        self.calls += 1
+        return response
 
 
 class _BlockingInvoker(_Invoker):
@@ -316,6 +335,26 @@ class _Fixture:
         return b"".join(values)
 
 
+def _leave_safe_turn_checkpoint(
+    fixture: _Fixture,
+    claim,
+    request_ref: ArtifactRef,
+) -> None:
+    def crash_before_second_provider(message: str) -> None:
+        if message == "[Turn 2]":
+            raise RuntimeError("simulated process death")
+
+    fixture.executor._context_factory = lambda _request: AgentContext(
+        display_fn=crash_before_second_provider
+    )
+    fixture.executor._mark_uncertain = lambda _claim: None
+    try:
+        fixture.executor.execute(claim, request_ref)
+    except AgentActivityExecutionError:
+        return
+    raise AssertionError("simulated worker death did not stop execution")
+
+
 class DurableAgentActivityExecutorTests(unittest.TestCase):
     def test_success_commits_payload_free_verified_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -366,8 +405,308 @@ class DurableAgentActivityExecutorTests(unittest.TestCase):
                 and event.event_type == "attempt.succeeded"
             ]
             self.assertEqual(len(terminal_events), 1)
-            self.assertFalse(fixture.executor.durable_result_recovery_ready)
+            self.assertTrue(fixture.executor.durable_result_recovery_ready)
             self.assertFalse(fixture.executor.production_security_ready)
+
+    def test_safe_turn_checkpoint_resumes_before_next_provider_call(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            invoker = _SequenceInvoker(
+                [
+                    _response_bytes(""),
+                    _response_bytes("resumed final answer"),
+                ]
+            )
+            fixture = _Fixture(Path(directory), invoker=invoker)
+            claim, request_ref = fixture.claim()
+
+            _leave_safe_turn_checkpoint(fixture, claim, request_ref)
+
+            checkpoint_record = (
+                fixture.store.get_latest_agent_turn_checkpoint(
+                    claim.run_id,
+                    claim.node_id,
+                    claim.attempt_id,
+                )
+            )
+            self.assertIsNotNone(checkpoint_record)
+            assert checkpoint_record is not None
+            self.assertEqual(checkpoint_record.completed_turn, 1)
+            self.assertEqual(invoker.calls, 1)
+            self.assertIs(
+                fixture.store.get_attempt(claim.attempt_id).status,
+                AttemptStatus.RUNNING,
+            )
+            for index, ref in enumerate(
+                (
+                    checkpoint_record.checkpoint_ref,
+                    *checkpoint_record.dependency_artifact_refs,
+                )
+            ):
+                self.assertFalse(
+                    fixture.store.claim_artifact_gc_candidate(
+                        ref.sha256,
+                        quarantine_id=(
+                            f"q{index + 1:020d}_"
+                            "0123456789abcdef0123456789abcdef"
+                        ),
+                        size=ref.size,
+                        claimed_at=fixture.clock.now,
+                    )
+                )
+
+            fixture.executor._context_factory = lambda _request: AgentContext(
+                display_fn=lambda _message: None
+            )
+            restored_claim = fixture.scheduler.restore_claim(
+                claim.run_id,
+                claim.node_id,
+                claim.attempt_id,
+                claim.worker_id,
+                request_hash=claim.request_hash,
+                claim_token=claim.claim_token,
+                fencing_token=claim.fencing_token,
+            )
+            result = fixture.executor.resume(
+                restored_claim,
+                request_ref,
+            )
+
+            self.assertEqual(invoker.calls, 2)
+            self.assertIs(
+                fixture.store.get_attempt(claim.attempt_id).status,
+                AttemptStatus.SUCCEEDED,
+            )
+            payload = json.loads(
+                fixture.artifacts.read(
+                    result.result_artifact_ref
+                ).decode("utf-8")
+            )
+            self.assertEqual(payload["response"], "resumed final answer")
+            self.assertEqual(payload["turns"], 2)
+
+    def test_resume_rejects_runtime_configuration_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            invoker = _SequenceInvoker(
+                [_response_bytes(""), _response_bytes("final")]
+            )
+            fixture = _Fixture(Path(directory), invoker=invoker)
+            claim, request_ref = fixture.claim()
+            _leave_safe_turn_checkpoint(fixture, claim, request_ref)
+            fixture.executor._context_factory = lambda _request: AgentContext(
+                display_fn=lambda _message: None
+            )
+            fixture.executor._max_turns = 2
+
+            with self.assertRaisesRegex(
+                AgentActivityExecutionError,
+                "agent_activity_preflight_failed",
+            ):
+                fixture.executor.resume(claim, request_ref)
+
+            self.assertEqual(invoker.calls, 1)
+            self.assertIs(
+                fixture.store.get_attempt(claim.attempt_id).status,
+                AttemptStatus.RUNNING,
+            )
+
+    def test_checkpoint_same_turn_is_append_only_and_claim_fenced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            invoker = _SequenceInvoker(
+                [_response_bytes(""), _response_bytes("final")]
+            )
+            fixture = _Fixture(Path(directory), invoker=invoker)
+            claim, request_ref = fixture.claim()
+            _leave_safe_turn_checkpoint(fixture, claim, request_ref)
+            record = fixture.store.get_latest_agent_turn_checkpoint(
+                claim.run_id,
+                claim.node_id,
+                claim.attempt_id,
+            )
+            assert record is not None
+            checkpoint_store = AgentTurnCheckpointArtifactStore(
+                fixture.artifacts
+            )
+            checkpoint = checkpoint_store.load(record.checkpoint_ref)
+            changed_state = dict(checkpoint.loop_state)
+            changed_state["final_response"] = "alternate"
+            alternate = replace(checkpoint, loop_state=changed_state)
+            alternate_ref = checkpoint_store.stage(alternate)
+
+            with self.assertRaisesRegex(
+                AgentTurnCheckpointConflict,
+                "agent_turn_checkpoint_state_conflict",
+            ):
+                fixture.store.commit_agent_turn_checkpoint(
+                    claim.run_id,
+                    claim.node_id,
+                    claim.attempt_id,
+                    claim.request_hash,
+                    claim.worker_id,
+                    claim_token=claim.claim_token,
+                    fencing_token=claim.fencing_token,
+                    completed_turn=checkpoint.completed_turn,
+                    previous_checkpoint_digest=(
+                        checkpoint.previous_checkpoint_digest
+                    ),
+                    checkpoint_ref=alternate_ref,
+                    request_ref=request_ref,
+                    provider_response_refs=(
+                        alternate.dependency_artifact_refs
+                    ),
+                    now=fixture.clock.now,
+                )
+            with self.assertRaisesRegex(
+                AgentTurnCheckpointConflict,
+                "agent_turn_checkpoint_claim_mismatch",
+            ):
+                fixture.store.commit_agent_turn_checkpoint(
+                    claim.run_id,
+                    claim.node_id,
+                    claim.attempt_id,
+                    claim.request_hash,
+                    claim.worker_id,
+                    claim_token=claim.claim_token,
+                    fencing_token=claim.fencing_token + 1,
+                    completed_turn=checkpoint.completed_turn,
+                    previous_checkpoint_digest=(
+                        checkpoint.previous_checkpoint_digest
+                    ),
+                    checkpoint_ref=record.checkpoint_ref,
+                    request_ref=request_ref,
+                    provider_response_refs=(
+                        checkpoint.dependency_artifact_refs
+                    ),
+                    now=fixture.clock.now,
+                )
+            self.assertEqual(
+                fixture.store.get_latest_agent_turn_checkpoint(
+                    claim.run_id,
+                    claim.node_id,
+                    claim.attempt_id,
+                ),
+                record,
+            )
+
+    def test_equal_provider_payloads_preserve_ordered_checkpoint_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repeated = _response_bytes("")
+            invoker = _SequenceInvoker(
+                [
+                    repeated,
+                    repeated,
+                    _response_bytes("final"),
+                ]
+            )
+            fixture = _Fixture(Path(directory), invoker=invoker)
+            claim, request_ref = fixture.claim()
+
+            result = fixture.executor.execute(claim, request_ref)
+
+            latest = fixture.store.get_latest_agent_turn_checkpoint(
+                claim.run_id,
+                claim.node_id,
+                claim.attempt_id,
+            )
+            self.assertIsNotNone(latest)
+            assert latest is not None
+            self.assertEqual(latest.completed_turn, 2)
+            self.assertIsNotNone(latest.previous_checkpoint_digest)
+            self.assertEqual(
+                latest.dependency_artifact_refs[1].sha256,
+                latest.dependency_artifact_refs[2].sha256,
+            )
+            self.assertEqual(invoker.calls, 3)
+            self.assertEqual(
+                json.loads(
+                    fixture.artifacts.read(
+                        result.result_artifact_ref
+                    ).decode("utf-8")
+                )["response"],
+                "final",
+            )
+
+    def test_checkpoint_payload_stays_outside_control_databases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            invoker = _SequenceInvoker(
+                [
+                    _response_bytes(f"```text\n{_LEAK}\n```"),
+                    _response_bytes("final"),
+                ]
+            )
+            fixture = _Fixture(Path(directory), invoker=invoker)
+            claim, request_ref = fixture.claim()
+            _leave_safe_turn_checkpoint(fixture, claim, request_ref)
+            record = fixture.store.get_latest_agent_turn_checkpoint(
+                claim.run_id,
+                claim.node_id,
+                claim.attempt_id,
+            )
+            self.assertIsNotNone(record)
+            assert record is not None
+
+            self.assertNotIn(_LEAK, repr(record))
+            self.assertNotIn(
+                _LEAK.encode("utf-8"),
+                fixture.durable_database_bytes(),
+            )
+            self.assertIn(
+                _LEAK.encode("utf-8"),
+                fixture.artifacts.read(record.checkpoint_ref),
+            )
+            self.assertIs(
+                record.checkpoint_ref.sensitivity,
+                ArtifactSensitivity.SENSITIVE,
+            )
+
+    def test_unknown_child_tool_outcome_cannot_become_known_parent_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = _Fixture(
+                Path(directory),
+                invoker=_Invoker(_response_bytes()),
+            )
+            claim, _request_ref = fixture.claim()
+
+            class Binding:
+                run_id = claim.run_id
+                attempt_id = "child-attempt"
+
+                @staticmethod
+                def validate_receipt(_receipt) -> None:
+                    return None
+
+            class Collector:
+                @staticmethod
+                def finalize(*, exit_reason, turns):
+                    self.assertEqual(exit_reason, "EXITED")
+                    self.assertEqual(turns, 1)
+                    return type(
+                        "Manifest",
+                        (),
+                        {"tool_receipts": (Binding(),)},
+                    )()
+
+            unknown_receipt = type(
+                "UnknownReceipt",
+                (),
+                {"attempt_status": AttemptStatus.OUTCOME_UNKNOWN},
+            )()
+            fixture.store.get_tool_receipt = (
+                lambda _run_id, _attempt_id: unknown_receipt
+            )
+            marked = []
+            fixture.executor._mark_uncertain = marked.append
+
+            fixture.executor._complete_known_non_success(
+                claim,
+                {"exit_reason": "EXITED", "turns": 1},
+                Collector(),
+            )
+
+            self.assertEqual(marked, [claim])
+            self.assertIs(
+                fixture.store.get_attempt(claim.attempt_id).status,
+                AttemptStatus.CLAIMED,
+            )
 
     def test_blocking_provider_call_keeps_parent_lease_alive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

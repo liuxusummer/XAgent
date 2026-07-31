@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -22,6 +23,11 @@ from .agent_request import (
 from .agent_terminal import (
     AgentActivityTerminalCommit,
     DurableAgentTerminalCommitter,
+)
+from .agent_turn_checkpoint import (
+    AgentTurnCheckpoint,
+    AgentTurnCheckpointArtifactStore,
+    AgentTurnCheckpointError,
 )
 from .agent_tool_handler import (
     AgentToolExecutor,
@@ -53,10 +59,12 @@ _SAFE_METRIC_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
 _ERROR_REASONS = frozenset(
     {
         "agent_activity_claim_invalid",
+        "agent_activity_checkpoint_failed",
         "agent_activity_configuration_invalid",
         "agent_activity_execution_failed",
         "agent_activity_preflight_failed",
         "agent_activity_request_invalid",
+        "agent_activity_recovery_unavailable",
         "agent_activity_terminal_failed",
     }
 )
@@ -266,14 +274,17 @@ class DurableAgentActivityExecutor:
         self._request_artifacts = AgentActivityRequestArtifactStore(
             artifact_store
         )
+        self._checkpoint_artifacts = AgentTurnCheckpointArtifactStore(
+            artifact_store
+        )
         self._active_attempts: set[str] = set()
         self._active_lock = threading.Lock()
 
     @property
     def durable_result_recovery_ready(self) -> bool:
-        """Exact cross-process Agent Loop recovery is not implemented yet."""
+        """Safe-turn state can be restored with the current Claim authority."""
 
-        return False
+        return True
 
     @property
     def production_security_ready(self) -> bool:
@@ -355,22 +366,68 @@ class DurableAgentActivityExecutor:
             with self._active_lock:
                 self._active_attempts.discard(claim.attempt_id)
 
-    def _execute_once(
+    def resume(
         self,
         claim: ActivityClaim,
         request_ref: ArtifactRef,
     ) -> AgentActivityExecutionResult:
+        """Continue one RUNNING Attempt from its newest exact safe turn."""
+
+        if type(claim) is not ActivityClaim:
+            raise AgentActivityExecutionError(
+                "agent_activity_claim_invalid"
+            )
+        with self._active_lock:
+            if claim.attempt_id in self._active_attempts:
+                raise AgentActivityExecutionError(
+                    "agent_activity_claim_invalid"
+                )
+            self._active_attempts.add(claim.attempt_id)
+        try:
+            self._preflight_request(
+                claim,
+                request_ref,
+                allow_running=True,
+            )
+            checkpoint = self._load_checkpoint(claim, request_ref)
+            return self._execute_once(
+                claim,
+                request_ref,
+                checkpoint=checkpoint,
+            )
+        finally:
+            with self._active_lock:
+                self._active_attempts.discard(claim.attempt_id)
+
+    def _execute_once(
+        self,
+        claim: ActivityClaim,
+        request_ref: ArtifactRef,
+        *,
+        checkpoint: AgentTurnCheckpoint | None = None,
+    ) -> AgentActivityExecutionResult:
         """Execute after acquiring this process's Attempt slot."""
 
-        request = self._preflight_request(claim, request_ref)
-        collector = AgentExecutionEvidenceCollector(
-            run_id=request.run_id,
-            node_id=request.node_id,
-            attempt_id=request.attempt_id,
-            request_digest=request.request_digest,
-            request_artifact_digest=request_ref.sha256,
-            definition_digest=request.definition_digest,
-            request_sensitivity=request_ref.sensitivity,
+        request = self._preflight_request(
+            claim,
+            request_ref,
+            allow_running=checkpoint is not None,
+        )
+        collector = (
+            AgentExecutionEvidenceCollector(
+                run_id=request.run_id,
+                node_id=request.node_id,
+                attempt_id=request.attempt_id,
+                request_digest=request.request_digest,
+                request_artifact_digest=request_ref.sha256,
+                definition_digest=request.definition_digest,
+                request_sensitivity=request_ref.sensitivity,
+            )
+            if checkpoint is None
+            else AgentExecutionEvidenceCollector.from_checkpoint_manifest(
+                checkpoint.evidence_manifest,
+                request_sensitivity=request_ref.sensitivity,
+            )
         )
         context = self._context(request, collector)
         client = self._provider_client(
@@ -389,9 +446,32 @@ class DurableAgentActivityExecutor:
                 request_ref=request_ref,
                 collector=collector,
                 tool_specs=self._tool_specs,
+                checkpoint_manifest=(
+                    None
+                    if checkpoint is None
+                    else checkpoint.evidence_manifest
+                ),
             )
             system_prompt = self._system_prompt(request)
             user_input = _user_input(request)
+            runtime_configuration_digest = (
+                self._runtime_configuration_digest(
+                    system_prompt,
+                    client,
+                )
+            )
+            if checkpoint is not None:
+                if (
+                    checkpoint.runtime_configuration_digest
+                    != runtime_configuration_digest
+                ):
+                    raise AgentTurnCheckpointError(
+                        "invalid_agent_turn_checkpoint"
+                    )
+                client.restore_checkpoint_state(
+                    checkpoint.provider_state,
+                    evidence_manifest=checkpoint.evidence_manifest,
+                )
         except (KeyboardInterrupt, SystemExit):
             raise
         except BaseException:
@@ -408,7 +488,24 @@ class DurableAgentActivityExecutor:
             raise AgentActivityExecutionError(
                 "agent_activity_preflight_failed"
             )
-        self._start(claim)
+        if checkpoint is None:
+            self._start(claim)
+        previous_checkpoint_digest = [
+            None
+            if checkpoint is None
+            else checkpoint.checkpoint_digest
+        ]
+        context.durable_turn_callback = self._checkpoint_callback(
+            claim=claim,
+            request=request,
+            request_ref=request_ref,
+            collector=collector,
+            client=client,
+            runtime_configuration_digest=(
+                runtime_configuration_digest
+            ),
+            previous_checkpoint_digest=previous_checkpoint_digest,
+        )
         heartbeat = _ClaimHeartbeat(
             self.scheduler,
             claim,
@@ -436,6 +533,11 @@ class DurableAgentActivityExecutor:
                 handler=handler,
                 tools_schema=list(self._tools_schema),
                 max_turns=self._max_turns,
+                resume_state=(
+                    None
+                    if checkpoint is None
+                    else dict(checkpoint.loop_state)
+                ),
             )
         except (KeyboardInterrupt, SystemExit):
             self._mark_uncertain(claim)
@@ -454,7 +556,11 @@ class DurableAgentActivityExecutor:
                 "agent_activity_execution_failed"
             )
         if loop_result.get("exit_reason") != "CURRENT_TASK_DONE":
-            self._complete_known_non_success(claim, loop_result)
+            self._complete_known_non_success(
+                claim,
+                loop_result,
+                collector,
+            )
             raise AgentActivityExecutionError(
                 "agent_activity_execution_failed"
             )
@@ -511,6 +617,8 @@ class DurableAgentActivityExecutor:
         self,
         claim: ActivityClaim,
         request_ref: ArtifactRef,
+        *,
+        allow_running: bool = False,
     ) -> AgentActivityRequest:
         if (
             type(claim) is not ActivityClaim
@@ -555,7 +663,12 @@ class DurableAgentActivityExecutor:
             != self.scheduler.workflow.definition_digest
             or request.agent_name != claim.config.get("agent")
             or attempt is None
-            or attempt.status is not AttemptStatus.CLAIMED
+            or attempt.status
+            not in (
+                {AttemptStatus.CLAIMED, AttemptStatus.RUNNING}
+                if allow_running
+                else {AttemptStatus.CLAIMED}
+            )
             or attempt.worker_id != claim.worker_id
             or attempt.lease_id != claim.claim_token
             or attempt.fencing_token != claim.fencing_token
@@ -564,6 +677,167 @@ class DurableAgentActivityExecutor:
                 "agent_activity_claim_invalid"
             )
         return request
+
+    def _load_checkpoint(
+        self,
+        claim: ActivityClaim,
+        request_ref: ArtifactRef,
+    ) -> AgentTurnCheckpoint:
+        failed = False
+        try:
+            record = self.store.get_latest_agent_turn_checkpoint(
+                claim.run_id,
+                claim.node_id,
+                claim.attempt_id,
+            )
+            checkpoint = (
+                None
+                if record is None
+                else self._checkpoint_artifacts.load(
+                    record.checkpoint_ref
+                )
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            failed = True
+            record = None
+            checkpoint = None
+        if (
+            failed
+            or record is None
+            or checkpoint is None
+            or record.run_id != claim.run_id
+            or record.node_id != claim.node_id
+            or record.attempt_id != claim.attempt_id
+            or record.request_digest != claim.request_hash
+            or record.fencing_token != claim.fencing_token
+            or record.completed_turn != checkpoint.completed_turn
+            or record.checkpoint_digest
+            != checkpoint.checkpoint_digest
+            or record.previous_checkpoint_digest
+            != checkpoint.previous_checkpoint_digest
+            or record.checkpoint_ref.sha256
+            != checkpoint.checkpoint_digest
+            or not record.dependency_artifact_refs
+            or record.dependency_artifact_refs[0] != request_ref
+            or record.dependency_artifact_refs[1:]
+            != checkpoint.dependency_artifact_refs
+            or checkpoint.run_id != claim.run_id
+            or checkpoint.node_id != claim.node_id
+            or checkpoint.attempt_id != claim.attempt_id
+            or checkpoint.request_digest != claim.request_hash
+            or checkpoint.request_artifact_digest
+            != request_ref.sha256
+            or checkpoint.definition_digest
+            != self.scheduler.workflow.definition_digest
+        ):
+            raise AgentActivityExecutionError(
+                "agent_activity_recovery_unavailable"
+            )
+        return checkpoint
+
+    def _checkpoint_callback(
+        self,
+        *,
+        claim: ActivityClaim,
+        request: AgentActivityRequest,
+        request_ref: ArtifactRef,
+        collector: AgentExecutionEvidenceCollector,
+        client: DurableAgentProviderClient,
+        runtime_configuration_digest: str,
+        previous_checkpoint_digest: list[str | None],
+    ) -> Callable[[dict[str, Any]], None]:
+        def commit(snapshot: dict[str, Any]) -> None:
+            try:
+                completed_turn = snapshot["completed_turn"]
+                manifest = collector.checkpoint_manifest(
+                    completed_turn=completed_turn
+                )
+                provider_state = client.checkpoint_state()
+                checkpoint = AgentTurnCheckpoint(
+                    run_id=request.run_id,
+                    node_id=request.node_id,
+                    attempt_id=request.attempt_id,
+                    request_digest=request.request_digest,
+                    request_artifact_digest=request_ref.sha256,
+                    definition_digest=request.definition_digest,
+                    runtime_configuration_digest=(
+                        runtime_configuration_digest
+                    ),
+                    completed_turn=completed_turn,
+                    previous_checkpoint_digest=(
+                        previous_checkpoint_digest[0]
+                    ),
+                    loop_state=snapshot,
+                    provider_state=provider_state,
+                    evidence_manifest=manifest,
+                    artifact_sensitivity=(
+                        manifest.artifact_sensitivity
+                    ),
+                )
+                ref = self._checkpoint_artifacts.stage(checkpoint)
+                record = self.store.commit_agent_turn_checkpoint(
+                    claim.run_id,
+                    claim.node_id,
+                    claim.attempt_id,
+                    claim.request_hash,
+                    claim.worker_id,
+                    claim_token=claim.claim_token,
+                    fencing_token=claim.fencing_token,
+                    completed_turn=completed_turn,
+                    previous_checkpoint_digest=(
+                        previous_checkpoint_digest[0]
+                    ),
+                    checkpoint_ref=ref,
+                    request_ref=request_ref,
+                    provider_response_refs=(
+                        checkpoint.dependency_artifact_refs
+                    ),
+                    now=self.scheduler.current_time(),
+                )
+                if (
+                    record.checkpoint_ref != ref
+                    or record.checkpoint_digest
+                    != checkpoint.checkpoint_digest
+                ):
+                    raise AgentTurnCheckpointError(
+                        "invalid_agent_turn_checkpoint"
+                    )
+                previous_checkpoint_digest[0] = (
+                    checkpoint.checkpoint_digest
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
+                raise AgentActivityExecutionError(
+                    "agent_activity_checkpoint_failed"
+                ) from None
+
+        return commit
+
+    def _runtime_configuration_digest(
+        self,
+        system_prompt: str,
+        client: DurableAgentProviderClient,
+    ) -> str:
+        return hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "schema": "agent_activity_checkpoint_runtime_v1",
+                    "system_prompt_digest": hashlib.sha256(
+                        system_prompt.encode("utf-8")
+                    ).hexdigest(),
+                    "tools_schema_digest": hashlib.sha256(
+                        canonical_json_bytes(list(self._tools_schema))
+                    ).hexdigest(),
+                    "provider_configuration_digest": (
+                        client.checkpoint_configuration_digest
+                    ),
+                    "max_turns": self._max_turns,
+                }
+            )
+        ).hexdigest()
 
     def _context(
         self,
@@ -589,6 +863,7 @@ class DurableAgentActivityExecutor:
         if (
             type(context) is not AgentContext
             or context.execution_evidence_observer is not None
+            or context.durable_turn_callback is not None
             or context.agent_name not in {"", request.agent_name}
         ):
             raise AgentActivityExecutionError(
@@ -734,7 +1009,36 @@ class DurableAgentActivityExecutor:
         self,
         claim: ActivityClaim,
         loop_result: Mapping[str, Any],
+        collector: AgentExecutionEvidenceCollector,
     ) -> None:
+        evidence_unknown = False
+        try:
+            manifest = collector.finalize(
+                exit_reason=str(
+                    loop_result.get("exit_reason") or "ERROR"
+                ),
+                turns=loop_result["turns"],
+            )
+            for binding in manifest.tool_receipts:
+                receipt = self.store.get_tool_receipt(
+                    binding.run_id,
+                    binding.attempt_id,
+                )
+                if receipt is None:
+                    evidence_unknown = True
+                    break
+                binding.validate_receipt(receipt)
+                if receipt.attempt_status is AttemptStatus.OUTCOME_UNKNOWN:
+                    evidence_unknown = True
+                    break
+        except (KeyboardInterrupt, SystemExit):
+            self._mark_uncertain(claim)
+            raise
+        except BaseException:
+            evidence_unknown = True
+        if evidence_unknown:
+            self._mark_uncertain(claim)
+            return
         status = (
             AttemptStatus.CANCELLED
             if loop_result.get("exit_reason") == "INTERRUPTED"

@@ -330,6 +330,76 @@ class _RuntimeFixture:
 
 
 class DurableAgentProviderClientTests(unittest.TestCase):
+    def test_safe_turn_checkpoint_restores_history_and_lineage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            invoker = _Invoker(
+                [
+                    _response_bytes(content="first"),
+                    _response_bytes(content="second"),
+                ]
+            )
+            fixture = _RuntimeFixture(
+                Path(directory),
+                invoker=invoker,
+            )
+            first = fixture.client()
+            fixture.collector.provider_call_started(turn=1)
+            response = first.chat(
+                [{"role": "user", "content": "task"}],
+                [],
+            )
+            fixture.collector.provider_call_finished(
+                turn=1,
+                receipt=response.provider_receipt,
+            )
+            evidence = fixture.collector.checkpoint_manifest(
+                completed_turn=1
+            )
+            state = first.checkpoint_state()
+            restored_collector = (
+                AgentExecutionEvidenceCollector.from_checkpoint_manifest(
+                    evidence,
+                    request_sensitivity=ArtifactSensitivity.SENSITIVE,
+                )
+            )
+            restored = fixture.client(collector=restored_collector)
+
+            restored.restore_checkpoint_state(
+                state,
+                evidence_manifest=evidence,
+            )
+            restored_collector.provider_call_started(turn=2)
+            second = restored.chat(
+                [{"role": "user", "content": "continue"}],
+                [],
+            )
+            restored_collector.provider_call_finished(
+                turn=2,
+                receipt=second.provider_receipt,
+            )
+
+            self.assertEqual(restored.request_count, 2)
+            self.assertEqual(len(restored.result_artifact_refs), 2)
+            payload = json.loads(invoker.calls[1][1].decode("utf-8"))
+            self.assertEqual(
+                [message["content"] for message in payload["messages"]],
+                ["task", "first", "continue"],
+            )
+            tampered = dict(state)
+            tampered["authorization_digest"] = _digest("foreign")
+            fresh = fixture.client(collector=restored_collector)
+            with self.assertRaises(
+                AgentProviderClientError
+            ) as raised:
+                fresh.restore_checkpoint_state(
+                    tampered,
+                    evidence_manifest=evidence,
+                )
+            self.assertEqual(
+                raised.exception.reason_code,
+                "agent_provider_checkpoint_invalid",
+            )
+
     def test_real_loop_preserves_history_and_emits_durable_receipts(
         self,
     ) -> None:

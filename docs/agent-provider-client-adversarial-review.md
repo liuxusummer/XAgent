@@ -127,10 +127,10 @@ Round 3：通过。
 ## 残余风险
 
 - grant 签发成功后进程崩溃，新的进程无法重取 bearer；禁止通过普通持久化泄露 token。
-- client history 与 checkpoint 尚未 crash-consistent；恢复 Attempt 不能仅凭聊天文本决定
-  下一 invocation。
-- provider、动态 Tool 和本地 Agent terminal 子链已经形成参考组合，但跨进程 Loop resume、
-  远程 assignment ownership 与 attestation 未完成，仍不能开放远程 Agent。
+- client history、collector receipt prefix 和 Loop state 已由本地 Agent 组合纳入安全轮次
+  checkpoint；恢复不再依赖聊天文本猜测下一 invocation。
+- provider、动态 Tool、本地 checkpoint/resume 和 Agent terminal 子链已经形成参考组合，但
+  过期 Claim 接管、远程 assignment ownership 与 attestation 未完成，仍不能开放远程 Agent。
 - reference Broker/Invoker 不证明生产 gateway attestation、外部 ledger 或网络隔离。
 - reference ProviderInvoker 接口尚未证明有界网络 deadline 或 cooperative cancellation；
   client 不用不可终止的后台线程伪造 timeout，超时后的外部结果必须保持 unknown。

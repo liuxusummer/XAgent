@@ -18,6 +18,7 @@ from .agent_execution_evidence import (
     AgentExecutionEvidenceCollectorError,
 )
 from .agent_execution_manifest import (
+    AgentActivityExecutionManifest,
     MAX_AGENT_EXECUTION_TOOL_RECEIPTS,
     MAX_AGENT_EXECUTION_TURNS,
 )
@@ -308,6 +309,7 @@ class DurableAgentToolHandler(BaseHandler):
         request_ref: ArtifactRef,
         collector: AgentExecutionEvidenceCollector,
         tool_specs: Iterable[AgentToolSpec],
+        checkpoint_manifest: AgentActivityExecutionManifest | None = None,
     ) -> None:
         if (
             type(ctx) is not AgentContext
@@ -367,6 +369,26 @@ class DurableAgentToolHandler(BaseHandler):
             raise AgentToolHandlerError(
                 "agent_tool_parent_binding_mismatch"
             ) from None
+        if checkpoint_manifest is not None:
+            if (
+                type(checkpoint_manifest)
+                is not AgentActivityExecutionManifest
+            ):
+                raise AgentToolHandlerError(
+                    "agent_tool_parent_binding_mismatch"
+                )
+            try:
+                restored_manifest = collector.checkpoint_manifest(
+                    completed_turn=checkpoint_manifest.turns or 0
+                )
+            except AgentExecutionEvidenceCollectorError:
+                restored_manifest = None
+            if (
+                restored_manifest != checkpoint_manifest
+            ):
+                raise AgentToolHandlerError(
+                    "agent_tool_parent_binding_mismatch"
+                )
         try:
             specs = tuple(tool_specs)
         except TypeError:
@@ -394,6 +416,23 @@ class DurableAgentToolHandler(BaseHandler):
         self._state_lock = threading.Lock()
         self._seen_attempt_ids: set[str] = set()
         self._seen_receipt_digests: set[str] = set()
+        if checkpoint_manifest is not None:
+            self._seen_attempt_ids.update(
+                binding.attempt_id
+                for binding in checkpoint_manifest.tool_receipts
+            )
+            self._seen_receipt_digests.update(
+                checkpoint_manifest.tool_receipt_digests
+            )
+            if (
+                len(self._seen_attempt_ids)
+                != len(checkpoint_manifest.tool_receipts)
+                or len(self._seen_receipt_digests)
+                != len(checkpoint_manifest.tool_receipts)
+            ):
+                raise AgentToolHandlerError(
+                    "agent_tool_parent_binding_mismatch"
+                )
 
     def __repr__(self) -> str:
         return (

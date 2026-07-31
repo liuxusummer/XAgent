@@ -2548,6 +2548,42 @@ class DurableRunStoreTests(unittest.TestCase):
         with self.assertRaises(StoreSchemaError):
             DurableRunStore(other)
 
+    def test_version_ten_migration_creates_agent_checkpoint_ledger(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executescript(
+                """
+                DROP TABLE agent_turn_checkpoints;
+                DELETE FROM schema_migrations WHERE version = 10;
+                PRAGMA user_version = 9;
+                """
+            )
+
+        DurableRunStore(self.db_path)
+
+        with sqlite3.connect(self.db_path) as conn:
+            version = conn.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()[0]
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(agent_turn_checkpoints)"
+                )
+            }
+        self.assertEqual(version, STORE_SCHEMA_VERSION)
+        self.assertIn("checkpoint_ref_json", columns)
+        self.assertIn("dependency_artifact_refs_json", columns)
+
+    def test_current_schema_cannot_omit_agent_checkpoint_ledger(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DROP TABLE agent_turn_checkpoints")
+
+        with self.assertRaisesRegex(
+            StoreSchemaError,
+            "checkpoint ledger schema is incomplete",
+        ):
+            DurableRunStore(self.db_path)
+
     def test_version_six_migration_installs_fleet_run_route_fencing(
         self,
     ) -> None:

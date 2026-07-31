@@ -57,6 +57,7 @@ class ArtifactWriteError(ArtifactError):
 class ArtifactKind(StrEnum):
     AGENT_REQUEST = "agent_request"
     AGENT_EXECUTION_MANIFEST = "agent_execution_manifest"
+    AGENT_TURN_CHECKPOINT = "agent_turn_checkpoint"
     MODEL_RESPONSE = "model_response"
     TOOL_RECEIPT = "tool_receipt"
     TOOL_RESULT = "tool_result"

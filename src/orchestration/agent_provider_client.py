@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import threading
 from typing import Any, Callable
@@ -12,6 +13,10 @@ from src.core.llm import ChatResponse
 from .agent_execution_evidence import (
     AgentExecutionEvidenceCollector,
     AgentExecutionEvidenceCollectorError,
+)
+from .agent_execution_manifest import (
+    AgentActivityExecutionManifest,
+    MAX_AGENT_EXECUTION_PROVIDER_RECEIPTS,
 )
 from .agent_request import (
     AgentActivityRequest,
@@ -65,6 +70,7 @@ _CLIENT_ERROR_REASONS = frozenset(
         "agent_provider_request_too_large",
         "agent_provider_response_invalid",
         "agent_provider_result_binding_mismatch",
+        "agent_provider_checkpoint_invalid",
         "invalid_agent_provider_client",
     }
 )
@@ -267,6 +273,210 @@ class DurableAgentProviderClient:
                 ArtifactRef.from_dict(ref.to_dict())
                 for ref in self._result_artifact_refs
             )
+
+    @property
+    def checkpoint_configuration_digest(self) -> str:
+        """Bind every client option that can change a resumed wire request."""
+
+        return hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "schema": "agent_provider_client_checkpoint_config_v1",
+                    "route_id": self._route_id,
+                    "route_digest": self._route.route_digest,
+                    "grant_ttl_seconds": self._grant_ttl_seconds,
+                    "maximum_broker_attempts": self._maximum_broker_attempts,
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens,
+                    "context_window_chars": self.context_window_chars,
+                }
+            )
+        ).hexdigest()
+
+    def checkpoint_state(self) -> dict[str, Any]:
+        """Return detached sensitive state for a safe-turn Artifact."""
+
+        with self._lock:
+            payload = {
+                "schema_version": 1,
+                "configuration_digest": self.checkpoint_configuration_digest,
+                "request_count": self.request_count,
+                "authorization_digest": self._authorization_digest,
+                "system_messages": self._system_messages,
+                "history": self.history,
+                "history_compaction": self.history_compaction,
+                "result_artifact_refs": [
+                    ref.to_dict()
+                    for ref in self._result_artifact_refs
+                ],
+            }
+            try:
+                return json.loads(
+                    canonical_json_bytes(payload).decode("utf-8")
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
+                pass
+        raise AgentProviderClientError(
+            "agent_provider_checkpoint_invalid"
+        )
+
+    def restore_checkpoint_state(
+        self,
+        state: Any,
+        *,
+        evidence_manifest: AgentActivityExecutionManifest,
+    ) -> None:
+        """Restore a validated closed provider prefix before the next call."""
+
+        invalid = False
+        try:
+            detached = json.loads(
+                canonical_json_bytes(state).decode("utf-8")
+            )
+            required = {
+                "schema_version",
+                "configuration_digest",
+                "request_count",
+                "authorization_digest",
+                "system_messages",
+                "history",
+                "history_compaction",
+                "result_artifact_refs",
+            }
+            request_count = detached["request_count"]
+            configuration_digest = detached["configuration_digest"]
+            authorization_digest = detached["authorization_digest"]
+            system_messages = detached["system_messages"]
+            history = detached["history"]
+            compaction = detached["history_compaction"]
+            raw_refs = detached["result_artifact_refs"]
+            refs = tuple(
+                ArtifactRef.from_dict(value) for value in raw_refs
+            )
+            receipts = tuple(
+                binding.receipt
+                for binding in evidence_manifest.provider_receipts
+            )
+            encode_agent_provider_request(
+                [*system_messages, *history],
+                [],
+                retained_system=[],
+                retained_history=[],
+                invocation_index=request_count + 1,
+                temperature=self.temperature,
+                max_output_tokens=self.max_tokens,
+            )
+            if (
+                type(detached) is not dict
+                or set(detached) != required
+                or detached["schema_version"] != 1
+                or configuration_digest
+                != self.checkpoint_configuration_digest
+                or type(evidence_manifest)
+                is not AgentActivityExecutionManifest
+                or evidence_manifest.exit_reason != "CHECKPOINT"
+                or evidence_manifest.run_id != self._request.run_id
+                or evidence_manifest.node_id != self._request.node_id
+                or evidence_manifest.attempt_id
+                != self._request.attempt_id
+                or evidence_manifest.request_digest
+                != self._request.request_digest
+                or evidence_manifest.request_artifact_digest
+                != self._request_ref.sha256
+                or not evidence_manifest.has_complete_provider_receipt_lineage
+                or type(request_count) is not int
+                or not 1
+                <= request_count
+                <= MAX_AGENT_EXECUTION_PROVIDER_RECEIPTS
+                or type(authorization_digest) is not str
+                or len(authorization_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in authorization_digest
+                )
+                or type(system_messages) is not list
+                or any(
+                    message.get("role") != "system"
+                    for message in system_messages
+                )
+                or type(history) is not list
+                or any(
+                    message.get("role") == "system"
+                    for message in history
+                )
+                or not _valid_checkpoint_compaction(compaction)
+                or type(raw_refs) is not list
+                or [ref.to_dict() for ref in refs] != raw_refs
+                or len(refs) != request_count
+                or len(receipts) != request_count
+                or any(
+                    not self._checkpoint_ref_valid(ref)
+                    for ref in refs
+                )
+                or any(
+                    receipt.authorization_digest
+                    != authorization_digest
+                    or receipt.response_digest != ref.sha256
+                    or receipt.response_sensitivity
+                    is not ref.sensitivity
+                    or receipt.response_artifact_ref_digest
+                    != hashlib.sha256(
+                        canonical_json_bytes(ref.to_dict())
+                    ).hexdigest()
+                    for receipt, ref in zip(
+                        receipts,
+                        refs,
+                        strict=True,
+                    )
+                )
+            ):
+                raise ValueError
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            invalid = True
+            request_count = 0
+            authorization_digest = None
+            system_messages = []
+            history = []
+            compaction = []
+            refs = ()
+        if invalid:
+            raise AgentProviderClientError(
+                "agent_provider_checkpoint_invalid"
+            )
+        with self._lock:
+            if (
+                self.request_count != 0
+                or self._authorization_digest is not None
+                or self._system_messages
+                or self.history
+                or self.history_compaction
+                or self._result_artifact_refs
+            ):
+                raise AgentProviderClientError(
+                    "agent_provider_checkpoint_invalid"
+                )
+            self.request_count = request_count
+            self._authorization_digest = authorization_digest
+            self._system_messages = system_messages
+            self.history = history
+            self.history_compaction = compaction
+            self._result_artifact_refs = list(refs)
+
+    def _checkpoint_ref_valid(self, ref: ArtifactRef) -> bool:
+        return (
+            ref.kind is ArtifactKind.MODEL_RESPONSE
+            and ref.media_type == "application/octet-stream"
+            and ref.producer_run_id == self._request.run_id
+            and ref.producer_node_id == self._request.node_id
+            and ref.producer_attempt_id == self._request.attempt_id
+            and not ref.metadata
+            and _sensitivity_rank(ref.sensitivity)
+            >= _sensitivity_rank(self._request_ref.sensitivity)
+        )
 
     def chat(
         self,
@@ -634,6 +844,31 @@ def _sensitivity_rank(value: ArtifactSensitivity) -> int:
         ArtifactSensitivity.SENSITIVE: 2,
         ArtifactSensitivity.SECRET: 3,
     }[ArtifactSensitivity(value)]
+
+
+def _valid_checkpoint_compaction(value: Any) -> bool:
+    if (
+        type(value) is not list
+        or len(value) > MAX_AGENT_PROVIDER_HISTORY_COMPACTIONS
+    ):
+        return False
+    for item in value:
+        if (
+            type(item) is not dict
+            or set(item)
+            != {"reason", "omitted_count", "source_sha256"}
+            or item.get("reason") != "agent_provider_history_bound"
+            or type(item.get("omitted_count")) is not int
+            or item["omitted_count"] < 1
+            or type(item.get("source_sha256")) is not str
+            or len(item["source_sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in item["source_sha256"]
+            )
+        ):
+            return False
+    return True
 
 
 __all__ = [

@@ -22,12 +22,12 @@ import sqlite3
 import threading
 import time
 from contextlib import closing, contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field as dataclass_field, replace
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Sequence
 
-from .artifacts import ArtifactRef, ArtifactSensitivity
+from .artifacts import ArtifactKind, ArtifactRef, ArtifactSensitivity
 from .event_types import DURABLE_EVENT_TYPES
 from .models import (
     MODEL_SCHEMA_VERSION,
@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from .agent_receipt import AgentActivityReceipt
     from .executor import ToolReceipt
 
-STORE_SCHEMA_VERSION = 9
+STORE_SCHEMA_VERSION = 10
 DEFAULT_BUSY_TIMEOUT_MS = 10_000
 DEFAULT_EVENT_LIMIT = 1_000
 MAX_EVENT_LIMIT = 10_000
@@ -75,6 +75,8 @@ FLEET_RUN_ROUTE_SCHEMA_VERSION = 1
 HIERARCHY_ADMISSION_SCHEMA_VERSION = 1
 MAX_HIERARCHY_ADMISSION_DEPTH = 64
 AGENT_TOOL_INVOCATION_SCHEMA_VERSION = 1
+AGENT_TURN_CHECKPOINT_RECORD_SCHEMA_VERSION = 1
+MAX_AGENT_TURN_CHECKPOINTS_PER_ATTEMPT = 64
 MAX_AGENT_TOOL_INVOCATIONS_PER_ATTEMPT = 64
 MAX_AGENT_TOOL_LEASE_SECONDS = 24 * 60 * 60
 DEFAULT_AGENT_TOOL_LEASE_SECONDS = 5 * 60
@@ -361,6 +363,25 @@ class AgentToolInvocationConflict(OrchestrationStoreError, ValueError):
         super().__init__(reason_code)
 
 
+class AgentTurnCheckpointConflict(OrchestrationStoreError, ValueError):
+    """A safe-turn checkpoint lost fencing or violated its append-only chain."""
+
+    _REASON_CODES = frozenset(
+        {
+            "agent_turn_checkpoint_binding_mismatch",
+            "agent_turn_checkpoint_claim_mismatch",
+            "agent_turn_checkpoint_sequence_conflict",
+            "agent_turn_checkpoint_state_conflict",
+        }
+    )
+
+    def __init__(self, reason_code: str) -> None:
+        if reason_code not in self._REASON_CODES:
+            raise ValueError("invalid Agent turn checkpoint reason code")
+        self.reason_code = reason_code
+        super().__init__(reason_code)
+
+
 _SCHEMA_LOCK = threading.Lock()
 
 
@@ -371,6 +392,36 @@ class ArtifactGCClaimRecord:
     size: int
     claimed_at: float
     state: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class AgentTurnCheckpointRecord:
+    """One append-only checkpoint pointer committed under an Activity lease."""
+
+    run_id: str
+    node_id: str
+    attempt_id: str
+    request_digest: str
+    completed_turn: int
+    checkpoint_digest: str
+    previous_checkpoint_digest: str | None
+    checkpoint_ref: ArtifactRef = dataclass_field(repr=False)
+    dependency_artifact_refs: tuple[ArtifactRef, ...] = dataclass_field(
+        repr=False
+    )
+    fencing_token: int
+    created_at: float
+    schema_version: int = AGENT_TURN_CHECKPOINT_RECORD_SCHEMA_VERSION
+
+    def __repr__(self) -> str:
+        return (
+            "AgentTurnCheckpointRecord("
+            f"run_id={self.run_id!r}, node_id={self.node_id!r}, "
+            f"attempt_id={self.attempt_id!r}, "
+            f"completed_turn={self.completed_turn}, "
+            f"checkpoint_digest={self.checkpoint_digest!r}, "
+            f"fencing_token={self.fencing_token})"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1822,6 +1873,12 @@ class DurableRunStore:
                     "PRAGMA table_info(agent_tool_invocations)"
                 ).fetchall()
             }
+            agent_checkpoint_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(agent_turn_checkpoints)"
+                ).fetchall()
+            }
             expected_agent_tool_columns = {
                 "schema_version",
                 "invocation_id",
@@ -1862,6 +1919,23 @@ class DurableRunStore:
             if agent_tool_columns != expected_agent_tool_columns:
                 raise StoreSchemaError(
                     "Agent Tool invocation ledger schema is incomplete"
+                )
+            if agent_checkpoint_columns != {
+                "schema_version",
+                "run_id",
+                "node_id",
+                "attempt_id",
+                "request_digest",
+                "completed_turn",
+                "checkpoint_digest",
+                "previous_checkpoint_digest",
+                "checkpoint_ref_json",
+                "dependency_artifact_refs_json",
+                "fencing_token",
+                "created_at",
+            }:
+                raise StoreSchemaError(
+                    "Agent turn checkpoint ledger schema is incomplete"
                 )
             if {
                 "status",
@@ -2934,6 +3008,44 @@ class DurableRunStore:
                 status, lease_expires_at, updated_at, run_id
             )
             WHERE status IN ('scheduled', 'running')
+            """
+        )
+
+    @staticmethod
+    def _migrate_9_to_10(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_turn_checkpoints (
+                schema_version INTEGER NOT NULL,
+                run_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL
+                    CHECK(length(request_digest) = 64),
+                completed_turn INTEGER NOT NULL
+                    CHECK(completed_turn BETWEEN 1 AND 64),
+                checkpoint_digest TEXT NOT NULL
+                    CHECK(length(checkpoint_digest) = 64),
+                previous_checkpoint_digest TEXT
+                    CHECK(
+                        previous_checkpoint_digest IS NULL
+                        OR length(previous_checkpoint_digest) = 64
+                    ),
+                checkpoint_ref_json TEXT NOT NULL,
+                dependency_artifact_refs_json TEXT NOT NULL,
+                fencing_token INTEGER NOT NULL CHECK(fencing_token >= 1),
+                created_at REAL NOT NULL,
+                PRIMARY KEY(attempt_id, completed_turn),
+                UNIQUE(attempt_id, checkpoint_digest),
+                FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE RESTRICT,
+                FOREIGN KEY(attempt_id) REFERENCES attempts(attempt_id) ON DELETE RESTRICT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS agent_turn_checkpoints_latest_idx
+            ON agent_turn_checkpoints(attempt_id, completed_turn DESC)
             """
         )
 
@@ -4057,6 +4169,269 @@ class DurableRunStore:
                 (root_run_id, bounded_limit),
             ).fetchone()
         return int(row["descendant_count"])
+
+    @_audit_stale_activity_rejection
+    def commit_agent_turn_checkpoint(
+        self,
+        run_id: str,
+        node_id: str,
+        attempt_id: str,
+        request_hash: str,
+        owner_id: str,
+        *,
+        claim_token: str,
+        fencing_token: int,
+        completed_turn: int,
+        previous_checkpoint_digest: str | None,
+        checkpoint_ref: ArtifactRef,
+        request_ref: ArtifactRef,
+        provider_response_refs: Sequence[ArtifactRef],
+        now: float | None = None,
+    ) -> AgentTurnCheckpointRecord:
+        """Append one exact safe-turn pointer under the current live Claim."""
+
+        current_time = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        if (
+            type(completed_turn) is not int
+            or not 1
+            <= completed_turn
+            <= MAX_AGENT_TURN_CHECKPOINTS_PER_ATTEMPT
+            or isinstance(fencing_token, bool)
+            or not isinstance(fencing_token, int)
+            or fencing_token < 1
+        ):
+            raise AgentTurnCheckpointConflict(
+                "agent_turn_checkpoint_binding_mismatch"
+            )
+        previous = (
+            None
+            if previous_checkpoint_digest is None
+            else _sha256_digest(
+                previous_checkpoint_digest,
+                "previous_checkpoint_digest",
+            )
+        )
+        try:
+            responses = tuple(
+                ArtifactRef.from_dict(ref.to_dict())
+                for ref in provider_response_refs
+            )
+            checkpoint = ArtifactRef.from_dict(checkpoint_ref.to_dict())
+            request = ArtifactRef.from_dict(request_ref.to_dict())
+        except (AttributeError, TypeError, ValueError):
+            raise AgentTurnCheckpointConflict(
+                "agent_turn_checkpoint_binding_mismatch"
+            ) from None
+        if (
+            type(checkpoint_ref) is not ArtifactRef
+            or type(request_ref) is not ArtifactRef
+            or len(responses) != completed_turn
+            or any(type(ref) is not ArtifactRef for ref in provider_response_refs)
+            or checkpoint.kind is not ArtifactKind.AGENT_TURN_CHECKPOINT
+            or checkpoint.media_type
+            != "application/vnd.xagent.agent-turn-checkpoint+json"
+            or dict(checkpoint.metadata)
+            != {"schema": "agent_turn_checkpoint_v1"}
+            or checkpoint.producer_run_id != run_id
+            or checkpoint.producer_node_id != node_id
+            or checkpoint.producer_attempt_id != attempt_id
+            or checkpoint.sensitivity
+            not in {ArtifactSensitivity.SENSITIVE, ArtifactSensitivity.SECRET}
+            or request.kind is not ArtifactKind.AGENT_REQUEST
+            or request.producer_run_id != run_id
+            or request.producer_node_id != node_id
+            or request.producer_attempt_id != attempt_id
+            or request.sensitivity is not checkpoint.sensitivity
+            or any(
+                ref.kind is not ArtifactKind.MODEL_RESPONSE
+                or ref.producer_run_id != run_id
+                or ref.producer_node_id != node_id
+                or ref.producer_attempt_id != attempt_id
+                or _artifact_sensitivity_rank(ref.sensitivity)
+                < _artifact_sensitivity_rank(request.sensitivity)
+                for ref in responses
+            )
+        ):
+            raise AgentTurnCheckpointConflict(
+                "agent_turn_checkpoint_binding_mismatch"
+            )
+        dependency_refs = (request, *responses)
+        dependency_json = _json_dump(
+            [ref.to_dict() for ref in dependency_refs]
+        )
+        checkpoint_json = _json_dump(checkpoint.to_dict())
+        with self._write_transaction() as conn:
+            run, node, attempt = self._load_activity_tx(
+                conn,
+                run_id,
+                node_id,
+                attempt_id,
+            )
+            self._require_remote_activity_authority_tx(
+                conn,
+                attempt,
+                owner_id,
+            )
+            record = self._get_idempotency_tx(
+                conn,
+                run_id,
+                attempt.idempotency_key,
+            )
+            if record is None:
+                raise AgentTurnCheckpointConflict(
+                    "agent_turn_checkpoint_claim_mismatch"
+                )
+            try:
+                self._validate_claim_owner(
+                    record,
+                    request_hash=request_hash,
+                    owner_id=owner_id,
+                    claim_token=claim_token,
+                )
+            except IdempotencyConflictError:
+                raise AgentTurnCheckpointConflict(
+                    "agent_turn_checkpoint_claim_mismatch"
+                ) from None
+            if (
+                run.status is not RunStatus.RUNNING
+                or node.status is not NodeStatus.RUNNING
+                or attempt.activity_kind != "agent"
+                or attempt.status is not AttemptStatus.RUNNING
+                or attempt.metadata.get("request_hash") != request_hash
+                or attempt.worker_id != owner_id
+                or attempt.lease_id != claim_token
+                or attempt.fencing_token != fencing_token
+                or record.status is not IdempotencyStatus.IN_PROGRESS
+                or record.claim_count != fencing_token
+                or record.lease_expires_at <= current_time
+            ):
+                raise AgentTurnCheckpointConflict(
+                    "agent_turn_checkpoint_claim_mismatch"
+                )
+            existing_row = conn.execute(
+                """
+                SELECT * FROM agent_turn_checkpoints
+                WHERE attempt_id = ? AND completed_turn = ?
+                """,
+                (attempt_id, completed_turn),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._agent_turn_checkpoint_from_row(
+                    existing_row
+                )
+                if (
+                    existing.run_id != run_id
+                    or existing.node_id != node_id
+                    or existing.request_digest != request_hash
+                    or existing.previous_checkpoint_digest != previous
+                    or existing.checkpoint_ref != checkpoint
+                    or existing.dependency_artifact_refs
+                    != dependency_refs
+                    or existing.fencing_token != fencing_token
+                ):
+                    raise AgentTurnCheckpointConflict(
+                        "agent_turn_checkpoint_state_conflict"
+                    )
+                return existing
+            latest_row = conn.execute(
+                """
+                SELECT * FROM agent_turn_checkpoints
+                WHERE attempt_id = ?
+                ORDER BY completed_turn DESC
+                LIMIT 1
+                """,
+                (attempt_id,),
+            ).fetchone()
+            latest = (
+                None
+                if latest_row is None
+                else self._agent_turn_checkpoint_from_row(latest_row)
+            )
+            if (
+                latest is None
+                and (completed_turn != 1 or previous is not None)
+            ) or (
+                latest is not None
+                and (
+                    completed_turn != latest.completed_turn + 1
+                    or previous != latest.checkpoint_digest
+                )
+            ):
+                raise AgentTurnCheckpointConflict(
+                    "agent_turn_checkpoint_sequence_conflict"
+                )
+            _record_artifact_references_tx(
+                conn,
+                run_id=run_id,
+                event_id=(
+                    f"agent-turn-checkpoint:{attempt_id}:{completed_turn}"
+                ),
+                occurred_at=current_time,
+                value=[
+                    checkpoint.to_dict(),
+                    *(ref.to_dict() for ref in dependency_refs),
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO agent_turn_checkpoints(
+                    schema_version, run_id, node_id, attempt_id,
+                    request_digest, completed_turn, checkpoint_digest,
+                    previous_checkpoint_digest, checkpoint_ref_json,
+                    dependency_artifact_refs_json, fencing_token, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    AGENT_TURN_CHECKPOINT_RECORD_SCHEMA_VERSION,
+                    run_id,
+                    node_id,
+                    attempt_id,
+                    request_hash,
+                    completed_turn,
+                    checkpoint.sha256,
+                    previous,
+                    checkpoint_json,
+                    dependency_json,
+                    fencing_token,
+                    current_time,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM agent_turn_checkpoints
+                WHERE attempt_id = ? AND completed_turn = ?
+                """,
+                (attempt_id, completed_turn),
+            ).fetchone()
+            assert row is not None
+            return self._agent_turn_checkpoint_from_row(row)
+
+    def get_latest_agent_turn_checkpoint(
+        self,
+        run_id: str,
+        node_id: str,
+        attempt_id: str,
+    ) -> AgentTurnCheckpointRecord | None:
+        """Return the newest immutable checkpoint for one exact Attempt."""
+
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM agent_turn_checkpoints
+                WHERE run_id = ? AND node_id = ? AND attempt_id = ?
+                ORDER BY completed_turn DESC
+                LIMIT 1
+                """,
+                (run_id, node_id, attempt_id),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else self._agent_turn_checkpoint_from_row(row)
+        )
 
     def claim_artifact_gc_candidate(
         self,
@@ -11251,6 +11626,54 @@ class DurableRunStore:
             ) from exc
 
     @staticmethod
+    def _agent_turn_checkpoint_from_row(
+        row: sqlite3.Row,
+    ) -> AgentTurnCheckpointRecord:
+        try:
+            checkpoint_ref = ArtifactRef.from_dict(
+                _json_load(row["checkpoint_ref_json"])
+            )
+            raw_dependencies = _json_load(
+                row["dependency_artifact_refs_json"]
+            )
+            if not isinstance(raw_dependencies, list):
+                raise ValueError
+            dependencies = tuple(
+                ArtifactRef.from_dict(value)
+                for value in raw_dependencies
+            )
+            if (
+                _json_dump(checkpoint_ref.to_dict())
+                != row["checkpoint_ref_json"]
+                or _json_dump(
+                    [ref.to_dict() for ref in dependencies]
+                )
+                != row["dependency_artifact_refs_json"]
+            ):
+                raise ValueError
+            record = AgentTurnCheckpointRecord(
+                schema_version=row["schema_version"],
+                run_id=row["run_id"],
+                node_id=row["node_id"],
+                attempt_id=row["attempt_id"],
+                request_digest=row["request_digest"],
+                completed_turn=row["completed_turn"],
+                checkpoint_digest=row["checkpoint_digest"],
+                previous_checkpoint_digest=(
+                    row["previous_checkpoint_digest"]
+                ),
+                checkpoint_ref=checkpoint_ref,
+                dependency_artifact_refs=dependencies,
+                fencing_token=row["fencing_token"],
+                created_at=row["created_at"],
+            )
+            _validate_agent_turn_checkpoint_record(record)
+            return record
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise StoreSchemaError(
+                "Agent turn checkpoint ledger row is malformed"
+            ) from None
+    @staticmethod
     def _agent_tool_receipt_from_row(
         row: sqlite3.Row,
     ) -> "ToolReceipt | None":
@@ -11415,6 +11838,71 @@ def _agent_tool_text(value: Any, field_name: str) -> str:
             "agent_tool_binding_mismatch"
         )
     return value
+
+
+def _validate_agent_turn_checkpoint_record(
+    record: AgentTurnCheckpointRecord,
+) -> None:
+    if (
+        record.schema_version
+        != AGENT_TURN_CHECKPOINT_RECORD_SCHEMA_VERSION
+        or any(
+            not isinstance(value, str)
+            or not value
+            or len(value) > 255
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+            for value in (record.run_id, record.node_id, record.attempt_id)
+        )
+        or type(record.completed_turn) is not int
+        or not 1
+        <= record.completed_turn
+        <= MAX_AGENT_TURN_CHECKPOINTS_PER_ATTEMPT
+        or type(record.fencing_token) is not int
+        or record.fencing_token < 1
+    ):
+        raise ValueError("invalid Agent turn checkpoint identity")
+    _sha256_digest(record.request_digest, "request_digest")
+    digest = _sha256_digest(record.checkpoint_digest, "checkpoint_digest")
+    previous = record.previous_checkpoint_digest
+    if (record.completed_turn == 1) != (previous is None):
+        raise ValueError("invalid Agent turn checkpoint predecessor")
+    if previous is not None:
+        _sha256_digest(previous, "previous_checkpoint_digest")
+    _finite_timestamp(record.created_at, "created_at")
+    checkpoint = record.checkpoint_ref
+    dependencies = record.dependency_artifact_refs
+    if (
+        type(checkpoint) is not ArtifactRef
+        or checkpoint.sha256 != digest
+        or checkpoint.kind is not ArtifactKind.AGENT_TURN_CHECKPOINT
+        or checkpoint.media_type
+        != "application/vnd.xagent.agent-turn-checkpoint+json"
+        or dict(checkpoint.metadata)
+        != {"schema": "agent_turn_checkpoint_v1"}
+        or checkpoint.producer_run_id != record.run_id
+        or checkpoint.producer_node_id != record.node_id
+        or checkpoint.producer_attempt_id != record.attempt_id
+        or checkpoint.sensitivity
+        not in {ArtifactSensitivity.SENSITIVE, ArtifactSensitivity.SECRET}
+        or type(dependencies) is not tuple
+        or len(dependencies) != record.completed_turn + 1
+        or not all(type(ref) is ArtifactRef for ref in dependencies)
+        or dependencies[0].kind is not ArtifactKind.AGENT_REQUEST
+        or dependencies[0].sensitivity is not checkpoint.sensitivity
+        or any(
+            ref.producer_run_id != record.run_id
+            or ref.producer_node_id != record.node_id
+            or ref.producer_attempt_id != record.attempt_id
+            for ref in dependencies
+        )
+        or any(
+            ref.kind is not ArtifactKind.MODEL_RESPONSE
+            or _artifact_sensitivity_rank(ref.sensitivity)
+            < _artifact_sensitivity_rank(dependencies[0].sensitivity)
+            for ref in dependencies[1:]
+        )
+    ):
+        raise ValueError("invalid Agent turn checkpoint binding")
 
 
 def _agent_tool_effect_class(value: Any) -> str:

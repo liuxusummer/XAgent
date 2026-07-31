@@ -125,6 +125,47 @@ def _tool_receipt(sequence: int) -> ToolReceipt:
 
 
 class AgentExecutionEvidenceCollectorTests(unittest.TestCase):
+    def test_safe_turn_checkpoint_restores_exact_receipt_prefix(self):
+        collector = _collector()
+        provider = _provider_receipt(1)
+        tool = _tool_receipt(1)
+        collector.provider_call_started(turn=1)
+        collector.provider_call_finished(turn=1, receipt=provider)
+        collector.tool_call_started(
+            turn=1,
+            tool_name=tool.tool_name,
+            tool_call_id="call-1",
+        )
+        collector.tool_call_finished(
+            turn=1,
+            tool_name=tool.tool_name,
+            tool_call_id="call-1",
+            receipt=tool,
+        )
+
+        checkpoint = collector.checkpoint_manifest(completed_turn=1)
+        restored = AgentExecutionEvidenceCollector.from_checkpoint_manifest(
+            checkpoint,
+            request_sensitivity=ArtifactSensitivity.SENSITIVE,
+        )
+
+        self.assertEqual(checkpoint.exit_reason, "CHECKPOINT")
+        self.assertEqual(restored.observed_provider_calls, 1)
+        self.assertEqual(restored.observed_tool_calls, 1)
+        restored.provider_call_started(turn=2)
+        restored.provider_call_finished(
+            turn=2,
+            receipt=_provider_receipt(2),
+        )
+        terminal = restored.finalize(
+            exit_reason="CURRENT_TASK_DONE",
+            turns=2,
+        )
+        self.assertEqual(terminal.observed_provider_invocations, 2)
+        self.assertEqual(terminal.observed_tool_results, 1)
+        self.assertTrue(terminal.provider_receipts_complete)
+        self.assertTrue(terminal.tool_receipts_complete)
+
     def test_parent_binding_validation_is_exact_and_sanitized(
         self,
     ) -> None:

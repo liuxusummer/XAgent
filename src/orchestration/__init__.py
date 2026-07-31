@@ -65,6 +65,11 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "AgentTerminalCommitError",
         "DurableAgentTerminalCommitter",
     ),
+    ".agent_turn_checkpoint": (
+        "AgentTurnCheckpoint",
+        "AgentTurnCheckpointArtifactStore",
+        "AgentTurnCheckpointError",
+    ),
     ".agent_request": (
         "AgentActivityRequest",
         "AgentActivityRequestArtifactStore",

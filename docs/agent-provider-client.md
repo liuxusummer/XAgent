@@ -128,14 +128,20 @@ client 的重试始终复用同一个 grant、同一 authorization 和完全相�
 签发 grant 后进程崩溃仍无法在新进程取回 bearer；这是 Broker 已声明的限制。不得为了
 可恢复性把 bearer 写进 Event、manifest、checkpoint 或普通日志。
 
+在一次调用已经返回完整 receipt 后，`checkpoint_state()` 可导出 detached system/history、
+compaction、authorization digest、request count 和有序 response refs；它同时绑定 route、
+generation、context 和 retry 配置 digest。`restore_checkpoint_state()` 只接受与安全轮次
+manifest 完全一致的 provider receipt/ref prefix，并要求新 client 仍为空。该机制只恢复下一次
+尚未开始的调用，不恢复或猜测 in-flight grant。
+
 ## 7. 尚未完成
 
 - reference Durable Tool Handler、动态 child authority、父终态事务和本地
   `DurableAgentActivityExecutor` 已形成显式组合，但远程 Worker adapter 仍未接入；
-- provider client 的 history、collector manifest staging 和 checkpoint 尚未组成同一
-  crash-consistent transaction；
-- 本地组合已经原子提交 manifest、NodeResult、AgentActivityReceipt 和 Attempt terminal
-  Event；跨进程接管仍因 history/collector checkpoint 缺失而不可用；
+- 本地组合已把 client state、collector receipt prefix 和 Loop state 组成安全轮次 checkpoint，
+  并由主 Store 原子登记 checkpoint/request/provider response Artifact 引用；
+- 跨进程恢复仍要求控制面安全提供当前未过期 Claim bearer；过期 Claim 的换 owner/fencing
+  接管尚未实现；
 - Broker 的参考 `ProviderInvoker` readiness 不能证明 mTLS、attestation、egress 或外部
   operation ledger；
 - reference client 不在进程内线程上伪造可中断 timeout；部署侧 invoker 必须实施有界网络

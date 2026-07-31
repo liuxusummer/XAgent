@@ -59,7 +59,9 @@ state 一致。
 
 - 动态 child 的 `REQUIRE_APPROVAL` 暂以安全失败收敛，尚无 WAITING_APPROVAL/resume；
 - reference executor 是同进程 composition，远程认证、attestation 与外部幂等由部署负责；
-- child receipt 与父 Agent manifest/checkpoint/terminal receipt 尚未组成单一跨对象事务；
+- child terminal 与父 checkpoint/terminal 仍是顺序事务；安全轮次 checkpoint 会重验完整
+  receipt prefix，稳定 operation key 和 append-only child ledger 用于跨事务恢复，但这不等价于
+  外部副作用 exactly-once；
 - 独立全局 child scanner 尚未实现；父 lease recovery 已能事务化清理 orphan，父仍活跃时依赖
   同请求重放或显式 preflight abandonment；
 - reference LocalArtifactStore 不提供 secret encryption。

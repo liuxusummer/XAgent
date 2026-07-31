@@ -689,8 +689,9 @@ class AgentToolAuthorityStoreTests(unittest.TestCase):
             with sqlite3.connect(fixture.store.path) as conn:
                 conn.executescript(
                     """
+                    DROP TABLE agent_turn_checkpoints;
                     DROP TABLE agent_tool_invocations;
-                    DELETE FROM schema_migrations WHERE version = 9;
+                    DELETE FROM schema_migrations WHERE version >= 9;
                     PRAGMA user_version = 8;
                     """
                 )

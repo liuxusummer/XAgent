@@ -402,6 +402,88 @@ class AgentExecutionEvidenceCollector:
             self._close_tool(turn, tool_name, tool_call_id)
             self._tool_prefix_complete = False
 
+    def checkpoint_manifest(
+        self,
+        *,
+        completed_turn: int,
+    ) -> AgentActivityExecutionManifest:
+        """Return a validated receipt prefix without finalizing collection."""
+
+        with self._lock:
+            turn = _turn(completed_turn)
+            if (
+                self._finalized is not None
+                or self._open_provider is not None
+                or self._open_tool is not None
+                or turn != self._last_turn
+                or self._observed_provider_calls != turn
+                or not self._provider_prefix_complete
+                or not self._tool_prefix_complete
+            ):
+                raise AgentExecutionEvidenceCollectorError(
+                    "execution_evidence_checkpoint_unavailable"
+                )
+            return self._build_manifest(
+                exit_reason="CHECKPOINT",
+                turns=turn,
+            )
+
+    @classmethod
+    def from_checkpoint_manifest(
+        cls,
+        manifest: AgentActivityExecutionManifest,
+        *,
+        request_sensitivity: ArtifactSensitivity | str,
+    ) -> "AgentExecutionEvidenceCollector":
+        """Restore an exact closed receipt prefix at a safe turn boundary."""
+
+        if (
+            type(manifest) is not AgentActivityExecutionManifest
+            or manifest.exit_reason != "CHECKPOINT"
+            or manifest.turns is None
+            or manifest.turns < 1
+            or manifest.observed_provider_invocations
+            != manifest.turns
+            or not manifest.has_complete_provider_receipt_lineage
+            or not manifest.tool_receipts_complete
+        ):
+            raise AgentExecutionEvidenceCollectorError(
+                "invalid_execution_evidence_checkpoint"
+            )
+        collector = cls(
+            run_id=manifest.run_id,
+            node_id=manifest.node_id,
+            attempt_id=manifest.attempt_id,
+            request_digest=manifest.request_digest,
+            request_artifact_digest=(
+                manifest.request_artifact_digest
+            ),
+            definition_digest=manifest.definition_digest,
+            request_sensitivity=request_sensitivity,
+        )
+        with collector._lock:
+            collector._last_turn = manifest.turns
+            collector._observed_provider_calls = (
+                manifest.observed_provider_invocations
+            )
+            collector._observed_tool_calls = (
+                manifest.observed_tool_results
+            )
+            collector._provider_bindings = list(
+                manifest.provider_receipts
+            )
+            collector._tool_bindings = list(
+                manifest.tool_receipts
+            )
+            if (
+                collector._manifest_sensitivity()
+                is not manifest.artifact_sensitivity
+            ):
+                raise AgentExecutionEvidenceCollectorError(
+                    "invalid_execution_evidence_checkpoint"
+                )
+        return collector
+
     def finalize(
         self,
         *,
@@ -425,47 +507,54 @@ class AgentExecutionEvidenceCollector:
                 raise AgentExecutionEvidenceCollectorError(
                     "execution_evidence_finalization_conflict"
                 )
-            sensitivity = self._manifest_sensitivity()
-            try:
-                manifest = AgentActivityExecutionManifest(
-                    run_id=self._run_id,
-                    node_id=self._node_id,
-                    attempt_id=self._attempt_id,
-                    request_digest=self._request_digest,
-                    request_artifact_digest=(
-                        self._request_artifact_digest
-                    ),
-                    definition_digest=self._definition_digest,
-                    artifact_sensitivity=sensitivity,
-                    exit_reason=final_exit_reason,
-                    turns=final_turns,
-                    observed_tool_results=(
-                        self._observed_tool_calls
-                    ),
-                    tool_receipts_complete=(
-                        self._tool_prefix_complete
-                        and len(self._tool_bindings)
-                        == self._observed_tool_calls
-                    ),
-                    tool_receipts=tuple(self._tool_bindings),
-                    observed_provider_invocations=(
-                        self._observed_provider_calls
-                    ),
-                    provider_receipts_complete=(
-                        self._provider_prefix_complete
-                        and len(self._provider_bindings)
-                        == self._observed_provider_calls
-                    ),
-                    provider_receipts=tuple(
-                        self._provider_bindings
-                    ),
-                )
-            except AgentExecutionManifestError:
-                raise AgentExecutionEvidenceCollectorError(
-                    "execution_evidence_manifest_invalid"
-                ) from None
+            manifest = self._build_manifest(
+                exit_reason=final_exit_reason,
+                turns=final_turns,
+            )
             self._finalized = manifest
             return manifest
+
+    def _build_manifest(
+        self,
+        *,
+        exit_reason: str,
+        turns: int,
+    ) -> AgentActivityExecutionManifest:
+        sensitivity = self._manifest_sensitivity()
+        try:
+            return AgentActivityExecutionManifest(
+                run_id=self._run_id,
+                node_id=self._node_id,
+                attempt_id=self._attempt_id,
+                request_digest=self._request_digest,
+                request_artifact_digest=(
+                    self._request_artifact_digest
+                ),
+                definition_digest=self._definition_digest,
+                artifact_sensitivity=sensitivity,
+                exit_reason=exit_reason,
+                turns=turns,
+                observed_tool_results=self._observed_tool_calls,
+                tool_receipts_complete=(
+                    self._tool_prefix_complete
+                    and len(self._tool_bindings)
+                    == self._observed_tool_calls
+                ),
+                tool_receipts=tuple(self._tool_bindings),
+                observed_provider_invocations=(
+                    self._observed_provider_calls
+                ),
+                provider_receipts_complete=(
+                    self._provider_prefix_complete
+                    and len(self._provider_bindings)
+                    == self._observed_provider_calls
+                ),
+                provider_receipts=tuple(self._provider_bindings),
+            )
+        except AgentExecutionManifestError:
+            raise AgentExecutionEvidenceCollectorError(
+                "execution_evidence_manifest_invalid"
+            ) from None
 
     def _start_observation(self, turn: int) -> int:
         if self._finalized is not None:

@@ -43,6 +43,7 @@ MAX_CONTEXT_JSON_STRING_CHARS = 512 * 1024
 MAX_CONTEXT_JSON_KEY_CHARS = 256
 CONTEXT_STRING_PREVIEW_CHARS = 4_096
 CONTEXT_STRING_TRUNCATION_MARKER = "\n...[context string truncated]...\n"
+MAX_DURABLE_TURN_SNAPSHOT_BYTES = 16 * 1024 * 1024
 
 
 class _ContextValueLimitError(ValueError):
@@ -64,6 +65,14 @@ class ActionResult:
 
 class ExecutionEvidenceObservationError(RuntimeError):
     """A configured runtime evidence observer failed closed."""
+
+
+class DurableTurnCommitError(RuntimeError):
+    """A trusted safe-turn observer failed before the next provider call."""
+
+
+class DurableTurnRecoveryError(RuntimeError):
+    """A persisted safe-turn state cannot be restored exactly."""
 
 
 class AgentExecutionEvidenceObserver(Protocol):
@@ -159,6 +168,9 @@ class AgentContext:
     execution_evidence_observer: (
         AgentExecutionEvidenceObserver | None
     ) = field(default=None, repr=False)
+    durable_turn_callback: (
+        Callable[[dict[str, Any]], None] | None
+    ) = field(default=None, repr=False)
 
 
 @dataclass
@@ -211,6 +223,237 @@ def _observe_execution_evidence(
         raise ExecutionEvidenceObservationError(
             "execution_evidence_observation_failed"
         ) from None
+
+
+def _commit_durable_turn(
+    ctx: AgentContext,
+    *,
+    messages: list[dict[str, Any]],
+    final_response: str,
+    tool_results: list[dict[str, Any]],
+) -> None:
+    """Commit a detached exact safe-turn state before Loop continuation."""
+
+    callback = ctx.durable_turn_callback
+    if callback is None:
+        return
+    snapshot_failed = False
+    try:
+        principal = ctx.principal
+        payload = {
+            "schema_version": 1,
+            "completed_turn": ctx.current_turn,
+            "next_messages": messages,
+            "final_response": final_response,
+            "tool_results": tool_results,
+            "usage": ctx.token_usage.to_event_data(),
+            "context": {
+                "working": ctx.working,
+                "history_info": ctx.history_info,
+                "done_hooks": ctx.done_hooks,
+                "empty_count": ctx.empty_count,
+                "active_skills": ctx.active_skills,
+                "context_state": ctx.context_state,
+                "pending_approval": ctx.pending_approval,
+                "last_policy_decision": ctx.last_policy_decision,
+                "session_id": ctx.session_id,
+                "agent_name": ctx.agent_name,
+                "principal_digest": (
+                    principal.principal_digest
+                    if isinstance(principal, Principal)
+                    else ""
+                ),
+                "principal_boundary_digest": (
+                    principal.boundary_digest
+                    if isinstance(principal, Principal)
+                    else ""
+                ),
+            },
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if (
+            len(encoded) > MAX_DURABLE_TURN_SNAPSHOT_BYTES
+            or type(payload["completed_turn"]) is not int
+            or payload["completed_turn"] < 1
+        ):
+            raise ValueError
+        snapshot = json.loads(encoded.decode("utf-8"))
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        snapshot_failed = True
+        snapshot = None
+    if snapshot_failed or type(snapshot) is not dict:
+        raise DurableTurnCommitError(
+            "durable_turn_snapshot_invalid"
+        )
+    commit_failed = False
+    try:
+        callback(snapshot)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        commit_failed = True
+    if commit_failed:
+        raise DurableTurnCommitError(
+            "durable_turn_commit_failed"
+        )
+
+
+def _restore_durable_turn(
+    ctx: AgentContext,
+    state: Any,
+    *,
+    max_turns: int,
+) -> tuple[
+    list[dict[str, Any]],
+    str,
+    list[dict[str, Any]],
+    int,
+]:
+    """Restore a detached safe-turn state before any resumed provider call."""
+
+    invalid = False
+    try:
+        encoded = json.dumps(
+            state,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if not encoded or len(encoded) > MAX_DURABLE_TURN_SNAPSHOT_BYTES:
+            raise ValueError
+        snapshot = json.loads(encoded.decode("utf-8"))
+        required = {
+            "schema_version",
+            "completed_turn",
+            "next_messages",
+            "final_response",
+            "tool_results",
+            "usage",
+            "context",
+        }
+        context_required = {
+            "working",
+            "history_info",
+            "done_hooks",
+            "empty_count",
+            "active_skills",
+            "context_state",
+            "pending_approval",
+            "last_policy_decision",
+            "session_id",
+            "agent_name",
+            "principal_digest",
+            "principal_boundary_digest",
+        }
+        completed_turn = snapshot["completed_turn"]
+        messages = snapshot["next_messages"]
+        final_response = snapshot["final_response"]
+        tool_results = snapshot["tool_results"]
+        usage = snapshot["usage"]
+        context = snapshot["context"]
+        usage_fields = set(TokenUsage.__dataclass_fields__)
+        principal = ctx.principal
+        principal_digest = (
+            principal.principal_digest
+            if isinstance(principal, Principal)
+            else ""
+        )
+        principal_boundary_digest = (
+            principal.boundary_digest
+            if isinstance(principal, Principal)
+            else ""
+        )
+        if (
+            type(snapshot) is not dict
+            or set(snapshot) != required
+            or snapshot["schema_version"] != 1
+            or type(completed_turn) is not int
+            or not 1 <= completed_turn <= max_turns
+            or type(messages) is not list
+            or not messages
+            or any(type(message) is not dict for message in messages)
+            or type(final_response) is not str
+            or type(tool_results) is not list
+            or any(type(item) is not dict for item in tool_results)
+            or type(usage) is not dict
+            or set(usage).difference(usage_fields)
+            or any(type(value) is not int or value < 0 for value in usage.values())
+            or type(context) is not dict
+            or set(context) != context_required
+            or type(context["working"]) is not dict
+            or any(
+                type(key) is not str or type(value) is not str
+                for key, value in context["working"].items()
+            )
+            or any(
+                type(context[field_name]) is not list
+                or any(type(item) is not str for item in context[field_name])
+                for field_name in (
+                    "history_info",
+                    "done_hooks",
+                    "active_skills",
+                )
+            )
+            or type(context["empty_count"]) is not int
+            or context["empty_count"] < 0
+            or type(context["context_state"]) is not dict
+            or context["pending_approval"] is not None
+            and type(context["pending_approval"]) is not dict
+            or type(context["last_policy_decision"]) is not dict
+            or context["session_id"] != ctx.session_id
+            or context["agent_name"] != ctx.agent_name
+            or context["principal_digest"] != principal_digest
+            or context["principal_boundary_digest"]
+            != principal_boundary_digest
+        ):
+            raise ValueError
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        invalid = True
+        snapshot = None
+        messages = []
+        final_response = ""
+        tool_results = []
+        completed_turn = 0
+        usage = {}
+        context = {}
+    if invalid or snapshot is None:
+        raise DurableTurnRecoveryError("durable_turn_resume_invalid")
+    try:
+        ctx.working = dict(context["working"])
+        ctx.history_info = list(context["history_info"])
+        ctx.done_hooks = list(context["done_hooks"])
+        ctx.empty_count = context["empty_count"]
+        ctx.active_skills = list(context["active_skills"])
+        ctx.context_state = dict(context["context_state"])
+        ctx.pending_approval = (
+            None
+            if context["pending_approval"] is None
+            else dict(context["pending_approval"])
+        )
+        ctx.last_policy_decision = dict(
+            context["last_policy_decision"]
+        )
+        ctx.current_turn = completed_turn
+        ctx.context_manifest = None
+        ctx.token_usage = TokenUsage(**usage)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        raise DurableTurnRecoveryError(
+            "durable_turn_resume_invalid"
+        ) from None
+    return messages, final_response, tool_results, completed_turn + 1
 
 
 def _context_limits(client: Any) -> tuple[int, int]:
@@ -973,23 +1216,36 @@ def run_agent_loop(
     tools_schema: list[dict[str, Any]],
     max_turns: int = 40,
     stop_event: threading.Event | None = None,
+    resume_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     effective_system_prompt = "\n\n".join(
         part for part in (system_prompt.strip(), UNTRUSTED_TOOL_RESULTS_INSTRUCTION) if part
     )
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": effective_system_prompt},
-        {"role": "user", "content": user_input},
-    ]
-    final_response = ""
-    all_tool_results: list[dict[str, Any]] = []
+    if resume_state is None:
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": effective_system_prompt},
+            {"role": "user", "content": user_input},
+        ]
+        final_response = ""
+        all_tool_results: list[dict[str, Any]] = []
+        first_turn = 1
+        handler.ctx.token_usage = TokenUsage()
+    else:
+        (
+            messages,
+            final_response,
+            all_tool_results,
+            first_turn,
+        ) = _restore_durable_turn(
+            handler.ctx,
+            resume_state,
+            max_turns=max_turns,
+        )
     exit_reason = "MAX_TURNS_EXCEEDED"
 
     sink = handler.ctx.sink
     session_id = handler.ctx.session_id
     run_started_at = time.time()
-    handler.ctx.token_usage = TokenUsage()
-
     def _skill_state_data() -> dict[str, Any]:
         active_skills = list(getattr(handler.ctx, "active_skills", []) or [])
         return {"active_skills": active_skills}
@@ -1125,7 +1381,7 @@ def run_agent_loop(
             }
         ]
 
-    for turn in range(1, max_turns + 1):
+    for turn in range(first_turn, max_turns + 1):
         handler.ctx.current_turn = turn
         if _check_interrupt():
             _mark_interrupted()
@@ -1225,8 +1481,14 @@ def run_agent_loop(
             next_prompts = [result.next_prompt]
             if turn_end_prompt:
                 next_prompts.append(turn_end_prompt)
-            _emit_checkpoint("running", pending_prompts=next_prompts)
             messages = build_next_user_message(next_prompts, [])
+            _commit_durable_turn(
+                handler.ctx,
+                messages=messages,
+                final_response=final_response,
+                tool_results=all_tool_results,
+            )
+            _emit_checkpoint("running", pending_prompts=next_prompts)
             continue
 
         next_prompts: list[str] = []
@@ -1337,6 +1599,12 @@ def run_agent_loop(
 
         messages = build_next_user_message(next_prompts, turn_tool_results)
         _emit_turn_end(len(turn_tool_results))
+        _commit_durable_turn(
+            handler.ctx,
+            messages=messages,
+            final_response=final_response,
+            tool_results=all_tool_results,
+        )
         _emit_checkpoint("running", pending_prompts=next_prompts)
 
     handler.ctx.display_fn(f"[Done] exit_reason={exit_reason}, turns={handler.ctx.current_turn}")

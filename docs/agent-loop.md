@@ -225,11 +225,23 @@ def turn_end_callback(self, response, ...):
 
 **准入条件**：`_turn_end_hooks` 只允许注册**轮次级横切关注点**。判断标准：该逻辑是否需要感知 `current_turn` 或 `response` 全文？如果只需要感知单个工具的 `ActionResult`，它应该在 `tool_after_callback` 中。
 
+### durable_turn_callback 的安全边界
+
+默认路径不配置该回调，行为不变。Durable Orchestration 可注入
+`AgentContext.durable_turn_callback`：主循环仅在本轮 provider/Tool 调用已全部返回、下一轮
+messages 已构造且下一 provider 调用尚未开始时，传入 detached canonical snapshot。回调失败会
+抛出固定 `DurableTurnCommitError` 并阻止继续，不能像旧 summary checkpoint 一样吞掉错误。
+
+恢复时 `resume_state` 必须匹配 session、agent 和 principal digest，恢复累计 usage、Tool 结果、
+下一轮 messages 及有界 Context 字段，然后从 `completed_turn + 1` 开始。Loop 本身不选择文件、
+不查 `latest`、不持久化 Artifact，也不处理 Claim/CAS；这些仍属于外层控制面。
+
 ## 6. 不做的事
 
 - **不做并行工具调用**：物理操作有副作用，串行是最安全的默认策略
 - **不做工具结果缓存**：文件系统和浏览器状态随时变化，缓存会导致过期数据
-- **不做循环状态持久化**：循环中断后从 Session 历史恢复，不需要额外的状态快照
+- **不内建循环状态存储**：默认路径仍从 Session 历史恢复；只有显式注入的 durable callback
+  才能在安全轮边界交给外层控制面持久化
 - **Agent Loop 内不做自定义循环拓扑**：它仍是线性循环，不是 DAG 或持久状态机。需要跨
   Agent/Tool 的确定性 DAG、恢复和策略门禁时，由可选 Durable Orchestration 外层控制面负责
 - **不做工具级重试**：工具失败返回错误信息给 LLM，由 LLM 决定重试策略。循环引擎不替 LLM 做决策

@@ -75,8 +75,10 @@
 - Agent Kernel：默认路径的工具授权、Memory 候选、EvidenceBundle 和 ContextManifest
   使用统一的有界元数据契约；完整边界见 `docs/agent-kernel.md`
 - Durable Orchestration 是显式启用的外层控制面：它只持久化 Run、Node、Attempt、Domain
-  Event 和 Artifact 引用，不持久化 Agent Loop 的 provider 内部状态，也不允许原始工具输出越过
-  Artifact 边界。未启用时，现有 CLI、Web 单 Agent 和 Team Workflow 行为保持不变。完整协议见
+  Event 和 Artifact 引用；本地 Agent 参考执行器还可把安全轮次的精确 Loop/provider 状态写入
+  至少 SENSITIVE 的 content-addressed checkpoint Artifact，主库只保存不可变指针、CAS 链和
+  GC 依赖引用。原始工具输出仍不得越过 Artifact 边界。未启用时，现有 CLI、Web 单 Agent 和
+  Team Workflow 行为保持不变。完整协议见
   `docs/durable-orchestration-spec.md`
 - Agent Activity 终态以 `AgentActivityReceipt` 绑定 request digest、规范 NodeResult 和
   Artifact digest；它只证明运行时观察到整个 Loop 边界，不会把内部未回执的工具副作用
@@ -100,8 +102,11 @@
   契约与三轮审查见 `docs/agent-terminal-commit.md`。
 - `DurableAgentActivityExecutor` 已提供显式启用的本地参考组合：request 在 Claim 前 stage，
   所有配置在 RUNNING 前预检，执行中续租父 Claim，并把真实 provider refs、动态 Tool receipts
-  和最终 response Artifact 交给上述终态边界。它不改默认 CLI/Web；因跨进程 Loop resume 与
-  远程 ownership 尚未完成，两个 readiness 均为 false。见
+  和最终 response Artifact 交给上述终态边界。每个闭合非终态轮次还会在下一 provider 调用前
+  原子提交 checkpoint 指针及 request/provider Artifact GC 引用；持有当前 Claim bearer 的重启
+  进程可恢复 history、receipt prefix、上下文和 usage。它不改默认 CLI/Web；
+  `durable_result_recovery_ready` 为 true，但远程 ownership/attestation 与过期 Claim 接管尚未
+  完成，`production_security_ready` 仍为 false。见
   `docs/agent-activity-executor.md`。
 - Agent Activity 的 task/context 可由 `AgentActivityRequest` 物化为至少 sensitive
   （并继承 context 最高分类）的 content-addressed Artifact，绑定稳定
