@@ -389,9 +389,10 @@ active durable authority 只延期到 terminal，不由内存 projection 撤销�
 typed `AgentActivityRequest` task/context Artifact 和 `AgentActivityReceipt` 整体回执
 基础契约已经存在，credential-free route + one-call `ProviderAccessGrant` 也提供了
 参考边界，但都尚未接入安全 remote adapter；ProviderAccessBroker 虽可持久化
-anti-replay 墓碑，仍没有 invocation result receipt，生产 readiness 固定为 false。
-未来仍必须提供独立、可验证的 Agent runtime、durable provider result receipt、逐工具
-receipt 聚合及完整 completion/recovery 组合后，才能把 `agent`
+anti-replay 墓碑和 completed result receipt，仍不能消除 upstream 调用与 receipt
+提交之间的 unknown window，生产 readiness 固定为 false。未来仍必须提供独立、可验证的
+Agent runtime、upstream idempotency/查询协议、逐工具 receipt 聚合及完整
+completion/recovery 组合后，才能把 `agent`
 加入两侧的 `supported_activity_kinds`，禁止仅修改注册字符串或 Fleet 路由绕过该门禁。
 输入契约见 [agent-activity-request.md](agent-activity-request.md)，credential 边界见
 [provider-credential-boundary.md](provider-credential-boundary.md)。
@@ -420,8 +421,13 @@ Domain Event；仅内存 staging 仍需调用方重新发送原内容。过期 t
 schema v3 为 provider gateway 增加逻辑调用唯一 digest、gateway token/binding digest、
 `issued/consumed` 墓碑和 purge 时间水位。共享同一本机 SQLite 的 Broker 以
 `BEGIN IMMEDIATE` 串行化签发与消费；journal 不保存 prompt、response、upstream
-credential 或 endpoint。该能力只恢复 one-call grant 的 anti-replay 状态，不恢复
-provider 调用结果，也不提供跨主机共识，因此不能独立提升 remote Agent readiness。
+credential 或 endpoint。
+
+schema v4 将实际 request payload SHA-256 与 `invoking/completed/outcome_unknown`
+invocation receipt 分表持久化。completed receipt 可保存由受信 ArtifactStore 生成的
+MODEL_RESPONSE `ArtifactRef`，但不保存 response bytes；journal commit 后响应丢失可从
+Artifact 重放，commit 前或 upstream 异常只保留 unknown tombstone、禁止重调。该能力
+仍不提供跨主机共识或上游 exactly-once，因此不能独立提升 remote Agent readiness。
 完整契约见 [remote-execution-recovery.md](remote-execution-recovery.md)。
 
 ## 8. Observability

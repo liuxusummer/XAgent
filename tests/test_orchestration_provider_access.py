@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -17,7 +18,10 @@ from src.orchestration.remote_execution_journal import (
     RemoteExecutionJournal,
 )
 from src.orchestration.worker_security import WorkerAuthorization
-from src.orchestration.artifacts import ArtifactSensitivity
+from src.orchestration.artifacts import (
+    ArtifactSensitivity,
+    LocalArtifactStore,
+)
 
 
 _UPSTREAM_SECRET = "upstream-provider-secret-28c6a"
@@ -78,6 +82,19 @@ class ProviderInvoker:
                 f"provider leaked {self.api_key}"
             )
         return self.response
+
+
+class CrashAfterProviderCompletionJournal(RemoteExecutionJournal):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.crash_after_completion = True
+
+    def complete_provider_invocation(self, **kwargs):
+        completed = super().complete_provider_invocation(**kwargs)
+        if self.crash_after_completion:
+            self.crash_after_completion = False
+            raise SystemExit("simulated response loss")
+        return completed
 
 
 def _route(
@@ -166,6 +183,13 @@ class ProviderAccessBrokerTests(unittest.TestCase):
         self.assertNotIn("endpoint", serialized)
         self.assertFalse(self.broker.production_security_ready)
         self.assertFalse(self.broker.durable_recovery_ready)
+        self.assertFalse(
+            self.broker.durable_result_recovery_ready
+        )
+        self.assertEqual(
+            grant.response_sensitivity,
+            ArtifactSensitivity.SENSITIVE,
+        )
         record = self.broker._recovery_journal.get_provider_grant(
             grant.grant_id
         )
@@ -193,7 +217,7 @@ class ProviderAccessBrokerTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             ProviderAccessDenied,
-            "provider_grant_unavailable",
+            "provider_result_unavailable",
         ):
             self.broker.invoke(
                 grant,
@@ -249,9 +273,16 @@ class ProviderAccessBrokerTests(unittest.TestCase):
             outcomes = list(executor.map(invoke_once, range(16)))
 
         self.assertEqual(outcomes.count("ok"), 1)
-        self.assertEqual(
-            outcomes.count("provider_grant_unavailable"),
-            15,
+        self.assertTrue(
+            all(
+                outcome
+                in {
+                    "ok",
+                    "provider_invocation_outcome_unknown",
+                    "provider_result_unavailable",
+                }
+                for outcome in outcomes
+            )
         )
         self.assertEqual(len(self.invoker.calls), 1)
 
@@ -311,7 +342,7 @@ class ProviderAccessBrokerTests(unittest.TestCase):
         self.assertIsNone(raised.exception.__context__)
         with self.assertRaisesRegex(
             ProviderAccessDenied,
-            "provider_grant_unavailable",
+            "provider_invocation_outcome_unknown",
         ):
             broker.invoke(grant, self.authorization, b"safe")
         self.assertEqual(len(invoker.calls), 1)
@@ -350,7 +381,7 @@ class ProviderAccessBrokerTests(unittest.TestCase):
             broker.invoke(grant, self.authorization, b"1234")
         with self.assertRaisesRegex(
             ProviderAccessDenied,
-            "provider_grant_unavailable",
+            "provider_invocation_outcome_unknown",
         ):
             broker.invoke(grant, self.authorization, b"1234")
 
@@ -514,6 +545,9 @@ class ProviderAccessBrokerTests(unittest.TestCase):
         payload = b'{"messages":[{"content":"restart-safe"}]}'
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "provider-grants.sqlite3"
+            result_store = LocalArtifactStore(
+                Path(temporary) / "provider-results"
+            )
             first_journal = RemoteExecutionJournal(path)
             first = ProviderAccessBroker(
                 (_route(),),
@@ -521,6 +555,7 @@ class ProviderAccessBrokerTests(unittest.TestCase):
                 invoker=self.invoker,
                 clock=self.clock,
                 recovery_journal=first_journal,
+                result_store=result_store,
             )
             grant = first.issue(
                 self.authorization,
@@ -538,14 +573,27 @@ class ProviderAccessBrokerTests(unittest.TestCase):
                 invoker=self.invoker,
                 clock=self.clock,
                 recovery_journal=second_journal,
+                result_store=result_store,
             )
             self.assertTrue(second.durable_recovery_ready)
+            self.assertTrue(second.durable_result_recovery_ready)
+            self.assertFalse(second.production_security_ready)
             result = second.invoke(
                 grant,
                 self.authorization,
                 payload,
             )
             self.assertEqual(result.content, b'{"status":"ok"}')
+            self.assertIsNotNone(result.artifact_ref)
+            assert result.artifact_ref is not None
+            self.assertEqual(
+                result.artifact_ref.sensitivity,
+                ArtifactSensitivity.SENSITIVE,
+            )
+            self.assertNotIn(
+                result.artifact_ref.artifact_id,
+                repr(result),
+            )
             second_journal.close()
 
             third_journal = RemoteExecutionJournal(path)
@@ -555,12 +603,27 @@ class ProviderAccessBrokerTests(unittest.TestCase):
                 invoker=self.invoker,
                 clock=self.clock,
                 recovery_journal=third_journal,
+                result_store=result_store,
+            )
+            replayed = third.invoke(
+                grant,
+                self.authorization,
+                payload,
+            )
+            self.assertEqual(replayed.content, result.content)
+            self.assertEqual(
+                replayed.artifact_ref,
+                result.artifact_ref,
             )
             with self.assertRaisesRegex(
                 ProviderAccessDenied,
                 "provider_grant_unavailable",
             ):
-                third.invoke(grant, self.authorization, payload)
+                third.invoke(
+                    grant,
+                    self.authorization,
+                    b"different-payload",
+                )
             self.assertEqual(len(self.invoker.calls), 1)
             third_journal.close()
 
@@ -577,6 +640,279 @@ class ProviderAccessBrokerTests(unittest.TestCase):
                         _UPSTREAM_SECRET.encode(),
                         durable_bytes,
                     )
+                    self.assertNotIn(
+                        result.content,
+                        durable_bytes,
+                    )
+
+    def test_crash_after_claim_recovers_as_unknown_without_reinvoke(
+        self,
+    ) -> None:
+        payload = b"provider-payload"
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "provider-grants.sqlite3"
+            journal = RemoteExecutionJournal(path)
+            broker = ProviderAccessBroker(
+                (_route(),),
+                authorization_verifier=AuthorizationVerifier(),
+                invoker=self.invoker,
+                clock=self.clock,
+                recovery_journal=journal,
+            )
+            grant = broker.issue(
+                self.authorization,
+                route_id="primary-route",
+                request_digest=_REQUEST_DIGEST,
+                request_artifact_digest=_REQUEST_ARTIFACT_DIGEST,
+                invocation_index=1,
+            )
+            claim = journal.claim_provider_invocation(
+                grant_id=grant.grant_id,
+                token_digest=hashlib.sha256(
+                    grant.token.encode()
+                ).hexdigest(),
+                binding_digest=grant.binding_digest,
+                route_id=grant.route.route_id,
+                expires_at=grant.expires_at,
+                request_payload_digest=hashlib.sha256(
+                    payload
+                ).hexdigest(),
+                now=self.clock.now,
+            )
+            self.assertTrue(claim.execute)
+            journal.close()
+
+            restarted_journal = RemoteExecutionJournal(path)
+            restarted = ProviderAccessBroker(
+                (_route(),),
+                authorization_verifier=AuthorizationVerifier(),
+                invoker=self.invoker,
+                clock=self.clock,
+                recovery_journal=restarted_journal,
+            )
+            with self.assertRaisesRegex(
+                ProviderAccessDenied,
+                "provider_invocation_outcome_unknown",
+            ):
+                restarted.invoke(
+                    grant,
+                    self.authorization,
+                    payload,
+                )
+            self.assertEqual(self.invoker.calls, [])
+            restarted_journal.close()
+
+    def test_result_store_failure_is_sanitized_and_becomes_unknown(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            def fail_store(_stage: str, _path: Path) -> None:
+                raise RuntimeError(
+                    f"artifact path leaked {_UPSTREAM_SECRET}"
+                )
+
+            store = LocalArtifactStore(
+                Path(temporary) / "provider-results",
+                fault_hook=fail_store,
+            )
+            broker = ProviderAccessBroker(
+                (_route(),),
+                authorization_verifier=AuthorizationVerifier(),
+                invoker=self.invoker,
+                clock=self.clock,
+                result_store=store,
+            )
+            grant = broker.issue(
+                self.authorization,
+                route_id="primary-route",
+                request_digest=_REQUEST_DIGEST,
+                request_artifact_digest=_REQUEST_ARTIFACT_DIGEST,
+                invocation_index=1,
+            )
+            with self.assertRaises(ProviderAccessDenied) as raised:
+                broker.invoke(
+                    grant,
+                    self.authorization,
+                    b"safe",
+                )
+            self.assertEqual(
+                raised.exception.reason_code,
+                "provider_result_persistence_failed",
+            )
+            self.assertNotIn(
+                _UPSTREAM_SECRET,
+                str(raised.exception),
+            )
+            self.assertIsNone(raised.exception.__cause__)
+            self.assertIsNone(raised.exception.__context__)
+            with self.assertRaisesRegex(
+                ProviderAccessDenied,
+                "provider_invocation_outcome_unknown",
+            ):
+                broker.invoke(
+                    grant,
+                    self.authorization,
+                    b"safe",
+                )
+            self.assertEqual(len(self.invoker.calls), 1)
+
+    def test_corrupt_result_artifact_fails_closed_without_reinvoke(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = LocalArtifactStore(
+                Path(temporary) / "provider-results"
+            )
+            broker = ProviderAccessBroker(
+                (_route(),),
+                authorization_verifier=AuthorizationVerifier(),
+                invoker=self.invoker,
+                clock=self.clock,
+                result_store=store,
+            )
+            grant = broker.issue(
+                self.authorization,
+                route_id="primary-route",
+                request_digest=_REQUEST_DIGEST,
+                request_artifact_digest=_REQUEST_ARTIFACT_DIGEST,
+                invocation_index=1,
+            )
+            result = broker.invoke(
+                grant,
+                self.authorization,
+                b"safe",
+            )
+            self.assertIsNotNone(result.artifact_ref)
+            assert result.artifact_ref is not None
+            (store.root / result.artifact_ref.uri).write_bytes(
+                b"corrupt"
+            )
+            with self.assertRaises(ProviderAccessDenied) as raised:
+                broker.invoke(
+                    grant,
+                    self.authorization,
+                    b"safe",
+                )
+            self.assertEqual(
+                raised.exception.reason_code,
+                "provider_result_integrity_failed",
+            )
+            self.assertNotIn(str(store.root), str(raised.exception))
+            self.assertIsNone(raised.exception.__cause__)
+            self.assertIsNone(raised.exception.__context__)
+            self.assertEqual(len(self.invoker.calls), 1)
+
+    def test_completion_commit_then_response_loss_replays_without_reinvoke(
+        self,
+    ) -> None:
+        payload = b"response-loss-payload"
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "provider-grants.sqlite3"
+            store = LocalArtifactStore(
+                Path(temporary) / "provider-results"
+            )
+            crashing_journal = CrashAfterProviderCompletionJournal(
+                path
+            )
+            first = ProviderAccessBroker(
+                (_route(),),
+                authorization_verifier=AuthorizationVerifier(),
+                invoker=self.invoker,
+                clock=self.clock,
+                recovery_journal=crashing_journal,
+                result_store=store,
+            )
+            grant = first.issue(
+                self.authorization,
+                route_id="primary-route",
+                request_digest=_REQUEST_DIGEST,
+                request_artifact_digest=_REQUEST_ARTIFACT_DIGEST,
+                invocation_index=1,
+            )
+            with self.assertRaises(SystemExit):
+                first.invoke(
+                    grant,
+                    self.authorization,
+                    payload,
+                )
+            crashing_journal.close()
+
+            restarted_journal = RemoteExecutionJournal(path)
+            restarted = ProviderAccessBroker(
+                (_route(),),
+                authorization_verifier=AuthorizationVerifier(),
+                invoker=self.invoker,
+                clock=self.clock,
+                recovery_journal=restarted_journal,
+                result_store=store,
+            )
+            replayed = restarted.invoke(
+                grant,
+                self.authorization,
+                payload,
+            )
+            self.assertEqual(replayed.content, b'{"status":"ok"}')
+            self.assertEqual(len(self.invoker.calls), 1)
+            restarted_journal.close()
+
+    def test_result_classification_is_bound_and_secret_local_store_denied(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "provider_result_sensitivity_exceeds_policy",
+        ):
+            self.broker.issue(
+                _authorization(
+                    maximum_artifact_sensitivity=(
+                        ArtifactSensitivity.INTERNAL
+                    )
+                ),
+                route_id="primary-route",
+                request_digest=_REQUEST_DIGEST,
+                request_artifact_digest=_REQUEST_ARTIFACT_DIGEST,
+                invocation_index=1,
+            )
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "provider_result_sensitivity_mismatch",
+        ):
+            self.broker.issue(
+                self.authorization,
+                route_id="primary-route",
+                request_digest=_REQUEST_DIGEST,
+                request_artifact_digest=_REQUEST_ARTIFACT_DIGEST,
+                invocation_index=1,
+                response_sensitivity=ArtifactSensitivity.INTERNAL,
+            )
+        with tempfile.TemporaryDirectory() as temporary:
+            local = ProviderAccessBroker(
+                (_route(),),
+                authorization_verifier=AuthorizationVerifier(),
+                invoker=self.invoker,
+                clock=self.clock,
+                result_store=LocalArtifactStore(
+                    Path(temporary) / "provider-results"
+                ),
+            )
+            with self.assertRaisesRegex(
+                ProviderAccessDenied,
+                "secret_provider_result_requires_encrypted_store",
+            ):
+                local.issue(
+                    _authorization(
+                        maximum_artifact_sensitivity=(
+                            ArtifactSensitivity.SECRET
+                        )
+                    ),
+                    route_id="primary-route",
+                    request_digest=_REQUEST_DIGEST,
+                    request_artifact_digest=(
+                        _REQUEST_ARTIFACT_DIGEST
+                    ),
+                    invocation_index=1,
+                    response_sensitivity=ArtifactSensitivity.SECRET,
+                )
 
     def test_separate_registries_serialize_issue_and_consume(
         self,
@@ -645,9 +981,16 @@ class ProviderAccessBrokerTests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=2) as executor:
                 invoked = list(executor.map(invoke, (first, second)))
             self.assertEqual(invoked.count("ok"), 1)
-            self.assertEqual(
-                invoked.count("provider_grant_unavailable"),
-                1,
+            self.assertTrue(
+                all(
+                    outcome
+                    in {
+                        "ok",
+                        "provider_invocation_outcome_unknown",
+                        "provider_result_unavailable",
+                    }
+                    for outcome in invoked
+                )
             )
             self.assertEqual(len(self.invoker.calls), 1)
             first_journal.close()

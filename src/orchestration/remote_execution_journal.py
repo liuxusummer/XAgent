@@ -1,10 +1,10 @@
 """Durable bearer-free recovery authority for remote executions.
 
 The journal proves which authorization binding the control plane actually
-issued for one durable Attempt and tracks monotonic Artifact grant state.  It
-intentionally stores no claim token, bearer plaintext, response body, script
-bytes, Artifact content, environment value, runtime proof, or raw execution
-plan.
+issued for one durable Attempt and tracks monotonic Artifact/provider grant
+state plus payload-free provider invocation receipts.  It intentionally stores
+no claim token, bearer plaintext, prompt, response body, script bytes, Artifact
+content, environment value, runtime proof, or raw execution plan.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Iterator
 
-REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION = 3
+REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION = 4
 DEFAULT_EXECUTION_JOURNAL_BUSY_TIMEOUT_MS = 10_000
 MAX_EXECUTION_JOURNAL_RECORDS = 100_000
 MAX_ARTIFACT_GRANT_JOURNAL_RECORDS = 100_000
@@ -94,7 +94,7 @@ _V2_SCHEMA_INDEXES = {
         ("expires_at",),
     ),
 }
-_SCHEMA_COLUMNS = {
+_V3_SCHEMA_COLUMNS = {
     **_V2_SCHEMA_COLUMNS,
     "remote_provider_grants": (
         ("grant_id", "TEXT", 1, 1),
@@ -111,7 +111,7 @@ _SCHEMA_COLUMNS = {
         ("purge_watermark", "REAL", 1, 0),
     ),
 }
-_SCHEMA_INDEXES = {
+_V3_SCHEMA_INDEXES = {
     **_V2_SCHEMA_INDEXES,
     "idx_remote_provider_grants_logical": (
         "remote_provider_grants",
@@ -124,6 +124,18 @@ _SCHEMA_INDEXES = {
         ("expires_at",),
     ),
 }
+_SCHEMA_COLUMNS = {
+    **_V3_SCHEMA_COLUMNS,
+    "remote_provider_invocations": (
+        ("grant_id", "TEXT", 1, 1),
+        ("request_payload_digest", "TEXT", 1, 0),
+        ("state", "TEXT", 1, 0),
+        ("response_digest", "TEXT", 0, 0),
+        ("response_artifact_ref", "TEXT", 0, 0),
+        ("updated_at", "REAL", 1, 0),
+    ),
+}
+_SCHEMA_INDEXES = dict(_V3_SCHEMA_INDEXES)
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE remote_execution_journal_metadata(
@@ -228,12 +240,37 @@ _SCHEMA_STATEMENTS = (
         singleton, purge_watermark
     ) VALUES (1, 0)
     """,
+    """
+    CREATE TABLE remote_provider_invocations(
+        grant_id TEXT NOT NULL PRIMARY KEY,
+        request_payload_digest TEXT NOT NULL,
+        state TEXT NOT NULL
+            CHECK(state IN ('invoking', 'completed', 'outcome_unknown')),
+        response_digest TEXT,
+        response_artifact_ref TEXT,
+        updated_at REAL NOT NULL,
+        CHECK(
+            (state = 'completed' AND response_digest IS NOT NULL)
+            OR
+            (state <> 'completed'
+                AND response_digest IS NULL
+                AND response_artifact_ref IS NULL)
+        ),
+        CHECK(
+            response_artifact_ref IS NULL OR state = 'completed'
+        )
+    )
+    """,
 )
 _V1_UPGRADE_SCHEMA_STATEMENTS = _SCHEMA_STATEMENTS[2:]
-_V2_UPGRADE_SCHEMA_STATEMENTS = _SCHEMA_STATEMENTS[-5:]
+_V2_UPGRADE_SCHEMA_STATEMENTS = _SCHEMA_STATEMENTS[6:]
+_V3_UPGRADE_SCHEMA_STATEMENTS = _SCHEMA_STATEMENTS[-1:]
 _READ_GRANT_STATES = frozenset({"issued", "consumed"})
 _WRITE_GRANT_STATES = frozenset({"issued", "finalized", "failed"})
 _PROVIDER_GRANT_STATES = frozenset({"issued", "consumed"})
+_PROVIDER_INVOCATION_STATES = frozenset(
+    {"invoking", "completed", "outcome_unknown"}
+)
 
 
 class RemoteExecutionJournalError(RuntimeError):
@@ -262,6 +299,14 @@ class RemoteProviderGrantUnavailable(RemoteExecutionJournalError):
 
 class RemoteProviderGrantConflict(RemoteExecutionJournalError):
     """A provider grant or logical invocation was rebound."""
+
+
+class RemoteProviderInvocationUnknown(RemoteExecutionJournalError):
+    """A consumed provider invocation has no replayable terminal result."""
+
+
+class RemoteProviderInvocationConflict(RemoteExecutionJournalError):
+    """A provider invocation receipt was rebound to different evidence."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,13 +472,77 @@ class RemoteProviderGrantRecord:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteProviderInvocationRecord:
+    """Payload-free durable state for one provider call."""
+
+    grant_id: str
+    request_payload_digest: str
+    state: str
+    response_digest: str | None
+    response_artifact_ref: str | None
+    updated_at: float
+
+    def __post_init__(self) -> None:
+        _identifier(self.grant_id, "grant_id")
+        _digest(
+            self.request_payload_digest,
+            "request_payload_digest",
+        )
+        if self.state not in _PROVIDER_INVOCATION_STATES:
+            raise RemoteExecutionJournalError(
+                "invalid_provider_invocation_state"
+            )
+        if self.state == "completed":
+            if self.response_digest is None:
+                raise RemoteExecutionJournalError(
+                    "invalid_provider_invocation_result"
+                )
+            _digest(self.response_digest, "response_digest")
+            if self.response_artifact_ref is not None:
+                _canonical_json_text(
+                    self.response_artifact_ref,
+                    "response_artifact_ref",
+                )
+        elif (
+            self.response_digest is not None
+            or self.response_artifact_ref is not None
+        ):
+            raise RemoteExecutionJournalError(
+                "invalid_provider_invocation_result"
+            )
+        _finite_time(self.updated_at)
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteProviderInvocationClaim:
+    """Journal decision: invoke upstream now or replay a completed receipt."""
+
+    record: RemoteProviderInvocationRecord
+    execute: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, RemoteProviderInvocationRecord):
+            raise RemoteExecutionJournalError(
+                "invalid_provider_invocation_claim"
+            )
+        if not isinstance(self.execute, bool):
+            raise RemoteExecutionJournalError(
+                "invalid_provider_invocation_claim"
+            )
+        if self.execute != (self.record.state == "invoking"):
+            raise RemoteExecutionJournalError(
+                "invalid_provider_invocation_claim"
+            )
+
+
 class RemoteExecutionJournal:
     """SQLite-backed exact authorization binding registry.
 
-    Execution rows are immutable.  Artifact rows move only through explicit
-    issued/consumed/finalized/failed transitions.  Rebinding is a conflict and
-    unexpired rows are never evicted to make room because doing so would erase
-    recovery or anti-replay evidence.
+    Execution rows are immutable.  Artifact/provider rows move only through
+    explicit state transitions.  Rebinding is a conflict and unexpired rows
+    are never evicted to make room because doing so would erase recovery or
+    anti-replay evidence.
     """
 
     def __init__(
@@ -1173,6 +1282,302 @@ class RemoteExecutionJournal:
             )
         return consumed
 
+    def claim_provider_invocation(
+        self,
+        *,
+        grant_id: str,
+        token_digest: str,
+        binding_digest: str,
+        route_id: str,
+        expires_at: float,
+        request_payload_digest: str,
+        now: float,
+    ) -> RemoteProviderInvocationClaim:
+        """Atomically consume a grant or recover its completed receipt."""
+
+        _identifier(grant_id, "grant_id")
+        _digest(token_digest, "token_digest")
+        _digest(binding_digest, "binding_digest")
+        _identifier(route_id, "route_id")
+        expected_expires_at = _finite_time(expires_at)
+        _digest(request_payload_digest, "request_payload_digest")
+        current = _finite_time(now)
+        with self._transaction() as connection:
+            self._require_provider_time_floor_locked(
+                connection,
+                now=current,
+            )
+            grant = self._provider_grant_locked(
+                connection,
+                grant_id,
+            )
+            if (
+                grant is None
+                or current >= grant.expires_at
+                or grant.route_id != route_id
+                or grant.binding_digest != binding_digest
+                or grant.expires_at != expected_expires_at
+                or not hmac.compare_digest(
+                    grant.token_digest,
+                    token_digest,
+                )
+            ):
+                raise RemoteProviderGrantUnavailable(
+                    "provider_grant_unavailable"
+                )
+            invocation = self._provider_invocation_locked(
+                connection,
+                grant_id,
+            )
+            if grant.state == "issued":
+                if invocation is not None:
+                    raise RemoteProviderInvocationConflict(
+                        "provider_invocation_state_conflict"
+                    )
+                cursor = connection.execute(
+                    """
+                    UPDATE remote_provider_grants
+                    SET state = 'consumed', updated_at = ?
+                    WHERE grant_id = ? AND state = 'issued'
+                    """,
+                    (current, grant_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RemoteProviderGrantUnavailable(
+                        "provider_grant_unavailable"
+                    )
+                claimed = RemoteProviderInvocationRecord(
+                    grant_id=grant_id,
+                    request_payload_digest=request_payload_digest,
+                    state="invoking",
+                    response_digest=None,
+                    response_artifact_ref=None,
+                    updated_at=current,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO remote_provider_invocations(
+                        grant_id, request_payload_digest, state,
+                        response_digest, response_artifact_ref, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    tuple(
+                        getattr(claimed, item.name)
+                        for item in fields(claimed)
+                    ),
+                )
+                return RemoteProviderInvocationClaim(
+                    record=claimed,
+                    execute=True,
+                )
+            if (
+                grant.state != "consumed"
+                or invocation is None
+            ):
+                raise RemoteProviderInvocationUnknown(
+                    "provider_invocation_outcome_unknown"
+                )
+            if (
+                invocation.request_payload_digest
+                != request_payload_digest
+            ):
+                raise RemoteProviderGrantUnavailable(
+                    "provider_grant_unavailable"
+                )
+            if invocation.state == "completed":
+                return RemoteProviderInvocationClaim(
+                    record=invocation,
+                    execute=False,
+                )
+            raise RemoteProviderInvocationUnknown(
+                "provider_invocation_outcome_unknown"
+            )
+
+    def complete_provider_invocation(
+        self,
+        *,
+        grant_id: str,
+        token_digest: str,
+        binding_digest: str,
+        route_id: str,
+        expires_at: float,
+        request_payload_digest: str,
+        response_digest: str,
+        response_artifact_ref: str | None,
+        now: float,
+    ) -> RemoteProviderInvocationRecord:
+        """Persist an exact terminal response receipt after Artifact write."""
+
+        _identifier(grant_id, "grant_id")
+        _digest(token_digest, "token_digest")
+        _digest(binding_digest, "binding_digest")
+        _identifier(route_id, "route_id")
+        expected_expires_at = _finite_time(expires_at)
+        _digest(request_payload_digest, "request_payload_digest")
+        _digest(response_digest, "response_digest")
+        if response_artifact_ref is not None:
+            _canonical_json_text(
+                response_artifact_ref,
+                "response_artifact_ref",
+            )
+        current = _finite_time(now)
+        with self._transaction() as connection:
+            self._require_provider_time_floor_locked(
+                connection,
+                now=current,
+            )
+            self._require_provider_grant_binding_locked(
+                connection,
+                grant_id=grant_id,
+                token_digest=token_digest,
+                binding_digest=binding_digest,
+                route_id=route_id,
+                expires_at=expected_expires_at,
+                required_state="consumed",
+            )
+            invocation = self._provider_invocation_locked(
+                connection,
+                grant_id,
+            )
+            if (
+                invocation is None
+                or invocation.request_payload_digest
+                != request_payload_digest
+            ):
+                raise RemoteProviderInvocationConflict(
+                    "provider_invocation_binding_mismatch"
+                )
+            completed = RemoteProviderInvocationRecord(
+                grant_id=grant_id,
+                request_payload_digest=request_payload_digest,
+                state="completed",
+                response_digest=response_digest,
+                response_artifact_ref=response_artifact_ref,
+                updated_at=current,
+            )
+            if invocation.state == "completed":
+                if (
+                    invocation.response_digest
+                    != completed.response_digest
+                    or invocation.response_artifact_ref
+                    != completed.response_artifact_ref
+                ):
+                    raise RemoteProviderInvocationConflict(
+                        "provider_invocation_result_conflict"
+                    )
+                return invocation
+            if invocation.state != "invoking":
+                raise RemoteProviderInvocationUnknown(
+                    "provider_invocation_outcome_unknown"
+                )
+            cursor = connection.execute(
+                """
+                UPDATE remote_provider_invocations
+                SET state = 'completed', response_digest = ?,
+                    response_artifact_ref = ?, updated_at = ?
+                WHERE grant_id = ? AND state = 'invoking'
+                    AND request_payload_digest = ?
+                """,
+                (
+                    response_digest,
+                    response_artifact_ref,
+                    current,
+                    grant_id,
+                    request_payload_digest,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RemoteProviderInvocationConflict(
+                    "provider_invocation_state_conflict"
+                )
+            return completed
+
+    def mark_provider_invocation_unknown(
+        self,
+        *,
+        grant_id: str,
+        token_digest: str,
+        binding_digest: str,
+        route_id: str,
+        expires_at: float,
+        request_payload_digest: str,
+        now: float,
+    ) -> RemoteProviderInvocationRecord:
+        """Irreversibly record a call whose upstream outcome is uncertain."""
+
+        _identifier(grant_id, "grant_id")
+        _digest(token_digest, "token_digest")
+        _digest(binding_digest, "binding_digest")
+        _identifier(route_id, "route_id")
+        expected_expires_at = _finite_time(expires_at)
+        _digest(request_payload_digest, "request_payload_digest")
+        current = _finite_time(now)
+        with self._transaction() as connection:
+            self._require_provider_time_floor_locked(
+                connection,
+                now=current,
+            )
+            self._require_provider_grant_binding_locked(
+                connection,
+                grant_id=grant_id,
+                token_digest=token_digest,
+                binding_digest=binding_digest,
+                route_id=route_id,
+                expires_at=expected_expires_at,
+                required_state="consumed",
+            )
+            invocation = self._provider_invocation_locked(
+                connection,
+                grant_id,
+            )
+            if (
+                invocation is None
+                or invocation.request_payload_digest
+                != request_payload_digest
+            ):
+                raise RemoteProviderInvocationConflict(
+                    "provider_invocation_binding_mismatch"
+                )
+            if invocation.state in {"completed", "outcome_unknown"}:
+                return invocation
+            cursor = connection.execute(
+                """
+                UPDATE remote_provider_invocations
+                SET state = 'outcome_unknown', updated_at = ?
+                WHERE grant_id = ? AND state = 'invoking'
+                    AND request_payload_digest = ?
+                """,
+                (current, grant_id, request_payload_digest),
+            )
+            if cursor.rowcount != 1:
+                raise RemoteProviderInvocationConflict(
+                    "provider_invocation_state_conflict"
+                )
+            return RemoteProviderInvocationRecord(
+                grant_id=grant_id,
+                request_payload_digest=request_payload_digest,
+                state="outcome_unknown",
+                response_digest=None,
+                response_artifact_ref=None,
+                updated_at=current,
+            )
+
+    def get_provider_invocation(
+        self,
+        grant_id: str,
+    ) -> RemoteProviderInvocationRecord | None:
+        _identifier(grant_id, "grant_id")
+        try:
+            with self._connection() as connection:
+                return self._provider_invocation_locked(
+                    connection,
+                    grant_id,
+                )
+        except sqlite3.Error as exc:
+            raise RemoteExecutionJournalError(
+                "execution_journal_unavailable"
+            ) from exc
+
     def purge_expired_provider_grants(self, *, now: float) -> int:
         current = _finite_time(now)
         with self._transaction() as connection:
@@ -1245,6 +1650,17 @@ class RemoteExecutionJournal:
         *,
         now: float,
     ) -> int:
+        connection.execute(
+            """
+            DELETE FROM remote_provider_invocations
+            WHERE grant_id IN (
+                SELECT grant_id
+                FROM remote_provider_grants
+                WHERE expires_at <= ?
+            )
+            """,
+            (now,),
+        )
         cursor = connection.execute(
             """
             DELETE FROM remote_provider_grants
@@ -1285,6 +1701,35 @@ class RemoteExecutionJournal:
             raise RemoteExecutionJournalError(
                 "provider_grant_clock_rollback"
             )
+
+    @classmethod
+    def _require_provider_grant_binding_locked(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        grant_id: str,
+        token_digest: str,
+        binding_digest: str,
+        route_id: str,
+        expires_at: float,
+        required_state: str,
+    ) -> RemoteProviderGrantRecord:
+        grant = cls._provider_grant_locked(connection, grant_id)
+        if (
+            grant is None
+            or grant.state != required_state
+            or grant.route_id != route_id
+            or grant.binding_digest != binding_digest
+            or grant.expires_at != expires_at
+            or not hmac.compare_digest(
+                grant.token_digest,
+                token_digest,
+            )
+        ):
+            raise RemoteProviderGrantUnavailable(
+                "provider_grant_unavailable"
+            )
+        return grant
 
     @staticmethod
     def _read_grant_locked(
@@ -1345,6 +1790,25 @@ class RemoteExecutionJournal:
             (logical_invocation_digest,),
         ).fetchone()
         return None if row is None else _provider_grant_from_row(row)
+
+    @staticmethod
+    def _provider_invocation_locked(
+        connection: sqlite3.Connection,
+        grant_id: str,
+    ) -> RemoteProviderInvocationRecord | None:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM remote_provider_invocations
+            WHERE grant_id = ?
+            """,
+            (grant_id,),
+        ).fetchone()
+        return (
+            None
+            if row is None
+            else _provider_invocation_from_row(row)
+        )
 
     @staticmethod
     def _get_locked(
@@ -1425,6 +1889,34 @@ class RemoteExecutionJournal:
                     UPDATE remote_execution_journal_metadata
                     SET schema_version = ?
                     WHERE singleton = 1 AND schema_version = 2
+                    """,
+                    (REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION,),
+                )
+                if cursor.rowcount != 1:
+                    raise RemoteExecutionJournalError(
+                        "unsupported_execution_schema"
+                    )
+                self._validate_schema(
+                    connection,
+                    _SCHEMA_COLUMNS,
+                    schema_indexes=_SCHEMA_INDEXES,
+                )
+                return
+
+            if existing_tables == frozenset(_V3_SCHEMA_COLUMNS):
+                self._validate_schema(
+                    connection,
+                    _V3_SCHEMA_COLUMNS,
+                    schema_indexes=_V3_SCHEMA_INDEXES,
+                )
+                self._require_schema_version(connection, expected=3)
+                for statement in _V3_UPGRADE_SCHEMA_STATEMENTS:
+                    connection.execute(statement)
+                cursor = connection.execute(
+                    """
+                    UPDATE remote_execution_journal_metadata
+                    SET schema_version = ?
+                    WHERE singleton = 1 AND schema_version = 3
                     """,
                     (REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION,),
                 )
@@ -1637,6 +2129,16 @@ class RemoteExecutionJournal:
                     connection,
                     expected=2,
                 )
+            elif tables == frozenset(_V3_SCHEMA_COLUMNS):
+                self._validate_schema(
+                    connection,
+                    _V3_SCHEMA_COLUMNS,
+                    schema_indexes=_V3_SCHEMA_INDEXES,
+                )
+                self._require_schema_version(
+                    connection,
+                    expected=3,
+                )
             elif tables == frozenset(_SCHEMA_COLUMNS):
                 self._validate_schema(
                     connection,
@@ -1730,6 +2232,28 @@ class RemoteExecutionJournal:
                 raise RemoteExecutionJournalError(
                     "invalid_execution_schema"
                 )
+        if "remote_provider_invocations" in schema_columns:
+            invocation_rows = connection.execute(
+                """
+                SELECT invocation.*, grant.state AS grant_state
+                FROM remote_provider_invocations AS invocation
+                LEFT JOIN remote_provider_grants AS grant
+                    ON grant.grant_id = invocation.grant_id
+                """
+            ).fetchall()
+            for invocation_row in invocation_rows:
+                invalid_invocation = (
+                    invocation_row["grant_state"] != "consumed"
+                )
+                if not invalid_invocation:
+                    try:
+                        _provider_invocation_from_row(invocation_row)
+                    except RemoteExecutionJournalError:
+                        invalid_invocation = True
+                if invalid_invocation:
+                    raise RemoteExecutionJournalError(
+                        "invalid_execution_schema"
+                    )
             clock_row = clock_rows[0]
             watermark = clock_row["purge_watermark"]
             if (
@@ -1904,6 +2428,22 @@ def _provider_grant_from_row(
         ) from exc
 
 
+def _provider_invocation_from_row(
+    row: sqlite3.Row,
+) -> RemoteProviderInvocationRecord:
+    try:
+        return RemoteProviderInvocationRecord(
+            **{
+                item.name: row[item.name]
+                for item in fields(RemoteProviderInvocationRecord)
+            }
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RemoteExecutionJournalError(
+            "invalid_provider_invocation_record"
+        ) from exc
+
+
 def _canonical_json_text(value: object, name: str) -> str:
     if not isinstance(value, str):
         raise RemoteExecutionJournalError(f"invalid_{name}")
@@ -1987,4 +2527,8 @@ __all__ = [
     "RemoteProviderGrantConflict",
     "RemoteProviderGrantRecord",
     "RemoteProviderGrantUnavailable",
+    "RemoteProviderInvocationClaim",
+    "RemoteProviderInvocationConflict",
+    "RemoteProviderInvocationRecord",
+    "RemoteProviderInvocationUnknown",
 ]

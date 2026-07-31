@@ -94,7 +94,9 @@ Round 3：参考契约通过。
 - durable token-digest/logic-key/consumed tombstone journal 与共享同一本机 SQLite
   的跨 Broker 原子签发/消费已在后续阶段完成，审查证据见
   [Provider Grant Journal 三轮对抗性审查](provider-grant-journal-adversarial-review.md)；
-- provider invocation receipt、响应丢失与上游 idempotency；
+- completed provider invocation receipt 与 Artifact 结果重放已在后续阶段完成；仍缺少
+  upstream idempotency 与 receipt 提交前的 unknown-outcome 恢复，见
+  [Provider Invocation Receipt 三轮对抗性审查](provider-invocation-receipt-adversarial-review.md)；
 - mTLS/attestation、egress allowlist 和 secret-manager backed invoker；
 - 与 AgentActivityRequest、远程 Agent runtime、逐工具 receipt、AgentActivityReceipt
   completion 的完整组合审查。

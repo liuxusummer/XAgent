@@ -62,6 +62,8 @@ Artifact 创建。签发时必须同时匹配 WorkerAuthorization 的 tenant、p
 - Scheduler request digest 与 AgentActivityRequest Artifact digest；
 - provider route 的完整 credential-free descriptor；
 - 单调的 `invocation_index`；
+- 响应 Artifact 分类；为防止 Worker 降级分类，它必须等于
+  WorkerAuthorization 的 `maximum_artifact_sensitivity`；
 - issued/expiry 时间。
 
 token 使用 CSPRNG 生成并从 repr 隐藏。`to_wire_dict()` 会有意携带 token，因为 Worker
@@ -79,11 +81,14 @@ Broker 的调用顺序固定为：
 1. 使用受信 verifier 重验新鲜 WorkerAuthorization；
 2. 重验 route、tenant、worker、Attempt、action、authorization 和 request binding；
 3. 校验 payload 是非空 bytes 且不超过 route 上限；
-4. 在 SQLite `BEGIN IMMEDIATE` 事务中用 constant-time token digest 比较，并以
-   `issued → consumed` CAS 提交墓碑；
+4. 在 SQLite `BEGIN IMMEDIATE` 事务中用 constant-time token digest 比较，以
+   `issued → consumed` CAS 提交墓碑，并插入绑定实际 payload digest 的 `invoking`；
 5. 仅把 credential-free route、raw request bytes 和 grant ID 交给部署侧
    `ProviderInvoker`；
-6. 将 invoker 的有界 bytes 包装成 repr-safe `ProviderInvocationResult`。
+6. 若配置 result store，将有界 response 写为按 sensitivity 分类的 MODEL_RESPONSE
+   Artifact；
+7. 提交 completed response digest/ArtifactRef receipt；
+8. 将 invoker 的有界 bytes 包装成 repr-safe `ProviderInvocationResult`。
 
 消费发生在 provider 调用之前。invoker 抛错、返回类型错误或响应超限时 token 仍已花费，
 错误只返回固定 reason code，禁止把 provider 异常或响应内容保留为 cause/context。
@@ -114,23 +119,56 @@ operator 修复时钟，不能通过清空安全数据库绕过。
 `durable_recovery_ready` 只表示 grant/tombstone 可跨 Broker 重启恢复：内存 journal
 返回 false，磁盘 journal 返回 true。它不等价于端到端生产 readiness。
 
-## 7. 当前 fail-closed 限制
+## 7. Invocation receipt 与结果 Artifact
+
+schema v4 用独立 `remote_provider_invocations` 表记录：
+
+```text
+grant id / actual request payload SHA-256
+invoking | completed | outcome_unknown
+response SHA-256 / optional canonical ArtifactRef / updated_at
+```
+
+首次调用在同一事务中把 grant 置为 consumed 并插入 `invoking`。因此重启或并发重放不会
+再次进入 invoker。实际 payload digest 在该线性化点绑定；同一个 bearer 不能换 prompt
+重放。
+
+若注入受信 ArtifactStore，成功 response 先写为 `MODEL_RESPONSE` Artifact，再把 exact
+ref 与 response digest 提交为 completed。response bytes、prompt 和 provider body
+不进入 SQLite。journal commit 后响应丢失时，相同 bearer + authorization + payload
+可以验证 Artifact 并重放相同 bytes；Artifact 写成功而 journal 未提交只留下可 GC
+orphan，状态仍为 unknown，不会重调 provider。
+
+Result Artifact 必须精确匹配 grant 的 sensitivity、Run/Node/Attempt producer、digest、
+size、kind 和空 metadata。参考 `LocalArtifactStore` 不加密，因此拒绝 SECRET；
+SECRET 必须由返回 `deployment_managed` encryption 的部署 Store 处理。
+
+没有 result store 时，首次调用仍返回 response，并记录 completed response digest；
+响应丢失后的重放返回 `provider_result_unavailable`，不会重新调用 provider。
+`durable_result_recovery_ready` 仅在磁盘 journal 与项目内可证明落盘的
+`LocalArtifactStore` 同时存在时为 true；自定义 ArtifactStore 不会被参考实现自动声明
+为 durable。
+
+## 8. 当前 fail-closed 限制
 
 - 签发响应丢失后无法重取同一个 token，只能等待墓碑过期或由 operator 处理；
-- token 在调用 invoker 前消费，因此“已消费但未调用”会安全地丢失一次可用性；
-- provider 已执行但响应丢失时，当前实现没有 durable invocation receipt，重启后只能
-  拒绝重放，不能证明是否已经产生费用或恢复响应；
+- token 在调用 invoker 前消费；若进程在 `invoking` 后、completed receipt 前崩溃，
+  状态为 outcome unknown，安全地拒绝重调；
+- completed receipt 可恢复已登记的结果，但 provider 已执行、结果登记前崩溃时仍不能
+  证明是否已经产生费用；解决该窗口仍需要上游 idempotency/查询协议；
 - 同一 SQLite 文件可跨本机进程线性化，但不提供跨主机共识、复制或自动故障转移；
 - `production_security_ready` 仍固定为 false；
 - 参考实现不提供 mTLS、provider egress allowlist、secret manager、经过 attestation
   的 invoker 或上游 idempotency。
 
-生产 remote Agent 仍必须提供 invocation receipt/恢复语义、经过 attestation 的
-ProviderInvoker 和完整远程 Agent runtime。未完成前禁止把
+生产 remote Agent 仍必须提供 upstream idempotency/unknown-outcome 恢复语义、经过
+attestation 的 ProviderInvoker 和完整远程 Agent runtime。未完成前禁止把
 `agent` 加入 `SecureRemoteAssignmentAdmitter`、`SecureRemoteExecutionAdapter`、
 Fleet projector 或 Worker daemon 的 `supported_activity_kinds`。
 
 credential 基线审查见
 [Provider Credential 三轮对抗性审查](provider-credential-adversarial-review.md)，
 durable journal 审查见
-[Provider Grant Journal 三轮对抗性审查](provider-grant-journal-adversarial-review.md)。
+[Provider Grant Journal 三轮对抗性审查](provider-grant-journal-adversarial-review.md)，
+invocation result 审查见
+[Provider Invocation Receipt 三轮对抗性审查](provider-invocation-receipt-adversarial-review.md)。

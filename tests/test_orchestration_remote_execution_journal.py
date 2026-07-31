@@ -23,6 +23,7 @@ from src.orchestration.remote_execution_journal import (
     RemoteExecutionJournalError,
     RemoteProviderGrantRecord,
     RemoteProviderGrantUnavailable,
+    RemoteProviderInvocationUnknown,
 )
 
 
@@ -417,7 +418,7 @@ class RemoteExecutionJournalTests(unittest.TestCase):
             replace(second, updated_at=201.0)
         )
 
-    def test_exact_v1_schema_migrates_atomically_to_v3(self) -> None:
+    def test_exact_v1_schema_migrates_atomically_to_v4(self) -> None:
         connection = sqlite3.connect(self.path)
         connection.executescript(
             """
@@ -476,13 +477,14 @@ class RemoteExecutionJournalTests(unittest.TestCase):
             )
         }
         connection.close()
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
         self.assertIn("remote_artifact_read_grants", tables)
         self.assertIn("remote_artifact_write_grants", tables)
         self.assertIn("remote_provider_grants", tables)
         self.assertIn("remote_provider_grant_clock", tables)
+        self.assertIn("remote_provider_invocations", tables)
 
-    def test_exact_v2_schema_migrates_atomically_to_v3(self) -> None:
+    def test_exact_v2_schema_migrates_atomically_to_v4(self) -> None:
         previous = RemoteArtifactReadGrantRecord(
             grant_id="v2-read-grant",
             token_digest="e" * 64,
@@ -498,6 +500,7 @@ class RemoteExecutionJournalTests(unittest.TestCase):
         original.record_read_grant(previous)
         original.close()
         connection = sqlite3.connect(self.path)
+        connection.execute("DROP TABLE remote_provider_invocations")
         connection.execute("DROP TABLE remote_provider_grants")
         connection.execute("DROP TABLE remote_provider_grant_clock")
         connection.execute(
@@ -537,9 +540,71 @@ class RemoteExecutionJournalTests(unittest.TestCase):
             )
         }
         connection.close()
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
         self.assertIn("remote_provider_grants", tables)
         self.assertIn("remote_provider_grant_clock", tables)
+        self.assertIn("remote_provider_invocations", tables)
+
+    def test_exact_v3_schema_migrates_atomically_to_v4(self) -> None:
+        original = RemoteExecutionJournal(self.path)
+        previous = _provider_record()
+        original.record_provider_grant(previous)
+        consumed = original.consume_provider_grant(
+            grant_id=previous.grant_id,
+            token_digest=previous.token_digest,
+            binding_digest=previous.binding_digest,
+            route_id=previous.route_id,
+            expires_at=previous.expires_at,
+            now=101.0,
+        )
+        original.close()
+        connection = sqlite3.connect(self.path)
+        connection.execute("DROP TABLE remote_provider_invocations")
+        connection.execute(
+            """
+            UPDATE remote_execution_journal_metadata
+            SET schema_version = 3
+            WHERE singleton = 1
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        migrated = RemoteExecutionJournal(self.path)
+        self.assertEqual(
+            migrated.get_provider_grant("provider-grant-1"),
+            consumed,
+        )
+        with self.assertRaises(RemoteProviderInvocationUnknown):
+            migrated.claim_provider_invocation(
+                grant_id=previous.grant_id,
+                token_digest=previous.token_digest,
+                binding_digest=previous.binding_digest,
+                route_id=previous.route_id,
+                expires_at=previous.expires_at,
+                request_payload_digest="1" * 64,
+                now=102.0,
+            )
+        migrated.close()
+        connection = sqlite3.connect(self.path)
+        version = connection.execute(
+            """
+            SELECT schema_version
+            FROM remote_execution_journal_metadata
+            """
+        ).fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                """
+            )
+        }
+        connection.close()
+        self.assertEqual(version, 4)
+        self.assertIn("remote_provider_invocations", tables)
 
     def test_expiry_indexes_exist_and_unexpected_trigger_fails_closed(
         self,
@@ -600,6 +665,57 @@ class RemoteExecutionJournalTests(unittest.TestCase):
         RemoteExecutionJournal(self.path).close()
         connection = sqlite3.connect(self.path)
         connection.execute("DELETE FROM remote_provider_grant_clock")
+        connection.commit()
+        connection.close()
+
+        with self.assertRaisesRegex(
+            RemoteExecutionJournalError,
+            "invalid_execution_schema",
+        ):
+            RemoteExecutionJournal(self.path)
+
+    def test_orphan_provider_invocation_fails_at_startup(self) -> None:
+        RemoteExecutionJournal(self.path).close()
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            """
+            INSERT INTO remote_provider_invocations(
+                grant_id, request_payload_digest, state,
+                response_digest, response_artifact_ref, updated_at
+            ) VALUES (?, ?, 'invoking', NULL, NULL, ?)
+            """,
+            ("orphan-provider-grant", "f" * 64, 100.0),
+        )
+        connection.commit()
+        connection.close()
+
+        with self.assertRaisesRegex(
+            RemoteExecutionJournalError,
+            "invalid_execution_schema",
+        ):
+            RemoteExecutionJournal(self.path)
+
+    def test_malformed_provider_invocation_fails_at_startup(self) -> None:
+        journal = RemoteExecutionJournal(self.path)
+        grant = _provider_record()
+        journal.record_provider_grant(grant)
+        journal.claim_provider_invocation(
+            grant_id=grant.grant_id,
+            token_digest=grant.token_digest,
+            binding_digest=grant.binding_digest,
+            route_id=grant.route_id,
+            expires_at=grant.expires_at,
+            request_payload_digest="d" * 64,
+            now=101.0,
+        )
+        journal.close()
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            """
+            UPDATE remote_provider_invocations
+            SET request_payload_digest = 'not-a-digest'
+            """
+        )
         connection.commit()
         connection.close()
 

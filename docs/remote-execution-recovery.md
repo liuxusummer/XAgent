@@ -1,7 +1,7 @@
 # Remote Execution Authority Recovery
 
 > 状态：digest-only execution authority、bearer-free Artifact grant recovery 与
-> provider grant anti-replay journal 已实现
+> provider grant anti-replay 与 completed-result replay journal 已实现
 > 依赖：`distributed-execution-adr.md`、`durable-orchestration-spec.md`
 
 ## 1. 问题
@@ -44,6 +44,11 @@ issued | finalized | failed / staging digest / final ArtifactRef / expires_at
 provider grant:
 grant id / logical invocation digest / token digest / binding digest / route id
 issued | consumed / expires_at / purge watermark
+
+provider invocation（schema v4）:
+grant id / actual request payload digest
+invoking | completed | outcome_unknown
+response digest / optional MODEL_RESPONSE ArtifactRef / updated_at
 ```
 
 记录明确不包含：
@@ -63,7 +68,12 @@ SQLite 位于 Worker 不可访问的 control-plane isolation root。首次创建
 完整事务、`fsync` 和 no-clobber hard link 原子发布；数据库与 bootstrap lock 必须是
 `0600` 普通文件，symlink、宽权限、未知/残缺 schema、额外 trigger/view/index、
 integrity failure 均拒绝启动。既有精确 v1/v2 schema 在一个 SQLite transaction 内
-迁移到 v3；半迁移状态不会被自动补齐。
+直接迁移到 v4；半迁移状态不会被自动补齐。
+
+精确 v3 可在单事务内只增 invocation receipt 表并迁移到 v4。v3 consumed grant 没有
+足够证据推断调用结果，在 v4 Broker 中只能恢复为 outcome unknown。Provider wire schema
+同时升级到 v2；部署升级前应 drain 最长五分钟的活跃 grant，旧 wire grant 不会被新进程
+猜测补全。
 
 ## 3. 恢复算法
 
@@ -107,6 +117,9 @@ Artifact 的独立线性化点为：
 | terminal response replay | 可恢复 | 直接使用 Store 的 Receipt/Event evidence |
 | successful completion with pre-restart output handle | 可恢复 | Worker 持有原 handle；broker 只按 token digest 重放 exact finalized `ArtifactRef` |
 | input grant 在 broker 重启后首次兑换 | 可恢复一次 | durable `issued → consumed` CAS 跨进程保持单次语义 |
+| provider completed receipt + result Artifact | 可恢复 | exact bearer/binding/payload 重验后读取并校验同一 Artifact |
+| provider `invoking` 或 v3 consumed 无 receipt | outcome unknown | 不重新调用 provider，不猜测费用或响应 |
+| provider response Artifact 写后、receipt 前崩溃 | 不猜测结果 | 只产生可 GC orphan；不把它自动绑定为 completed |
 | Store 写入后、finalization journal 前崩溃 | 不猜测结果 | 只产生可 GC orphan；原 grant 保持 issued，持有原内容的一方可在有效期内重试 |
 | 只完成内存 staging、尚未写 Store 就崩溃 | staging 丢失 | journal 不保存 Artifact bytes；调用方必须重新 stage 原内容 |
 | 重新发送 assignment | 禁止 | digest-only binding 不包含 bearer token |
@@ -129,6 +142,10 @@ Execution journal row 不按 TTL/LRU 淘汰活跃 authority。达到硬上限时
 Artifact consumed/finalized/failed tombstone 在 grant 严格 expiry 前保留，防止时钟回拨
 复活。读写共用硬记录上限，不做 LRU；容量满时拒绝签发。过期列有受 schema 校验的索引，
 签发会清理过期记录，运维也可显式调用 `ArtifactGrantBroker.purge_expired_grants()`。
+
+Provider grant purge 会先删除同 grant 的 invocation receipt，再删除 grant，并在同一
+事务推进 purge watermark。未过期 invoking/completed/outcome-unknown evidence 不因容量
+压力淘汰。
 
 `RemoteControlPlane.production_recovery_ready` 只有在 security path、持久 session
 journal、持久 execution journal、持久 Artifact broker registry 和 recovery API 同时

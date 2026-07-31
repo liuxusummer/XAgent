@@ -12,6 +12,14 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Protocol, runtime_checkable
 
+from .artifacts import (
+    ArtifactEncryption,
+    ArtifactKind,
+    ArtifactRef,
+    ArtifactSensitivity,
+    ArtifactStore,
+    LocalArtifactStore,
+)
 from .remote_execution_journal import (
     RemoteExecutionJournal,
     RemoteExecutionJournalCapacityError,
@@ -19,13 +27,16 @@ from .remote_execution_journal import (
     RemoteProviderGrantConflict,
     RemoteProviderGrantRecord,
     RemoteProviderGrantUnavailable,
+    RemoteProviderInvocationConflict,
+    RemoteProviderInvocationRecord,
+    RemoteProviderInvocationUnknown,
 )
 from .worker_security import (
     WorkerAuthorization,
     WorkerAuthorizationVerifier,
 )
 
-PROVIDER_ACCESS_SCHEMA_VERSION = 1
+PROVIDER_ACCESS_SCHEMA_VERSION = 2
 MAX_PROVIDER_GRANT_TTL_SECONDS = 5 * 60.0
 MAX_PROVIDER_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_PROVIDER_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -34,6 +45,25 @@ MAX_ACTIVE_PROVIDER_GRANTS = 100_000
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$")
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,512}$")
+_ARTIFACT_REF_KEYS = frozenset(
+    {
+        "schema_version",
+        "artifact_id",
+        "sha256",
+        "size",
+        "media_type",
+        "kind",
+        "uri",
+        "sensitivity",
+        "encryption",
+        "producer_run_id",
+        "producer_node_id",
+        "producer_attempt_id",
+        "encryption_key_ref",
+        "metadata",
+        "created_at",
+    }
+)
 
 
 class ProviderAccessDenied(RuntimeError):
@@ -178,6 +208,9 @@ class ProviderAccessGrant:
     request_digest: str = ""
     request_artifact_digest: str = ""
     invocation_index: int = 0
+    response_sensitivity: ArtifactSensitivity = (
+        ArtifactSensitivity.SENSITIVE
+    )
     route: ProviderRouteDescriptor | None = None
     issued_at: float = 0
     expires_at: float = 0
@@ -235,6 +268,16 @@ class ProviderAccessGrant:
             )
         if not isinstance(self.route, ProviderRouteDescriptor):
             raise ProviderAccessDenied("invalid_provider_route")
+        try:
+            object.__setattr__(
+                self,
+                "response_sensitivity",
+                ArtifactSensitivity(self.response_sensitivity),
+            )
+        except (TypeError, ValueError):
+            raise ProviderAccessDenied(
+                "invalid_provider_result_sensitivity"
+            ) from None
         object.__setattr__(
             self,
             "issued_at",
@@ -284,6 +327,7 @@ class ProviderAccessGrant:
                 self.request_artifact_digest
             ),
             "invocation_index": self.invocation_index,
+            "response_sensitivity": self.response_sensitivity.value,
             "route": self.route.to_dict(),
             "issued_at": self.issued_at,
             "expires_at": self.expires_at,
@@ -308,6 +352,7 @@ class ProviderAccessGrant:
             "request_digest",
             "request_artifact_digest",
             "invocation_index",
+            "response_sensitivity",
             "route",
             "issued_at",
             "expires_at",
@@ -332,6 +377,7 @@ class ProviderAccessGrant:
                     "request_artifact_digest"
                 ],
                 invocation_index=value["invocation_index"],
+                response_sensitivity=value["response_sensitivity"],
                 route=ProviderRouteDescriptor.from_dict(
                     value["route"]
                 ),
@@ -360,6 +406,10 @@ class ProviderInvocationResult:
     route_id: str
     response_digest: str
     content: bytes = field(repr=False)
+    artifact_ref: ArtifactRef | None = field(
+        default=None,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -387,6 +437,15 @@ class ProviderInvocationResult:
             != self.response_digest
         ):
             raise ProviderAccessDenied("invalid_provider_result")
+        if self.artifact_ref is not None:
+            if (
+                not isinstance(self.artifact_ref, ArtifactRef)
+                or self.artifact_ref.sha256 != self.response_digest
+                or self.artifact_ref.size != len(self.content)
+            ):
+                raise ProviderAccessDenied(
+                    "invalid_provider_result"
+                )
 
 
 @runtime_checkable
@@ -417,6 +476,7 @@ class ProviderAccessBroker:
         ),
         maximum_active_grants: int = MAX_ACTIVE_PROVIDER_GRANTS,
         recovery_journal: RemoteExecutionJournal | None = None,
+        result_store: ArtifactStore | None = None,
     ) -> None:
         if not isinstance(
             authorization_verifier,
@@ -475,16 +535,31 @@ class ProviderAccessBroker:
                 "provider_grant_capacity_mismatch"
             )
         self._recovery_journal = recovery_journal
+        if result_store is not None and not isinstance(
+            result_store,
+            ArtifactStore,
+        ):
+            raise ProviderAccessDenied(
+                "invalid_provider_result_store"
+            )
+        self._result_store = result_store
 
     @property
     def production_security_ready(self) -> bool:
-        """A durable result receipt and hardened gateway are still required."""
+        """Upstream idempotency and a hardened gateway are still required."""
 
         return False
 
     @property
     def durable_recovery_ready(self) -> bool:
         return self._recovery_journal.durable
+
+    @property
+    def durable_result_recovery_ready(self) -> bool:
+        return (
+            self._recovery_journal.durable
+            and isinstance(self._result_store, LocalArtifactStore)
+        )
 
     def issue(
         self,
@@ -494,6 +569,9 @@ class ProviderAccessBroker:
         request_digest: str,
         request_artifact_digest: str,
         invocation_index: int,
+        response_sensitivity: ArtifactSensitivity | str = (
+            ArtifactSensitivity.SENSITIVE
+        ),
         ttl_seconds: float | None = None,
     ) -> ProviderAccessGrant:
         now = _timestamp(self._clock())
@@ -524,6 +602,36 @@ class ProviderAccessBroker:
         )
         if expires_at <= now:
             raise ProviderAccessDenied("authorization_expired")
+        try:
+            requested_sensitivity = ArtifactSensitivity(
+                response_sensitivity
+            )
+        except (TypeError, ValueError):
+            raise ProviderAccessDenied(
+                "invalid_provider_result_sensitivity"
+            ) from None
+        if _sensitivity_rank(
+            requested_sensitivity
+        ) > _sensitivity_rank(
+            authorization.maximum_artifact_sensitivity
+        ):
+            raise ProviderAccessDenied(
+                "provider_result_sensitivity_exceeds_policy"
+            )
+        if (
+            requested_sensitivity
+            is not authorization.maximum_artifact_sensitivity
+        ):
+            raise ProviderAccessDenied(
+                "provider_result_sensitivity_mismatch"
+            )
+        if (
+            requested_sensitivity is ArtifactSensitivity.SECRET
+            and isinstance(self._result_store, LocalArtifactStore)
+        ):
+            raise ProviderAccessDenied(
+                "secret_provider_result_requires_encrypted_store"
+            )
         token = secrets.token_urlsafe(32)
         grant = ProviderAccessGrant(
             grant_id=f"provider-grant-{uuid.uuid4()}",
@@ -540,6 +648,7 @@ class ProviderAccessBroker:
             request_digest=request_digest,
             request_artifact_digest=request_artifact_digest,
             invocation_index=invocation_index,
+            response_sensitivity=requested_sensitivity,
             route=route,
             issued_at=now,
             expires_at=expires_at,
@@ -626,22 +735,39 @@ class ProviderAccessBroker:
             raise ProviderAccessDenied(
                 "provider_request_exceeds_policy"
             )
+        request_payload_digest = hashlib.sha256(payload).hexdigest()
         failure_reason: str | None = None
+        claim = None
         try:
-            self._recovery_journal.consume_provider_grant(
+            claim = self._recovery_journal.claim_provider_invocation(
                 grant_id=grant.grant_id,
                 token_digest=_token_digest(grant.token),
                 binding_digest=grant.binding_digest,
                 route_id=route.route_id,
                 expires_at=grant.expires_at,
+                request_payload_digest=request_payload_digest,
                 now=now,
             )
         except RemoteProviderGrantUnavailable:
             failure_reason = "provider_grant_unavailable"
+        except RemoteProviderInvocationUnknown:
+            failure_reason = "provider_invocation_outcome_unknown"
+        except RemoteProviderInvocationConflict:
+            failure_reason = "provider_grant_registry_unavailable"
         except RemoteExecutionJournalError:
             failure_reason = "provider_grant_registry_unavailable"
         if failure_reason is not None:
             raise ProviderAccessDenied(failure_reason)
+        if claim is None:
+            raise ProviderAccessDenied(
+                "provider_grant_registry_unavailable"
+            )
+        if not claim.execute:
+            return self._replay_provider_result(
+                grant,
+                route,
+                claim.record,
+            )
         invocation_failed = False
         try:
             response = self._invoker.invoke(
@@ -655,6 +781,11 @@ class ProviderAccessBroker:
             invocation_failed = True
             response = None
         if invocation_failed:
+            self._mark_invocation_unknown(
+                grant,
+                route,
+                request_payload_digest=request_payload_digest,
+            )
             raise ProviderAccessDenied(
                 "provider_invocation_failed"
             )
@@ -663,15 +794,224 @@ class ProviderAccessBroker:
             or not response
             or len(response) > route.maximum_response_bytes
         ):
+            self._mark_invocation_unknown(
+                grant,
+                route,
+                request_payload_digest=request_payload_digest,
+            )
             raise ProviderAccessDenied(
                 "provider_response_exceeds_policy"
+            )
+        response_digest = hashlib.sha256(response).hexdigest()
+        artifact_ref = self._persist_provider_result(
+            grant,
+            route,
+            response,
+            response_digest=response_digest,
+            request_payload_digest=request_payload_digest,
+        )
+        completion_failed = False
+        try:
+            self._recovery_journal.complete_provider_invocation(
+                grant_id=grant.grant_id,
+                token_digest=_token_digest(grant.token),
+                binding_digest=grant.binding_digest,
+                route_id=route.route_id,
+                expires_at=grant.expires_at,
+                request_payload_digest=request_payload_digest,
+                response_digest=response_digest,
+                response_artifact_ref=(
+                    None
+                    if artifact_ref is None
+                    else _provider_result_ref_json(artifact_ref)
+                ),
+                now=_timestamp(self._clock()),
+            )
+        except (
+            RemoteProviderGrantUnavailable,
+            RemoteProviderInvocationConflict,
+            RemoteProviderInvocationUnknown,
+            RemoteExecutionJournalError,
+        ):
+            completion_failed = True
+        if completion_failed:
+            raise ProviderAccessDenied(
+                "provider_grant_registry_unavailable"
             )
         return ProviderInvocationResult(
             grant_id=grant.grant_id,
             route_id=route.route_id,
-            response_digest=hashlib.sha256(response).hexdigest(),
+            response_digest=response_digest,
             content=response,
+            artifact_ref=artifact_ref,
         )
+
+    def _persist_provider_result(
+        self,
+        grant: ProviderAccessGrant,
+        route: ProviderRouteDescriptor,
+        response: bytes,
+        *,
+        response_digest: str,
+        request_payload_digest: str,
+    ) -> ArtifactRef | None:
+        store = self._result_store
+        if store is None:
+            return None
+        persistence_failed = False
+        try:
+            ref = store.put_bytes(
+                response,
+                media_type="application/octet-stream",
+                kind=ArtifactKind.MODEL_RESPONSE,
+                sensitivity=grant.response_sensitivity,
+                producer_run_id=grant.run_id,
+                producer_node_id=grant.node_id,
+                producer_attempt_id=grant.attempt_id,
+                metadata={},
+            )
+            valid = self._provider_result_ref_is_valid(
+                grant,
+                route,
+                ref,
+                response_digest=response_digest,
+                response_size=len(response),
+            )
+            if valid:
+                valid = store.verify(ref) is True
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            persistence_failed = True
+            ref = None
+            valid = False
+        if persistence_failed or not valid or ref is None:
+            self._mark_invocation_unknown(
+                grant,
+                route,
+                request_payload_digest=request_payload_digest,
+            )
+            raise ProviderAccessDenied(
+                "provider_result_persistence_failed"
+            )
+        return ref
+
+    def _replay_provider_result(
+        self,
+        grant: ProviderAccessGrant,
+        route: ProviderRouteDescriptor,
+        invocation: RemoteProviderInvocationRecord,
+    ) -> ProviderInvocationResult:
+        store = self._result_store
+        if (
+            store is None
+            or invocation.state != "completed"
+            or invocation.response_digest is None
+            or invocation.response_artifact_ref is None
+        ):
+            raise ProviderAccessDenied(
+                "provider_result_unavailable"
+            )
+        replay_failed = False
+        try:
+            ref = _provider_result_ref_from_json(
+                invocation.response_artifact_ref
+            )
+            if not self._provider_result_ref_is_valid(
+                grant,
+                route,
+                ref,
+                response_digest=invocation.response_digest,
+                response_size=ref.size,
+            ):
+                replay_failed = True
+                content = None
+            else:
+                content = store.read(ref)
+                if (
+                    not isinstance(content, bytes)
+                    or not content
+                    or len(content) != ref.size
+                    or len(content) > route.maximum_response_bytes
+                    or hashlib.sha256(content).hexdigest()
+                    != invocation.response_digest
+                ):
+                    replay_failed = True
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            replay_failed = True
+            ref = None
+            content = None
+        if replay_failed or ref is None or content is None:
+            raise ProviderAccessDenied(
+                "provider_result_integrity_failed"
+            )
+        return ProviderInvocationResult(
+            grant_id=grant.grant_id,
+            route_id=route.route_id,
+            response_digest=invocation.response_digest,
+            content=content,
+            artifact_ref=ref,
+        )
+
+    def _provider_result_ref_is_valid(
+        self,
+        grant: ProviderAccessGrant,
+        route: ProviderRouteDescriptor,
+        ref: object,
+        *,
+        response_digest: str,
+        response_size: int,
+    ) -> bool:
+        if not isinstance(ref, ArtifactRef):
+            return False
+        if (
+            ref.sha256 != response_digest
+            or ref.size != response_size
+            or ref.size <= 0
+            or ref.size > route.maximum_response_bytes
+            or ref.media_type != "application/octet-stream"
+            or ref.kind is not ArtifactKind.MODEL_RESPONSE
+            or ref.sensitivity is not grant.response_sensitivity
+            or ref.producer_run_id != grant.run_id
+            or ref.producer_node_id != grant.node_id
+            or ref.producer_attempt_id != grant.attempt_id
+            or dict(ref.metadata)
+        ):
+            return False
+        if (
+            ref.sensitivity is ArtifactSensitivity.SECRET
+            and ref.encryption
+            is not ArtifactEncryption.DEPLOYMENT_MANAGED
+        ):
+            return False
+        return True
+
+    def _mark_invocation_unknown(
+        self,
+        grant: ProviderAccessGrant,
+        route: ProviderRouteDescriptor,
+        *,
+        request_payload_digest: str,
+    ) -> None:
+        try:
+            now = _timestamp(self._clock())
+            self._recovery_journal.mark_provider_invocation_unknown(
+                grant_id=grant.grant_id,
+                token_digest=_token_digest(grant.token),
+                binding_digest=grant.binding_digest,
+                route_id=route.route_id,
+                expires_at=grant.expires_at,
+                request_payload_digest=request_payload_digest,
+                now=now,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            # The durable `invoking` row is already an unknown-outcome
+            # tombstone if this best-effort refinement cannot be written.
+            return
 
     def purge_expired(self) -> int:
         now = _timestamp(self._clock())
@@ -788,6 +1128,76 @@ def _canonical_digest(value: Any) -> str:
 
 def _token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _provider_result_ref_json(ref: ArtifactRef) -> str:
+    if not isinstance(ref, ArtifactRef):
+        raise ProviderAccessDenied(
+            "invalid_provider_result_reference"
+        )
+    return _canonical_json(ref.to_dict())
+
+
+def _provider_result_ref_from_json(value: str) -> ArtifactRef:
+    invalid = False
+    try:
+        payload = json.loads(
+            value,
+            parse_constant=_reject_json_constant,
+        )
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != _ARTIFACT_REF_KEYS
+        ):
+            invalid = True
+            ref = None
+        else:
+            ref = ArtifactRef.from_dict(payload)
+            if _provider_result_ref_json(ref) != value:
+                invalid = True
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        invalid = True
+        ref = None
+    if invalid or not isinstance(ref, ArtifactRef):
+        raise ProviderAccessDenied(
+            "invalid_provider_result_reference"
+        )
+    return ref
+
+
+def _canonical_json(value: Any) -> str:
+    invalid = False
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        invalid = True
+        encoded = ""
+    if invalid:
+        raise ProviderAccessDenied(
+            "invalid_provider_metadata"
+        )
+    return encoded
+
+
+def _reject_json_constant(constant: str) -> object:
+    raise ValueError(f"invalid JSON constant: {constant}")
+
+
+def _sensitivity_rank(value: ArtifactSensitivity) -> int:
+    return {
+        ArtifactSensitivity.PUBLIC: 0,
+        ArtifactSensitivity.INTERNAL: 1,
+        ArtifactSensitivity.SENSITIVE: 2,
+        ArtifactSensitivity.SECRET: 3,
+    }[value]
 
 
 __all__ = [

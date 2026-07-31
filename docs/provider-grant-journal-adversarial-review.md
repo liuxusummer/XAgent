@@ -3,8 +3,9 @@
 > 审查对象：`RemoteExecutionJournal` schema v3、
 > `RemoteProviderGrantRecord`、`ProviderAccessBroker`
 >
-> 结论：本机 durable anti-replay 边界通过；provider invocation result recovery 与
-> 跨主机高可用仍未实现，`production_security_ready` 保持 false。
+> 结论：本机 durable anti-replay 边界通过；后续 completed invocation result replay
+> 不改变跨主机高可用与 upstream unknown window 未实现的结论，
+> `production_security_ready` 保持 false。
 
 ## Round 1：重启、时钟与墓碑复活
 
@@ -47,15 +48,16 @@ Round 1：通过。
 - 消费在同类事务中校验 exact route/binding/expiry 和 constant-time token digest，
   再以 `state = 'issued'` 条件更新；
 - 任一绑定不一致统一返回 unavailable，不泄露哪一字段匹配；
-- v1/v2 只在 exact schema/version 校验成功后，于单事务升级到 v3；半迁移或未知
-  table/index/trigger/view fail closed。
+- v1/v2 只在 exact schema/version 校验成功后迁移；当前实现于单事务直接升级到 v4，
+  仍覆盖本阶段 v3 grant/clock schema，半迁移或未知 table/index/trigger/view
+  fail closed。
 
 对应测试：
 
 - `test_separate_registries_serialize_issue_and_consume`
 - `test_wrong_authorization_and_tampering_do_not_consume`
-- `test_exact_v1_schema_migrates_atomically_to_v3`
-- `test_exact_v2_schema_migrates_atomically_to_v3`
+- `test_exact_v1_schema_migrates_atomically_to_v4`
+- `test_exact_v2_schema_migrates_atomically_to_v4`
 
 Round 2：通过。
 
@@ -80,8 +82,8 @@ Round 2：通过。
   `production_security_ready` 始终 false；
 - purge 水位单例在 schema 启动校验中验证；缺失或损坏时数据库拒绝打开，不会先报告
   durable readiness、再延迟到首次调用失败；
-- 文档明确单机 SQLite 不提供复制、跨主机共识、invocation receipt、mTLS、attestation
-  或 upstream idempotency。
+- 当时的文档明确单机 SQLite 不提供复制、跨主机共识、invocation receipt、mTLS、
+  attestation 或 upstream idempotency。
 
 对应测试：
 
@@ -95,7 +97,8 @@ Round 3：在声明的本机 anti-replay 范围内通过。
 
 ## 剩余工作
 
-- durable provider invocation/result receipt 与响应恢复；
+- completed provider invocation/result receipt 与响应重放已在后续阶段完成，见
+  [Provider Invocation Receipt 三轮对抗性审查](provider-invocation-receipt-adversarial-review.md)；
 - 明确的上游 idempotency key 和 unknown-outcome operator protocol；
 - secret-manager backed、mTLS、egress allowlist 与 attested ProviderInvoker；
 - 跨主机线性一致存储或单写者 fencing；
