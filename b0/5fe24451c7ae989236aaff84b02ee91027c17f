@@ -1,0 +1,27 @@
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_b3bff134ef8efc 48-52,311-313
+src/orchestration/event_types.py
+  s_72af05a5dabd4c::t_1a37538bdebcab 45-52
+tests/test_orchestration_public_api.py
+  s_72af05a5dabd4c::t_30e20d7a5b8168 23-24,119-122,160-161
+tests/test_orchestration_store.py
+  s_72af05a5dabd4c::t_8ff9f266006484 40-43,64,2561,2590,2627,2651,2696,2726,3207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b05fe24451c7ae989236aaff84b02ee91027c17f",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
