@@ -33,10 +33,11 @@ task / context Artifact
 ```
 
 当前 Legacy adapter 的请求仍由 task 与 runner kwargs 的规范 JSON digest 绑定；task 和
-上下文本身不进入 receipt。将远程 Agent 请求物化为不可变输入 Artifact 是后续独立阶段，
-不能因为已有 request digest 就声称已经完成。
+上下文本身不进入 receipt。远程 Agent 可使用独立 `AgentActivityRequest` 不可变
+Artifact，但生产 remote adapter 尚未接线，不能因为已有 request/manifest digest 就
+声称远程 Agent 已完成。
 
-## 3. Schema v1
+## 3. Schema v1/v2
 
 | 字段 | 约束 |
 |---|---|
@@ -52,8 +53,9 @@ task / context Artifact
 | `result_artifact_digests` | 与 NodeResult `artifact_refs` 顺序一致，最多 64 个 |
 | `tool_receipt_digests` | 与 NodeResult `tool_receipt_refs` 顺序一致，最多 64 个 |
 | `internal_tool_receipts_complete` | 是否一项观察结果对应一个 receipt digest |
+| `execution_manifest_digest` | v2 可选；有 ToolReceipt 或声明完整时必填，并对应唯一 result Artifact |
 | `verification` | `runtime_observed` 或 `unverified` |
-| `schema_version` | 严格整数 `1`；布尔值不视为整数 |
+| `schema_version` | 严格整数 `1/2`；布尔值不视为整数 |
 
 反序列化采用 exact-field schema。未知字段、缺字段、NaN、非 JSON 值、畸形 digest、
 控制字符和超界集合全部拒绝。
@@ -71,9 +73,15 @@ task / context Artifact
 `unverified`。Legacy adapter 始终设置
 `internal_tool_receipts_complete=false`，即使工具结果数恰好与引用数相等。
 
-对未来提供完整逐工具回执的 adapter，`internal_tool_receipts_complete=true` 只证明
-receipt 覆盖数量精确且整个 Loop 终态被观察到。调度器仍必须逐个读取 ToolReceipt 的
-verification、effect class 和外部操作身份，不能把覆盖完整等同于副作用 verified。
+v2 有 ToolReceipt 时必须绑定
+[AgentActivityExecutionManifest](agent-execution-manifest.md)。只有实际加载并验证
+manifest、request Artifact 和逐个 ToolReceipt 后，才能把
+`has_manifest_bound_tool_receipt_lineage` 用作新路径的 lineage 门禁。该属性本身只说明
+receipt 已绑定 digest，不说明 Artifact bytes 已加载。调度器仍必须逐个判断 ToolReceipt
+的 verification、effect class 和外部操作身份，不能把覆盖完整等同于副作用 verified。
+
+v1 保持 exact-field 历史兼容；其中 `internal_tool_receipts_complete=true` 仍是旧的
+count-only 语义，不能用于新远程 Agent。
 
 ## 5. 原子提交与读取
 
@@ -90,7 +98,8 @@ receipt dict 和其 canonical digest 与 Attempt 终态 Event、Attempt/Node/Run
 3. effect class、Attempt status 和终态 Event type；
 4. request digest、`COMPLETED` 状态与 idempotency record；
 5. result digest 与规范化 idempotency result、Attempt result；
-6. 两组 Artifact digest 与 NodeResult 引用的精确顺序。
+6. 两组 Artifact digest 与 NodeResult 引用的精确顺序；
+7. v2 manifest digest 对应唯一、typed、精确 producer 的 result Artifact ref。
 
 任一不一致都抛出完整性错误。查询不得从 projection 的普通 dict 推断或伪造 receipt。
 如果事务已经提交但 adapter 没收到响应，adapter 只有在重新读取到非空、验证通过的

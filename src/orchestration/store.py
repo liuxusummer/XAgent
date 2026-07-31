@@ -1290,6 +1290,59 @@ def _agent_result_ref_digests(
     return tuple(digests)
 
 
+def _validate_agent_execution_manifest_ref(
+    result: Any,
+    receipt: Any,
+) -> None:
+    manifest_digest = getattr(
+        receipt,
+        "execution_manifest_digest",
+        None,
+    )
+    if manifest_digest is None:
+        return
+    if not isinstance(result, Mapping):
+        raise ValueError(
+            "Agent execution manifest requires a NodeResult"
+        )
+    raw_refs = result.get("artifact_refs")
+    if not isinstance(raw_refs, list):
+        raise ValueError(
+            "Agent execution manifest requires Artifact refs"
+        )
+    matches: list[ArtifactRef] = []
+    for raw_ref in raw_refs:
+        if (
+            not isinstance(raw_ref, Mapping)
+            or raw_ref.get("sha256") != manifest_digest
+        ):
+            continue
+        ref = ArtifactRef.from_dict(raw_ref)
+        canonical = ref.to_dict()
+        if set(raw_ref) != set(canonical) or dict(raw_ref) != canonical:
+            raise ValueError(
+                "Agent execution manifest ref is not canonical"
+            )
+        matches.append(ref)
+    if len(matches) != 1:
+        raise ValueError(
+            "Agent execution manifest ref must be unique"
+        )
+    from .agent_execution_manifest import (
+        AgentExecutionManifestArtifactStore,
+    )
+
+    AgentExecutionManifestArtifactStore.validate_ref(matches[0])
+    if (
+        matches[0].producer_run_id != receipt.run_id
+        or matches[0].producer_node_id != receipt.node_id
+        or matches[0].producer_attempt_id != receipt.attempt_id
+    ):
+        raise ValueError(
+            "Agent execution manifest ref has the wrong producer"
+        )
+
+
 def _canonical_optional_workflow_ref(value: Any) -> ArtifactRef | None:
     if value is None:
         return None
@@ -5684,6 +5737,10 @@ class DurableRunStore:
                     "AgentActivityReceipt payload must be an object"
                 )
             receipt = AgentActivityReceipt.from_dict(raw_receipt)
+            _validate_agent_execution_manifest_ref(
+                attempt.result,
+                receipt,
+            )
             if (
                 receipt.run_id != run_id
                 or receipt.node_id != attempt.node_id

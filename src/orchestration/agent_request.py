@@ -623,7 +623,7 @@ class AgentActivityRequestArtifactStore:
             raise AgentActivityRequestError(
                 "agent_request_artifact_write_failed"
             ) from None
-        self._validate_ref(ref, request)
+        self.validate_ref(ref, request)
         try:
             verified = self._store.verify(ref)
         except (KeyboardInterrupt, SystemExit):
@@ -644,7 +644,7 @@ class AgentActivityRequestArtifactStore:
         *,
         expected_candidate: ActivityAdmissionCandidate | None = None,
     ) -> AgentActivityRequest:
-        self._validate_ref(ref)
+        self.validate_ref(ref)
         try:
             verified = self._store.verify(ref)
         except (KeyboardInterrupt, SystemExit):
@@ -674,7 +674,7 @@ class AgentActivityRequestArtifactStore:
                 "agent_request_artifact_integrity_failed"
             )
         request = AgentActivityRequest.from_bytes(content)
-        self._validate_ref(ref, request)
+        self.validate_ref(ref, request)
         if (
             expected_candidate is not None
             and request
@@ -686,7 +686,7 @@ class AgentActivityRequestArtifactStore:
         return request
 
     @staticmethod
-    def _validate_ref(
+    def validate_ref(
         ref: ArtifactRef,
         request: AgentActivityRequest | None = None,
     ) -> None:

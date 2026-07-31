@@ -12,12 +12,17 @@ import json
 import re
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from .models import AttemptStatus
 from .policy import EffectClass
 
-AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION = 1
+if TYPE_CHECKING:
+    from .agent_execution_manifest import AgentActivityExecutionManifest
+
+
+AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION = 2
+LEGACY_AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION = 1
 MAX_AGENT_RECEIPT_REFS = 64
 MAX_AGENT_RECEIPT_TURNS = 1_000_000
 MAX_AGENT_RECEIPT_TOOL_RESULTS = 1_000_000
@@ -55,6 +60,7 @@ class AgentActivityReceipt:
     result_artifact_digests: tuple[str, ...] = ()
     tool_receipt_digests: tuple[str, ...] = ()
     internal_tool_receipts_complete: bool = False
+    execution_manifest_digest: str | None = None
     verification: AgentActivityVerification = (
         AgentActivityVerification.UNVERIFIED
     )
@@ -158,6 +164,52 @@ class AgentActivityReceipt:
         )
         object.__setattr__(self, "result_artifact_digests", result_refs)
         object.__setattr__(self, "tool_receipt_digests", tool_refs)
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version
+            not in {
+                LEGACY_AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION,
+                AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION,
+            }
+        ):
+            raise AgentActivityReceiptError(
+                "unsupported AgentActivityReceipt schema version"
+            )
+        manifest_digest = self.execution_manifest_digest
+        if manifest_digest is not None:
+            manifest_digest = _digest(
+                manifest_digest,
+                "execution_manifest_digest",
+            )
+            object.__setattr__(
+                self,
+                "execution_manifest_digest",
+                manifest_digest,
+            )
+        if (
+            self.schema_version
+            == LEGACY_AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION
+            and manifest_digest is not None
+        ):
+            raise AgentActivityReceiptError(
+                "legacy AgentActivityReceipt cannot bind a manifest"
+            )
+        if (
+            self.schema_version == AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION
+            and tool_refs
+            and manifest_digest is None
+        ):
+            raise AgentActivityReceiptError(
+                "v2 ToolReceipts require an execution manifest"
+            )
+        if (
+            manifest_digest is not None
+            and result_refs.count(manifest_digest) != 1
+        ):
+            raise AgentActivityReceiptError(
+                "execution manifest must have one result Artifact"
+            )
         if not isinstance(self.internal_tool_receipts_complete, bool):
             raise AgentActivityReceiptError(
                 "internal_tool_receipts_complete must be a bool"
@@ -168,27 +220,52 @@ class AgentActivityReceipt:
                 verification
                 is not AgentActivityVerification.RUNTIME_OBSERVED
                 or self.observed_tool_results != len(tool_refs)
+                or (
+                    self.schema_version
+                    == AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION
+                    and manifest_digest is None
+                )
             )
         ):
             raise AgentActivityReceiptError(
                 "complete internal receipts require exact observed coverage"
-            )
-        if (
-            isinstance(self.schema_version, bool)
-            or not isinstance(self.schema_version, int)
-            or self.schema_version
-            != AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION
-        ):
-            raise AgentActivityReceiptError(
-                "unsupported AgentActivityReceipt schema version"
             )
 
     @property
     def receipt_digest(self) -> str:
         return canonical_agent_result_digest(self.to_dict())
 
+    @property
+    def has_manifest_bound_tool_receipt_lineage(self) -> bool:
+        """Whether completeness is bound to a v2 manifest digest."""
+
+        return (
+            self.schema_version == AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION
+            and self.internal_tool_receipts_complete
+            and self.execution_manifest_digest is not None
+        )
+
+    def validate_execution_manifest(
+        self,
+        manifest: "AgentActivityExecutionManifest",
+    ) -> None:
+        from .agent_execution_manifest import (
+            AgentActivityExecutionManifest,
+        )
+
+        if not isinstance(manifest, AgentActivityExecutionManifest):
+            raise AgentActivityReceiptError(
+                "execution manifest is invalid"
+            )
+        try:
+            manifest.validate_agent_receipt(self)
+        except ValueError as exc:
+            raise AgentActivityReceiptError(
+                "execution manifest does not match AgentActivityReceipt"
+            ) from exc
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "kind": "agent_activity_receipt",
             "run_id": self.run_id,
@@ -211,6 +288,11 @@ class AgentActivityReceipt:
             ),
             "verification": self.verification.value,
         }
+        if self.schema_version == AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION:
+            payload["execution_manifest_digest"] = (
+                self.execution_manifest_digest
+            )
+        return payload
 
     @classmethod
     def from_dict(
@@ -220,6 +302,19 @@ class AgentActivityReceipt:
         if not isinstance(payload, Mapping):
             raise AgentActivityReceiptError(
                 "AgentActivityReceipt must be an object"
+            )
+        version = payload.get("schema_version")
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version
+            not in {
+                LEGACY_AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION,
+                AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION,
+            }
+        ):
+            raise AgentActivityReceiptError(
+                "unsupported AgentActivityReceipt schema version"
             )
         required = {
             "schema_version",
@@ -240,6 +335,8 @@ class AgentActivityReceipt:
             "internal_tool_receipts_complete",
             "verification",
         }
+        if version == AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION:
+            required.add("execution_manifest_digest")
         if (
             set(payload) != required
             or payload.get("kind") != "agent_activity_receipt"
@@ -275,6 +372,9 @@ class AgentActivityReceipt:
             tool_receipt_digests=tuple(tool_refs),
             internal_tool_receipts_complete=payload.get(
                 "internal_tool_receipts_complete"
+            ),
+            execution_manifest_digest=payload.get(
+                "execution_manifest_digest"
             ),
             verification=payload.get("verification"),
         )

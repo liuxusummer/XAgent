@@ -107,10 +107,10 @@ replay 四类关键窗口。
 
 - 当前安全 remote control/worker 参考链仍只证明 `tool` Activity；不能因为本 receipt
   契约存在就开放 `agent` capability。
-- Legacy Agent 的 `internal_tool_receipts_complete` 始终为 false。逐工具 receipt 接入
-  是后续工作。
-- task/context 目前只进入 canonical request digest；将远程 Agent 输入物化为受 grant
-  约束的不可变 Artifact 是后续独立阶段。
+- Legacy Agent 的 `internal_tool_receipts_complete` 始终为 false。v2 已能绑定独立
+  Agent execution manifest，但受信 runtime 的逐工具接入仍是后续工作。
+- task/context 已可物化为受 grant 约束的 `AgentActivityRequest` Artifact；当前仍未接入
+  Tool-only 的生产 remote adapter。
 - receipt digest 是完整性绑定，不是抗数据库管理员篡改的数字签名。生产部署仍需要独立
   OS identity、只读查询身份、备份和可选外部签名/透明日志。
 - 外部系统与 SQLite 没有共同事务；本功能不承诺通用 exactly-once。

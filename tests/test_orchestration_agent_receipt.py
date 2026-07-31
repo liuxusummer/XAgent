@@ -55,6 +55,7 @@ class AgentActivityReceiptContractTests(unittest.TestCase):
             tool_receipt_digests=("d" * 64,),
             observed_tool_results=1,
             internal_tool_receipts_complete=True,
+            execution_manifest_digest="c" * 64,
         )
 
         restored = AgentActivityReceipt.from_dict(receipt.to_dict())
@@ -91,9 +92,11 @@ class AgentActivityReceiptContractTests(unittest.TestCase):
             "exact observed coverage",
         ):
             _receipt(
+                result_artifact_digests=("c" * 64,),
                 observed_tool_results=2,
                 tool_receipt_digests=("d" * 64,),
                 internal_tool_receipts_complete=True,
+                execution_manifest_digest="c" * 64,
             )
 
     def test_unknown_fields_and_non_identifier_activity_name_are_rejected(

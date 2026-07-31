@@ -291,6 +291,10 @@ adapter 都通过不可变 `supported_activity_kinds` 声明真实能力，注�
 start 前逐层验证；协议存在 `agent` 枚举或调用方声明 `activity.agent` 都不能扩大能力。
 完整 Agent Loop 的远程执行必须另行证明整体副作用、上下文 Artifact 和 Agent 级回执，
 不能把内部单次 ToolReceipt 冒充为整个 Agent Activity 的结果。
+`AgentActivityExecutionManifest` 已提供工具 lineage 的前置契约：父 Agent 的稳定身份与
+request digest 为每个有序 child Tool Activity 派生 operation/idempotency key，并把
+精确 ToolReceipt digest 绑定进 v2 Agent receipt。该 manifest 仍不证明 provider 调用
+或 sandbox egress 已受控，因此生产 reference adapter 继续保持 Tool-only。
 
 进程内 Artifact broker 除单 Artifact 上限外，还对所有 staged/finalizing 内容实施
 全局驻留字节硬上限；超限的新增 stage 必须 fail closed，不能淘汰已接受的旧 stage。

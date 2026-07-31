@@ -81,6 +81,10 @@
 - Agent Activity 终态以 `AgentActivityReceipt` 绑定 request digest、规范 NodeResult 和
   Artifact digest；它只证明运行时观察到整个 Loop 边界，不会把内部未回执的工具副作用
   提升为 verified 或 exactly-once。完整契约见 `docs/agent-activity-receipt.md`
+- `AgentActivityExecutionManifest` 进一步用父 Attempt 派生的确定性 child operation key
+  绑定有序 ToolReceipt、精确 request Artifact/definition 和分类；只有 v2 receipt
+  实际加载并验证该 manifest 后，才具备远程 Agent 所需的工具 lineage 前置证据。见
+  `docs/agent-execution-manifest.md`
 - Agent Activity 的 task/context 可由 `AgentActivityRequest` 物化为至少 sensitive
   （并继承 context 最高分类）的 content-addressed Artifact，绑定稳定
   Attempt/request/definition/config/input descriptor，但不绑定 Worker/lease/grant。

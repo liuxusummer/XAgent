@@ -71,6 +71,7 @@ Durable Orchestration
 | ToolReceipt | 一次工具调用的输入摘要、结果摘要和副作用证明 |
 | AgentActivityRequest | 一次 Agent Activity 的 task/context 敏感 Artifact envelope |
 | AgentActivityReceipt | 一次完整 Agent Loop Attempt 的边界观察与持久结果绑定 |
+| AgentActivityExecutionManifest | 父 Agent 与有序子 ToolReceipt 的 payload-free lineage |
 | ProviderAccessGrant | 一次模型网关调用的短期、窄作用域 bearer，不是 upstream API key |
 | Artifact | 大型输出、文件快照、模型响应或报告的持久化对象 |
 | Outcome Unknown | Activity 可能已产生副作用，但运行时没有可靠完成收据 |
@@ -402,6 +403,7 @@ exit_reason / turns / observed_tool_results
 result_artifact_digests[]
 tool_receipt_digests[]
 internal_tool_receipts_complete
+execution_manifest_digest?  v2 typed result Artifact
 verification          runtime_observed | unverified
 ```
 
@@ -411,9 +413,11 @@ verification          runtime_observed | unverified
 工具参数、工具原始结果或凭据。
 
 `runtime_observed` 不等于外部副作用已验证：Legacy Agent 即使正常返回，也必须保持
-`internal_tool_receipts_complete=false`。该布尔值只表示每个观察到的内部工具结果都有
-一个对应的 receipt Artifact digest；即使为 true，各 ToolReceipt 的 verification
-强度仍须逐个判断，禁止据此宣称通用 exactly-once。
+`internal_tool_receipts_complete=false`。v2 有 ToolReceipt 或声明完整时还必须绑定
+唯一 `AgentActivityExecutionManifest` result Artifact；manifest 使用父
+run/node/attempt/request/sequence 派生的 child operation/idempotency key digest，阻止
+无关 receipt 替换和重排。即使 lineage 完整，各 ToolReceipt 的 verification 强度仍须
+逐个判断，禁止据此宣称通用 exactly-once。v1 的完整标志仅为历史 count-only 语义。
 
 成功 Attempt 必须是 `runtime_observed`；`OUTCOME_UNKNOWN` 和 `ABANDONED` 必须是
 `unverified`。Store 查询必须在同一 SQLite read transaction 中校验终态 Event、
