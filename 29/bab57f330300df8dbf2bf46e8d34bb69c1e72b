@@ -1,0 +1,33 @@
+docs/architecture.md
+  s_72af05a5dabd4c::t_344e6d361eee5f 141-145
+docs/durable-orchestration-spec.md
+  s_72af05a5dabd4c::t_107ff36b1a8956 941-949
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_f54ef4e2a2101b 85-93,175-178
+src/orchestration/deadline.py
+  s_72af05a5dabd4c::t_08d00e93622bdb 50,208
+src/orchestration/remote_fleet_reconcile.py
+  s_72af05a5dabd4c::t_565689f97691f7 458,468-472
+src/orchestration/scheduler.py
+  s_72af05a5dabd4c::t_93dd9d321f3552 1984-1993
+tests/test_orchestration_public_api.py
+  s_72af05a5dabd4c::t_22b27eb66b3c3e 47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "29bab57f330300df8dbf2bf46e8d34bb69c1e72b",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
