@@ -39,14 +39,13 @@ from src.orchestration import (
     DeterministicRemoteScheduler,
     DurableFleetReconciler,
     DurableFleetProjector,
-    FleetRunRoute,
+    DurableStoreFleetRunSource,
     FleetToolRoutingPolicy,
     FleetWorkerPolicy,
     RemoteControlFleetClaimer,
     RemoteFleetCoordinator,
     SecureRemoteFleetPoller,
     StaticFleetToolPolicyResolver,
-    StaticFleetRunSource,
     StaticFleetWorkerResolver,
 )
 
@@ -106,8 +105,15 @@ poller = SecureRemoteFleetPoller(
 production_remote_control.bind_fleet_poller(poller)
 
 projector = DurableFleetProjector(tool_policies)
-run_source = StaticFleetRunSource(
-    [FleetRunRoute(run_id, "tenant-a", "analysis")]
+run_route = scheduler.store.register_fleet_run_route(
+    run_id,
+    "tenant-a",
+    "analysis",
+)
+run_source = DurableStoreFleetRunSource(
+    [scheduler.store],
+    control_plane_root="/var/lib/xagent/control",
+    agent_roots=("/srv/xagent/workspaces",),
 )
 fleet_reconciler = DurableFleetReconciler(
     fleet,
@@ -123,9 +129,23 @@ fleet_reconciler.run_once()
 two-phase admission 和 reference fallback 禁用要求。`DurableFleetReconciler` 也不会
 启动线程、扫描任意 Store 或推进 Domain Run；部署显式周期调用 `run_once()`，并通过
 `FleetRunSource` 与 scheduler resolver 注入已经授权的 Run/tenant/pool 路由。示例的
-`StaticFleetRunSource` 适合固定目录和测试；生产实现应读取受保护、已认证的控制面 Run
-registry，不能从 Run input、Worker 声明或 Fleet snapshot 猜 tenant。独立 durable
-reconciler 仍负责先把 Run/Node 推进到 `RUNNING/READY`。
+`DurableStoreFleetRunSource` 动态读取 Store schema v7 的持久路由注册表。
+`StaticFleetRunSource` 只用于开发和确定性测试，必须显式设置
+`allow_reference_source=True`，且永远不会让 reconciler 报告 production-ready。
+独立 durable reconciler 仍负责先把 Run/Node 推进到 `RUNNING/READY`。
+
+生产 source 必须显式接收控制面根目录和全部 Agent 可写根目录。每个 Store 文件必须
+严格位于控制面根内，控制面根不得与任一 Agent 根互为祖先；source 会固定目录和数据库
+的 device/inode，并在每次 snapshot 前后复验。路径被替换、Store 越界、同一物理 Store
+经别名重复注册、同一 Run 出现在多个 Store，或 resolver 把 Run 指向另一个克隆 Store
+时均 fail closed 并 quarantine 旧 queued binding。这是部署配置的可验证防线，不替代
+独立 service/OS identity、ACL 和“控制面目录不挂载给 Agent”的要求。
+
+路由注册是显式控制面操作，不从 Run input、Worker 声明或 Fleet snapshot 猜 tenant。
+一个 Run 的 tenant/pool 创建后不可变；撤销与重新启用都使用当前
+`FleetRunRouteRecord` 做 CAS，每次状态变化增加 generation 并产生新 digest，防止
+A→disabled→A 复活旧队列。注册表最多保留 100,000 条记录且不自动删除 tombstone；
+容量规划和 Run 生命周期由运维负责。
 
 每次 `run_once()` 先完整解析有界 route snapshot、scheduler、pool authority 和 READY
 投影，再进入 Coordinator 的单锁 queue linearization。陈旧 queued binding 先
@@ -179,6 +199,14 @@ owner 与 policy digest 完全一致时才会合并；新 epoch 取旧最大值�
 所有 v5 envelope。若一个 pool 已经出现不同 owner 或 policy，迁移会原子失败并保留
 v5 数据，要求运维先消除 split ownership；epoch 已耗尽时同样 fail closed。
 
+schema v7 新增 Store-local `fleet_run_routes`。注册某个 Run 后，该 Run 的 Fleet
+admission 必须使用 schema v2，并精确携带当前 enabled route digest。route 校验在
+claim 的 `BEGIN IMMEDIATE` 事务内先于容量、资源、ownership、quota 和公平游标推进；
+撤销赢得事务时不会产生 Attempt，claim 先赢时后续 `CLAIMED -> RUNNING` 仍由数据库
+trigger 再次检查。已经 `RUNNING` 的合法 Activity 可凭原 lease/fencing 完成。
+迁移同时安装 INSERT/UPDATE trigger，因此迁移前已打开数据库的旧进程也不能在已注册
+Run 上继续写入 schema v1 或陈旧 route；滚动启用路由前应先 drain 旧版 active claim。
+
 ## 路由信封
 
 `DurableFleetProjector` 只投影 Tool Activity，并为每项任务绑定：
@@ -186,6 +214,7 @@ v5 数据，要求运维先消除 split ownership；epoch 已耗尽时同样 fai
 - tenant、pool 和确定性 task id；
 - 精确 `run_id`、`node_id` 和 Activity config digest；
 - Tool 名称与服务端工具策略 digest；
+- 当前 Store-local Run route generation digest；
 - 完整 required capabilities；
 - Workflow 声明的 resource keys；
 - Activity runtime 最小/最大版本。
@@ -212,7 +241,8 @@ session      = current durable RemoteControlJournal binding
 Fleet 预留 routing capacity 后，`RemoteControlFleetClaimer` 用精确 binding 和当前
 session 调用 `RemoteControlPlane.claim_for_fleet()`。Coordinator 同时生成
 `FleetAdmissionScope`，绑定 task/tenant/pool、Tool routing policy digest、完整 quota
-policy digest 和本次生效的 global/tenant/pool 上限。控制面再次检查：
+policy digest、本次生效的 global/tenant/pool 上限，以及当前 Run route digest。
+控制面再次检查：
 
 - run authorizer；
 - 当前 registration/session，包含 Store 线性化点前后的 supersession 检查；
@@ -257,13 +287,15 @@ resources 一致，否则不发送给 Worker；已经发生的 durable claim 由
 进程重启时：
 
 1. 从可信 Run registry 解析各 Run 的 `DurableScheduler`；
-2. 先执行独立 durable reconciler；
-3. 构造受信 `FleetRunSource`，调用 `DurableFleetReconciler.run_once()`；它先读取本
+2. 用当前 Store 恢复 `DurableStoreFleetRunSource`，复验控制面/Agent 根隔离和物理
+   Store 身份；
+3. 先执行独立 durable reconciler；
+4. 调用 `DurableFleetReconciler.run_once()`；它先读取本
    进程负责 pool 的 current ownership/cursor，验证 shard/owner/epoch/policy，
    恢复 cursor，再差量收敛 READY binding；
-4. Worker 重新通过 mTLS register，session journal 恢复或 fencing 旧 instance；
-5. lease reaper 处理崩溃前的 durable claims；
-6. 新进程的 Fleet active projection 从空状态开始，不从 Worker 响应推断旧 authority；
+5. Worker 重新通过 mTLS register，session journal 恢复或 fencing 旧 instance；
+6. lease reaper 处理崩溃前的 durable claims；
+7. 新进程的 Fleet active projection 从空状态开始，不从 Worker 响应推断旧 authority；
    新 claim 的配额检查直接读取 Store 中旧 active Attempt 的 durable scope。
    exact claim 的控制权限可由 `RemoteExecutionJournal` + Store + 新鲜 attestation
    重建；projection 随后由 completion 或周期 `run_once()` 收敛。
@@ -276,7 +308,8 @@ pool 的显式单写 shard owner 防止两个可信控制器同时消费同一�
 保证同 Store、显式接管或重启后的 tenant round-robin 不从默认位置重新开始，但不等价
 于共享 broker：跨 Store quota/ownership/cursor、自动 leader 故障检测和在线无损
 queue handoff 仍是部署/后续实现边界。所有权表有 4096 个 pool 的硬上限且不自动
-删除；pool 生命周期和容量规划必须由运维控制，禁止通过删除记录重置 epoch。真实
+删除；Run route 表有 100,000 条历史记录的硬上限且同样不做 LRU 淘汰。pool/route
+生命周期和容量规划必须由运维控制，禁止通过删除记录重置 epoch/generation。真实
 TLS-extension server 和生产 Sandbox 也仍需独立验证。
 
 ## 验证

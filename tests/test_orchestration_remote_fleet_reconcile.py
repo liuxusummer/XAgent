@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sqlite3
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -18,6 +20,7 @@ from src.orchestration.remote_fleet_control import (
 )
 from src.orchestration.remote_fleet_reconcile import (
     DurableFleetReconciler,
+    DurableStoreFleetRunSource,
     FleetRunRoute,
     FleetRunSource,
     StaticFleetRunSource,
@@ -27,6 +30,7 @@ from src.orchestration.remote_scheduling import (
 )
 from src.orchestration.scheduler import DurableScheduler
 from src.orchestration.store import DurableRunStore
+from src.orchestration.remote_worker import RemoteWorkerError
 
 from tests import test_orchestration_remote_protocol as protocol_tests
 
@@ -61,6 +65,12 @@ class DurableFleetReconcilerTests(unittest.TestCase):
             resource_keys=("workspace:project",),
             activity_kinds=("tool",),
             max_concurrency=2,
+        )
+        self.run_route = self.harness.store.register_fleet_run_route(
+            "run-remote",
+            "tenant-1",
+            "pool-a",
+            now=1,
         )
 
     @staticmethod
@@ -125,7 +135,15 @@ class DurableFleetReconcilerTests(unittest.TestCase):
         self.harness.control.bind_fleet_poller(poller)
         projector, policy = self._projector(policy_version)
         source = run_source or StaticFleetRunSource(
-            [FleetRunRoute("run-remote", "tenant-1", "pool-a")]
+            [
+                FleetRunRoute(
+                    "run-remote",
+                    "tenant-1",
+                    "pool-a",
+                    self.run_route,
+                    self.harness.store.path,
+                )
+            ]
         )
         reconciler = DurableFleetReconciler(
             fleet,
@@ -136,6 +154,7 @@ class DurableFleetReconcilerTests(unittest.TestCase):
             if run_id == "run-remote"
             else (_ for _ in ()).throw(KeyError(run_id)),
             max_routes=max_routes,
+            allow_reference_source=True,
         )
         return fleet, poller, reconciler, source, policy
 
@@ -154,6 +173,344 @@ class DurableFleetReconcilerTests(unittest.TestCase):
         self.assertEqual(repeated.queue.retained_tasks, 1)
         self.assertEqual(fleet.snapshot().queued_tasks, 1)
         self.assertFalse(first.execution_truth)
+
+    def test_durable_store_source_recovers_registered_running_routes(
+        self,
+    ) -> None:
+        source = DurableStoreFleetRunSource(
+            [self.harness.store],
+            control_plane_root=self.harness.control_root,
+            agent_roots=(self.harness.agent_root,),
+        )
+
+        first = source.snapshot(2)
+        restarted = DurableStoreFleetRunSource(
+            [DurableRunStore(self.harness.store.path)],
+            control_plane_root=self.harness.control_root,
+            agent_roots=(self.harness.agent_root,),
+        ).snapshot(2)
+
+        self.assertTrue(source.production_security_ready)
+        self.assertEqual(first, restarted)
+        self.assertEqual(
+            first,
+            (
+                FleetRunRoute(
+                    "run-remote",
+                    "tenant-1",
+                    "pool-a",
+                    self.run_route,
+                    self.harness.store.path,
+                ),
+            ),
+        )
+
+    def test_route_withdrawal_fences_stale_queue_before_reconcile(
+        self,
+    ) -> None:
+        source = DurableStoreFleetRunSource(
+            [self.harness.store],
+            control_plane_root=self.harness.control_root,
+            agent_roots=(self.harness.agent_root,),
+        )
+        fleet, _poller, reconciler, _source, _policy = self._compose(
+            run_source=source
+        )
+        reconciler.run_once()
+        disabled = self.harness.store.withdraw_fleet_run_route(
+            self.run_route,
+            now=2,
+        )
+
+        with self.assertRaisesRegex(
+            RemoteWorkerError,
+            "control_unavailable",
+        ):
+            self.client.poll_fleet()
+
+        self.assertEqual(
+            self.harness.store.list_attempts("run-remote"),
+            [],
+        )
+        report = reconciler.run_once()
+        self.assertEqual(report.routes_examined, 0)
+        self.assertEqual(report.queue.task_bindings, 0)
+
+        enabled = self.harness.store.register_fleet_run_route(
+            "run-remote",
+            "tenant-1",
+            "pool-a",
+            expected=disabled,
+            now=3,
+        )
+        report = reconciler.run_once()
+        self.assertEqual(report.queue.admitted_tasks, 1)
+        assignment = self.client.poll_fleet()
+        assert assignment is not None
+        attempt = self.harness.store.get_attempt(
+            assignment.claim.attempt_id
+        )
+        assert attempt is not None
+        self.assertEqual(
+            attempt.metadata["fleet_admission"][
+                "run_route_digest"
+            ],
+            enabled.route_digest,
+        )
+
+    def test_route_disable_enable_aba_replaces_queued_binding(
+        self,
+    ) -> None:
+        source = DurableStoreFleetRunSource(
+            [self.harness.store],
+            control_plane_root=self.harness.control_root,
+            agent_roots=(self.harness.agent_root,),
+        )
+        fleet, _poller, reconciler, _source, _policy = self._compose(
+            run_source=source
+        )
+        reconciler.run_once()
+        disabled = self.harness.store.withdraw_fleet_run_route(
+            self.run_route,
+            now=2,
+        )
+        enabled = self.harness.store.register_fleet_run_route(
+            "run-remote",
+            "tenant-1",
+            "pool-a",
+            expected=disabled,
+            now=3,
+        )
+
+        report = reconciler.run_once()
+        assignment = self.client.poll_fleet()
+
+        self.assertEqual(report.queue.withdrawn_tasks, 1)
+        self.assertEqual(report.queue.admitted_tasks, 1)
+        assert assignment is not None
+        attempt = self.harness.store.get_attempt(
+            assignment.claim.attempt_id
+        )
+        assert attempt is not None
+        self.assertEqual(
+            attempt.metadata["fleet_admission"][
+                "run_route_digest"
+            ],
+            enabled.route_digest,
+        )
+        self.assertNotEqual(
+            enabled.route_digest,
+            self.run_route.route_digest,
+        )
+
+    def test_static_run_source_requires_explicit_reference_opt_in(
+        self,
+    ) -> None:
+        fleet, poller, _reconciler, source, _policy = self._compose()
+        projector, _policy = self._projector()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "not production ready",
+        ):
+            DurableFleetReconciler(
+                fleet,
+                poller,
+                projector,
+                source,
+                lambda _run_id: self.harness.scheduler,
+            )
+
+    def test_durable_source_rejects_duplicate_store_registration(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "duplicate Store",
+        ):
+            DurableStoreFleetRunSource(
+                [
+                    self.harness.store,
+                    DurableRunStore(self.harness.store.path),
+                ],
+                control_plane_root=self.harness.control_root,
+                agent_roots=(self.harness.agent_root,),
+            )
+
+    def test_durable_source_rejects_physical_store_alias(
+        self,
+    ) -> None:
+        with sqlite3.connect(self.harness.store.path) as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        alias_path = self.harness.control_root / "runs-alias.sqlite3"
+        try:
+            os.link(self.harness.store.path, alias_path)
+        except OSError as exc:
+            self.skipTest(f"hard links unavailable: {type(exc).__name__}")
+        alias_store = DurableRunStore(alias_path)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "physical alias",
+        ):
+            DurableStoreFleetRunSource(
+                [self.harness.store, alias_store],
+                control_plane_root=self.harness.control_root,
+                agent_roots=(self.harness.agent_root,),
+            )
+
+    def test_durable_source_requires_non_overlapping_control_storage(
+        self,
+    ) -> None:
+        outside_store = DurableRunStore(
+            self.harness.root / "outside.sqlite3"
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "outside the control-plane root",
+        ):
+            DurableStoreFleetRunSource(
+                [outside_store],
+                control_plane_root=self.harness.control_root,
+                agent_roots=(self.harness.agent_root,),
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            "overlaps an Agent root",
+        ):
+            DurableStoreFleetRunSource(
+                [self.harness.store],
+                control_plane_root=self.harness.control_root,
+                agent_roots=(self.harness.root,),
+            )
+
+    def test_durable_source_detects_control_path_replacement(
+        self,
+    ) -> None:
+        source = DurableStoreFleetRunSource(
+            [self.harness.store],
+            control_plane_root=self.harness.control_root,
+            agent_roots=(self.harness.agent_root,),
+        )
+        moved = self.harness.root / "old-control"
+        self.harness.control_root.rename(moved)
+        self.harness.control_root.mkdir()
+
+        self.assertFalse(source.production_security_ready)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "isolation changed",
+        ):
+            source.snapshot(2)
+
+    def test_durable_source_rejects_run_registered_in_two_stores(
+        self,
+    ) -> None:
+        second_store = DurableRunStore(
+            self.harness.control_root / "duplicate-runs.sqlite3"
+        )
+        second = DurableScheduler(
+            second_store,
+            self.harness.workflow,
+            clock=self.harness.clock,
+            artifact_verifier=self.harness.artifacts.verify,
+        )
+        second.create_run("run-remote")
+        second.reconcile("run-remote")
+        second_store.register_fleet_run_route(
+            "run-remote",
+            "tenant-1",
+            "pool-a",
+            now=1,
+        )
+        source = DurableStoreFleetRunSource(
+            [self.harness.store, second_store],
+            control_plane_root=self.harness.control_root,
+            agent_roots=(self.harness.agent_root,),
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "multiple Stores",
+        ):
+            source.snapshot(3)
+
+    def test_durable_route_cannot_resolve_to_a_cloned_store(
+        self,
+    ) -> None:
+        second_store = DurableRunStore(
+            self.harness.control_root / "cloned-runs.sqlite3"
+        )
+        second = DurableScheduler(
+            second_store,
+            self.harness.workflow,
+            clock=self.harness.clock,
+            artifact_verifier=self.harness.artifacts.verify,
+        )
+        second.create_run("run-remote")
+        second.reconcile("run-remote")
+        cloned = second_store.register_fleet_run_route(
+            "run-remote",
+            "tenant-1",
+            "pool-a",
+            now=1,
+        )
+        self.assertEqual(cloned, self.run_route)
+        source = DurableStoreFleetRunSource(
+            [self.harness.store],
+            control_plane_root=self.harness.control_root,
+            agent_roots=(self.harness.agent_root,),
+        )
+        fleet, poller, _unused, _source, _policy = self._compose(
+            run_source=source
+        )
+        projector, _policy = self._projector()
+        reconciler = DurableFleetReconciler(
+            fleet,
+            poller,
+            projector,
+            source,
+            lambda _run_id: second,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "different Store",
+        ):
+            reconciler.run_once()
+
+        self.assertEqual(fleet.snapshot().queued_tasks, 0)
+
+    def test_corrupt_durable_route_quarantines_existing_queue(
+        self,
+    ) -> None:
+        source = DurableStoreFleetRunSource(
+            [self.harness.store],
+            control_plane_root=self.harness.control_root,
+            agent_roots=(self.harness.agent_root,),
+        )
+        fleet, _poller, reconciler, _source, _policy = self._compose(
+            run_source=source
+        )
+        reconciler.run_once()
+        with sqlite3.connect(self.harness.store.path) as conn:
+            conn.execute(
+                """
+                UPDATE fleet_run_routes
+                SET route_digest = ?
+                WHERE run_id = ?
+                """,
+                ("z" * 64, "run-remote"),
+            )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "snapshot failed",
+        ):
+            reconciler.run_once()
+
+        self.assertEqual(fleet.snapshot().queued_tasks, 0)
+        self.assertEqual(fleet.snapshot().task_bindings, 0)
 
     def test_concurrent_control_rounds_converge_to_one_binding(
         self,
@@ -193,6 +550,7 @@ class DurableFleetReconcilerTests(unittest.TestCase):
             projector,
             source,
             lambda _run_id: self.harness.scheduler,
+            allow_reference_source=True,
         )
 
         report = changed.run_once()
@@ -389,6 +747,7 @@ class DurableFleetReconcilerTests(unittest.TestCase):
             projector,
             source,
             schedulers.__getitem__,
+            allow_reference_source=True,
         )
 
         with self.assertRaisesRegex(
@@ -446,6 +805,7 @@ class DurableFleetReconcilerTests(unittest.TestCase):
             projector,
             source,
             schedulers.__getitem__,
+            allow_reference_source=True,
         )
         cursor = self.harness.store.get_fleet_fairness_cursor(
             "pool-a"
@@ -490,7 +850,15 @@ class DurableFleetReconcilerTests(unittest.TestCase):
 
     def test_revoked_run_source_quarantines_queued_work(self) -> None:
         source = _RevocableRunSource(
-            [FleetRunRoute("run-remote", "tenant-1", "pool-a")]
+            [
+                FleetRunRoute(
+                    "run-remote",
+                    "tenant-1",
+                    "pool-a",
+                    self.run_route,
+                    self.harness.store.path,
+                )
+            ]
         )
         fleet, _poller, reconciler, _source, _policy = (
             self._compose(run_source=source)
@@ -521,6 +889,7 @@ class DurableFleetReconcilerTests(unittest.TestCase):
             lambda _run_id: (_ for _ in ()).throw(
                 RuntimeError("resolver unavailable")
             ),
+            allow_reference_source=True,
         )
 
         with self.assertRaisesRegex(

@@ -42,7 +42,7 @@ from .scheduler import (
     ACTIVE_ATTEMPT_STATUSES,
     DurableScheduler,
 )
-from .store import FleetShardOwnership
+from .store import FleetRunRouteRecord, FleetShardOwnership
 
 MAX_FLEET_WORKER_POLICIES = 4_096
 MAX_TRACKED_FLEET_ASSIGNMENTS = 1_000_000
@@ -398,9 +398,33 @@ class DurableFleetProjector:
         tenant_id: str,
         pool_id: str,
         shard_ownership: FleetShardOwnership | None = None,
+        run_route: FleetRunRouteRecord | None = None,
     ) -> tuple[FleetTaskBinding, ...]:
         if not isinstance(scheduler, DurableScheduler):
             raise TypeError("scheduler must be a DurableScheduler")
+        if run_route is None:
+            current_route = scheduler.store.get_fleet_run_route(run_id)
+            if (
+                current_route is not None
+                and current_route.enabled
+                and current_route.tenant_id == tenant_id
+                and current_route.pool_id == pool_id
+            ):
+                run_route = current_route
+        if run_route is not None:
+            if not isinstance(run_route, FleetRunRouteRecord):
+                raise TypeError("run_route must be FleetRunRouteRecord")
+            if (
+                not run_route.enabled
+                or run_route.run_id != run_id
+                or run_route.tenant_id != tenant_id
+                or run_route.pool_id != pool_id
+                or scheduler.store.get_fleet_run_route(run_id)
+                != run_route
+            ):
+                raise RemoteFleetControlConflict(
+                    "Fleet Run route authority is stale"
+                )
         if shard_ownership is not None:
             if not isinstance(
                 shard_ownership,
@@ -505,6 +529,11 @@ class DurableFleetProjector:
                 routing_policy_digest=(
                     routing_policy.policy_digest
                 ),
+                run_route_digest=(
+                    None
+                    if run_route is None
+                    else run_route.route_digest
+                ),
                 shard_ownership=shard_ownership,
                 task=RemoteTask(
                     task_id=f"flt-{task_identity[:60]}",
@@ -601,6 +630,8 @@ class RemoteControlFleetClaimer:
             or admission_scope.pool_id != binding.task.pool_id
             or admission_scope.routing_policy_digest
             != binding.routing_policy_digest
+            or admission_scope.run_route_digest
+            != binding.run_route_digest
             or binding.shard_ownership != shard_ownership
             or (
                 shard_ownership is not None

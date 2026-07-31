@@ -78,6 +78,7 @@ class FleetTaskBinding:
     node_id: str | None = None
     activity_config_digest: str | None = None
     routing_policy_digest: str | None = None
+    run_route_digest: str | None = None
     shard_ownership: FleetShardOwnership | None = None
 
     def __post_init__(self) -> None:
@@ -110,6 +111,16 @@ class FleetTaskBinding:
                 "routing_policy_digest must be a SHA-256 digest"
             )
         if (
+            self.run_route_digest is not None
+            and (
+                not isinstance(self.run_route_digest, str)
+                or _DIGEST.fullmatch(self.run_route_digest) is None
+            )
+        ):
+            raise RemoteFleetValidationError(
+                "run_route_digest must be a SHA-256 digest"
+            )
+        if (
             self.shard_ownership is not None
             and not isinstance(
                 self.shard_ownership,
@@ -126,6 +137,7 @@ class FleetTaskBinding:
             self.node_id is not None
             and self.activity_config_digest is not None
             and self.routing_policy_digest is not None
+            and self.run_route_digest is not None
         )
 
     @property
@@ -521,6 +533,7 @@ class RemoteFleetCoordinator:
                         routing_policy_digest=(
                             binding.routing_policy_digest
                         ),
+                        run_route_digest=binding.run_route_digest,
                     )
                     if binding.routing_policy_digest is not None
                     else None

@@ -53,7 +53,7 @@ from .recovery import UnknownOutcomeDecision, UnknownOutcomeResolution
 if TYPE_CHECKING:
     from .executor import ToolReceipt
 
-STORE_SCHEMA_VERSION = 6
+STORE_SCHEMA_VERSION = 7
 DEFAULT_BUSY_TIMEOUT_MS = 10_000
 DEFAULT_EVENT_LIMIT = 1_000
 MAX_EVENT_LIMIT = 10_000
@@ -63,13 +63,17 @@ MAX_PROJECTION_REPLAY_SECONDS = 30.0
 MAX_PROJECTION_REPLAY_PAGE = 1_000
 MAX_ACTIVITY_LEASE_SECONDS = 24 * 60 * 60
 MAX_FLEET_SHARD_OWNERS = 4_096
+MAX_FLEET_RUN_ROUTES = 100_000
 MAX_FLEET_FENCING_EPOCH = (1 << 63) - 1
 MAX_FLEET_SELECTION_SEQUENCE = (1 << 63) - 1
+MAX_FLEET_RUN_ROUTE_GENERATION = (1 << 63) - 1
 FLEET_SHARD_OWNERSHIP_SCHEMA_VERSION = 2
 FLEET_FAIRNESS_CURSOR_SCHEMA_VERSION = 1
+FLEET_RUN_ROUTE_SCHEMA_VERSION = 1
 _SAFE_RECEIPT_CODE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
 _SHA256_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _FLEET_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+_FLEET_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,254}$")
 _GC_QUARANTINE_ID = re.compile(r"^q[0-9]{20}_[0-9a-f]{32}$")
 _ARTIFACT_REF_FIELDS = frozenset(ArtifactRef.__dataclass_fields__)
 _DEADLINE_KINDS = frozenset(
@@ -311,6 +315,14 @@ class FleetShardOwnershipCapacityError(OrchestrationStoreError):
     """The bounded Fleet shard ownership registry is full."""
 
 
+class FleetRunRouteConflict(OrchestrationStoreError):
+    """A Fleet Run route compare-and-swap or immutable identity is stale."""
+
+
+class FleetRunRouteCapacityError(OrchestrationStoreError):
+    """The bounded Fleet Run route registry is full."""
+
+
 class ActivityAdmissionDenied(OrchestrationStoreError):
     """A scheduled Activity did not acquire bounded execution capacity."""
 
@@ -482,6 +494,91 @@ class FleetFairnessCursor:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class FleetRunRouteRecord:
+    """Store-local, generation-fenced routing authority for one durable Run."""
+
+    run_id: str
+    tenant_id: str
+    pool_id: str
+    generation: int
+    enabled: bool
+    route_digest: str
+    registered_at: float
+    updated_at: float
+    schema_version: int = FLEET_RUN_ROUTE_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != FLEET_RUN_ROUTE_SCHEMA_VERSION:
+            raise ValueError("unsupported Fleet Run route schema version")
+        if (
+            not isinstance(self.run_id, str)
+            or _FLEET_RUN_ID.fullmatch(self.run_id) is None
+        ):
+            raise ValueError("run_id must be a bounded Fleet Run identifier")
+        for field_name in ("tenant_id", "pool_id"):
+            value = getattr(self, field_name)
+            if (
+                not isinstance(value, str)
+                or _FLEET_IDENTIFIER.fullmatch(value) is None
+            ):
+                raise ValueError(
+                    f"{field_name} must be a bounded Fleet identifier"
+                )
+        if (
+            isinstance(self.generation, bool)
+            or not isinstance(self.generation, int)
+            or not 1
+            <= self.generation
+            <= MAX_FLEET_RUN_ROUTE_GENERATION
+        ):
+            raise ValueError("Fleet Run route generation is invalid")
+        if not isinstance(self.enabled, bool):
+            raise ValueError("Fleet Run route enabled must be boolean")
+        expected_digest = _fleet_run_route_digest(
+            self.run_id,
+            self.tenant_id,
+            self.pool_id,
+            self.generation,
+        )
+        if (
+            not isinstance(self.route_digest, str)
+            or self.route_digest != expected_digest
+        ):
+            raise ValueError("Fleet Run route digest is invalid")
+        registered_at = _finite_timestamp(
+            self.registered_at,
+            "registered_at",
+        )
+        updated_at = _finite_timestamp(self.updated_at, "updated_at")
+        if updated_at < registered_at:
+            raise ValueError(
+                "Fleet Run route updated_at precedes registered_at"
+            )
+
+
+def _fleet_run_route_digest(
+    run_id: str,
+    tenant_id: str,
+    pool_id: str,
+    generation: int,
+) -> str:
+    payload = json.dumps(
+        {
+            "schema": "fleet_run_route_v1",
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "pool_id": pool_id,
+            "generation": generation,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _json_dump(value: JsonValue) -> str:
     normalized = normalize_json(value)
     return json.dumps(
@@ -593,7 +690,7 @@ def _fleet_admission_metadata(
 ) -> dict[str, JsonValue] | None:
     if value is None:
         return None
-    required = {
+    base_fields = {
         "schema_version",
         "task_id",
         "tenant_id",
@@ -604,18 +701,32 @@ def _fleet_admission_metadata(
         "tenant_concurrency",
         "pool_concurrency",
     }
-    if not isinstance(value, Mapping) or set(value) != required:
+    if not isinstance(value, Mapping):
+        raise ProjectionConflictError(
+            "Fleet admission fields are invalid"
+        )
+    schema_version = value.get("schema_version")
+    required = (
+        base_fields
+        if schema_version == 1
+        else base_fields | {"run_route_digest"}
+        if schema_version == 2
+        else frozenset()
+    )
+    if not required or set(value) != required:
         raise ProjectionConflictError(
             "Fleet admission fields are invalid"
         )
     if (
-        isinstance(value["schema_version"], bool)
-        or value["schema_version"] != 1
+        isinstance(schema_version, bool)
+        or schema_version not in (1, 2)
     ):
         raise ProjectionConflictError(
             "Fleet admission schema version is invalid"
         )
-    normalized: dict[str, JsonValue] = {"schema_version": 1}
+    normalized: dict[str, JsonValue] = {
+        "schema_version": schema_version
+    }
     for field_name in ("task_id", "tenant_id", "pool_id"):
         item = value[field_name]
         if (
@@ -626,6 +737,16 @@ def _fleet_admission_metadata(
                 f"Fleet admission {field_name} is invalid"
             )
         normalized[field_name] = item
+    if schema_version == 2:
+        route_digest = value["run_route_digest"]
+        if (
+            not isinstance(route_digest, str)
+            or _SHA256_DIGEST.fullmatch(route_digest) is None
+        ):
+            raise ProjectionConflictError(
+                "Fleet admission run_route_digest is invalid"
+            )
+        normalized["run_route_digest"] = route_digest
     for field_name in (
         "routing_policy_digest",
         "quota_policy_digest",
@@ -1910,6 +2031,88 @@ class DurableRunStore:
             )
 
     @staticmethod
+    def _migrate_6_to_7(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE fleet_run_routes (
+                run_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                pool_id TEXT NOT NULL,
+                generation INTEGER NOT NULL
+                    CHECK(generation >= 1),
+                enabled INTEGER NOT NULL
+                    CHECK(enabled IN (0, 1)),
+                route_digest TEXT NOT NULL
+                    CHECK(length(route_digest) = 64),
+                registered_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(run_id)
+                    REFERENCES runs(run_id)
+                    ON DELETE RESTRICT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX fleet_run_routes_enabled_idx
+            ON fleet_run_routes(
+                enabled, pool_id, tenant_id, run_id
+            )
+            """
+        )
+        route_guard = """
+            NEW.status IN ('claimed', 'running')
+            AND NEW.worker_id LIKE 'remote-session:%'
+            AND EXISTS (
+                SELECT 1
+                FROM fleet_run_routes AS registered_route
+                WHERE registered_route.run_id = NEW.run_id
+            )
+            AND (
+                json_type(
+                    NEW.metadata_json,
+                    '$.fleet_admission'
+                ) IS NOT 'object'
+                OR json_extract(
+                    NEW.metadata_json,
+                    '$.fleet_admission.schema_version'
+                ) IS NOT 2
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM fleet_run_routes AS exact_route
+                    WHERE exact_route.run_id = NEW.run_id
+                      AND exact_route.enabled = 1
+                      AND exact_route.tenant_id = json_extract(
+                          NEW.metadata_json,
+                          '$.fleet_admission.tenant_id'
+                      )
+                      AND exact_route.pool_id = json_extract(
+                          NEW.metadata_json,
+                          '$.fleet_admission.pool_id'
+                      )
+                      AND exact_route.route_digest = json_extract(
+                          NEW.metadata_json,
+                          '$.fleet_admission.run_route_digest'
+                      )
+                )
+            )
+        """
+        for operation in ("INSERT", "UPDATE"):
+            conn.execute(
+                f"""
+                CREATE TRIGGER attempts_fleet_route_{operation.lower()}
+                BEFORE {operation} ON attempts
+                WHEN {route_guard}
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'Fleet Run route is required or stale'
+                    );
+                END
+                """
+            )
+
+    @staticmethod
     def _prepare_new_run(
         run: RunRecord,
     ) -> tuple[RunRecord, EventRecord, str]:
@@ -2209,6 +2412,321 @@ class DurableRunStore:
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         return self._run_from_row(row) if row is not None else None
+
+    def register_fleet_run_route(
+        self,
+        run_id: str,
+        tenant_id: str,
+        pool_id: str,
+        *,
+        expected: FleetRunRouteRecord | None = None,
+        now: float | None = None,
+    ) -> FleetRunRouteRecord:
+        """Create or explicitly re-enable an immutable Run routing identity."""
+
+        route_id = FleetRunRouteRecord(
+            run_id=run_id,
+            tenant_id=tenant_id,
+            pool_id=pool_id,
+            generation=1,
+            enabled=True,
+            route_digest=_fleet_run_route_digest(
+                run_id,
+                tenant_id,
+                pool_id,
+                1,
+            ),
+            registered_at=0,
+            updated_at=0,
+        )
+        if expected is not None and not isinstance(
+            expected,
+            FleetRunRouteRecord,
+        ):
+            raise TypeError("expected must be FleetRunRouteRecord")
+        current_time = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        with self._write_transaction() as conn:
+            run_row = conn.execute(
+                "SELECT status FROM runs WHERE run_id = ?",
+                (route_id.run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise RunNotFoundError(route_id.run_id)
+            try:
+                status = RunStatus(run_row["status"])
+            except ValueError as exc:
+                raise StoreSchemaError("Fleet routed Run status is invalid") from exc
+            if status.is_terminal:
+                raise FleetRunRouteConflict(
+                    "terminal Run cannot enter Fleet routing"
+                )
+            row = conn.execute(
+                """
+                SELECT run_id, tenant_id, pool_id, generation, enabled,
+                       route_digest, registered_at, updated_at
+                FROM fleet_run_routes
+                WHERE run_id = ?
+                """,
+                (route_id.run_id,),
+            ).fetchone()
+            if row is None:
+                if expected is not None:
+                    raise FleetRunRouteConflict(
+                        "Fleet Run route disappeared"
+                    )
+                count_row = conn.execute(
+                    "SELECT COUNT(*) AS route_count FROM fleet_run_routes"
+                ).fetchone()
+                if int(count_row["route_count"]) >= MAX_FLEET_RUN_ROUTES:
+                    raise FleetRunRouteCapacityError(
+                        "Fleet Run route registry is full"
+                    )
+                created = replace(
+                    route_id,
+                    registered_at=current_time,
+                    updated_at=current_time,
+                )
+                conn.execute(
+                    """
+                    INSERT INTO fleet_run_routes(
+                        run_id, tenant_id, pool_id, generation, enabled,
+                        route_digest, registered_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                    """,
+                    (
+                        created.run_id,
+                        created.tenant_id,
+                        created.pool_id,
+                        created.generation,
+                        created.route_digest,
+                        created.registered_at,
+                        created.updated_at,
+                    ),
+                )
+                self._fault("fleet_run_route.after_insert")
+                return created
+
+            current = self._fleet_run_route_from_row(row)
+            if (
+                current.tenant_id != route_id.tenant_id
+                or current.pool_id != route_id.pool_id
+            ):
+                raise FleetRunRouteConflict(
+                    "Fleet Run routing identity is immutable"
+                )
+            if current.enabled:
+                if expected is not None and expected != current:
+                    raise FleetRunRouteConflict(
+                        "Fleet Run route changed concurrently"
+                    )
+                return current
+            if expected != current:
+                raise FleetRunRouteConflict(
+                    "re-enabling a Fleet Run route requires current authority"
+                )
+            if current.generation >= MAX_FLEET_RUN_ROUTE_GENERATION:
+                raise FleetRunRouteConflict(
+                    "Fleet Run route generation is exhausted"
+                )
+            replacement = replace(
+                current,
+                generation=current.generation + 1,
+                enabled=True,
+                route_digest=_fleet_run_route_digest(
+                    current.run_id,
+                    current.tenant_id,
+                    current.pool_id,
+                    current.generation + 1,
+                ),
+                updated_at=max(current.updated_at, current_time),
+            )
+            changed = conn.execute(
+                """
+                UPDATE fleet_run_routes
+                SET generation = ?, enabled = 1, route_digest = ?,
+                    updated_at = ?
+                WHERE run_id = ? AND generation = ? AND enabled = 0
+                  AND route_digest = ?
+                """,
+                (
+                    replacement.generation,
+                    replacement.route_digest,
+                    replacement.updated_at,
+                    current.run_id,
+                    current.generation,
+                    current.route_digest,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise FleetRunRouteConflict(
+                    "Fleet Run route changed concurrently"
+                )
+            self._fault("fleet_run_route.after_enable")
+            return replacement
+
+    def withdraw_fleet_run_route(
+        self,
+        current: FleetRunRouteRecord,
+        *,
+        now: float | None = None,
+    ) -> FleetRunRouteRecord:
+        """CAS-disable a route so stale queue snapshots cannot claim it."""
+
+        if not isinstance(current, FleetRunRouteRecord):
+            raise TypeError("current must be FleetRunRouteRecord")
+        current_time = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        with self._write_transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT run_id, tenant_id, pool_id, generation, enabled,
+                       route_digest, registered_at, updated_at
+                FROM fleet_run_routes
+                WHERE run_id = ?
+                """,
+                (current.run_id,),
+            ).fetchone()
+            if row is None:
+                raise FleetRunRouteConflict("Fleet Run route disappeared")
+            observed = self._fleet_run_route_from_row(row)
+            if not current.enabled:
+                if observed == current:
+                    return observed
+                raise FleetRunRouteConflict(
+                    "Fleet Run route changed concurrently"
+                )
+            if observed != current:
+                if (
+                    not observed.enabled
+                    and observed.tenant_id == current.tenant_id
+                    and observed.pool_id == current.pool_id
+                    and observed.generation == current.generation + 1
+                ):
+                    return observed
+                raise FleetRunRouteConflict(
+                    "Fleet Run route changed concurrently"
+                )
+            if current.generation >= MAX_FLEET_RUN_ROUTE_GENERATION:
+                raise FleetRunRouteConflict(
+                    "Fleet Run route generation is exhausted"
+                )
+            replacement = replace(
+                current,
+                generation=current.generation + 1,
+                enabled=False,
+                route_digest=_fleet_run_route_digest(
+                    current.run_id,
+                    current.tenant_id,
+                    current.pool_id,
+                    current.generation + 1,
+                ),
+                updated_at=max(current.updated_at, current_time),
+            )
+            changed = conn.execute(
+                """
+                UPDATE fleet_run_routes
+                SET generation = ?, enabled = 0, route_digest = ?,
+                    updated_at = ?
+                WHERE run_id = ? AND generation = ? AND enabled = 1
+                  AND route_digest = ?
+                """,
+                (
+                    replacement.generation,
+                    replacement.route_digest,
+                    replacement.updated_at,
+                    current.run_id,
+                    current.generation,
+                    current.route_digest,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise FleetRunRouteConflict(
+                    "Fleet Run route changed concurrently"
+                )
+            self._fault("fleet_run_route.after_withdraw")
+            return replacement
+
+    def get_fleet_run_route(
+        self,
+        run_id: str,
+    ) -> FleetRunRouteRecord | None:
+        if (
+            not isinstance(run_id, str)
+            or _FLEET_RUN_ID.fullmatch(run_id) is None
+        ):
+            raise ValueError("run_id must be a bounded Fleet Run identifier")
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT run_id, tenant_id, pool_id, generation, enabled,
+                       route_digest, registered_at, updated_at
+                FROM fleet_run_routes
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else self._fleet_run_route_from_row(row)
+        )
+
+    def list_fleet_run_routes(
+        self,
+        *,
+        enabled_only: bool = True,
+        running_only: bool = False,
+        limit: int = 1_000,
+        offset: int = 0,
+    ) -> list[FleetRunRouteRecord]:
+        if not isinstance(enabled_only, bool):
+            raise TypeError("enabled_only must be boolean")
+        if not isinstance(running_only, bool):
+            raise TypeError("running_only must be boolean")
+        bounded_limit = _bounded_limit(limit, maximum=1_000)
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < 0
+            or offset > MAX_FLEET_RUN_ROUTES
+        ):
+            raise ValueError(
+                "offset must be a bounded non-negative integer"
+            )
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if enabled_only:
+            clauses.append("route.enabled = 1")
+        if running_only:
+            clauses.append("run.status = ?")
+            parameters.append(RunStatus.RUNNING.value)
+        where = (
+            ""
+            if not clauses
+            else " WHERE " + " AND ".join(clauses)
+        )
+        parameters.extend((bounded_limit, offset))
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT route.run_id, route.tenant_id, route.pool_id,
+                       route.generation, route.enabled,
+                       route.route_digest, route.registered_at,
+                       route.updated_at
+                FROM fleet_run_routes AS route
+                JOIN runs AS run ON run.run_id = route.run_id
+                {where}
+                ORDER BY route.pool_id, route.tenant_id, route.run_id
+                LIMIT ? OFFSET ?
+                """,
+                parameters,
+            ).fetchall()
+        return [self._fleet_run_route_from_row(row) for row in rows]
 
     def claim_fleet_shard(
         self,
@@ -5136,6 +5654,12 @@ class DurableRunStore:
                 raise ProjectionConflictError(
                     "Attempt Fleet shard ownership changed"
                 )
+        if fleet_admission is not None:
+            DurableRunStore._validate_fleet_run_route_tx(
+                conn,
+                attempt.run_id,
+                normalized_fleet_admission,
+            )
         if (
             max_active_attempts is None
             and worker_capacity is None
@@ -5238,6 +5762,44 @@ class DurableRunStore:
             DurableRunStore._admit_fleet_tx(
                 conn,
                 normalized_fleet_admission,
+            )
+
+    @staticmethod
+    def _validate_fleet_run_route_tx(
+        conn: sqlite3.Connection,
+        run_id: str,
+        scope: dict[str, JsonValue],
+    ) -> None:
+        row = conn.execute(
+            """
+            SELECT run_id, tenant_id, pool_id, generation, enabled,
+                   route_digest, registered_at, updated_at
+            FROM fleet_run_routes
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            if scope["schema_version"] == 2:
+                raise ActivityAdmissionDenied(
+                    "fleet_run_route_missing"
+                )
+            return
+        try:
+            route = DurableRunStore._fleet_run_route_from_row(row)
+        except StoreSchemaError as exc:
+            raise ActivityAdmissionDenied(
+                "fleet_run_route_corrupt"
+            ) from exc
+        if (
+            scope["schema_version"] != 2
+            or not route.enabled
+            or scope["tenant_id"] != route.tenant_id
+            or scope["pool_id"] != route.pool_id
+            or scope.get("run_route_digest") != route.route_digest
+        ):
+            raise ActivityAdmissionDenied(
+                "fleet_run_route_fenced"
             )
 
     @staticmethod
@@ -8107,6 +8669,29 @@ class DurableRunStore:
         except (TypeError, ValueError) as exc:
             raise StoreSchemaError(
                 "Fleet shard ownership is malformed"
+            ) from exc
+
+    @staticmethod
+    def _fleet_run_route_from_row(
+        row: sqlite3.Row,
+    ) -> FleetRunRouteRecord:
+        try:
+            enabled = row["enabled"]
+            if enabled not in (0, 1):
+                raise ValueError("enabled is not canonical")
+            return FleetRunRouteRecord(
+                run_id=row["run_id"],
+                tenant_id=row["tenant_id"],
+                pool_id=row["pool_id"],
+                generation=row["generation"],
+                enabled=bool(enabled),
+                route_digest=row["route_digest"],
+                registered_at=row["registered_at"],
+                updated_at=row["updated_at"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise StoreSchemaError(
+                "Fleet Run route is malformed"
             ) from exc
 
     @staticmethod

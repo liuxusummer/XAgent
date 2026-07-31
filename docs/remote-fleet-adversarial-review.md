@@ -1,4 +1,4 @@
-# Remote Fleet 数据面六轮对抗审查
+# Remote Fleet 数据面九轮对抗审查
 
 审查对象：
 
@@ -370,8 +370,69 @@ retry 安装新 authority；有 active task 时继续等待 terminal。
 - `test_shard_transfer_fences_stale_queue_then_new_epoch_claims`
 
 结论：显式 Fleet projection 控制轮次的 policy/Run 收敛、active authority 保留和
-restart bootstrap P0/P1=0。生产 Run registry、自动 failure detector/接管、共享 broker
+restart bootstrap P0/P1=0。自动 failure detector/接管、共享 broker
 与跨 Store 共识仍是部署或后续阶段边界。
+
+## 第九轮：持久 Run 路由权威
+
+### 第一遍：身份、授权与隔离
+
+初版 route source 只用一个布尔属性声明 production-ready，绝对路径也不能证明
+数据库位于 Agent 不可写的控制面。另一个内容相同的克隆 Store 还能通过 route record
+值比较。修复后 `DurableStoreFleetRunSource` 要求显式控制面根和 Agent 根，固定
+device/inode，拒绝祖先重叠、越界 Store、物理别名、跨 Store 重复 Run，并把 source
+Store 的规范物理路径绑定到 route。scheduler resolver 必须回到同一个 Store；
+`StaticFleetRunSource` 固定为 reference-only。
+
+证据：
+
+- `test_durable_source_requires_non_overlapping_control_storage`
+- `test_durable_source_detects_control_path_replacement`
+- `test_durable_source_rejects_duplicate_store_registration`
+- `test_durable_source_rejects_physical_store_alias`
+- `test_durable_source_rejects_run_registered_in_two_stores`
+- `test_durable_route_cannot_resolve_to_a_cloned_store`
+- `test_static_run_source_requires_explicit_reference_opt_in`
+
+### 第二遍：claim、撤销、ABA 与旧进程
+
+Store schema v7 持久化不可变 Run/tenant/pool 和单调 generation。Fleet admission
+schema v2 携带 route digest，并在创建 Attempt 的同一 `BEGIN IMMEDIATE` 事务内先于
+quota/fairness 校验。撤销先赢则 claim 无 mutation；claim 先赢后撤销，则
+`CLAIMED -> RUNNING` 的数据库 trigger fencing 旧 digest。已经 RUNNING 的 Attempt
+仍只能凭原 Activity lease 完成。disable→enable 即使跳过中间 reconcile 也会替换
+同 task id 的旧 queued binding，旧 generation 不会复活。
+
+证据：
+
+- `test_concurrent_poll_and_route_withdrawal_never_start_stale_work`
+- `test_route_withdrawal_fences_claimed_work_before_start`
+- `test_running_work_can_finish_after_route_withdrawal`
+- `test_route_disable_enable_aba_replaces_queued_binding`
+- `test_withdrawn_route_rolls_back_claim_and_fairness_cursor`
+- `test_schema_trigger_blocks_legacy_claim_on_registered_run`
+
+### 第三遍：迁移、重启、损坏与容量
+
+schema v6→v7 原子创建注册表、索引和双 trigger；旧 Store 默认没有注册 route，保持
+legacy schema v1 兼容，但一旦显式注册就成为不可绕过的升级开关。source 重启只读取
+enabled 且 RUNNING 的持久 route，不恢复内存 queue。畸形 digest、snapshot/resolver
+失败或 source readiness 撤销会先 quarantine queued projection。注册表有硬容量，
+写入、撤销故障整笔回滚，generation 耗尽 fail closed，terminal Run 不能新注册。
+
+证据：
+
+- `test_durable_store_source_recovers_registered_running_routes`
+- `test_corrupt_durable_route_quarantines_existing_queue`
+- `test_fleet_run_route_is_durable_immutable_and_aba_safe`
+- `test_fleet_run_route_capacity_and_faults_never_evict`
+- `test_fleet_run_route_insert_fault_and_generation_exhaustion`
+- `test_terminal_run_cannot_enter_fleet_routing`
+- `test_version_six_migration_installs_fleet_run_route_fencing`
+- `test_fleet_route_authority_is_checked_in_claim_transaction`
+
+结论：持久 Run route 的身份、撤销线性化、ABA、重启和升级路径未发现未关闭 P0/P1。
+OS 权限、自动注册/撤销编排和跨 Store 全局共识仍由部署层负责。
 
 ## 残余边界
 
@@ -386,9 +447,10 @@ restart bootstrap P0/P1=0。生产 Run registry、自动 failure detector/接管
   隔离 Store，不能绕过该安全门。
 - Store claim 已提交、assignment 返回前进程崩溃时，Worker 不获得执行权；lease
   recovery 会收敛该 claim。该窗口不能伪装成零 mutation。
-- ready Run route、tenant/pool 归属仍来自部署注入的受保护 registry；参考实现提供
-  `StaticFleetRunSource` 和显式 `DurableFleetReconciler.run_once()`，但不隐式启动
-  后台线程、不从 Run input 猜身份，也不负责 Domain scheduler reconcile。
+- ready Run route、tenant/pool 归属由 Store schema v7 的
+  `DurableStoreFleetRunSource` 持久化恢复；注册/撤销、调用周期和 Domain scheduler
+  reconcile 仍由部署显式驱动，不隐式启动后台线程。`StaticFleetRunSource` 仅是
+  reference-only 测试目录。
 - digest-only execution binding 已可跨重启从 Store/当前配置/新鲜 attestation 重建，
   且不会从 Worker 候选结果恢复 bearer。Artifact broker 只持久化 token digest、消费/
   失败墓碑和 exact finalized ref；持有原 grant/handle 的 Worker 可跨 broker 重启完成

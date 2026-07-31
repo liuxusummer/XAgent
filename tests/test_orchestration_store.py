@@ -18,6 +18,9 @@ from src.orchestration import (
     DurableRunStore,
     FleetShardOwnershipCapacityError,
     FleetShardOwnershipConflict,
+    FleetRunRouteCapacityError,
+    FleetRunRouteConflict,
+    FleetRunRouteRecord,
     IdempotencyConflictError,
     InvalidStateTransition,
     LocalArtifactStore,
@@ -52,6 +55,9 @@ class DurableRunStoreTests(unittest.TestCase):
         with sqlite3.connect(self.db_path) as conn:
             conn.executescript(
                 """
+                DROP TRIGGER attempts_fleet_route_insert;
+                DROP TRIGGER attempts_fleet_route_update;
+                DROP TABLE fleet_run_routes;
                 DROP TRIGGER attempts_fleet_ownership_insert;
                 DROP TRIGGER attempts_fleet_ownership_update;
                 DROP TABLE fleet_shard_owners;
@@ -65,7 +71,7 @@ class DurableRunStoreTests(unittest.TestCase):
                     assigned_at REAL NOT NULL,
                     UNIQUE(tenant_id, pool_id)
                 );
-                DELETE FROM schema_migrations WHERE version = 6;
+                DELETE FROM schema_migrations WHERE version >= 6;
                 PRAGMA user_version = 5;
                 """
             )
@@ -1908,6 +1914,330 @@ class DurableRunStoreTests(unittest.TestCase):
         self.assertEqual(reopened.get_run(run.run_id), run)
         self.assertTrue(reopened.verify_projections(run.run_id))
 
+    def test_fleet_run_route_is_durable_immutable_and_aba_safe(
+        self,
+    ) -> None:
+        self._create_running_run("fleet-routed-run")
+        first = self.store.register_fleet_run_route(
+            "fleet-routed-run",
+            "tenant-a",
+            "pool-a",
+            now=10,
+        )
+
+        self.assertIsInstance(first, FleetRunRouteRecord)
+        self.assertTrue(first.enabled)
+        self.assertEqual(first.generation, 1)
+        self.assertEqual(
+            DurableRunStore(self.db_path).register_fleet_run_route(
+                "fleet-routed-run",
+                "tenant-a",
+                "pool-a",
+                now=20,
+            ),
+            first,
+        )
+        with self.assertRaisesRegex(
+            FleetRunRouteConflict,
+            "immutable",
+        ):
+            self.store.register_fleet_run_route(
+                "fleet-routed-run",
+                "tenant-b",
+                "pool-a",
+                now=20,
+            )
+
+        disabled = self.store.withdraw_fleet_run_route(first, now=5)
+        self.assertFalse(disabled.enabled)
+        self.assertEqual(disabled.generation, 2)
+        self.assertEqual(disabled.updated_at, 10)
+        self.assertNotEqual(disabled.route_digest, first.route_digest)
+        self.assertEqual(
+            self.store.withdraw_fleet_run_route(first, now=12),
+            disabled,
+        )
+        with self.assertRaisesRegex(
+            FleetRunRouteConflict,
+            "current authority",
+        ):
+            self.store.register_fleet_run_route(
+                "fleet-routed-run",
+                "tenant-a",
+                "pool-a",
+                now=12,
+            )
+
+        enabled = DurableRunStore(
+            self.db_path
+        ).register_fleet_run_route(
+            "fleet-routed-run",
+            "tenant-a",
+            "pool-a",
+            expected=disabled,
+            now=4,
+        )
+        self.assertTrue(enabled.enabled)
+        self.assertEqual(enabled.generation, 3)
+        self.assertEqual(enabled.updated_at, 10)
+        self.assertNotEqual(enabled.route_digest, first.route_digest)
+        self.assertEqual(
+            self.store.get_fleet_run_route("fleet-routed-run"),
+            enabled,
+        )
+
+    def test_fleet_run_route_listing_is_bounded_and_running_only(
+        self,
+    ) -> None:
+        self._create_running_run("route-running")
+        self.store.create_run(
+            RunRecord(
+                "route-created",
+                "workflow",
+                definition_digest=TEST_DEFINITION_DIGEST,
+            )
+        )
+        running = self.store.register_fleet_run_route(
+            "route-running",
+            "tenant-b",
+            "pool-b",
+            now=1,
+        )
+        created = self.store.register_fleet_run_route(
+            "route-created",
+            "tenant-a",
+            "pool-a",
+            now=1,
+        )
+
+        self.assertEqual(
+            self.store.list_fleet_run_routes(running_only=True),
+            [running],
+        )
+        self.assertEqual(
+            self.store.list_fleet_run_routes(limit=1),
+            [created],
+        )
+        self.assertEqual(
+            self.store.list_fleet_run_routes(limit=1, offset=1),
+            [running],
+        )
+        self.store.withdraw_fleet_run_route(created, now=2)
+        self.assertEqual(
+            self.store.list_fleet_run_routes(enabled_only=True),
+            [running],
+        )
+        self.assertEqual(
+            len(
+                self.store.list_fleet_run_routes(
+                    enabled_only=False,
+                )
+            ),
+            2,
+        )
+        with self.assertRaises(ValueError):
+            self.store.list_fleet_run_routes(offset=100_001)
+
+    def test_fleet_run_route_capacity_and_faults_never_evict(
+        self,
+    ) -> None:
+        self._create_running_run("route-retained")
+        self._create_running_run("route-overflow")
+        with mock.patch(
+            "src.orchestration.store.MAX_FLEET_RUN_ROUTES",
+            1,
+        ):
+            retained = self.store.register_fleet_run_route(
+                "route-retained",
+                "tenant-a",
+                "pool-a",
+                now=1,
+            )
+            with self.assertRaises(FleetRunRouteCapacityError):
+                self.store.register_fleet_run_route(
+                    "route-overflow",
+                    "tenant-b",
+                    "pool-b",
+                    now=1,
+                )
+        self.assertEqual(
+            self.store.get_fleet_run_route("route-retained"),
+            retained,
+        )
+        self.assertIsNone(
+            self.store.get_fleet_run_route("route-overflow")
+        )
+
+        def fail(stage: str) -> None:
+            if stage == "fleet_run_route.after_withdraw":
+                raise RuntimeError("route withdrawal fault")
+
+        self.store._fault = fail
+        with self.assertRaisesRegex(RuntimeError, "withdrawal fault"):
+            self.store.withdraw_fleet_run_route(retained, now=2)
+        self.store._fault = lambda _stage: None
+        self.assertEqual(
+            self.store.get_fleet_run_route("route-retained"),
+            retained,
+        )
+
+    def test_fleet_run_route_insert_fault_and_generation_exhaustion(
+        self,
+    ) -> None:
+        self._create_running_run("route-insert-fault")
+
+        def fail(stage: str) -> None:
+            if stage == "fleet_run_route.after_insert":
+                raise RuntimeError("route insert fault")
+
+        self.store._fault = fail
+        with self.assertRaisesRegex(RuntimeError, "insert fault"):
+            self.store.register_fleet_run_route(
+                "route-insert-fault",
+                "tenant-a",
+                "pool-a",
+                now=1,
+            )
+        self.store._fault = lambda _stage: None
+        self.assertIsNone(
+            self.store.get_fleet_run_route("route-insert-fault")
+        )
+        route = self.store.register_fleet_run_route(
+            "route-insert-fault",
+            "tenant-a",
+            "pool-a",
+            now=2,
+        )
+        with mock.patch(
+            "src.orchestration.store.MAX_FLEET_RUN_ROUTE_GENERATION",
+            route.generation,
+        ):
+            with self.assertRaisesRegex(
+                FleetRunRouteConflict,
+                "generation is exhausted",
+            ):
+                self.store.withdraw_fleet_run_route(route, now=3)
+        self.assertEqual(
+            self.store.get_fleet_run_route(route.run_id),
+            route,
+        )
+
+    def test_terminal_run_cannot_enter_fleet_routing(
+        self,
+    ) -> None:
+        run = self._create_running_run("terminal-route")
+        self.store.append_event(
+            run.run_id,
+            "run.completed",
+            expected_run_version=run.projection_version,
+            run_projection=replace(
+                run,
+                status=RunStatus.COMPLETED,
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            FleetRunRouteConflict,
+            "terminal Run",
+        ):
+            self.store.register_fleet_run_route(
+                run.run_id,
+                "tenant-a",
+                "pool-a",
+                now=3,
+            )
+
+    def test_concurrent_fleet_run_route_enable_has_one_winner(
+        self,
+    ) -> None:
+        self._create_running_run("route-enable-race")
+        first = self.store.register_fleet_run_route(
+            "route-enable-race",
+            "tenant-a",
+            "pool-a",
+            now=1,
+        )
+        disabled = self.store.withdraw_fleet_run_route(first, now=2)
+        barrier = threading.Barrier(2)
+
+        def enable(_index: int):
+            contender = DurableRunStore(self.db_path)
+            barrier.wait(timeout=5)
+            try:
+                return contender.register_fleet_run_route(
+                    disabled.run_id,
+                    disabled.tenant_id,
+                    disabled.pool_id,
+                    expected=disabled,
+                    now=3,
+                )
+            except FleetRunRouteConflict:
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(enable, range(2)))
+
+        self.assertEqual(
+            sum(outcome is not None for outcome in outcomes),
+            1,
+        )
+        winner = next(
+            outcome for outcome in outcomes if outcome is not None
+        )
+        self.assertEqual(winner.generation, 3)
+        self.assertEqual(
+            self.store.get_fleet_run_route(disabled.run_id),
+            winner,
+        )
+
+    def test_schema_trigger_blocks_legacy_claim_on_registered_run(
+        self,
+    ) -> None:
+        _run, _node, attempt = self._schedule_attempt(
+            "fleet-route-trigger"
+        )
+        route = self.store.register_fleet_run_route(
+            "fleet-route-trigger",
+            "tenant-a",
+            "pool-a",
+            now=1,
+        )
+        legacy_scope = {
+            "schema_version": 1,
+            "task_id": "trigger-task",
+            "tenant_id": route.tenant_id,
+            "pool_id": route.pool_id,
+            "routing_policy_digest": "a" * 64,
+            "quota_policy_digest": "b" * 64,
+            "max_active_tasks": 8,
+            "tenant_concurrency": 4,
+            "pool_concurrency": 4,
+        }
+        metadata = dict(attempt.metadata)
+        metadata["fleet_admission"] = legacy_scope
+
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "Run route is required or stale",
+        ):
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE attempts
+                    SET status = 'claimed', worker_id = ?, metadata_json = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (
+                        "remote-session:" + ("d" * 64),
+                        json.dumps(metadata),
+                        attempt.attempt_id,
+                    ),
+                )
+        self.assertEqual(
+            self.store.get_attempt(attempt.attempt_id).status,
+            AttemptStatus.SCHEDULED,
+        )
+
     def test_fleet_shard_transfer_is_clock_free_monotonic_and_aba_safe(
         self,
     ) -> None:
@@ -2214,6 +2544,53 @@ class DurableRunStoreTests(unittest.TestCase):
         with self.assertRaises(StoreSchemaError):
             DurableRunStore(other)
 
+    def test_version_six_migration_installs_fleet_run_route_fencing(
+        self,
+    ) -> None:
+        self._create_running_run("route-v6-migration")
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executescript(
+                """
+                DROP TRIGGER attempts_fleet_route_insert;
+                DROP TRIGGER attempts_fleet_route_update;
+                DROP TABLE fleet_run_routes;
+                DELETE FROM schema_migrations WHERE version >= 7;
+                PRAGMA user_version = 6;
+                """
+            )
+
+        migrated = DurableRunStore(self.db_path)
+        route = migrated.register_fleet_run_route(
+            "route-v6-migration",
+            "tenant-a",
+            "pool-a",
+            now=1,
+        )
+
+        self.assertTrue(route.enabled)
+        with sqlite3.connect(self.db_path) as conn:
+            version = conn.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()[0]
+            triggers = {
+                row[0]
+                for row in conn.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'trigger'
+                      AND name LIKE 'attempts_fleet_route_%'
+                    """
+                )
+            }
+        self.assertEqual(version, 7)
+        self.assertEqual(
+            triggers,
+            {
+                "attempts_fleet_route_insert",
+                "attempts_fleet_route_update",
+            },
+        )
+
     def test_version_two_migration_backfills_artifact_references(self) -> None:
         artifacts = LocalArtifactStore(
             Path(self.temp_dir.name) / "migration-artifacts"
@@ -2239,6 +2616,9 @@ class DurableRunStoreTests(unittest.TestCase):
                 DROP TABLE fleet_shard_owners;
                 DROP TABLE artifact_references;
                 DROP TABLE artifact_gc_claims;
+                DROP TRIGGER attempts_fleet_route_insert;
+                DROP TRIGGER attempts_fleet_route_update;
+                DROP TABLE fleet_run_routes;
                 DELETE FROM schema_migrations WHERE version >= 3;
                 PRAGMA user_version = 2;
                 """
@@ -2262,7 +2642,7 @@ class DurableRunStoreTests(unittest.TestCase):
                 "SELECT first_run_id FROM artifact_references WHERE sha256 = ?",
                 (ref.sha256,),
             ).fetchone()
-        self.assertEqual(version, 6)
+        self.assertEqual(version, 7)
         self.assertEqual(indexed[0], "migration-ref-run")
 
     def test_version_three_migration_rejects_legacy_raw_run_input(self) -> None:
@@ -2304,6 +2684,9 @@ class DurableRunStoreTests(unittest.TestCase):
                 DROP TRIGGER attempts_fleet_ownership_insert;
                 DROP TRIGGER attempts_fleet_ownership_update;
                 DROP TABLE fleet_shard_owners;
+                DROP TRIGGER attempts_fleet_route_insert;
+                DROP TRIGGER attempts_fleet_route_update;
+                DROP TABLE fleet_run_routes;
                 DELETE FROM schema_migrations WHERE version >= 5;
                 PRAGMA user_version = 4;
                 """
@@ -2333,7 +2716,7 @@ class DurableRunStoreTests(unittest.TestCase):
                     """
                 )
             }
-        self.assertEqual(version, 6)
+        self.assertEqual(version, 7)
         self.assertEqual(
             triggers,
             {
@@ -2814,7 +3197,7 @@ class DurableRunStoreTests(unittest.TestCase):
             indexes = {
                 row[1] for row in conn.execute("PRAGMA index_list(attempts)")
             }
-        self.assertEqual(version, 6)
+        self.assertEqual(version, 7)
         self.assertIn("content_digest", event_columns)
         self.assertIn("intent_digest", event_columns)
         self.assertIn("schema_version", idempotency_columns)

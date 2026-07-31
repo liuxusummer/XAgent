@@ -193,6 +193,7 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
     ),
     ".remote_fleet_reconcile": (
         "DurableFleetReconciler",
+        "DurableStoreFleetRunSource",
         "FleetProjectionReconcileReport",
         "FleetRunRoute",
         "FleetRunSource",
@@ -238,6 +239,9 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "ArtifactGCReferenceConflictError",
         "DurableRunStore",
         "FleetFairnessCursor",
+        "FleetRunRouteCapacityError",
+        "FleetRunRouteConflict",
+        "FleetRunRouteRecord",
         "FleetShardOwnership",
         "FleetShardOwnershipCapacityError",
         "FleetShardOwnershipConflict",

@@ -125,7 +125,10 @@
   前恢复该 pool 游标。显式 `DurableFleetReconciler` 从受信 Run route source 解析
   scheduler/tenant/pool，先收敛 terminal projection，再以撤销优先的锁内差量替换
   READY queue；policy 变化后旧 queued binding 不再等待 Worker 触发失败，active
-  durable authority 则只延期到 terminal。它不使用 wall-clock leader lease，也不
+  durable authority 则只延期到 terminal。生产 source 从 Store schema v7 恢复
+  enabled/running route，绑定隔离控制面物理 Store identity，并以 admission v2
+  generation digest 在 claim 事务和 `CLAIMED -> RUNNING` trigger 中 fencing 撤销与
+  ABA；静态 source 仅是显式 opt-in 的测试实现。它不使用 wall-clock leader lease，也不
   提供跨 Store 共识或自动故障转移。fleet claim 准入后失败必须从
   Store 重新投影，不能把内存队列或 journal 当作 Domain 事实源。完整边界见
   `docs/distributed-execution-adr.md`、

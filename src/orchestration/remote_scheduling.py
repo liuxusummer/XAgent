@@ -42,7 +42,8 @@ from .runtime_compatibility import (
 )
 
 REMOTE_SCHEDULING_SCHEMA_VERSION = 1
-FLEET_ADMISSION_SCHEMA_VERSION = 1
+LEGACY_FLEET_ADMISSION_SCHEMA_VERSION = 1
+FLEET_ADMISSION_SCHEMA_VERSION = 2
 MAX_IDENTIFIER_CHARS = 64
 MAX_CAPABILITIES = 64
 MAX_TOOLS = 256
@@ -394,12 +395,23 @@ class FleetAdmissionScope:
     max_active_tasks: int
     tenant_concurrency: int
     pool_concurrency: int
-    schema_version: int = FLEET_ADMISSION_SCHEMA_VERSION
+    run_route_digest: str | None = None
+    schema_version: int = LEGACY_FLEET_ADMISSION_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != FLEET_ADMISSION_SCHEMA_VERSION:
+        if self.schema_version not in (
+            LEGACY_FLEET_ADMISSION_SCHEMA_VERSION,
+            FLEET_ADMISSION_SCHEMA_VERSION,
+        ):
             raise RemoteSchedulingValidationError(
                 "unsupported FleetAdmissionScope schema version"
+            )
+        if (
+            self.schema_version
+            == LEGACY_FLEET_ADMISSION_SCHEMA_VERSION
+        ) != (self.run_route_digest is None):
+            raise RemoteSchedulingValidationError(
+                "Fleet Run route digest disagrees with admission schema"
             )
         object.__setattr__(
             self,
@@ -425,6 +437,13 @@ class FleetAdmissionScope:
                 raise RemoteSchedulingValidationError(
                     f"{field_name} must be a SHA-256 digest"
                 )
+        if self.run_route_digest is not None and (
+            not isinstance(self.run_route_digest, str)
+            or _DIGEST.fullmatch(self.run_route_digest) is None
+        ):
+            raise RemoteSchedulingValidationError(
+                "run_route_digest must be a SHA-256 digest"
+            )
         for field_name in (
             "max_active_tasks",
             "tenant_concurrency",
@@ -441,7 +460,7 @@ class FleetAdmissionScope:
             )
 
     def to_metadata(self) -> dict[str, object]:
-        return {
+        metadata: dict[str, object] = {
             "schema_version": self.schema_version,
             "task_id": self.task_id,
             "tenant_id": self.tenant_id,
@@ -452,6 +471,9 @@ class FleetAdmissionScope:
             "tenant_concurrency": self.tenant_concurrency,
             "pool_concurrency": self.pool_concurrency,
         }
+        if self.run_route_digest is not None:
+            metadata["run_route_digest"] = self.run_route_digest
+        return metadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -1153,6 +1175,7 @@ class DeterministicRemoteScheduler:
         task: RemoteTask,
         *,
         routing_policy_digest: str,
+        run_route_digest: str | None = None,
     ) -> FleetAdmissionScope:
         """Bind immutable routing policy and effective quotas for Store CAS."""
 
@@ -1169,6 +1192,12 @@ class DeterministicRemoteScheduler:
             max_active_tasks=self.max_active_tasks,
             tenant_concurrency=self._tenant_quota(task.tenant_id),
             pool_concurrency=self._pool_quota(task.pool_id),
+            run_route_digest=run_route_digest,
+            schema_version=(
+                LEGACY_FLEET_ADMISSION_SCHEMA_VERSION
+                if run_route_digest is None
+                else FLEET_ADMISSION_SCHEMA_VERSION
+            ),
         )
 
     def restore_tenant_cursor(
@@ -1290,6 +1319,7 @@ __all__ = [
     "AdmissionOutcome",
     "DeterministicRemoteScheduler",
     "FLEET_ADMISSION_SCHEMA_VERSION",
+    "LEGACY_FLEET_ADMISSION_SCHEMA_VERSION",
     "FleetAdmissionScope",
     "PollDecision",
     "PollOutcome",

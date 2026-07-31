@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 from src.orchestration.lease import DurableLeaseReaper
@@ -117,6 +119,12 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             activity_kinds=("tool",),
             max_concurrency=2,
         )
+        self.run_route = self.harness.store.register_fleet_run_route(
+            "run-remote",
+            "tenant-1",
+            "pool-a",
+            now=1,
+        )
 
     @staticmethod
     def _projector() -> DurableFleetProjector:
@@ -222,6 +230,16 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             attempt.metadata["fleet_admission"]["pool_id"],
             "pool-a",
         )
+        self.assertEqual(
+            attempt.metadata["fleet_admission"]["schema_version"],
+            2,
+        )
+        self.assertEqual(
+            attempt.metadata["fleet_admission"][
+                "run_route_digest"
+            ],
+            self.run_route.route_digest,
+        )
         self.client.start(assignment.claim)
         self.client.complete(
             assignment.claim,
@@ -230,6 +248,92 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
         self.assertEqual(poller.snapshot().active_assignments, 0)
         self.assertEqual(fleet.snapshot().active_assignments, 0)
         self.assertEqual(fleet.snapshot().task_bindings, 0)
+
+    def test_route_withdrawal_fences_claimed_work_before_start(
+        self,
+    ) -> None:
+        fleet, _poller = self._compose()
+        fleet.admit(self._binding())
+        assignment = self.client.poll_fleet()
+        assert assignment is not None
+
+        self.harness.store.withdraw_fleet_run_route(
+            self.run_route,
+            now=2,
+        )
+
+        with self.assertRaises(RemoteWorkerError):
+            self.client.start(assignment.claim)
+        attempt = self.harness.store.get_attempt(
+            assignment.claim.attempt_id
+        )
+        assert attempt is not None
+        self.assertEqual(attempt.status.value, "claimed")
+
+    def test_running_work_can_finish_after_route_withdrawal(
+        self,
+    ) -> None:
+        fleet, _poller = self._compose()
+        fleet.admit(self._binding())
+        assignment = self.client.poll_fleet()
+        assert assignment is not None
+        self.client.start(assignment.claim)
+
+        self.harness.store.withdraw_fleet_run_route(
+            self.run_route,
+            now=2,
+        )
+        self.client.complete(
+            assignment.claim,
+            self.harness._success_outcome(assignment),
+        )
+
+        attempt = self.harness.store.get_attempt(
+            assignment.claim.attempt_id
+        )
+        assert attempt is not None
+        self.assertEqual(attempt.status.value, "succeeded")
+
+    def test_concurrent_poll_and_route_withdrawal_never_start_stale_work(
+        self,
+    ) -> None:
+        fleet, _poller = self._compose()
+        fleet.admit(self._binding())
+        barrier = threading.Barrier(2)
+
+        def poll():
+            barrier.wait(timeout=5)
+            try:
+                return self.client.poll_fleet()
+            except RemoteWorkerError:
+                return None
+
+        def withdraw():
+            barrier.wait(timeout=5)
+            return self.harness.store.withdraw_fleet_run_route(
+                self.run_route,
+                now=2,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            polled = executor.submit(poll)
+            withdrawn = executor.submit(withdraw)
+            assignment = polled.result(timeout=10)
+            disabled = withdrawn.result(timeout=10)
+
+        self.assertFalse(disabled.enabled)
+        if assignment is not None:
+            with self.assertRaises(RemoteWorkerError):
+                self.client.start(assignment.claim)
+        self.assertNotIn(
+            "running",
+            {
+                attempt.status.value
+                for attempt in self.harness.store.list_attempts(
+                    "run-remote"
+                )
+            },
+        )
 
     def test_fleet_poll_is_exposed_through_authenticated_https_surface(self):
         fleet, _poller = self._compose()
@@ -392,6 +496,12 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
         )
         control.bind_fleet_poller(poller)
         for run_id, scheduler in schedulers.items():
+            scheduler.store.register_fleet_run_route(
+                run_id,
+                "tenant-1",
+                "pool-a",
+                now=1,
+            )
             for binding in self._projector().project_ready(
                 scheduler,
                 run_id,
@@ -510,6 +620,12 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             claimer,
         )
         control.bind_fleet_poller(poller)
+        scheduler.store.register_fleet_run_route(
+            "fleet-two-nodes",
+            "tenant-1",
+            "pool-a",
+            now=1,
+        )
         projected = self._projector().project_ready(
             scheduler,
             "fleet-two-nodes",
@@ -604,6 +720,12 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             activity_kinds=("tool",),
             max_concurrency=1,
         )
+        scheduler.store.register_fleet_run_route(
+            "fleet-target-kind",
+            "tenant-1",
+            "pool-a",
+            now=1,
+        )
         binding = self._projector().project_ready(
             scheduler,
             "fleet-target-kind",
@@ -616,6 +738,7 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             DeterministicRemoteScheduler().durable_admission_scope(
                 binding.task,
                 routing_policy_digest=binding.routing_policy_digest,
+                run_route_digest=binding.run_route_digest,
             )
         )
 
@@ -642,6 +765,7 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             DeterministicRemoteScheduler().durable_admission_scope(
                 binding.task,
                 routing_policy_digest=binding.routing_policy_digest,
+                run_route_digest=binding.run_route_digest,
             ).to_metadata()
         )
         scope["tenant_id"] = "tenant-other"
@@ -782,6 +906,7 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
                 node_id="different-node",
                 activity_config_digest=binding.activity_config_digest,
                 routing_policy_digest=binding.routing_policy_digest,
+                run_route_digest=binding.run_route_digest,
             )
         )
 
@@ -948,6 +1073,7 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             DeterministicRemoteScheduler().durable_admission_scope(
                 binding.task,
                 routing_policy_digest=binding.routing_policy_digest,
+                run_route_digest=binding.run_route_digest,
             )
         )
 
@@ -1133,6 +1259,7 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
         scope = DeterministicRemoteScheduler().durable_admission_scope(
             binding.task,
             routing_policy_digest=binding.routing_policy_digest,
+            run_route_digest=binding.run_route_digest,
         )
 
         with self.assertRaisesRegex(

@@ -198,6 +198,7 @@ class DurableSchedulerTests(unittest.TestCase):
         pool_id: str = "pool-a",
         quota_scheduler: DeterministicRemoteScheduler | None = None,
         fleet_shard_ownership=None,
+        run_route_digest: str | None = None,
     ):
         candidate = scheduler.prepare_next_admission(
             run_id,
@@ -218,6 +219,7 @@ class DurableSchedulerTests(unittest.TestCase):
             routing_policy_digest=hashlib.sha256(
                 b"routing-policy"
             ).hexdigest(),
+            run_route_digest=run_route_digest,
         )
         return scheduler.claim_admitted(
             candidate,
@@ -945,6 +947,95 @@ class DurableSchedulerTests(unittest.TestCase):
                 }
                 for event in store.list_events("fleet-invalid-scope")
             )
+        )
+
+    def test_fleet_route_authority_is_checked_in_claim_transaction(
+        self,
+    ) -> None:
+        store, scheduler = self.scheduler([_agent("activity")])
+        scheduler.create_run("fleet-route-claim")
+        scheduler.reconcile("fleet-route-claim")
+        fake_digest = "f" * 64
+
+        with self.assertRaisesRegex(
+            ActivityAdmissionDenied,
+            "fleet_run_route_missing",
+        ):
+            self._claim_with_fleet_scope(
+                scheduler,
+                "fleet-route-claim",
+                "worker-a",
+                task_id="fleet-route-task",
+                run_route_digest=fake_digest,
+            )
+        self.assertEqual(
+            store.list_attempts("fleet-route-claim"),
+            [],
+        )
+
+        route = store.register_fleet_run_route(
+            "fleet-route-claim",
+            "tenant-a",
+            "pool-a",
+            now=1,
+        )
+        claim, _event = self._claim_with_fleet_scope(
+            scheduler,
+            "fleet-route-claim",
+            "worker-a",
+            task_id="fleet-route-task",
+            run_route_digest=route.route_digest,
+        )
+        assert claim is not None
+        stored = store.get_attempt(claim.attempt_id)
+        assert stored is not None
+        self.assertEqual(
+            stored.metadata["fleet_admission"]["run_route_digest"],
+            route.route_digest,
+        )
+
+    def test_withdrawn_route_rolls_back_claim_and_fairness_cursor(
+        self,
+    ) -> None:
+        store, scheduler = self.scheduler([_agent("activity")])
+        scheduler.create_run("fleet-route-withdrawn")
+        scheduler.reconcile("fleet-route-withdrawn")
+        route = store.register_fleet_run_route(
+            "fleet-route-withdrawn",
+            "tenant-a",
+            "pool-a",
+            now=1,
+        )
+        ownership = store.claim_fleet_shard(
+            "fleet-route-shard",
+            "control-a",
+            "a" * 64,
+            pool_id="pool-a",
+            now=1,
+        )
+        before = store.get_fleet_fairness_cursor("pool-a")
+        store.withdraw_fleet_run_route(route, now=2)
+
+        with self.assertRaisesRegex(
+            ActivityAdmissionDenied,
+            "fleet_run_route_fenced",
+        ):
+            self._claim_with_fleet_scope(
+                scheduler,
+                "fleet-route-withdrawn",
+                "worker-a",
+                task_id="fleet-route-task",
+                fleet_shard_ownership=ownership,
+                run_route_digest=route.route_digest,
+            )
+
+        self.assertEqual(
+            store.get_fleet_fairness_cursor("pool-a"),
+            before,
+        )
+        self.assertEqual(
+            store.list_attempts("fleet-route-withdrawn"),
+            [],
         )
 
     def test_fleet_claim_waits_for_unscoped_remote_upgrade_drain(self) -> None:

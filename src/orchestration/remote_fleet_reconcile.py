@@ -26,9 +26,42 @@ from .remote_fleet_control import (
 )
 from .remote_scheduling import RemoteTask
 from .scheduler import DurableScheduler
-from .store import FleetFairnessCursor, FleetShardOwnership
+from .store import (
+    DurableRunStore,
+    FleetFairnessCursor,
+    FleetRunRouteRecord,
+    FleetShardOwnership,
+)
 
 MAX_FLEET_RUN_ROUTES = 100_000
+MAX_FLEET_ROUTE_STORES = 4_096
+
+
+def _resolve_existing_path(
+    value: str | Path,
+    *,
+    label: str,
+) -> Path:
+    try:
+        path = Path(value).expanduser().resolve(strict=True)
+    except (OSError, TypeError, ValueError) as exc:
+        raise RemoteFleetControlConfigurationError(
+            f"{label} is missing or invalid"
+        ) from exc
+    return path
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return (
+        left == right
+        or left in right.parents
+        or right in left.parents
+    )
+
+
+def _path_identity(path: Path) -> tuple[int, int]:
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino
 
 
 def _authority_key(
@@ -50,6 +83,8 @@ class FleetRunRoute:
     run_id: str
     tenant_id: str
     pool_id: str
+    authority: FleetRunRouteRecord | None = None
+    store_path: Path | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -70,6 +105,33 @@ class FleetRunRoute:
         object.__setattr__(self, "run_id", binding.run_id)
         object.__setattr__(self, "tenant_id", task.tenant_id)
         object.__setattr__(self, "pool_id", task.pool_id)
+        if self.authority is not None:
+            if (
+                not isinstance(self.authority, FleetRunRouteRecord)
+                or not self.authority.enabled
+                or self.authority.run_id != binding.run_id
+                or self.authority.tenant_id != task.tenant_id
+                or self.authority.pool_id != task.pool_id
+            ):
+                raise RemoteFleetControlConfigurationError(
+                    "Fleet Run route authority does not match its route"
+                )
+        if self.store_path is not None:
+            if self.authority is None:
+                raise RemoteFleetControlConfigurationError(
+                    "Fleet Run Store identity requires durable authority"
+                )
+            try:
+                store_path = self.store_path.resolve(strict=True)
+            except (AttributeError, OSError, TypeError) as exc:
+                raise RemoteFleetControlConfigurationError(
+                    "Fleet Run Store identity is invalid"
+                ) from exc
+            if not store_path.is_file():
+                raise RemoteFleetControlConfigurationError(
+                    "Fleet Run Store identity is not a file"
+                )
+            object.__setattr__(self, "store_path", store_path)
 
 
 @runtime_checkable
@@ -81,9 +143,10 @@ class FleetRunSource(Protocol):
 
 
 class StaticFleetRunSource:
-    """Immutable deployment-owned Run routing catalog."""
+    """Immutable reference catalog for development and deterministic tests."""
 
-    production_security_ready = True
+    production_security_ready = False
+    reference_only = True
 
     def __init__(
         self,
@@ -125,6 +188,180 @@ class StaticFleetRunSource:
         return self._routes[:limit]
 
 
+class DurableStoreFleetRunSource:
+    """Bounded source backed by protected durable Run Store registries."""
+
+    reference_only = False
+
+    def __init__(
+        self,
+        stores: Sequence[DurableRunStore],
+        *,
+        control_plane_root: str | Path,
+        agent_roots: Sequence[str | Path],
+    ) -> None:
+        if not isinstance(stores, Sequence) or isinstance(
+            stores,
+            (str, bytes),
+        ):
+            raise RemoteFleetControlConfigurationError(
+                "Fleet Run stores must be a bounded sequence"
+            )
+        if not 1 <= len(stores) <= MAX_FLEET_ROUTE_STORES:
+            raise RemoteFleetControlConfigurationError(
+                "Fleet Run store registry is empty or full"
+            )
+        if not isinstance(agent_roots, Sequence) or isinstance(
+            agent_roots,
+            (str, bytes),
+        ):
+            raise RemoteFleetControlConfigurationError(
+                "Fleet Agent roots must be a bounded sequence"
+            )
+        if not 1 <= len(agent_roots) <= MAX_FLEET_ROUTE_STORES:
+            raise RemoteFleetControlConfigurationError(
+                "Fleet Agent root registry is empty or full"
+            )
+        control_root = _resolve_existing_path(
+            control_plane_root,
+            label="Fleet control-plane root",
+        )
+        if not control_root.is_dir():
+            raise RemoteFleetControlConfigurationError(
+                "Fleet control-plane root is not a directory"
+            )
+        resolved_agent_roots = tuple(
+            _resolve_existing_path(
+                root,
+                label="Fleet Agent root",
+            )
+            for root in agent_roots
+        )
+        if any(
+            _paths_overlap(control_root, agent_root)
+            for agent_root in resolved_agent_roots
+        ):
+            raise RemoteFleetControlConfigurationError(
+                "Fleet control-plane root overlaps an Agent root"
+            )
+        normalized: list[DurableRunStore] = []
+        paths: set[Path] = set()
+        physical_stores: set[tuple[int, int]] = set()
+        for store in stores:
+            if not isinstance(store, DurableRunStore):
+                raise RemoteFleetControlConfigurationError(
+                    "Fleet Run store registry contains an invalid Store"
+                )
+            store_path = _resolve_existing_path(
+                store.path,
+                label="Fleet Run Store",
+            )
+            if not store_path.is_file():
+                raise RemoteFleetControlConfigurationError(
+                    "Fleet Run Store is not a file"
+                )
+            if control_root not in store_path.parents:
+                raise RemoteFleetControlConfigurationError(
+                    "Fleet Run Store is outside the control-plane root"
+                )
+            if store_path in paths:
+                raise RemoteFleetControlConfigurationError(
+                    "Fleet Run store registry contains a duplicate Store"
+                )
+            store_identity = _path_identity(store_path)
+            if store_identity in physical_stores:
+                raise RemoteFleetControlConfigurationError(
+                    "Fleet Run store registry contains a physical alias"
+                )
+            paths.add(store_path)
+            physical_stores.add(store_identity)
+            normalized.append(store)
+        self._stores = tuple(normalized)
+        self._control_plane_root = control_root
+        self._agent_roots = resolved_agent_roots
+        self._path_identities = {
+            path: _path_identity(path)
+            for path in (control_root, *resolved_agent_roots, *paths)
+        }
+
+    @property
+    def production_security_ready(self) -> bool:
+        try:
+            if (
+                not self._stores
+                or any(
+                    _path_identity(path) != identity
+                    for path, identity in self._path_identities.items()
+                )
+                or any(
+                    _paths_overlap(
+                        self._control_plane_root,
+                        agent_root,
+                    )
+                    for agent_root in self._agent_roots
+                )
+            ):
+                return False
+            return all(
+                self._control_plane_root
+                in store.path.resolve(strict=True).parents
+                for store in self._stores
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            return False
+
+    def snapshot(self, limit: int) -> Sequence[FleetRunRoute]:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_FLEET_RUN_ROUTES + 1
+        ):
+            raise ValueError("Fleet Run route limit is invalid")
+        if self.production_security_ready is not True:
+            raise RemoteFleetControlConflict(
+                "Fleet Run Store isolation changed"
+            )
+        routes: list[FleetRunRoute] = []
+        run_ids: set[str] = set()
+        for store in self._stores:
+            offset = 0
+            while len(routes) < limit:
+                page_limit = min(1_000, limit - len(routes))
+                page = store.list_fleet_run_routes(
+                    enabled_only=True,
+                    running_only=True,
+                    limit=page_limit,
+                    offset=offset,
+                )
+                for authority in page:
+                    if authority.run_id in run_ids:
+                        raise RemoteFleetControlConflict(
+                            "Fleet Run is registered in multiple Stores"
+                        )
+                    run_ids.add(authority.run_id)
+                    routes.append(
+                        FleetRunRoute(
+                            authority.run_id,
+                            authority.tenant_id,
+                            authority.pool_id,
+                            authority,
+                            store.path,
+                        )
+                    )
+                if len(page) < page_limit:
+                    break
+                offset += len(page)
+            if len(routes) >= limit:
+                break
+        if self.production_security_ready is not True:
+            raise RemoteFleetControlConflict(
+                "Fleet Run Store isolation changed"
+            )
+        return tuple(routes)
+
+
 @dataclass(frozen=True, slots=True)
 class FleetProjectionReconcileReport:
     routes_examined: int
@@ -151,6 +388,7 @@ class DurableFleetReconciler:
         scheduler_resolver: SchedulerResolver,
         *,
         max_routes: int = 4_096,
+        allow_reference_source: bool = False,
     ) -> None:
         if not isinstance(fleet, RemoteFleetCoordinator):
             raise TypeError("fleet must be a RemoteFleetCoordinator")
@@ -160,7 +398,17 @@ class DurableFleetReconciler:
             raise TypeError("projector must be a DurableFleetProjector")
         if not isinstance(run_source, FleetRunSource):
             raise TypeError("run_source must implement FleetRunSource")
-        if run_source.production_security_ready is not True:
+        if not isinstance(allow_reference_source, bool):
+            raise RemoteFleetControlConfigurationError(
+                "allow_reference_source must be boolean"
+            )
+        source_ready = run_source.production_security_ready is True
+        reference_source = (
+            getattr(run_source, "reference_only", False) is True
+        )
+        if not source_ready and not (
+            allow_reference_source and reference_source
+        ):
             raise RemoteFleetControlConfigurationError(
                 "Fleet Run source is not production ready"
             )
@@ -184,6 +432,8 @@ class DurableFleetReconciler:
         self._run_source = run_source
         self._scheduler_resolver = scheduler_resolver
         self.max_routes = max_routes
+        self._allow_reference_source = allow_reference_source
+        self._reference_source = reference_source
 
     @property
     def production_security_ready(self) -> bool:
@@ -191,6 +441,7 @@ class DurableFleetReconciler:
             return (
                 self._run_source.production_security_ready is True
                 and self._poller.production_security_ready is True
+                and not self._reference_source
             )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -225,7 +476,10 @@ class DurableFleetReconciler:
             raise RemoteFleetControlConflict(
                 "Fleet Run source readiness failed"
             ) from exc
-        if not source_ready:
+        if not source_ready and not (
+            self._allow_reference_source
+            and self._reference_source
+        ):
             raise RemoteFleetControlConflict(
                 "Fleet Run source is not production ready"
             )
@@ -295,6 +549,29 @@ class DurableFleetReconciler:
                 raise RemoteFleetControlConflict(
                     "Fleet route has no durable Run"
                 )
+            if route.authority is not None:
+                if (
+                    route.store_path is not None
+                    and scheduler.store.path != route.store_path
+                ):
+                    raise RemoteFleetControlConflict(
+                        "Fleet Run resolved to a different Store"
+                    )
+                if (
+                    scheduler.store.get_fleet_run_route(route.run_id)
+                    != route.authority
+                ):
+                    raise RemoteFleetControlConflict(
+                        "Fleet Run route authority changed"
+                    )
+            elif source_ready:
+                raise RemoteFleetControlConflict(
+                    "production Fleet route lacks durable authority"
+                )
+            if source_ready and route.store_path is None:
+                raise RemoteFleetControlConflict(
+                    "production Fleet route lacks Store identity"
+                )
             resolved += 1
 
             ownership = None
@@ -343,6 +620,7 @@ class DurableFleetReconciler:
                 tenant_id=route.tenant_id,
                 pool_id=route.pool_id,
                 shard_ownership=ownership,
+                run_route=route.authority,
             )
             for binding in bindings:
                 if binding.task.task_id in task_ids:
@@ -374,6 +652,7 @@ class DurableFleetReconciler:
 
 __all__ = [
     "DurableFleetReconciler",
+    "DurableStoreFleetRunSource",
     "FleetProjectionReconcileReport",
     "FleetRunRoute",
     "FleetRunSource",

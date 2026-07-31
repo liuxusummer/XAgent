@@ -203,12 +203,15 @@ imported by the top-level package, so the core API does not require FastAPI.
 - XAgent does **not** claim exactly-once execution for arbitrary tools, automatic
   rollback of external systems, distributed consensus, or exact restoration of
   process/provider/browser state.
-- The remote reference is run-scoped and process-local: it is not a production
-  server/pull transport, real mTLS, gVisor, or a heterogeneous fleet
-  integration. Its prepared-execution and staged-output registries are also
-  process-local. OCI/HMAC evidence demonstrates binding and verification, not
-  production sandbox isolation. A fleet claim that fails after admission must
-  be reprojected from Store before reassignment.
+- Remote execution includes strict HTTPS/server-pull composition, durable
+  session/execution journals, Store-local quota/ownership/fairness, and a
+  schema-v7 generation-fenced Fleet Run route registry. Fleet queue, Worker
+  registry, active routing, prepared execution, and staged bytes remain
+  process-local projections rather than a shared broker. The repository still
+  does not claim a deployed PKI/TLS-extension server, real gVisor isolation, or
+  cross-Store consensus. OCI/HMAC evidence demonstrates binding and
+  verification, not production sandbox isolation. A fleet claim that fails
+  after admission must be reprojected from Store before reassignment.
 - Checkpoint summaries and telemetry are useful projections, not execution
   truth. Large or sensitive content crosses the control plane only through
   reviewed Artifact references.

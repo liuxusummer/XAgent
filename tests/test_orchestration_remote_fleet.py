@@ -213,6 +213,7 @@ class RemoteFleetCoordinatorTests(unittest.TestCase):
                 node_id="node-1",
                 activity_config_digest=_digest("config"),
                 routing_policy_digest=_digest("routing"),
+                run_route_digest=_digest("run-route"),
                 shard_ownership=ownership,
                 task=RemoteTask(
                     task_id=task_id,
