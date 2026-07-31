@@ -1,0 +1,39 @@
+docs/distributed-execution-adr.md
+  s_72af05a5dabd4c::t_004521c59c71c4 132-134,183,258-261,385-394,442-443
+docs/remote-activity-capability-adversarial-review.md
+  s_72af05a5dabd4c::t_5664414254d82c 1-123
+docs/tool-layer.md
+  s_72af05a5dabd4c::t_ca58db611942eb 289-293
+examples/distributed_execution_demo.py
+  s_72af05a5dabd4c::t_58c0b509872acb 332
+src/orchestration/remote_control.py
+  s_72af05a5dabd4c::t_a563b42004937a 81,372,378,836-850,1111-1113,1115-1117,1176-1177,2046-2073
+src/orchestration/remote_execution.py
+  s_72af05a5dabd4c::t_64e0626b8864e6 90,533-536,540-541,690-691,789-792,881-887,2421-2424
+src/orchestration/remote_worker.py
+  s_72af05a5dabd4c::t_f369f800d594aa 36,351,368,381,390-393,395-399,471-473,475-488,491,494,499-516
+tests/test_orchestration_distributed_fault_matrix.py
+  s_72af05a5dabd4c::t_f9a8655e60d1bb 115
+tests/test_orchestration_remote_execution.py
+  s_72af05a5dabd4c::t_86dbeb8cacee5e 51-54,698-781
+tests/test_orchestration_remote_protocol.py
+  s_72af05a5dabd4c::t_ca7cf3c06ffe3f 101,325,361-366,392-395,1196,1293-1428,1544-1550
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5293a4c959aefe4ada594167b8de5c0ff8edee18",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
