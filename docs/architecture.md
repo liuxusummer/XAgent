@@ -78,6 +78,9 @@
   Event 和 Artifact 引用，不持久化 Agent Loop 的 provider 内部状态，也不允许原始工具输出越过
   Artifact 边界。未启用时，现有 CLI、Web 单 Agent 和 Team Workflow 行为保持不变。完整协议见
   `docs/durable-orchestration-spec.md`
+- Agent Activity 终态以 `AgentActivityReceipt` 绑定 request digest、规范 NodeResult 和
+  Artifact digest；它只证明运行时观察到整个 Loop 边界，不会把内部未回执的工具副作用
+  提升为 verified 或 exactly-once。完整契约见 `docs/agent-activity-receipt.md`
 - Durable Store、Artifact、GC 和锁必须放在 Agent workspace 外，由独立控制面
   service/OS identity 持有，且不挂载给 legacy 文件、代码或浏览器工具。默认 Web UI 不会
   自动发现数据库；投影服务必须显式注入受信 tenant→database 映射。同 UID 隐藏路径不构成

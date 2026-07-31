@@ -51,6 +51,7 @@ from .models import (
 from .recovery import UnknownOutcomeDecision, UnknownOutcomeResolution
 
 if TYPE_CHECKING:
+    from .agent_receipt import AgentActivityReceipt
     from .executor import ToolReceipt
 
 STORE_SCHEMA_VERSION = 8
@@ -1259,6 +1260,34 @@ def _sha256_digest(value: Any, field_name: str) -> str:
     if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
         raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
     return digest
+
+
+def _agent_result_ref_digests(
+    result: Any,
+    field_name: str,
+) -> tuple[str, ...]:
+    if not isinstance(result, Mapping):
+        return ()
+    raw_refs = result.get(field_name)
+    if raw_refs is None:
+        return ()
+    if not isinstance(raw_refs, list) or len(raw_refs) > 64:
+        raise ValueError(
+            f"Agent NodeResult {field_name} must be a bounded list"
+        )
+    digests: list[str] = []
+    for raw_ref in raw_refs:
+        if not isinstance(raw_ref, Mapping):
+            raise ValueError(
+                f"Agent NodeResult {field_name} contains an invalid ref"
+            )
+        digests.append(
+            _sha256_digest(
+                raw_ref.get("sha256"),
+                f"Agent NodeResult {field_name} digest",
+            )
+        )
+    return tuple(digests)
 
 
 def _canonical_optional_workflow_ref(value: Any) -> ArtifactRef | None:
@@ -5548,6 +5577,144 @@ class DurableRunStore:
         except (TypeError, ValueError) as exc:
             raise StoreSchemaError(
                 "durable ToolReceipt failed integrity validation"
+            ) from exc
+        return receipt
+
+    def get_agent_activity_receipt(
+        self,
+        run_id: str,
+        attempt_id: str,
+    ) -> "AgentActivityReceipt | None":
+        """Read and fully verify the latest whole-Agent terminal receipt."""
+
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                """
+                SELECT * FROM domain_events
+                WHERE run_id = ? AND attempt_id = ?
+                  AND event_type IN (
+                    'attempt.succeeded',
+                    'attempt.failed',
+                    'attempt.timed_out',
+                    'attempt.cancelled',
+                    'attempt.abandoned',
+                    'attempt.outcome_unknown'
+                  )
+                ORDER BY seq DESC
+                LIMIT 1
+                """,
+                (run_id, attempt_id),
+            ).fetchone()
+            attempt_row = conn.execute(
+                "SELECT * FROM attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            idempotency_row = conn.execute(
+                """
+                SELECT i.* FROM attempts AS a
+                JOIN idempotency_records AS i
+                  ON i.run_id = a.run_id
+                 AND i.key = a.idempotency_key
+                WHERE a.attempt_id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+        if row is None:
+            if attempt_row is None:
+                return None
+            try:
+                attempt = self._attempt_from_row(attempt_row)
+            except (TypeError, ValueError) as exc:
+                raise StoreSchemaError(
+                    "durable Agent Attempt failed integrity validation"
+                ) from exc
+            if (
+                attempt.activity_kind == "agent"
+                and attempt.status.is_terminal
+            ):
+                raise StoreSchemaError(
+                    "terminal Agent Attempt is missing its Domain Event"
+                )
+            return None
+        event = self._event_from_row(row)
+        raw_receipt = event.payload.get("agent_activity_receipt")
+        raw_digest = event.payload.get("agent_activity_receipt_digest")
+        try:
+            from .agent_receipt import (
+                AgentActivityReceipt,
+                AgentActivityReceiptError,
+                canonical_agent_result_digest,
+            )
+
+            if attempt_row is None:
+                raise AgentActivityReceiptError(
+                    "AgentActivityReceipt Attempt is missing"
+                )
+            attempt = self._attempt_from_row(attempt_row)
+            if attempt.activity_kind != "agent":
+                if raw_receipt is None and raw_digest is None:
+                    return None
+                raise AgentActivityReceiptError(
+                    "AgentActivityReceipt belongs to a non-Agent Attempt"
+                )
+            if idempotency_row is None:
+                raise AgentActivityReceiptError(
+                    "AgentActivityReceipt request binding is missing"
+                )
+            idempotency = self._idempotency_from_row(idempotency_row)
+            if (
+                attempt.run_id != run_id
+                or event.node_id != attempt.node_id
+                or event.event_type
+                != f"attempt.{attempt.status.value}"
+                or idempotency.run_id != run_id
+                or idempotency.key != attempt.idempotency_key
+                or idempotency.status is not IdempotencyStatus.COMPLETED
+                or _json_dump(idempotency.result)
+                != _json_dump(attempt.result)
+            ):
+                raise AgentActivityReceiptError(
+                    "Agent Activity terminal facts do not match"
+                )
+            if raw_receipt is None and raw_digest is None:
+                return None
+            if not isinstance(raw_receipt, dict):
+                raise AgentActivityReceiptError(
+                    "AgentActivityReceipt payload must be an object"
+                )
+            receipt = AgentActivityReceipt.from_dict(raw_receipt)
+            if (
+                receipt.run_id != run_id
+                or receipt.node_id != attempt.node_id
+                or receipt.attempt_id != attempt_id
+                or receipt.effect_class.value != attempt.effect_class
+                or receipt.attempt_status is not attempt.status
+                or receipt.request_digest != idempotency.request_hash
+                or receipt.result_digest
+                != canonical_agent_result_digest(attempt.result)
+                or receipt.result_artifact_digests
+                != _agent_result_ref_digests(
+                    attempt.result,
+                    "artifact_refs",
+                )
+                or receipt.tool_receipt_digests
+                != _agent_result_ref_digests(
+                    attempt.result,
+                    "tool_receipt_refs",
+                )
+                or receipt.receipt_digest
+                != _sha256_digest(
+                    raw_digest,
+                    "agent_activity_receipt_digest",
+                )
+            ):
+                raise AgentActivityReceiptError(
+                    "AgentActivityReceipt does not match durable truth"
+                )
+        except (TypeError, ValueError) as exc:
+            raise StoreSchemaError(
+                "durable AgentActivityReceipt failed integrity validation"
             ) from exc
         return receipt
 

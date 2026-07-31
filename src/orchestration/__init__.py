@@ -19,6 +19,11 @@ from typing import Any
 
 
 _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
+    ".agent_receipt": (
+        "AgentActivityReceipt",
+        "AgentActivityReceiptError",
+        "AgentActivityVerification",
+    ),
     ".artifacts": (
         "ArtifactEncryption",
         "ArtifactKind",

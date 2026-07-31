@@ -9,6 +9,7 @@
 > 相关文档：[architecture.md](architecture.md)、[agent-loop.md](agent-loop.md)、
 > [tool-layer.md](tool-layer.md)、[agent-teams-spec.md](agent-teams-spec.md)、
 > [resumable-long-tasks-spec.md](resumable-long-tasks-spec.md)、
+> [agent-activity-receipt.md](agent-activity-receipt.md)、
 > [observability.md](observability.md)
 
 ## 1. 背景与决策
@@ -66,6 +67,7 @@ Durable Orchestration
 | Domain Event | 影响执行正确性、必须可靠持久化的领域事件 |
 | Projection | 由 Domain Event 推导的当前状态查询表 |
 | ToolReceipt | 一次工具调用的输入摘要、结果摘要和副作用证明 |
+| AgentActivityReceipt | 一次完整 Agent Loop Attempt 的边界观察与持久结果绑定 |
 | Artifact | 大型输出、文件快照、模型响应或报告的持久化对象 |
 | Outcome Unknown | Activity 可能已产生副作用，但运行时没有可靠完成收据 |
 
@@ -385,7 +387,43 @@ Store 的查询 API 必须从 Attempt 的终态 Event 重新解析 ToolReceipt�
 自身 digest、Run/Attempt identity 以及 Event 终态一致性；缺少收据返回空，损坏或错绑
 必须 fail closed，不能把 projection 中的普通 result dict 当作已验证收据。
 
-### 5.10 Lease
+### 5.10 AgentActivityReceipt
+
+```text
+run_id / node_id / attempt_id
+activity_name
+effect_class / attempt_status
+request_digest / result_digest
+exit_reason / turns / observed_tool_results
+result_artifact_digests[]
+tool_receipt_digests[]
+internal_tool_receipts_complete
+verification          runtime_observed | unverified
+```
+
+`AgentActivityReceipt` 只证明编排运行时在完整 Agent Loop 边界观察到的终态，并把该
+观察绑定到 idempotency request、Attempt projection、规范化 Attempt result（成功和
+已知失败通常为 NodeResult）及其 Artifact digest。它不包含 task、prompt、response、
+工具参数、工具原始结果或凭据。
+
+`runtime_observed` 不等于外部副作用已验证：Legacy Agent 即使正常返回，也必须保持
+`internal_tool_receipts_complete=false`。该布尔值只表示每个观察到的内部工具结果都有
+一个对应的 receipt Artifact digest；即使为 true，各 ToolReceipt 的 verification
+强度仍须逐个判断，禁止据此宣称通用 exactly-once。
+
+成功 Attempt 必须是 `runtime_observed`；`OUTCOME_UNKNOWN` 和 `ABANDONED` 必须是
+`unverified`。Store 查询必须在同一 SQLite read transaction 中校验终态 Event、
+Attempt、已完成 idempotency request/result、规范 NodeResult digest、两组 Artifact
+digest 和 receipt digest。只有终态 Event、Attempt、已完成 idempotency result 一致且
+两个 receipt 字段都不存在时，才为旧数据返回空；缺 Event、仅缺一个 receipt 字段、
+内容损坏或身份错绑必须 fail closed。Legacy replay 可兼容完全无 receipt 的历史
+Attempt，但只要 receipt 存在就必须先验证；新提交在“提交成功/响应丢失”窗口也必须
+重读到非空 receipt。新远程 Agent Activity 不得接受空 receipt。
+
+完整字段、不变量和兼容边界见
+[Agent Activity Receipt 契约](agent-activity-receipt.md)。
+
+### 5.11 Lease
 
 ```text
 lease_id
@@ -1026,6 +1064,8 @@ preauthorization。
 - 新增 Legacy Agent Activity adapter，把一次 Agent Loop 运行包装为一个 Node Attempt。
 - `ActionResult` 继续是 Agent Loop/Handler 内部兼容契约，禁止直接作为持久化 schema。
 - adapter 将最终响应、exit reason、turns、工具摘要转换为类型化 `NodeResult` 和 Artifact。
+- adapter 在终态 Event 中写入 payload-free `AgentActivityReceipt`；恢复时验证已存在的
+  receipt，只有完全没有 receipt 的历史 Attempt 走兼容路径。
 - `should_exit`、`next_prompt=None` 等旧退出语义只在 adapter 内映射，编排核心不解析 prompt。
 - Agent Activity 内的工具在完成逐工具 Receipt 接入前，整体按保守 effect class 处理；
   不能因为 Agent 最终返回成功就推断所有中间副作用具备 exactly-once。
@@ -1154,7 +1194,7 @@ v1 必须满足：
 
 交付：
 
-- ToolReceipt、idempotency record、effect class。
+- ToolReceipt、AgentActivityReceipt、idempotency record、effect class。
 - RetryPolicy、持久 deadline、lease/heartbeat/fencing token。
 - pause/cancel 传播和 recovery scanner。
 

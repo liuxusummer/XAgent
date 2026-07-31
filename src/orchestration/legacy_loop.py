@@ -10,6 +10,12 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any, Protocol
 
+from .agent_receipt import (
+    AgentActivityReceipt,
+    AgentActivityReceiptError,
+    AgentActivityVerification,
+    canonical_agent_result_digest,
+)
 from .artifacts import ArtifactRef
 from .models import (
     AttemptRecord,
@@ -23,6 +29,7 @@ from .models import (
     RunStatus,
     normalize_json,
 )
+from .policy import EffectClass
 
 INLINE_RESULT_LIMIT = 16 * 1024
 DEFAULT_INLINE_RESULT_LIMIT = 0
@@ -31,6 +38,9 @@ DEFAULT_WORKER_CAPACITY = 1
 MAX_LEGACY_REQUEST_BYTES = 256 * 1024
 WRITER_RESULT_LIMIT = 16 * 1024
 _REQUEST_HASH_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_ACTIVITY_NAME_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z"
+)
 KNOWN_EXIT_REASONS = {
     "CURRENT_TASK_DONE",
     "INTERRUPTED",
@@ -62,6 +72,12 @@ class LegacyRunStore(Protocol):
         run_id: str,
         key: str,
     ) -> IdempotencyRecord | None: ...
+
+    def get_agent_activity_receipt(
+        self,
+        run_id: str,
+        attempt_id: str,
+    ) -> AgentActivityReceipt | None: ...
 
     def append_event(
         self,
@@ -187,6 +203,7 @@ class LegacyAgentLoopAdapter:
         store: LegacyRunStore,
         runner: LegacyRunner,
         *,
+        activity_name: str = "legacy-agent",
         result_writer: ResultWriter | None = None,
         artifact_verifier: Callable[[ArtifactRef], bool] | None = None,
         inline_result_limit: int = DEFAULT_INLINE_RESULT_LIMIT,
@@ -195,6 +212,7 @@ class LegacyAgentLoopAdapter:
     ) -> None:
         if artifact_verifier is not None and not callable(artifact_verifier):
             raise TypeError("artifact_verifier must be callable")
+        self._activity_name = _bounded_activity_name(activity_name)
         self._store = store
         self._runner = runner
         self._result_writer = result_writer
@@ -333,6 +351,7 @@ class LegacyAgentLoopAdapter:
                     owner_id=owner_id,
                     claim_token=claim.record.claim_token,
                     cause=exc,
+                    observed_result=result,
                 )
                 raise DurabilityError(
                     "attempt.result_not_durable",
@@ -360,6 +379,7 @@ class LegacyAgentLoopAdapter:
                 request_hash=stable_hash,
                 owner_id=owner_id,
                 claim_token=claim.record.claim_token,
+                observed_result=result,
             )
             raise ActivityRecoveryRequired(
                 f"legacy Agent exited with {exit_reason}; side effects are not receipted"
@@ -374,6 +394,7 @@ class LegacyAgentLoopAdapter:
             stable_hash,
             owner_id,
             claim.record.claim_token,
+            observed_result=result,
         )
         return result
 
@@ -560,6 +581,17 @@ class LegacyAgentLoopAdapter:
             raise ActivityClaimConflict(
                 f"attempt {attempt_id} cannot complete from {attempt.status.value}"
             )
+        receipt = self._build_agent_receipt(
+            attempt,
+            request_hash=request_hash,
+            durable_result=node_result,
+            attempt_status=AttemptStatus.SUCCEEDED,
+            exit_reason=_safe_exit_reason(result.get("exit_reason")),
+            observed_result=result,
+            verification=AgentActivityVerification.RUNTIME_OBSERVED,
+        )
+        event_payload = _result_summary(result, node_result)
+        event_payload.update(_agent_receipt_payload(receipt))
         event_type = "attempt.succeeded"
         try:
             self._store.complete_activity(
@@ -570,7 +602,7 @@ class LegacyAgentLoopAdapter:
                 owner_id,
                 claim_token=claim_token,
                 result=node_result,
-                event_payload=_result_summary(result, node_result),
+                event_payload=event_payload,
                 attempt_status=AttemptStatus.SUCCEEDED,
                 node_status=NodeStatus.SUCCEEDED,
                 run_status=RunStatus.COMPLETED if finalize_run else None,
@@ -585,6 +617,28 @@ class LegacyAgentLoopAdapter:
                 and fresh.status is AttemptStatus.SUCCEEDED
                 and fresh.result == node_result
             ):
+                try:
+                    durable_receipt = (
+                        self._store.get_agent_activity_receipt(
+                            run_id,
+                            attempt_id,
+                        )
+                    )
+                    if durable_receipt is None:
+                        raise AgentActivityReceiptError(
+                            "new Agent completion is missing its receipt"
+                        )
+                except BaseException as receipt_exc:
+                    if isinstance(
+                        receipt_exc,
+                        (KeyboardInterrupt, SystemExit),
+                    ):
+                        raise
+                    raise DurabilityError(
+                        "agent_activity_receipt.read",
+                        receipt_exc,
+                        activity_error=exc,
+                    ) from receipt_exc
                 return
             try:
                 self._transition_outcome_unknown(
@@ -596,6 +650,7 @@ class LegacyAgentLoopAdapter:
                     owner_id=owner_id,
                     claim_token=claim_token,
                     cause=exc,
+                    observed_result=result,
                 )
             except BaseException as recovery_exc:
                 raise DurabilityError(
@@ -617,6 +672,7 @@ class LegacyAgentLoopAdapter:
         claim_token: str,
         *,
         error_type: str = "",
+        observed_result: Mapping[str, Any] | None = None,
     ) -> None:
         run, node, attempt = self._load_projections(run_id, node_id, attempt_id)
         cancelled = exit_reason == "INTERRUPTED"
@@ -635,6 +691,21 @@ class LegacyAgentLoopAdapter:
                 **error,
             }
         )
+        receipt = self._build_agent_receipt(
+            attempt,
+            request_hash=request_hash,
+            durable_result=node_result,
+            attempt_status=(
+                AttemptStatus.CANCELLED
+                if cancelled
+                else AttemptStatus.FAILED
+            ),
+            exit_reason=_safe_exit_reason(exit_reason),
+            observed_result=observed_result,
+            verification=AgentActivityVerification.RUNTIME_OBSERVED,
+        )
+        event_payload = dict(error)
+        event_payload.update(_agent_receipt_payload(receipt))
         self._complete_activity(
             "attempt.cancelled" if cancelled else "attempt.failed",
             run_id,
@@ -644,7 +715,7 @@ class LegacyAgentLoopAdapter:
             owner_id,
             claim_token=claim_token,
             result=node_result,
-            event_payload=error,
+            event_payload=event_payload,
             attempt_status=(
                 AttemptStatus.CANCELLED if cancelled else AttemptStatus.FAILED
             ),
@@ -667,6 +738,7 @@ class LegacyAgentLoopAdapter:
         owner_id: str,
         claim_token: str,
         cause: BaseException | None = None,
+        observed_result: Mapping[str, Any] | None = None,
     ) -> None:
         run, node, attempt = self._load_projections(run_id, node_id, attempt_id)
         if attempt.status is AttemptStatus.OUTCOME_UNKNOWN:
@@ -679,6 +751,21 @@ class LegacyAgentLoopAdapter:
             "error_class": _bounded(type(cause).__name__ if cause else "OutcomeUnknown", 160),
             "error_code": _bounded(reason, 160),
         }
+        receipt = self._build_agent_receipt(
+            attempt,
+            request_hash=request_hash,
+            durable_result=error,
+            attempt_status=AttemptStatus.OUTCOME_UNKNOWN,
+            exit_reason=(
+                _safe_exit_reason(observed_result.get("exit_reason"))
+                if observed_result is not None
+                else _bounded(reason, 128)
+            ),
+            observed_result=observed_result,
+            verification=AgentActivityVerification.UNVERIFIED,
+        )
+        event_payload = dict(error)
+        event_payload.update(_agent_receipt_payload(receipt))
         self._complete_activity(
             "attempt.outcome_unknown",
             run_id,
@@ -688,7 +775,7 @@ class LegacyAgentLoopAdapter:
             owner_id,
             claim_token=claim_token,
             result=error,
-            event_payload=error,
+            event_payload=event_payload,
             attempt_status=AttemptStatus.OUTCOME_UNKNOWN,
             node_status=NodeStatus.WAITING_RECOVERY,
             run_status=RunStatus.WAITING_RECOVERY,
@@ -751,6 +838,59 @@ class LegacyAgentLoopAdapter:
             "legacy result requires an artifact writer; inline persistence is opt-in"
         )
 
+    def _build_agent_receipt(
+        self,
+        attempt: AttemptRecord,
+        *,
+        request_hash: str,
+        durable_result: Mapping[str, Any],
+        attempt_status: AttemptStatus,
+        exit_reason: str,
+        observed_result: Mapping[str, Any] | None,
+        verification: AgentActivityVerification,
+    ) -> AgentActivityReceipt:
+        tool_results = (
+            observed_result.get("tool_results")
+            if observed_result is not None
+            else None
+        )
+        return AgentActivityReceipt(
+            run_id=attempt.run_id,
+            node_id=attempt.node_id,
+            attempt_id=attempt.attempt_id,
+            activity_name=self._activity_name,
+            effect_class=EffectClass(attempt.effect_class),
+            attempt_status=attempt_status,
+            request_digest=request_hash,
+            result_digest=canonical_agent_result_digest(
+                durable_result
+            ),
+            exit_reason=exit_reason,
+            turns=(
+                _safe_turns(observed_result.get("turns"))
+                if observed_result is not None
+                else None
+            ),
+            observed_tool_results=(
+                len(tool_results)
+                if isinstance(tool_results, list)
+                else 0
+            ),
+            result_artifact_digests=_node_result_ref_digests(
+                durable_result,
+                "artifact_refs",
+            ),
+            tool_receipt_digests=_node_result_ref_digests(
+                durable_result,
+                "tool_receipt_refs",
+            ),
+            # Legacy Agent results expose summaries, not a complete
+            # one-receipt-per-tool-call proof. Keep this false even when the
+            # observed count happens to match.
+            internal_tool_receipts_complete=False,
+            verification=verification,
+        )
+
     def _complete_activity(
         self,
         event_type: str,
@@ -788,11 +928,30 @@ class LegacyAgentLoopAdapter:
                 raise
             raise DurabilityError(event_type, exc) from exc
 
-    @staticmethod
-    def _recover_terminal_attempt(attempt: AttemptRecord) -> dict[str, Any] | None:
-        if attempt.status is AttemptStatus.SUCCEEDED:
-            return _recover_legacy_result(attempt.result)
-        if attempt.status in {AttemptStatus.FAILED, AttemptStatus.CANCELLED}:
+    def _recover_terminal_attempt(
+        self,
+        attempt: AttemptRecord,
+    ) -> dict[str, Any] | None:
+        if attempt.status in {
+            AttemptStatus.SUCCEEDED,
+            AttemptStatus.FAILED,
+            AttemptStatus.CANCELLED,
+        }:
+            try:
+                # A fully absent receipt is a supported pre-v1 compatibility
+                # case. A partial, malformed, or misbound receipt raises and
+                # must prevent recovery from silently trusting projection.
+                self._store.get_agent_activity_receipt(
+                    attempt.run_id,
+                    attempt.attempt_id,
+                )
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                raise DurabilityError(
+                    "agent_activity_receipt.read",
+                    exc,
+                ) from exc
             return _recover_legacy_result(attempt.result)
         return None
 
@@ -810,6 +969,7 @@ def run_legacy_agent_activity(
     request_hash: str | None = None,
     lease_seconds: float = 60.0,
     finalize_run: bool = False,
+    activity_name: str = "legacy-agent",
     result_writer: ResultWriter | None = None,
     artifact_verifier: Callable[[ArtifactRef], bool] | None = None,
     inline_result_limit: int = DEFAULT_INLINE_RESULT_LIMIT,
@@ -821,6 +981,7 @@ def run_legacy_agent_activity(
     return LegacyAgentLoopAdapter(
         store,
         runner,
+        activity_name=activity_name,
         result_writer=result_writer,
         artifact_verifier=artifact_verifier,
         inline_result_limit=inline_result_limit,
@@ -1058,6 +1219,40 @@ def _result_summary(
     }
 
 
+def _agent_receipt_payload(
+    receipt: AgentActivityReceipt,
+) -> dict[str, Any]:
+    return {
+        "agent_activity_receipt": receipt.to_dict(),
+        "agent_activity_receipt_digest": receipt.receipt_digest,
+    }
+
+
+def _node_result_ref_digests(
+    node_result: Mapping[str, Any],
+    field_name: str,
+) -> tuple[str, ...]:
+    raw_refs = node_result.get(field_name)
+    if raw_refs is None:
+        return ()
+    if not isinstance(raw_refs, list) or len(raw_refs) > 64:
+        raise ResultPersistenceError(
+            f"NodeResult {field_name} must be a bounded list"
+        )
+    digests: list[str] = []
+    for raw_ref in raw_refs:
+        if (
+            not isinstance(raw_ref, Mapping)
+            or not isinstance(raw_ref.get("sha256"), str)
+            or _REQUEST_HASH_PATTERN.fullmatch(raw_ref["sha256"]) is None
+        ):
+            raise ResultPersistenceError(
+                f"NodeResult {field_name} contains an invalid digest"
+            )
+        digests.append(raw_ref["sha256"])
+    return tuple(digests)
+
+
 def _safe_turns(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
@@ -1070,6 +1265,13 @@ def _require_text(value: Any, name: str) -> str:
     text = str(value or "").strip()
     if not text:
         raise ValueError(f"{name} must be a non-empty string")
+    return text
+
+
+def _bounded_activity_name(value: Any) -> str:
+    text = _require_text(value, "activity_name")
+    if _ACTIVITY_NAME_PATTERN.fullmatch(text) is None:
+        raise ValueError("activity_name must be a bounded identifier")
     return text
 
 
