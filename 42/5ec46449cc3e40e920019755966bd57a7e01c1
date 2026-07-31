@@ -1,0 +1,57 @@
+docs/agent-execution-evidence-collector-adversarial-review.md
+  s_72af05a5dabd4c::t_cf15e7b880f35a 7-9
+docs/agent-execution-manifest-adversarial-review.md
+  s_72af05a5dabd4c::t_2a9bcd92d743d3 92
+docs/agent-execution-manifest.md
+  s_72af05a5dabd4c::t_0289acc4f0286d 188-191,200-202
+docs/agent-loop.md
+  s_72af05a5dabd4c::t_9129e3181b160b 144-148
+docs/agent-provider-client-adversarial-review.md
+  s_72af05a5dabd4c::t_b97eca0ffe6c8e 6-8,131-132
+docs/agent-provider-client.md
+  s_72af05a5dabd4c::t_c4d4fc72cd017b 132-133
+docs/agent-tool-handler-adversarial-review.md
+  s_72af05a5dabd4c::t_a3136abeda2ddd 1-123
+docs/agent-tool-handler.md
+  s_72af05a5dabd4c::t_e266c174faeea4 1-121
+docs/architecture.md
+  s_72af05a5dabd4c::t_92fa4f6667964d 117-121
+docs/durable-orchestration-spec.md
+  s_72af05a5dabd4c::t_81edb566a2f8ec 488-489,491,493-494
+docs/provider-credential-boundary.md
+  s_72af05a5dabd4c::t_577e5c868838fd 230-232
+docs/tool-layer.md
+  s_72af05a5dabd4c::t_4f80664241a482 50-55
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_6514ba033c4b61 41-52
+src/orchestration/agent_tool_handler.py
+  s_72af05a5dabd4c::t_6f3f7ec3710445 1-697
+src/orchestration/agent_tool_result.py
+  s_72af05a5dabd4c::t_3f312460f9466d 1-498
+src/orchestration/policy.py
+  s_72af05a5dabd4c::t_23ed3215be4c20 165-205,435-437
+tests/test_orchestration_agent_tool_handler.py
+  s_72af05a5dabd4c::t_227101c15235eb 1-856
+tests/test_orchestration_policy.py
+  s_72af05a5dabd4c::t_71ee61d1f4aeb7 23,123-161
+tests/test_orchestration_public_api.py
+  s_72af05a5dabd4c::t_862a44cb9c41cb 20-22,112-116,151-153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "425ec46449cc3e40e920019755966bd57a7e01c1",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
