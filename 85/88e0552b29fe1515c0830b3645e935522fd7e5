@@ -1,0 +1,45 @@
+docs/agent-execution-evidence-collector-adversarial-review.md
+  s_72af05a5dabd4c::t_159ca921b818fd 7,120-121
+docs/agent-execution-manifest-adversarial-review.md
+  s_72af05a5dabd4c::t_f761b614256f75 91-92
+docs/agent-execution-manifest.md
+  s_72af05a5dabd4c::t_5c99dc9da795e0 188-190
+docs/architecture.md
+  s_72af05a5dabd4c::t_cbf45e4f02fab3 111-116
+docs/durable-orchestration-spec.md
+  s_72af05a5dabd4c::t_3c45cd2872c387 486-490
+docs/llm-layer.md
+  s_72af05a5dabd4c::t_a38622a8be03ae 39-44
+docs/provider-agent-lineage-adversarial-review.md
+  s_72af05a5dabd4c::t_8f1c38b777136a 8-9
+docs/provider-credential-boundary.md
+  s_72af05a5dabd4c::t_8a2ed7b69998e3 56-59,229-231,247-249
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_fd17c7951d210d 37-40
+src/orchestration/agent_execution_evidence.py
+  s_72af05a5dabd4c::t_e601211449451b 162-197
+src/orchestration/provider_access.py
+  s_72af05a5dabd4c::t_59493c2dacaffc 1109-1122
+tests/test_orchestration_agent_execution_evidence.py
+  s_72af05a5dabd4c::t_5334754ee2be56 128-162
+tests/test_orchestration_provider_access.py
+  s_72af05a5dabd4c::t_910c469685bcd7 302-314
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8588e0552b29fe1515c0830b3645e935522fd7e5",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
