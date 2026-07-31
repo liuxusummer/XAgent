@@ -86,6 +86,10 @@
   Attempt/request/definition/config/input descriptor，但不绑定 Worker/lease/grant。
   当前仅提供输入契约与 Broker 单次读取闭环，安全远程 adapter 仍为 Tool-only；见
   `docs/agent-activity-request.md`
+- 远程 Agent 的长期 provider credential 必须留在部署侧模型网关；Worker 只能获得绑定
+  tenant/Attempt/request/route/invocation-index 的短期单次 `ProviderAccessGrant`。
+  当前 Broker 仅有内存消费墓碑，readiness 固定 false，不能据此开放 remote Agent；见
+  `docs/provider-credential-boundary.md`
 - Durable Store、Artifact、GC 和锁必须放在 Agent workspace 外，由独立控制面
   service/OS identity 持有，且不挂载给 legacy 文件、代码或浏览器工具。默认 Web UI 不会
   自动发现数据库；投影服务必须显式注入受信 tenant→database 映射。同 UID 隐藏路径不构成

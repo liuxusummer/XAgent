@@ -151,6 +151,18 @@ Claude 和 OpenAI 的 SSE 事件结构完全不同，各自独立实现，不抽
 
 流式请求中断后不重试——已经 yield 了部分内容给上层，重试会导致重复。返回错误文本，由上层（循环引擎）决定是否重新发起。
 
+### 4.5 Provider credential
+
+本地兼容 Session 仍持有原始 API key，但 credential、endpoint、prompt/history、
+embedding config、tool arguments 和 raw provider body 均不得进入 repr。transport、
+provider body 和 failover 异常只返回固定 `ProviderRequestError.reason_code`，不得链接
+原始 URL、response 或异常 cause/context。credential holder 禁止使用
+`dataclasses.asdict()`、`vars()` 或通用 JSON 序列化。
+
+远程 Agent 不复用本地 Session 的字符串 credential。部署侧 `ProviderInvoker` 保管长期
+API key，Worker 只接收一次调用的短期 `ProviderAccessGrant`；完整边界、消费顺序与当前
+非生产限制见 [provider-credential-boundary.md](provider-credential-boundary.md)。
+
 ## 5. 不做的事
 
 - **不做请求队列 / 并发控制**：Agent 是单线程串行调用，不需要并发管理

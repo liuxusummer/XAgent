@@ -129,10 +129,10 @@ def resolve_workspace_dir(workspace_dir: str | None = None, code_root: str | Pat
 
 @dataclass
 class XAgent:
-    system_prompt: str
-    tools_schema: list[dict[str, Any]]
-    api_key: str = ""
-    base_url: str = ""
+    system_prompt: str = field(repr=False)
+    tools_schema: list[dict[str, Any]] = field(repr=False)
+    api_key: str = field(default="", repr=False)
+    base_url: str = field(default="", repr=False)
     model: str = ""
     cwd: str = ""
     workspace_dir: str | None = None
@@ -151,7 +151,10 @@ class XAgent:
     memory_mode: str = "project"
     team_config: dict[str, Any] | None = None
     delegate_runner: Any | None = None
-    file_index_embedding_config: dict[str, Any] | None = None
+    file_index_embedding_config: dict[str, Any] | None = field(
+        default=None,
+        repr=False,
+    )
     runbook_min_interaction_records: int = 10
     principal_subject: str = "local-user"
     tenant_id: str = "local"

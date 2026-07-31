@@ -11,6 +11,7 @@
 > [resumable-long-tasks-spec.md](resumable-long-tasks-spec.md)、
 > [agent-activity-request.md](agent-activity-request.md)、
 > [agent-activity-receipt.md](agent-activity-receipt.md)、
+> [provider-credential-boundary.md](provider-credential-boundary.md)、
 > [observability.md](observability.md)
 
 ## 1. 背景与决策
@@ -70,6 +71,7 @@ Durable Orchestration
 | ToolReceipt | 一次工具调用的输入摘要、结果摘要和副作用证明 |
 | AgentActivityRequest | 一次 Agent Activity 的 task/context 敏感 Artifact envelope |
 | AgentActivityReceipt | 一次完整 Agent Loop Attempt 的边界观察与持久结果绑定 |
+| ProviderAccessGrant | 一次模型网关调用的短期、窄作用域 bearer，不是 upstream API key |
 | Artifact | 大型输出、文件快照、模型响应或报告的持久化对象 |
 | Outcome Unknown | Activity 可能已产生副作用，但运行时没有可靠完成收据 |
 
@@ -445,7 +447,27 @@ sensitivity 标签宣称加密，credential 禁止内联。
 Tool-only 改成 Agent-capable。完整约束见
 [Agent Activity Request Artifact 契约](agent-activity-request.md)。
 
-### 5.12 Lease
+### 5.12 ProviderAccessGrant
+
+远程 Agent Worker 禁止接收或持久化 OpenAI、Anthropic 等 upstream credential。部署侧
+`ProviderInvoker` 保管真实 API key；Worker 只接收短期单次 `ProviderAccessGrant`。
+credential-free route 必须绑定 tenant、pool、worker rule、provider/model、
+gateway binding digest 及 request/response 上限。
+
+grant 绑定 Worker/Run/Node/Attempt、action/authorization digest、Scheduler request
+digest、AgentActivityRequest Artifact digest、route 和 invocation index。bearer token
+只允许出现在受保护 wire grant，repr 隐藏；服务端 registry 只保存 token digest 和
+token-free binding digest。同一逻辑 invocation 在墓碑窗口内只能签发一次，兑换必须先
+原子标记 consumed 再调用 provider。
+
+当前 `ProviderAccessBroker` 只有进程内 registry，重启后既有 token fail closed，但不能
+恢复签发响应或 provider invocation 结果，也不能跨副本原子消费；因此
+`production_security_ready=false`。生产 remote Agent 必须补齐 durable tombstone、
+invocation receipt、mTLS/attestation、egress policy 和 secret-manager backed invoker。
+完整约束见
+[Provider Credential 与模型网关边界](provider-credential-boundary.md)。
+
+### 5.13 Lease
 
 ```text
 lease_id

@@ -89,7 +89,10 @@ class AgentContext:
     active_skills: list[str] = field(default_factory=list)
     allowed_tools: set[str] | None = None
     skill_allowlist: set[str] | None = None
-    file_index_embedding: dict[str, Any] | None = None
+    file_index_embedding: dict[str, Any] | None = field(
+        default=None,
+        repr=False,
+    )
     # Phase 8 观测性：每次 run_task 刷新 session_id；sink 默认 NullSink 零开销
     session_id: str = ""
     sink: EventSink = field(default_factory=NullSink)

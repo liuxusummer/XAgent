@@ -20,8 +20,8 @@ from src.core.llm import (
 @dataclass
 class SessionConfig:
     name: str
-    apikey: str
-    apibase: str
+    apikey: str = field(repr=False)
+    apibase: str = field(repr=False)
     model: str
     session_type: str = ""
     temperature: float | None = None
@@ -29,7 +29,7 @@ class SessionConfig:
     timeout: int = 120
     max_retries: int = 2
     group: str = ""
-    extra: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 def load_config(config_path: str | None = None) -> dict[str, SessionConfig]:

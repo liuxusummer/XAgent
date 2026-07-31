@@ -387,11 +387,13 @@ active durable authority 只延期到 terminal，不由内存 projection 撤销�
 `tool`。协议保留 `agent` 枚举不代表参考安全组合已经支持远程 Agent。Agent Activity
 目前由本地 `LegacyAgentLoopAdapter` 按整体 `non_idempotent_write` 的保守恢复契约执行；
 typed `AgentActivityRequest` task/context Artifact 和 `AgentActivityReceipt` 整体回执
-基础契约已经存在，但尚未接入安全 remote adapter。未来仍必须提供独立、可验证的 Agent
-runtime、provider credential boundary、逐工具 receipt 聚合及完整 completion/recovery
-组合后，才能把 `agent` 加入两侧的 `supported_activity_kinds`，禁止仅修改注册字符串
-或 Fleet 路由绕过该门禁。输入契约见
-[agent-activity-request.md](agent-activity-request.md)。
+基础契约已经存在，credential-free route + one-call `ProviderAccessGrant` 也提供了
+单进程参考边界，但都尚未接入安全 remote adapter；ProviderAccessBroker 的内存墓碑使
+readiness 固定为 false。未来仍必须提供独立、可验证的 Agent runtime、durable provider
+grant/receipt、逐工具 receipt 聚合及完整 completion/recovery 组合后，才能把 `agent`
+加入两侧的 `supported_activity_kinds`，禁止仅修改注册字符串或 Fleet 路由绕过该门禁。
+输入契约见 [agent-activity-request.md](agent-activity-request.md)，credential 边界见
+[provider-credential-boundary.md](provider-credential-boundary.md)。
 三轮能力真实性审查及可执行回归见
 [remote-activity-capability-adversarial-review.md](remote-activity-capability-adversarial-review.md)。
 

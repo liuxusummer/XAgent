@@ -140,6 +140,14 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "PolicyConformanceResult",
         "evaluate_policy_conformance",
     ),
+    ".provider_access": (
+        "ProviderAccessBroker",
+        "ProviderAccessDenied",
+        "ProviderAccessGrant",
+        "ProviderInvocationResult",
+        "ProviderInvoker",
+        "ProviderRouteDescriptor",
+    ),
     ".replay": (
         "ReplayReport",
         "build_replay_report",

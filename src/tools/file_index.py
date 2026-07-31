@@ -10,7 +10,7 @@ import sqlite3
 import struct
 import time
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 from urllib import error as urlerror
@@ -82,8 +82,8 @@ class EmbeddingProvider(Protocol):
 @dataclass(frozen=True)
 class EmbeddingConfig:
     enabled: bool
-    apikey: str
-    apibase: str
+    apikey: str = field(repr=False)
+    apibase: str = field(repr=False)
     model: str
     dimension: int
     batch_size: int = 32
@@ -91,7 +91,13 @@ class EmbeddingConfig:
 
     @property
     def fingerprint(self) -> str:
-        return f"openai-compatible:{self.apibase}:{self.model}:{self.dimension}"
+        endpoint_digest = hashlib.sha256(
+            self.apibase.encode("utf-8")
+        ).hexdigest()
+        return (
+            f"openai-compatible:{endpoint_digest}:"
+            f"{self.model}:{self.dimension}"
+        )
 
 
 def refresh_file_index(

@@ -19,6 +19,49 @@ SUMMARY_PATTERN = re.compile(r"<summary>\s*(.*?)\s*</summary>", re.DOTALL)
 
 StreamCallback = Callable[[dict[str, Any]], None]
 
+
+class ProviderRequestError(RuntimeError):
+    """A provider call failed without retaining provider diagnostics."""
+
+    _REASON_CODES = frozenset(
+        {
+            "provider_pool_exhausted",
+            "provider_request_failed",
+            "provider_response_invalid",
+        }
+    )
+
+    def __init__(self, reason_code: str) -> None:
+        if reason_code not in self._REASON_CODES:
+            raise ValueError("invalid provider failure reason")
+        self.reason_code = reason_code
+        message = (
+            "all nodes failed: provider_pool_exhausted"
+            if reason_code == "provider_pool_exhausted"
+            else reason_code
+        )
+        super().__init__(message)
+
+
+def _provider_json_response(content: bytes) -> dict[str, Any]:
+    invalid = False
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (
+        TypeError,
+        ValueError,
+        UnicodeError,
+        RecursionError,
+    ):
+        invalid = True
+        payload = None
+    if invalid or not isinstance(payload, dict):
+        raise ProviderRequestError(
+            "provider_response_invalid"
+        )
+    return payload
+
+
 # Patterns for history compression
 _COMPRESSIBLE_TAGS = re.compile(
     r"(<(?:thinking|tool_use|tool_result)>)(.*?)(</(?:thinking|tool_use|tool_result)>)",
@@ -62,7 +105,7 @@ def _message_context_text(message: dict[str, Any]) -> str:
 @dataclass
 class ToolCall:
     name: str
-    args: dict[str, Any]
+    args: dict[str, Any] = field(repr=False)
     id: str
 
 
@@ -141,25 +184,34 @@ class ChatResponse:
     thinking: str
     content: str
     tool_calls: list[ToolCall]
-    raw: Any = None
+    raw: Any = field(default=None, repr=False)
     stop_reason: str = "end_turn"
     usage: TokenUsage | None = None
 
 
 @dataclass
 class BaseSession:
-    api_key: str
-    base_url: str
+    api_key: str = field(repr=False)
+    base_url: str = field(repr=False)
     model: str
-    system: str = ""
+    system: str = field(default="", repr=False)
     timeout: float = 60.0
     max_retries: int = 2
     temperature: float = 0.2
     max_tokens: int = 4096
     context_window_chars: int = 24000
-    stream_callback: StreamCallback | None = None
-    history: list[dict[str, Any]] = field(default_factory=list)
-    history_compaction: list[dict[str, Any]] = field(default_factory=list)
+    stream_callback: StreamCallback | None = field(
+        default=None,
+        repr=False,
+    )
+    history: list[dict[str, Any]] = field(
+        default_factory=list,
+        repr=False,
+    )
+    history_compaction: list[dict[str, Any]] = field(
+        default_factory=list,
+        repr=False,
+    )
     last_usage: TokenUsage | None = None
     _ask_count: int = field(default=0, init=False)
 
@@ -286,22 +338,28 @@ class BaseSession:
             method="POST",
         )
 
-        last_error: Exception | None = None
         for _ in range(self.max_retries + 1):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    body = json.loads(response.read().decode("utf-8"))
+                    body = _provider_json_response(response.read())
                 self.last_usage = _normalize_usage(body.get("usage"))
                 return self._extract_text(body)
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
-                last_error = exc
-        raise RuntimeError(f"LLM request failed: {last_error}") from last_error
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                TimeoutError,
+                UnicodeError,
+            ):
+                pass
+        raise ProviderRequestError("provider_request_failed") from None
 
     @staticmethod
     def _extract_text(body: dict[str, Any]) -> str:
         choices = body.get("choices") or []
         if not choices:
-            raise RuntimeError(f"LLM response missing choices: {body}")
+            raise ProviderRequestError(
+                "provider_response_invalid"
+            ) from None
         message = choices[0].get("message") or {}
         content = message.get("content", "")
         if isinstance(content, list):
@@ -342,7 +400,6 @@ class OpenAITextSession(BaseSession):
             method="POST",
         )
 
-        last_error: Exception | None = None
         for _ in range(self.max_retries + 1):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -351,12 +408,17 @@ class OpenAITextSession(BaseSession):
                         result = _parse_openai_sse(line_iter, stream_callback=self.stream_callback)
                         self.last_usage = _normalize_usage(result.get("usage"))
                         return self._stream_result_to_text(result)
-                    body = json.loads(response.read().decode("utf-8"))
+                    body = _provider_json_response(response.read())
                 self.last_usage = _normalize_usage(body.get("usage"))
                 return self._extract_text(body)
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
-                last_error = exc
-        raise RuntimeError(f"LLM request failed: {last_error}") from last_error
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                TimeoutError,
+                UnicodeError,
+            ):
+                pass
+        raise ProviderRequestError("provider_request_failed") from None
 
     @staticmethod
     def _stream_result_to_text(result: dict[str, Any]) -> str:
@@ -450,7 +512,6 @@ class ClaudeTextSession(BaseSession):
             headers=headers,
             method="POST",
         )
-        last_error: Exception | None = None
         for _ in range(self.max_retries + 1):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as resp:
@@ -458,9 +519,14 @@ class ClaudeTextSession(BaseSession):
                     result = _parse_claude_sse(line_iter, stream_callback=self.stream_callback)
                 self.last_usage = _normalize_usage(result.get("usage"))
                 return self._extract_text_from_blocks(result["content_blocks"])
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
-                last_error = exc
-        raise RuntimeError(f"Claude request failed: {last_error}") from last_error
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                TimeoutError,
+                UnicodeError,
+            ):
+                pass
+        raise ProviderRequestError("provider_request_failed") from None
 
     def _non_stream_ask(self, payload: bytes, headers: dict[str, str]) -> str:
         request = urllib.request.Request(
@@ -469,17 +535,21 @@ class ClaudeTextSession(BaseSession):
             headers=headers,
             method="POST",
         )
-        last_error: Exception | None = None
         for _ in range(self.max_retries + 1):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as resp:
-                    body = json.loads(resp.read().decode("utf-8"))
+                    body = _provider_json_response(resp.read())
                 content_blocks = body.get("content", [])
                 self.last_usage = _normalize_usage(body.get("usage"))
                 return self._extract_text_from_blocks(content_blocks)
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
-                last_error = exc
-        raise RuntimeError(f"Claude request failed: {last_error}") from last_error
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                TimeoutError,
+                UnicodeError,
+            ):
+                pass
+        raise ProviderRequestError("provider_request_failed") from None
 
     @staticmethod
     def _extract_text_from_blocks(content_blocks: list[dict[str, Any]]) -> str:
@@ -499,8 +569,8 @@ class ClaudeTextSession(BaseSession):
 
 @dataclass
 class ToolClient:
-    backend: BaseSession
-    last_tools: str = ""
+    backend: BaseSession = field(repr=False)
+    last_tools: str = field(default="", repr=False)
     request_count: int = 0
 
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ChatResponse:
@@ -929,8 +999,6 @@ class ClaudeNativeSession(ClaudeTextSession):
             payload_dict["tools"] = self._pending_tools
 
         headers = self._build_headers()
-        last_error: Exception | None = None
-
         for _ in range(self.max_retries + 1):
             try:
                 payload = json.dumps(payload_dict).encode("utf-8")
@@ -947,11 +1015,16 @@ class ClaudeNativeSession(ClaudeTextSession):
                     return self._blocks_to_chat_response(result)
                 else:
                     with urllib.request.urlopen(request, timeout=self.timeout) as resp:
-                        body = json.loads(resp.read().decode("utf-8"))
+                        body = _provider_json_response(resp.read())
                     return self._body_to_chat_response(body)
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
-                last_error = exc
-        raise RuntimeError(f"Claude native request failed: {last_error}") from last_error
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                TimeoutError,
+                UnicodeError,
+            ):
+                pass
+        raise ProviderRequestError("provider_request_failed") from None
 
     def _blocks_to_chat_response(self, result: dict[str, Any]) -> ChatResponse:
         content_blocks = result["content_blocks"]
@@ -1092,7 +1165,6 @@ class OpenAINativeSession(OpenAITextSession):
             "Authorization": f"Bearer {self.api_key}",
         }
 
-        last_error: Exception | None = None
         for _ in range(self.max_retries + 1):
             try:
                 request = urllib.request.Request(
@@ -1108,11 +1180,16 @@ class OpenAINativeSession(OpenAITextSession):
                     return self._sse_result_to_chat_response(result)
                 else:
                     with urllib.request.urlopen(request, timeout=self.timeout) as resp:
-                        body = json.loads(resp.read().decode("utf-8"))
+                        body = _provider_json_response(resp.read())
                     return self._body_to_chat_response(body)
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
-                last_error = exc
-        raise RuntimeError(f"OpenAI native request failed: {last_error}") from last_error
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                TimeoutError,
+                UnicodeError,
+            ):
+                pass
+        raise ProviderRequestError("provider_request_failed") from None
 
     def _sse_result_to_chat_response(self, result: dict[str, Any]) -> ChatResponse:
         tool_calls: list[ToolCall] = []
@@ -1166,8 +1243,11 @@ class OpenAINativeSession(OpenAITextSession):
 
 @dataclass
 class NativeToolClient:
-    backend: BaseSession
-    _pending_tool_ids: list[str] = field(default_factory=list)
+    backend: BaseSession = field(repr=False)
+    _pending_tool_ids: list[str] = field(
+        default_factory=list,
+        repr=False,
+    )
 
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ChatResponse:
         merged = self._merge_messages(messages, tools)
@@ -1257,7 +1337,7 @@ class NativeToolClient:
 
 @dataclass
 class MixinSession:
-    sessions: list[BaseSession]
+    sessions: list[BaseSession] = field(repr=False)
     max_retries: int = 3
     base_delay: float = 1.0
     spring_back_timeout: float = 300.0
@@ -1307,7 +1387,6 @@ class MixinSession:
 
     def ask(self, prompt: str) -> str:
         self._maybe_spring_back()
-        last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             session = self.sessions[self._current_index]
             try:
@@ -1318,12 +1397,16 @@ class MixinSession:
                     session.history_compaction
                 )
                 return result
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, RuntimeError) as exc:
-                last_error = exc
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                TimeoutError,
+                RuntimeError,
+            ):
                 self._failover()
                 delay = min(30.0, self.base_delay * (1.5 ** attempt))
                 time.sleep(delay)
-        raise RuntimeError(f"MixinSession all nodes failed: {last_error}") from last_error
+        raise ProviderRequestError("provider_pool_exhausted") from None
 
     def _failover(self) -> None:
         self._last_fail_time = time.time()
