@@ -1,0 +1,23 @@
+src/orchestration/agent_provider_client.py
+  s_72af05a5dabd4c::t_d10c08a1b82033 104,218,261-270,370,546,548-551,572-574
+tests/test_orchestration_agent_provider_client.py
+  s_72af05a5dabd4c::t_c061489d7084c6 33,417-433,817
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b500ae0c9eaacad04ec5e34822c85ea581e4a0d3",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
