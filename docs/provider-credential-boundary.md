@@ -96,6 +96,10 @@ Broker 的调用顺序固定为：
 `ProviderInvoker` 自己持有或从 secret manager 临时解析 upstream credential。Broker、
 grant、route、Worker 和 orchestration Store 均不接触 API key。
 
+grant ID 同时是稳定 provider operation ID。普通 `ProviderInvoker` 不声明查询或
+幂等能力；只有部署显式注入 `RecoverableProviderInvoker` 且其
+`operation_recovery_ready is True` 时，Broker 才会尝试恢复 unknown operation。
+
 ## 6. Durable grant registry
 
 默认 Broker 使用进程内 SQLite，仅用于本地参考。部署方可注入位于 Worker 不可访问的
@@ -149,20 +153,61 @@ SECRET 必须由返回 `deployment_managed` encryption 的部署 Store 处理。
 `LocalArtifactStore` 同时存在时为 true；自定义 ArtifactStore 不会被参考实现自动声明
 为 durable。
 
-## 8. 当前 fail-closed 限制
+## 8. 可验证 operation 恢复
+
+schema v5 增加有界、append-only 的恢复证据表：
+
+```text
+grant id / sequence / actual request payload SHA-256
+not_started | completed / evidence SHA-256 / verifier id / created_at
+```
+
+`RecoverableProviderInvoker.recover()` 必须按稳定 operation ID 与 payload digest 返回
+严格的 `ProviderOperationRecovery`：
+
+- `IN_PROGRESS`、`UNKNOWN`：继续返回 outcome unknown，绝不调用 provider；
+- `COMPLETED`：必须返回与 response digest 精确匹配的有界 bytes；Broker 先按原
+  sensitivity 写 Result Artifact，再原子提交 completed evidence/receipt；
+- `NOT_STARTED`：只有 journal 已经明确收敛为 `outcome_unknown` 时，才能在同一事务中
+  追加证据并以 CAS 重新取得一次 `invoking` claim；原始 `invoking` 可能仍有 zombie
+  caller，因此即使网关报告 NOT_STARTED 也禁止重试。
+
+多个 Broker 同时拿到 NOT_STARTED 时，只有一个能完成
+`outcome_unknown → invoking` CAS。其余调用保持 unknown，不能形成并行上游重试。
+completed evidence 可安全收敛 `invoking` 或 `outcome_unknown`，因为它不会再次产生
+provider 副作用。
+
+NOT_STARTED evidence digest 在同一 grant 内只能使用一次，每次后续 retry 必须取得新的
+gateway evidence；否则固定旧证据会绕过 16 条上限。retry CAS 还会在事务内再次检查
+grant 未过期，防止恢复查询跨过授权截止点后启动新调用。COMPLETED 的同一终态证据允许
+幂等读取，但不能改变已登记的 response digest/ArtifactRef。
+
+NOT_STARTED 不是普通最终一致查询的瞬时快照。生产 gateway 必须以 grant ID 作为稳定
+幂等键，在线性一致、单调的 operation ledger 上生成证据，并保证延迟到达的旧请求与
+恢复后的请求只能竞争同一个 operation；否则“查询未开始—旧请求随后到达”的竞态仍会
+重复计费。`evidence_digest` 与 `verifier_id` 只是参考 journal 接受过哪份部署证据的
+审计记录，参考实现不会替部署验证 gateway attestation。
+
+`provider_operation_recovery_ready` 只反映注入 adapter 明确声明了该协议能力，不等价于
+durable result recovery，更不等价于生产 readiness。journal 不保存 response、
+prompt、bearer、provider credential 或证据原文；每个 invocation 最多保存 16 条证据，
+并与过期 grant 一起清理。
+
+## 9. 当前 fail-closed 限制
 
 - 签发响应丢失后无法重取同一个 token，只能等待墓碑过期或由 operator 处理；
 - token 在调用 invoker 前消费；若进程在 `invoking` 后、completed receipt 前崩溃，
-  状态为 outcome unknown，安全地拒绝重调；
-- completed receipt 可恢复已登记的结果，但 provider 已执行、结果登记前崩溃时仍不能
-  证明是否已经产生费用；解决该窗口仍需要上游 idempotency/查询协议；
+  普通 invoker 状态为 outcome unknown，安全地拒绝重调；
+- RecoverableProviderInvoker 可用可信 NOT_STARTED/COMPLETED 证据收敛部分 unknown
+  窗口，但参考实现无法证明部署 adapter 背后的 operation ledger、attestation 或
+  upstream 幂等保证真实成立；
 - 同一 SQLite 文件可跨本机进程线性化，但不提供跨主机共识、复制或自动故障转移；
 - `production_security_ready` 仍固定为 false；
 - 参考实现不提供 mTLS、provider egress allowlist、secret manager、经过 attestation
-  的 invoker 或上游 idempotency。
+  的 invoker。
 
-生产 remote Agent 仍必须提供 upstream idempotency/unknown-outcome 恢复语义、经过
-attestation 的 ProviderInvoker 和完整远程 Agent runtime。未完成前禁止把
+生产 remote Agent 仍必须提供经过验证的 upstream idempotency/operation ledger、
+经过 attestation 的 ProviderInvoker 和完整远程 Agent runtime。未完成前禁止把
 `agent` 加入 `SecureRemoteAssignmentAdmitter`、`SecureRemoteExecutionAdapter`、
 Fleet projector 或 Worker daemon 的 `supported_activity_kinds`。
 
@@ -171,4 +216,6 @@ credential 基线审查见
 durable journal 审查见
 [Provider Grant Journal 三轮对抗性审查](provider-grant-journal-adversarial-review.md)，
 invocation result 审查见
-[Provider Invocation Receipt 三轮对抗性审查](provider-invocation-receipt-adversarial-review.md)。
+[Provider Invocation Receipt 三轮对抗性审查](provider-invocation-receipt-adversarial-review.md)，
+operation 恢复审查见
+[Provider Operation Recovery 三轮对抗性审查](provider-operation-recovery-adversarial-review.md)。

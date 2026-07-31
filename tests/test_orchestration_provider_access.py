@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -12,6 +13,8 @@ from src.orchestration.provider_access import (
     ProviderAccessBroker,
     ProviderAccessDenied,
     ProviderAccessGrant,
+    ProviderOperationRecovery,
+    ProviderOperationState,
     ProviderRouteDescriptor,
 )
 from src.orchestration.remote_execution_journal import (
@@ -82,6 +85,121 @@ class ProviderInvoker:
                 f"provider leaked {self.api_key}"
             )
         return self.response
+
+
+class RecoverableGatewayInvoker:
+    def __init__(
+        self,
+        *,
+        invoke_outcomes: list[bytes | BaseException] | None = None,
+        recovery_state: ProviderOperationState = (
+            ProviderOperationState.NOT_STARTED
+        ),
+        recovery_content: bytes = b'{"status":"recovered"}',
+        ready: object = True,
+        recover_explode: bool = False,
+        readiness_explode: bool = False,
+        operation_id_override: str | None = None,
+        route_id_override: str | None = None,
+        request_digest_override: str | None = None,
+    ) -> None:
+        self.api_key = _UPSTREAM_SECRET
+        self.invoke_outcomes = list(invoke_outcomes or [])
+        self.recovery_state = recovery_state
+        self.recovery_content = recovery_content
+        self.ready = ready
+        self.recover_explode = recover_explode
+        self.readiness_explode = readiness_explode
+        self.operation_id_override = operation_id_override
+        self.route_id_override = route_id_override
+        self.request_digest_override = request_digest_override
+        self.recovery_override: object | None = None
+        self.calls: list[tuple[str, bytes, str]] = []
+        self.recovery_calls: list[tuple[str, str, str]] = []
+        self._lock = threading.Lock()
+
+    @property
+    def operation_recovery_ready(self) -> object:
+        if self.readiness_explode:
+            raise RuntimeError(
+                f"readiness leaked {self.api_key}"
+            )
+        return self.ready
+
+    def invoke(
+        self,
+        route: ProviderRouteDescriptor,
+        payload: bytes,
+        *,
+        request_id: str,
+    ) -> bytes:
+        with self._lock:
+            self.calls.append(
+                (route.route_id, payload, request_id)
+            )
+            outcome = (
+                self.invoke_outcomes.pop(0)
+                if self.invoke_outcomes
+                else b'{"status":"retried"}'
+            )
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def recover(
+        self,
+        route: ProviderRouteDescriptor,
+        *,
+        operation_id: str,
+        request_payload_digest: str,
+    ) -> ProviderOperationRecovery:
+        with self._lock:
+            self.recovery_calls.append(
+                (
+                    route.route_id,
+                    operation_id,
+                    request_payload_digest,
+                )
+            )
+        if self.recover_explode:
+            raise RuntimeError(
+                f"recovery leaked {self.api_key}"
+            )
+        on_recover = getattr(self, "on_recover", None)
+        if callable(on_recover):
+            on_recover()
+        if self.recovery_override is not None:
+            return self.recovery_override  # type: ignore[return-value]
+        content = (
+            self.recovery_content
+            if self.recovery_state
+            is ProviderOperationState.COMPLETED
+            else None
+        )
+        return ProviderOperationRecovery(
+            operation_id=(
+                self.operation_id_override or operation_id
+            ),
+            route_id=self.route_id_override or route.route_id,
+            request_payload_digest=(
+                self.request_digest_override
+                or request_payload_digest
+            ),
+            state=self.recovery_state,
+            evidence_digest=hashlib.sha256(
+                (
+                    f"{operation_id}:{request_payload_digest}:"
+                    f"{self.recovery_state.value}"
+                ).encode()
+            ).hexdigest(),
+            verifier_id="trusted-provider-verifier",
+            response_digest=(
+                None
+                if content is None
+                else hashlib.sha256(content).hexdigest()
+            ),
+            content=content,
+        )
 
 
 class CrashAfterProviderCompletionJournal(RemoteExecutionJournal):
@@ -163,6 +281,21 @@ class ProviderAccessBrokerTests(unittest.TestCase):
         values.update(changes)
         return self.broker.issue(self.authorization, **values)
 
+    def issue_from(
+        self,
+        broker: ProviderAccessBroker,
+        *,
+        invocation_index: int = 1,
+    ) -> ProviderAccessGrant:
+        return broker.issue(
+            self.authorization,
+            route_id="primary-route",
+            request_digest=_REQUEST_DIGEST,
+            request_artifact_digest=_REQUEST_ARTIFACT_DIGEST,
+            invocation_index=invocation_index,
+            ttl_seconds=30.0,
+        )
+
     def test_grant_is_canonical_path_free_and_credential_free(
         self,
     ) -> None:
@@ -185,6 +318,9 @@ class ProviderAccessBrokerTests(unittest.TestCase):
         self.assertFalse(self.broker.durable_recovery_ready)
         self.assertFalse(
             self.broker.durable_result_recovery_ready
+        )
+        self.assertFalse(
+            self.broker.provider_operation_recovery_ready
         )
         self.assertEqual(
             grant.response_sensitivity,
@@ -345,6 +481,582 @@ class ProviderAccessBrokerTests(unittest.TestCase):
             "provider_invocation_outcome_unknown",
         ):
             broker.invoke(grant, self.authorization, b"safe")
+        self.assertEqual(len(invoker.calls), 1)
+
+    def test_verified_not_started_retries_one_unknown_call(
+        self,
+    ) -> None:
+        invoker = RecoverableGatewayInvoker(
+            invoke_outcomes=[
+                RuntimeError(
+                    f"provider leaked {_UPSTREAM_SECRET}"
+                ),
+                b'{"status":"retried"}',
+            ],
+        )
+        broker = ProviderAccessBroker(
+            (_route(),),
+            authorization_verifier=AuthorizationVerifier(),
+            invoker=invoker,
+            clock=self.clock,
+        )
+        grant = self.issue_from(broker)
+        self.assertTrue(
+            broker.provider_operation_recovery_ready
+        )
+        self.assertFalse(broker.production_security_ready)
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "provider_invocation_failed",
+        ):
+            broker.invoke(grant, self.authorization, b"safe")
+
+        result = broker.invoke(
+            grant,
+            self.authorization,
+            b"safe",
+        )
+
+        self.assertEqual(result.content, b'{"status":"retried"}')
+        self.assertEqual(len(invoker.calls), 2)
+        self.assertEqual(len(invoker.recovery_calls), 1)
+        evidence = (
+            broker._recovery_journal
+            .list_provider_recovery_evidence(grant.grant_id)
+        )
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].decision, "not_started")
+
+    def test_not_started_evidence_cannot_authorize_two_retries(
+        self,
+    ) -> None:
+        invoker = RecoverableGatewayInvoker(
+            invoke_outcomes=[
+                RuntimeError("first call outcome unknown"),
+                RuntimeError("retry outcome unknown"),
+            ],
+        )
+        broker = ProviderAccessBroker(
+            (_route(),),
+            authorization_verifier=AuthorizationVerifier(),
+            invoker=invoker,
+            clock=self.clock,
+        )
+        grant = self.issue_from(broker)
+        for _index in range(2):
+            with self.assertRaisesRegex(
+                ProviderAccessDenied,
+                "provider_invocation_failed",
+            ):
+                broker.invoke(
+                    grant,
+                    self.authorization,
+                    b"safe",
+                )
+        with self.assertRaises(ProviderAccessDenied) as raised:
+            broker.invoke(
+                grant,
+                self.authorization,
+                b"safe",
+            )
+        self.assertEqual(
+            raised.exception.reason_code,
+            "provider_operation_recovery_replayed",
+        )
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        self.assertEqual(len(invoker.calls), 2)
+        evidence = (
+            broker._recovery_journal
+            .list_provider_recovery_evidence(grant.grant_id)
+        )
+        self.assertEqual(len(evidence), 1)
+
+    def test_not_started_never_retries_raw_invoking_zombie(
+        self,
+    ) -> None:
+        invoker = RecoverableGatewayInvoker()
+        journal = RemoteExecutionJournal()
+        broker = ProviderAccessBroker(
+            (_route(),),
+            authorization_verifier=AuthorizationVerifier(),
+            invoker=invoker,
+            clock=self.clock,
+            recovery_journal=journal,
+        )
+        grant = self.issue_from(broker)
+        payload = b"zombie-race"
+        journal.claim_provider_invocation(
+            grant_id=grant.grant_id,
+            token_digest=hashlib.sha256(
+                grant.token.encode()
+            ).hexdigest(),
+            binding_digest=grant.binding_digest,
+            route_id=grant.route.route_id,
+            expires_at=grant.expires_at,
+            request_payload_digest=hashlib.sha256(
+                payload
+            ).hexdigest(),
+            now=self.clock.now,
+        )
+
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "provider_invocation_outcome_unknown",
+        ):
+            broker.invoke(grant, self.authorization, payload)
+
+        self.assertEqual(invoker.calls, [])
+        self.assertEqual(len(invoker.recovery_calls), 1)
+        self.assertEqual(
+            journal.list_provider_recovery_evidence(
+                grant.grant_id
+            ),
+            (),
+        )
+
+    def test_not_started_cannot_retry_after_grant_expires(
+        self,
+    ) -> None:
+        invoker = RecoverableGatewayInvoker(
+            invoke_outcomes=[
+                RuntimeError("first call outcome unknown")
+            ]
+        )
+        broker = ProviderAccessBroker(
+            (_route(),),
+            authorization_verifier=AuthorizationVerifier(),
+            invoker=invoker,
+            clock=self.clock,
+        )
+        grant = broker.issue(
+            self.authorization,
+            route_id="primary-route",
+            request_digest=_REQUEST_DIGEST,
+            request_artifact_digest=_REQUEST_ARTIFACT_DIGEST,
+            invocation_index=1,
+            ttl_seconds=1.0,
+        )
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "provider_invocation_failed",
+        ):
+            broker.invoke(grant, self.authorization, b"safe")
+        invoker.on_recover = lambda: setattr(
+            self.clock,
+            "now",
+            grant.expires_at,
+        )
+
+        with self.assertRaises(ProviderAccessDenied) as raised:
+            broker.invoke(grant, self.authorization, b"safe")
+
+        self.assertEqual(
+            raised.exception.reason_code,
+            "provider_grant_unavailable",
+        )
+        self.assertEqual(len(invoker.calls), 1)
+        self.assertEqual(
+            broker._recovery_journal
+            .list_provider_recovery_evidence(grant.grant_id),
+            (),
+        )
+
+    def test_completed_gateway_evidence_recovers_and_replays(
+        self,
+    ) -> None:
+        payload = b"completed-recovery-request"
+        response = b'{"status":"already-completed"}'
+        invoker = RecoverableGatewayInvoker(
+            recovery_state=ProviderOperationState.COMPLETED,
+            recovery_content=response,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "provider-grants.sqlite3"
+            store = LocalArtifactStore(
+                Path(temporary) / "provider-results"
+            )
+            first_journal = RemoteExecutionJournal(path)
+            first = ProviderAccessBroker(
+                (_route(),),
+                authorization_verifier=AuthorizationVerifier(),
+                invoker=invoker,
+                clock=self.clock,
+                recovery_journal=first_journal,
+                result_store=store,
+            )
+            grant = self.issue_from(first)
+            first_journal.claim_provider_invocation(
+                grant_id=grant.grant_id,
+                token_digest=hashlib.sha256(
+                    grant.token.encode()
+                ).hexdigest(),
+                binding_digest=grant.binding_digest,
+                route_id=grant.route.route_id,
+                expires_at=grant.expires_at,
+                request_payload_digest=hashlib.sha256(
+                    payload
+                ).hexdigest(),
+                now=self.clock.now,
+            )
+            first_journal.close()
+
+            second_journal = RemoteExecutionJournal(path)
+            second = ProviderAccessBroker(
+                (_route(),),
+                authorization_verifier=AuthorizationVerifier(),
+                invoker=invoker,
+                clock=self.clock,
+                recovery_journal=second_journal,
+                result_store=store,
+            )
+            recovered = second.invoke(
+                grant,
+                self.authorization,
+                payload,
+            )
+            self.assertEqual(recovered.content, response)
+            self.assertEqual(invoker.calls, [])
+            self.assertEqual(len(invoker.recovery_calls), 1)
+            evidence = (
+                second_journal.list_provider_recovery_evidence(
+                    grant.grant_id
+                )
+            )
+            self.assertEqual(len(evidence), 1)
+            self.assertEqual(evidence[0].decision, "completed")
+            second_journal.close()
+
+            third_journal = RemoteExecutionJournal(path)
+            third_invoker = ProviderInvoker()
+            third = ProviderAccessBroker(
+                (_route(),),
+                authorization_verifier=AuthorizationVerifier(),
+                invoker=third_invoker,
+                clock=self.clock,
+                recovery_journal=third_journal,
+                result_store=store,
+            )
+            replayed = third.invoke(
+                grant,
+                self.authorization,
+                payload,
+            )
+            self.assertEqual(replayed.content, response)
+            self.assertEqual(third_invoker.calls, [])
+            third_journal.close()
+
+            for suffix in ("", "-wal", "-shm"):
+                candidate = Path(f"{path}{suffix}")
+                if candidate.exists():
+                    durable_bytes = candidate.read_bytes()
+                    self.assertNotIn(payload, durable_bytes)
+                    self.assertNotIn(response, durable_bytes)
+                    self.assertNotIn(
+                        grant.token.encode(),
+                        durable_bytes,
+                    )
+                    self.assertNotIn(
+                        _UPSTREAM_SECRET.encode(),
+                        durable_bytes,
+                    )
+
+    def test_concurrent_not_started_recovery_claims_one_retry(
+        self,
+    ) -> None:
+        invoker = RecoverableGatewayInvoker(
+            invoke_outcomes=[
+                RuntimeError("first call outcome unknown"),
+                b'{"status":"retried-once"}',
+            ],
+        )
+        broker = ProviderAccessBroker(
+            (_route(),),
+            authorization_verifier=AuthorizationVerifier(),
+            invoker=invoker,
+            clock=self.clock,
+        )
+        grant = self.issue_from(broker)
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "provider_invocation_failed",
+        ):
+            broker.invoke(grant, self.authorization, b"safe")
+
+        def recover_once(_index: int) -> str:
+            try:
+                broker.invoke(
+                    grant,
+                    self.authorization,
+                    b"safe",
+                )
+            except ProviderAccessDenied as exc:
+                return exc.reason_code
+            return "ok"
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            outcomes = list(
+                executor.map(recover_once, range(16))
+            )
+
+        self.assertEqual(outcomes.count("ok"), 1)
+        self.assertTrue(
+            all(
+                outcome
+                in {
+                    "ok",
+                    "provider_invocation_outcome_unknown",
+                    "provider_result_unavailable",
+                }
+                for outcome in outcomes
+            )
+        )
+        self.assertEqual(len(invoker.calls), 2)
+        evidence = (
+            broker._recovery_journal
+            .list_provider_recovery_evidence(grant.grant_id)
+        )
+        self.assertEqual(len(evidence), 1)
+
+    def test_recovery_binding_mismatch_fails_closed(
+        self,
+    ) -> None:
+        configurations = (
+            {"operation_id_override": "wrong-operation"},
+            {"route_id_override": "wrong-route"},
+            {"request_digest_override": "0" * 64},
+        )
+        for index, configuration in enumerate(
+            configurations,
+            start=1,
+        ):
+            with self.subTest(configuration=configuration):
+                invoker = RecoverableGatewayInvoker(
+                    invoke_outcomes=[
+                        RuntimeError("unknown outcome")
+                    ],
+                    **configuration,
+                )
+                broker = ProviderAccessBroker(
+                    (_route(),),
+                    authorization_verifier=(
+                        AuthorizationVerifier()
+                    ),
+                    invoker=invoker,
+                    clock=self.clock,
+                )
+                grant = self.issue_from(
+                    broker,
+                    invocation_index=index,
+                )
+                with self.assertRaises(ProviderAccessDenied):
+                    broker.invoke(
+                        grant,
+                        self.authorization,
+                        b"safe",
+                    )
+                with self.assertRaises(ProviderAccessDenied) as raised:
+                    broker.invoke(
+                        grant,
+                        self.authorization,
+                        b"safe",
+                    )
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "invalid_provider_operation_recovery",
+                )
+                self.assertEqual(len(invoker.calls), 1)
+                self.assertEqual(
+                    broker._recovery_journal
+                    .list_provider_recovery_evidence(
+                        grant.grant_id
+                    ),
+                    (),
+                )
+
+    def test_recovery_errors_are_sanitized_without_exception_chain(
+        self,
+    ) -> None:
+        for readiness_explode, recover_explode in (
+            (True, False),
+            (False, True),
+        ):
+            with self.subTest(
+                readiness_explode=readiness_explode,
+                recover_explode=recover_explode,
+            ):
+                invoker = RecoverableGatewayInvoker(
+                    invoke_outcomes=[
+                        RuntimeError("unknown outcome")
+                    ],
+                    readiness_explode=readiness_explode,
+                    recover_explode=recover_explode,
+                )
+                broker = ProviderAccessBroker(
+                    (_route(),),
+                    authorization_verifier=(
+                        AuthorizationVerifier()
+                    ),
+                    invoker=invoker,
+                    clock=self.clock,
+                )
+                grant = self.issue_from(broker)
+                with self.assertRaises(ProviderAccessDenied):
+                    broker.invoke(
+                        grant,
+                        self.authorization,
+                        b"safe",
+                    )
+                with self.assertRaises(ProviderAccessDenied) as raised:
+                    broker.invoke(
+                        grant,
+                        self.authorization,
+                        b"safe",
+                    )
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "provider_operation_recovery_failed",
+                )
+                self.assertNotIn(
+                    _UPSTREAM_SECRET,
+                    str(raised.exception),
+                )
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertIsNone(raised.exception.__context__)
+                self.assertEqual(len(invoker.calls), 1)
+
+    def test_in_progress_unknown_and_unready_never_retry(
+        self,
+    ) -> None:
+        cases = (
+            (ProviderOperationState.IN_PROGRESS, True),
+            (ProviderOperationState.UNKNOWN, True),
+            (ProviderOperationState.NOT_STARTED, False),
+            (ProviderOperationState.NOT_STARTED, 1),
+        )
+        for index, (state, ready) in enumerate(cases, start=1):
+            with self.subTest(state=state, ready=ready):
+                invoker = RecoverableGatewayInvoker(
+                    invoke_outcomes=[
+                        RuntimeError("unknown outcome")
+                    ],
+                    recovery_state=state,
+                    ready=ready,
+                )
+                broker = ProviderAccessBroker(
+                    (_route(),),
+                    authorization_verifier=(
+                        AuthorizationVerifier()
+                    ),
+                    invoker=invoker,
+                    clock=self.clock,
+                )
+                grant = self.issue_from(
+                    broker,
+                    invocation_index=index,
+                )
+                with self.assertRaises(ProviderAccessDenied):
+                    broker.invoke(
+                        grant,
+                        self.authorization,
+                        b"safe",
+                    )
+                with self.assertRaisesRegex(
+                    ProviderAccessDenied,
+                    "provider_invocation_outcome_unknown",
+                ):
+                    broker.invoke(
+                        grant,
+                        self.authorization,
+                        b"safe",
+                    )
+                self.assertEqual(len(invoker.calls), 1)
+
+    def test_operation_recovery_record_is_strict_and_payload_safe(
+        self,
+    ) -> None:
+        content = b"recovered-secret-response"
+        recovery = ProviderOperationRecovery(
+            operation_id="provider-grant-1",
+            route_id="primary-route",
+            request_payload_digest="a" * 64,
+            state=ProviderOperationState.COMPLETED,
+            evidence_digest="b" * 64,
+            verifier_id="trusted-provider-verifier",
+            response_digest=hashlib.sha256(content).hexdigest(),
+            content=content,
+        )
+        self.assertNotIn(content.decode(), repr(recovery))
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "invalid_provider_operation_recovery",
+        ):
+            ProviderOperationRecovery(
+                operation_id="provider-grant-1",
+                route_id="primary-route",
+                request_payload_digest="a" * 64,
+                state=ProviderOperationState.COMPLETED,
+                evidence_digest="b" * 64,
+                verifier_id="trusted-provider-verifier",
+                response_digest="c" * 64,
+                content=content,
+            )
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "invalid_provider_operation_recovery",
+        ):
+            ProviderOperationRecovery(
+                operation_id="provider-grant-1",
+                route_id="primary-route",
+                request_payload_digest="a" * 64,
+                state=ProviderOperationState.NOT_STARTED,
+                evidence_digest="b" * 64,
+                verifier_id="trusted-provider-verifier",
+                response_digest=hashlib.sha256(
+                    content
+                ).hexdigest(),
+                content=content,
+            )
+
+    def test_recovery_record_subclass_cannot_override_semantics(
+        self,
+    ) -> None:
+        class ForgedRecovery(ProviderOperationRecovery):
+            pass
+
+        invoker = RecoverableGatewayInvoker(
+            invoke_outcomes=[RuntimeError("unknown outcome")]
+        )
+        invoker.recovery_override = ForgedRecovery(
+            operation_id="placeholder-operation",
+            route_id="primary-route",
+            request_payload_digest=hashlib.sha256(
+                b"safe"
+            ).hexdigest(),
+            state=ProviderOperationState.NOT_STARTED,
+            evidence_digest="b" * 64,
+            verifier_id="trusted-provider-verifier",
+        )
+        broker = ProviderAccessBroker(
+            (_route(),),
+            authorization_verifier=AuthorizationVerifier(),
+            invoker=invoker,
+            clock=self.clock,
+        )
+        grant = self.issue_from(broker)
+        object.__setattr__(
+            invoker.recovery_override,
+            "operation_id",
+            grant.grant_id,
+        )
+        with self.assertRaises(ProviderAccessDenied):
+            broker.invoke(grant, self.authorization, b"safe")
+        with self.assertRaises(ProviderAccessDenied) as raised:
+            broker.invoke(grant, self.authorization, b"safe")
+        self.assertEqual(
+            raised.exception.reason_code,
+            "invalid_provider_operation_recovery",
+        )
         self.assertEqual(len(invoker.calls), 1)
 
     def test_request_response_and_expiry_limits_fail_closed(

@@ -388,10 +388,13 @@ active durable authority 只延期到 terminal，不由内存 projection 撤销�
 目前由本地 `LegacyAgentLoopAdapter` 按整体 `non_idempotent_write` 的保守恢复契约执行；
 typed `AgentActivityRequest` task/context Artifact 和 `AgentActivityReceipt` 整体回执
 基础契约已经存在，credential-free route + one-call `ProviderAccessGrant` 也提供了
-参考边界，但都尚未接入安全 remote adapter；ProviderAccessBroker 虽可持久化
-anti-replay 墓碑和 completed result receipt，仍不能消除 upstream 调用与 receipt
-提交之间的 unknown window，生产 readiness 固定为 false。未来仍必须提供独立、可验证的
-Agent runtime、upstream idempotency/查询协议、逐工具 receipt 聚合及完整
+参考边界，但都尚未接入安全 remote adapter；ProviderAccessBroker 可持久化
+anti-replay 墓碑和 completed result receipt，也可接受部署侧
+RecoverableProviderInvoker 的 NOT_STARTED/COMPLETED operation evidence 收敛部分
+unknown window，但参考实现不能证明外部 gateway 的线性一致幂等账本与 attestation，
+生产 readiness 固定为 false。未来仍必须提供独立、可验证的
+Agent runtime、经过验证的 upstream idempotency/operation ledger、逐工具 receipt
+聚合及完整
 completion/recovery 组合后，才能把 `agent`
 加入两侧的 `supported_activity_kinds`，禁止仅修改注册字符串或 Fleet 路由绕过该门禁。
 输入契约见 [agent-activity-request.md](agent-activity-request.md)，credential 边界见
@@ -428,6 +431,14 @@ invocation receipt 分表持久化。completed receipt 可保存由受信 Artifa
 MODEL_RESPONSE `ArtifactRef`，但不保存 response bytes；journal commit 后响应丢失可从
 Artifact 重放，commit 前或 upstream 异常只保留 unknown tombstone、禁止重调。该能力
 仍不提供跨主机共识或上游 exactly-once，因此不能独立提升 remote Agent readiness。
+
+schema v5 增加每次 invocation 最多 16 条的 append-only operation recovery evidence：
+只保存 request/evidence digest、NOT_STARTED/COMPLETED decision、verifier id 和时间。
+COMPLETED 可收敛 invoking/unknown；NOT_STARTED 只有在 durable outcome_unknown 上通过
+事务 CAS 才能重新 claim，原始 invoking 永不重试，以避免 zombie caller。并发恢复仍只
+允许一个 retry winner。该机制要求部署 gateway 对稳定 grant/operation ID 提供线性一致、
+单调的幂等账本；参考 Protocol 的结构匹配与 readiness 声明不构成 attestation，因此
+`production_security_ready` 仍为 false。
 完整契约见 [remote-execution-recovery.md](remote-execution-recovery.md)。
 
 ## 8. Observability

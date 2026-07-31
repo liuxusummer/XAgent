@@ -146,7 +146,10 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "ProviderAccessGrant",
         "ProviderInvocationResult",
         "ProviderInvoker",
+        "ProviderOperationRecovery",
+        "ProviderOperationState",
         "ProviderRouteDescriptor",
+        "RecoverableProviderInvoker",
     ),
     ".replay": (
         "ReplayReport",

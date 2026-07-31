@@ -23,11 +23,12 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Iterator
 
-REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION = 4
+REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION = 5
 DEFAULT_EXECUTION_JOURNAL_BUSY_TIMEOUT_MS = 10_000
 MAX_EXECUTION_JOURNAL_RECORDS = 100_000
 MAX_ARTIFACT_GRANT_JOURNAL_RECORDS = 100_000
 MAX_PROVIDER_GRANT_JOURNAL_RECORDS = 100_000
+MAX_PROVIDER_RECOVERY_EVIDENCE_PER_INVOCATION = 16
 MAX_ARTIFACT_GRANT_METADATA_BYTES = 16 * 1024
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,254}")
@@ -124,7 +125,7 @@ _V3_SCHEMA_INDEXES = {
         ("expires_at",),
     ),
 }
-_SCHEMA_COLUMNS = {
+_V4_SCHEMA_COLUMNS = {
     **_V3_SCHEMA_COLUMNS,
     "remote_provider_invocations": (
         ("grant_id", "TEXT", 1, 1),
@@ -135,7 +136,20 @@ _SCHEMA_COLUMNS = {
         ("updated_at", "REAL", 1, 0),
     ),
 }
-_SCHEMA_INDEXES = dict(_V3_SCHEMA_INDEXES)
+_V4_SCHEMA_INDEXES = dict(_V3_SCHEMA_INDEXES)
+_SCHEMA_COLUMNS = {
+    **_V4_SCHEMA_COLUMNS,
+    "remote_provider_recovery_evidence": (
+        ("grant_id", "TEXT", 1, 1),
+        ("sequence", "INTEGER", 1, 2),
+        ("request_payload_digest", "TEXT", 1, 0),
+        ("decision", "TEXT", 1, 0),
+        ("evidence_digest", "TEXT", 1, 0),
+        ("verifier_id", "TEXT", 1, 0),
+        ("created_at", "REAL", 1, 0),
+    ),
+}
+_SCHEMA_INDEXES = dict(_V4_SCHEMA_INDEXES)
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE remote_execution_journal_metadata(
@@ -261,15 +275,32 @@ _SCHEMA_STATEMENTS = (
         )
     )
     """,
+    """
+    CREATE TABLE remote_provider_recovery_evidence(
+        grant_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence BETWEEN 1 AND 16),
+        request_payload_digest TEXT NOT NULL,
+        decision TEXT NOT NULL
+            CHECK(decision IN ('not_started', 'completed')),
+        evidence_digest TEXT NOT NULL,
+        verifier_id TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        PRIMARY KEY(grant_id, sequence)
+    )
+    """,
 )
 _V1_UPGRADE_SCHEMA_STATEMENTS = _SCHEMA_STATEMENTS[2:]
 _V2_UPGRADE_SCHEMA_STATEMENTS = _SCHEMA_STATEMENTS[6:]
-_V3_UPGRADE_SCHEMA_STATEMENTS = _SCHEMA_STATEMENTS[-1:]
+_V3_UPGRADE_SCHEMA_STATEMENTS = _SCHEMA_STATEMENTS[-2:]
+_V4_UPGRADE_SCHEMA_STATEMENTS = _SCHEMA_STATEMENTS[-1:]
 _READ_GRANT_STATES = frozenset({"issued", "consumed"})
 _WRITE_GRANT_STATES = frozenset({"issued", "finalized", "failed"})
 _PROVIDER_GRANT_STATES = frozenset({"issued", "consumed"})
 _PROVIDER_INVOCATION_STATES = frozenset(
     {"invoking", "completed", "outcome_unknown"}
+)
+_PROVIDER_RECOVERY_DECISIONS = frozenset(
+    {"not_started", "completed"}
 )
 
 
@@ -534,6 +565,43 @@ class RemoteProviderInvocationClaim:
             raise RemoteExecutionJournalError(
                 "invalid_provider_invocation_claim"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteProviderRecoveryEvidenceRecord:
+    """Append-only digest proof accepted from a trusted provider gateway."""
+
+    grant_id: str
+    sequence: int
+    request_payload_digest: str
+    decision: str
+    evidence_digest: str
+    verifier_id: str
+    created_at: float
+
+    def __post_init__(self) -> None:
+        _identifier(self.grant_id, "grant_id")
+        if (
+            isinstance(self.sequence, bool)
+            or not isinstance(self.sequence, int)
+            or not 1
+            <= self.sequence
+            <= MAX_PROVIDER_RECOVERY_EVIDENCE_PER_INVOCATION
+        ):
+            raise RemoteExecutionJournalError(
+                "invalid_provider_recovery_sequence"
+            )
+        _digest(
+            self.request_payload_digest,
+            "request_payload_digest",
+        )
+        if self.decision not in _PROVIDER_RECOVERY_DECISIONS:
+            raise RemoteExecutionJournalError(
+                "invalid_provider_recovery_decision"
+            )
+        _digest(self.evidence_digest, "evidence_digest")
+        _identifier(self.verifier_id, "verifier_id")
+        _finite_time(self.created_at)
 
 
 class RemoteExecutionJournal:
@@ -1562,6 +1630,247 @@ class RemoteExecutionJournal:
                 updated_at=current,
             )
 
+    def claim_provider_retry_from_evidence(
+        self,
+        *,
+        grant_id: str,
+        token_digest: str,
+        binding_digest: str,
+        route_id: str,
+        expires_at: float,
+        request_payload_digest: str,
+        evidence_digest: str,
+        verifier_id: str,
+        now: float,
+    ) -> RemoteProviderInvocationClaim:
+        """Claim one retry after trusted evidence proves not-started."""
+
+        _identifier(grant_id, "grant_id")
+        _digest(token_digest, "token_digest")
+        _digest(binding_digest, "binding_digest")
+        _identifier(route_id, "route_id")
+        expected_expires_at = _finite_time(expires_at)
+        _digest(request_payload_digest, "request_payload_digest")
+        _digest(evidence_digest, "evidence_digest")
+        _identifier(verifier_id, "verifier_id")
+        current = _finite_time(now)
+        with self._transaction() as connection:
+            self._require_provider_time_floor_locked(
+                connection,
+                now=current,
+            )
+            grant = self._require_provider_grant_binding_locked(
+                connection,
+                grant_id=grant_id,
+                token_digest=token_digest,
+                binding_digest=binding_digest,
+                route_id=route_id,
+                expires_at=expected_expires_at,
+                required_state="consumed",
+            )
+            if current >= grant.expires_at:
+                raise RemoteProviderGrantUnavailable(
+                    "provider_grant_unavailable"
+                )
+            invocation = self._provider_invocation_locked(
+                connection,
+                grant_id,
+            )
+            if (
+                invocation is None
+                or invocation.request_payload_digest
+                != request_payload_digest
+            ):
+                raise RemoteProviderInvocationConflict(
+                    "provider_invocation_binding_mismatch"
+                )
+            if invocation.state != "outcome_unknown":
+                raise RemoteProviderInvocationUnknown(
+                    "provider_invocation_outcome_unknown"
+                )
+            self._append_provider_recovery_evidence_locked(
+                connection,
+                grant_id=grant_id,
+                request_payload_digest=request_payload_digest,
+                decision="not_started",
+                evidence_digest=evidence_digest,
+                verifier_id=verifier_id,
+                created_at=current,
+            )
+            cursor = connection.execute(
+                """
+                UPDATE remote_provider_invocations
+                SET state = 'invoking', updated_at = ?
+                WHERE grant_id = ? AND state = 'outcome_unknown'
+                    AND request_payload_digest = ?
+                """,
+                (current, grant_id, request_payload_digest),
+            )
+            if cursor.rowcount != 1:
+                raise RemoteProviderInvocationConflict(
+                    "provider_invocation_state_conflict"
+                )
+            claimed = RemoteProviderInvocationRecord(
+                grant_id=grant_id,
+                request_payload_digest=request_payload_digest,
+                state="invoking",
+                response_digest=None,
+                response_artifact_ref=None,
+                updated_at=current,
+            )
+            return RemoteProviderInvocationClaim(
+                record=claimed,
+                execute=True,
+            )
+
+    def complete_provider_invocation_from_evidence(
+        self,
+        *,
+        grant_id: str,
+        token_digest: str,
+        binding_digest: str,
+        route_id: str,
+        expires_at: float,
+        request_payload_digest: str,
+        response_digest: str,
+        response_artifact_ref: str | None,
+        evidence_digest: str,
+        verifier_id: str,
+        now: float,
+    ) -> RemoteProviderInvocationRecord:
+        """Resolve invoking/unknown state from trusted completed evidence."""
+
+        _identifier(grant_id, "grant_id")
+        _digest(token_digest, "token_digest")
+        _digest(binding_digest, "binding_digest")
+        _identifier(route_id, "route_id")
+        expected_expires_at = _finite_time(expires_at)
+        _digest(request_payload_digest, "request_payload_digest")
+        _digest(response_digest, "response_digest")
+        if response_artifact_ref is not None:
+            _canonical_json_text(
+                response_artifact_ref,
+                "response_artifact_ref",
+            )
+        _digest(evidence_digest, "evidence_digest")
+        _identifier(verifier_id, "verifier_id")
+        current = _finite_time(now)
+        with self._transaction() as connection:
+            self._require_provider_time_floor_locked(
+                connection,
+                now=current,
+            )
+            self._require_provider_grant_binding_locked(
+                connection,
+                grant_id=grant_id,
+                token_digest=token_digest,
+                binding_digest=binding_digest,
+                route_id=route_id,
+                expires_at=expected_expires_at,
+                required_state="consumed",
+            )
+            invocation = self._provider_invocation_locked(
+                connection,
+                grant_id,
+            )
+            if (
+                invocation is None
+                or invocation.request_payload_digest
+                != request_payload_digest
+            ):
+                raise RemoteProviderInvocationConflict(
+                    "provider_invocation_binding_mismatch"
+                )
+            if invocation.state == "completed":
+                if (
+                    invocation.response_digest != response_digest
+                    or invocation.response_artifact_ref
+                    != response_artifact_ref
+                ):
+                    raise RemoteProviderInvocationConflict(
+                        "provider_invocation_result_conflict"
+                    )
+                self._append_provider_recovery_evidence_locked(
+                    connection,
+                    grant_id=grant_id,
+                    request_payload_digest=request_payload_digest,
+                    decision="completed",
+                    evidence_digest=evidence_digest,
+                    verifier_id=verifier_id,
+                    created_at=current,
+                )
+                return invocation
+            if invocation.state not in {
+                "invoking",
+                "outcome_unknown",
+            }:
+                raise RemoteProviderInvocationUnknown(
+                    "provider_invocation_outcome_unknown"
+                )
+            self._append_provider_recovery_evidence_locked(
+                connection,
+                grant_id=grant_id,
+                request_payload_digest=request_payload_digest,
+                decision="completed",
+                evidence_digest=evidence_digest,
+                verifier_id=verifier_id,
+                created_at=current,
+            )
+            cursor = connection.execute(
+                """
+                UPDATE remote_provider_invocations
+                SET state = 'completed', response_digest = ?,
+                    response_artifact_ref = ?, updated_at = ?
+                WHERE grant_id = ?
+                    AND state IN ('invoking', 'outcome_unknown')
+                    AND request_payload_digest = ?
+                """,
+                (
+                    response_digest,
+                    response_artifact_ref,
+                    current,
+                    grant_id,
+                    request_payload_digest,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RemoteProviderInvocationConflict(
+                    "provider_invocation_state_conflict"
+                )
+            return RemoteProviderInvocationRecord(
+                grant_id=grant_id,
+                request_payload_digest=request_payload_digest,
+                state="completed",
+                response_digest=response_digest,
+                response_artifact_ref=response_artifact_ref,
+                updated_at=current,
+            )
+
+    def list_provider_recovery_evidence(
+        self,
+        grant_id: str,
+    ) -> tuple[RemoteProviderRecoveryEvidenceRecord, ...]:
+        _identifier(grant_id, "grant_id")
+        try:
+            with self._connection() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM remote_provider_recovery_evidence
+                    WHERE grant_id = ?
+                    ORDER BY sequence
+                    """,
+                    (grant_id,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise RemoteExecutionJournalError(
+                "execution_journal_unavailable"
+            ) from exc
+        return tuple(
+            _provider_recovery_evidence_from_row(row)
+            for row in rows
+        )
+
     def get_provider_invocation(
         self,
         grant_id: str,
@@ -1650,6 +1959,17 @@ class RemoteExecutionJournal:
         *,
         now: float,
     ) -> int:
+        connection.execute(
+            """
+            DELETE FROM remote_provider_recovery_evidence
+            WHERE grant_id IN (
+                SELECT grant_id
+                FROM remote_provider_grants
+                WHERE expires_at <= ?
+            )
+            """,
+            (now,),
+        )
         connection.execute(
             """
             DELETE FROM remote_provider_invocations
@@ -1811,6 +2131,89 @@ class RemoteExecutionJournal:
         )
 
     @staticmethod
+    def _append_provider_recovery_evidence_locked(
+        connection: sqlite3.Connection,
+        *,
+        grant_id: str,
+        request_payload_digest: str,
+        decision: str,
+        evidence_digest: str,
+        verifier_id: str,
+        created_at: float,
+    ) -> RemoteProviderRecoveryEvidenceRecord:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM remote_provider_recovery_evidence
+            WHERE grant_id = ?
+            ORDER BY sequence DESC
+            LIMIT 1
+            """,
+            (grant_id,),
+        ).fetchone()
+        if row is None:
+            sequence = 1
+        else:
+            previous = _provider_recovery_evidence_from_row(row)
+            if (
+                previous.request_payload_digest
+                == request_payload_digest
+                and previous.decision == decision
+                and previous.evidence_digest == evidence_digest
+                and previous.verifier_id == verifier_id
+            ):
+                if decision == "completed":
+                    return previous
+                raise RemoteProviderInvocationConflict(
+                    "provider_recovery_evidence_replayed"
+                )
+            sequence = previous.sequence + 1
+        reused = connection.execute(
+            """
+            SELECT 1
+            FROM remote_provider_recovery_evidence
+            WHERE grant_id = ? AND evidence_digest = ?
+            LIMIT 1
+            """,
+            (grant_id, evidence_digest),
+        ).fetchone()
+        if reused is not None:
+            raise RemoteProviderInvocationConflict(
+                "provider_recovery_evidence_replayed"
+            )
+        if sequence > MAX_PROVIDER_RECOVERY_EVIDENCE_PER_INVOCATION:
+            raise RemoteExecutionJournalCapacityError(
+                "provider_recovery_evidence_capacity"
+            )
+        evidence = RemoteProviderRecoveryEvidenceRecord(
+            grant_id=grant_id,
+            sequence=sequence,
+            request_payload_digest=request_payload_digest,
+            decision=decision,
+            evidence_digest=evidence_digest,
+            verifier_id=verifier_id,
+            created_at=created_at,
+        )
+        connection.execute(
+            """
+            INSERT INTO remote_provider_recovery_evidence(
+                grant_id, sequence, request_payload_digest,
+                decision, evidence_digest, verifier_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                evidence.grant_id,
+                evidence.sequence,
+                evidence.request_payload_digest,
+                evidence.decision,
+                evidence.evidence_digest,
+                evidence.verifier_id,
+                evidence.created_at,
+            ),
+        )
+        return evidence
+
+    @staticmethod
     def _get_locked(
         connection: sqlite3.Connection,
         run_id: str,
@@ -1917,6 +2320,34 @@ class RemoteExecutionJournal:
                     UPDATE remote_execution_journal_metadata
                     SET schema_version = ?
                     WHERE singleton = 1 AND schema_version = 3
+                    """,
+                    (REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION,),
+                )
+                if cursor.rowcount != 1:
+                    raise RemoteExecutionJournalError(
+                        "unsupported_execution_schema"
+                    )
+                self._validate_schema(
+                    connection,
+                    _SCHEMA_COLUMNS,
+                    schema_indexes=_SCHEMA_INDEXES,
+                )
+                return
+
+            if existing_tables == frozenset(_V4_SCHEMA_COLUMNS):
+                self._validate_schema(
+                    connection,
+                    _V4_SCHEMA_COLUMNS,
+                    schema_indexes=_V4_SCHEMA_INDEXES,
+                )
+                self._require_schema_version(connection, expected=4)
+                for statement in _V4_UPGRADE_SCHEMA_STATEMENTS:
+                    connection.execute(statement)
+                cursor = connection.execute(
+                    """
+                    UPDATE remote_execution_journal_metadata
+                    SET schema_version = ?
+                    WHERE singleton = 1 AND schema_version = 4
                     """,
                     (REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION,),
                 )
@@ -2139,6 +2570,16 @@ class RemoteExecutionJournal:
                     connection,
                     expected=3,
                 )
+            elif tables == frozenset(_V4_SCHEMA_COLUMNS):
+                self._validate_schema(
+                    connection,
+                    _V4_SCHEMA_COLUMNS,
+                    schema_indexes=_V4_SCHEMA_INDEXES,
+                )
+                self._require_schema_version(
+                    connection,
+                    expected=4,
+                )
             elif tables == frozenset(_SCHEMA_COLUMNS):
                 self._validate_schema(
                     connection,
@@ -2221,6 +2662,30 @@ class RemoteExecutionJournal:
                 raise RemoteExecutionJournalError(
                     "invalid_execution_schema"
                 )
+            index_list = {
+                str(row["name"]): (
+                    int(row["unique"]),
+                    str(row["origin"]),
+                    int(row["partial"]),
+                )
+                for row in connection.execute(
+                    f"PRAGMA index_list({expected_table})"
+                )
+            }
+            actual_columns = tuple(
+                str(row["name"])
+                for row in connection.execute(
+                    f"PRAGMA index_info({index_name})"
+                )
+            )
+            if (
+                index_list.get(index_name)
+                != (expected_unique, "c", 0)
+                or actual_columns != expected_index_columns
+            ):
+                raise RemoteExecutionJournalError(
+                    "invalid_execution_schema"
+                )
         if "remote_provider_grant_clock" in schema_columns:
             clock_rows = connection.execute(
                 """
@@ -2229,6 +2694,18 @@ class RemoteExecutionJournal:
                 """
             ).fetchall()
             if len(clock_rows) != 1:
+                raise RemoteExecutionJournalError(
+                    "invalid_execution_schema"
+                )
+            clock_row = clock_rows[0]
+            watermark = clock_row["purge_watermark"]
+            if (
+                clock_row["singleton"] != 1
+                or isinstance(watermark, bool)
+                or not isinstance(watermark, (int, float))
+                or not math.isfinite(float(watermark))
+                or float(watermark) < 0
+            ):
                 raise RemoteExecutionJournalError(
                     "invalid_execution_schema"
                 )
@@ -2254,42 +2731,93 @@ class RemoteExecutionJournal:
                     raise RemoteExecutionJournalError(
                         "invalid_execution_schema"
                     )
-            clock_row = clock_rows[0]
-            watermark = clock_row["purge_watermark"]
-            if (
-                clock_row["singleton"] != 1
-                or isinstance(watermark, bool)
-                or not isinstance(watermark, (int, float))
-                or not math.isfinite(float(watermark))
-                or float(watermark) < 0
-            ):
-                raise RemoteExecutionJournalError(
-                    "invalid_execution_schema"
+        if "remote_provider_recovery_evidence" in schema_columns:
+            evidence_rows = connection.execute(
+                """
+                SELECT evidence.*, grant.state AS grant_state,
+                    grant.expires_at AS grant_expires_at,
+                    invocation.state AS invocation_state,
+                    invocation.request_payload_digest
+                        AS invocation_payload_digest
+                FROM remote_provider_recovery_evidence AS evidence
+                LEFT JOIN remote_provider_grants AS grant
+                    ON grant.grant_id = evidence.grant_id
+                LEFT JOIN remote_provider_invocations AS invocation
+                    ON invocation.grant_id = evidence.grant_id
+                ORDER BY evidence.grant_id, evidence.sequence
+                """
+            ).fetchall()
+            expected_sequence: dict[str, int] = {}
+            evidence_digests: dict[str, set[str]] = {}
+            for evidence_row in evidence_rows:
+                invalid_evidence = (
+                    evidence_row["grant_state"] != "consumed"
+                    or evidence_row["invocation_state"] is None
+                    or evidence_row["invocation_payload_digest"]
+                    != evidence_row["request_payload_digest"]
                 )
-            index_list = {
-                str(row["name"]): (
-                    int(row["unique"]),
-                    str(row["origin"]),
-                    int(row["partial"]),
-                )
-                for row in connection.execute(
-                    f"PRAGMA index_list({expected_table})"
-                )
-            }
-            actual_columns = tuple(
-                str(row["name"])
-                for row in connection.execute(
-                    f"PRAGMA index_info({index_name})"
-                )
-            )
-            if (
-                index_list.get(index_name)
-                != (expected_unique, "c", 0)
-                or actual_columns != expected_index_columns
-            ):
-                raise RemoteExecutionJournalError(
-                    "invalid_execution_schema"
-                )
+                try:
+                    evidence = _provider_recovery_evidence_from_row(
+                        evidence_row
+                    )
+                except RemoteExecutionJournalError:
+                    invalid_evidence = True
+                    evidence = None
+                if evidence is not None:
+                    expected = (
+                        expected_sequence.get(evidence.grant_id, 0)
+                        + 1
+                    )
+                    if evidence.sequence != expected:
+                        invalid_evidence = True
+                    expected_sequence[evidence.grant_id] = (
+                        evidence.sequence
+                    )
+                    grant_evidence_digests = (
+                        evidence_digests.setdefault(
+                            evidence.grant_id,
+                            set(),
+                        )
+                    )
+                    if (
+                        evidence.evidence_digest
+                        in grant_evidence_digests
+                    ):
+                        invalid_evidence = True
+                    grant_evidence_digests.add(
+                        evidence.evidence_digest
+                    )
+                    if (
+                        evidence.decision == "completed"
+                        and evidence_row["invocation_state"]
+                        != "completed"
+                    ):
+                        invalid_evidence = True
+                    if (
+                        evidence.decision == "not_started"
+                        and (
+                            not isinstance(
+                                evidence_row["grant_expires_at"],
+                                (int, float),
+                            )
+                            or not math.isfinite(
+                                float(
+                                    evidence_row[
+                                        "grant_expires_at"
+                                    ]
+                                )
+                            )
+                            or evidence.created_at
+                            >= float(
+                                evidence_row["grant_expires_at"]
+                            )
+                        )
+                    ):
+                        invalid_evidence = True
+                if invalid_evidence:
+                    raise RemoteExecutionJournalError(
+                        "invalid_execution_schema"
+                    )
 
     def _new_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -2444,6 +2972,24 @@ def _provider_invocation_from_row(
         ) from exc
 
 
+def _provider_recovery_evidence_from_row(
+    row: sqlite3.Row,
+) -> RemoteProviderRecoveryEvidenceRecord:
+    try:
+        return RemoteProviderRecoveryEvidenceRecord(
+            **{
+                item.name: row[item.name]
+                for item in fields(
+                    RemoteProviderRecoveryEvidenceRecord
+                )
+            }
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RemoteExecutionJournalError(
+            "invalid_provider_recovery_evidence"
+        ) from exc
+
+
 def _canonical_json_text(value: object, name: str) -> str:
     if not isinstance(value, str):
         raise RemoteExecutionJournalError(f"invalid_{name}")
@@ -2514,6 +3060,7 @@ __all__ = [
     "MAX_ARTIFACT_GRANT_JOURNAL_RECORDS",
     "MAX_EXECUTION_JOURNAL_RECORDS",
     "MAX_PROVIDER_GRANT_JOURNAL_RECORDS",
+    "MAX_PROVIDER_RECOVERY_EVIDENCE_PER_INVOCATION",
     "REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION",
     "RemoteArtifactGrantConflict",
     "RemoteArtifactGrantUnavailable",
@@ -2531,4 +3078,5 @@ __all__ = [
     "RemoteProviderInvocationConflict",
     "RemoteProviderInvocationRecord",
     "RemoteProviderInvocationUnknown",
+    "RemoteProviderRecoveryEvidenceRecord",
 ]

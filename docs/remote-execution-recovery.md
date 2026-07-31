@@ -1,7 +1,8 @@
 # Remote Execution Authority Recovery
 
 > 状态：digest-only execution authority、bearer-free Artifact grant recovery 与
-> provider grant anti-replay 与 completed-result replay journal 已实现
+> provider grant anti-replay、completed-result replay 与可信 operation evidence
+> journal 已实现
 > 依赖：`distributed-execution-adr.md`、`durable-orchestration-spec.md`
 
 ## 1. 问题
@@ -49,6 +50,10 @@ provider invocation（schema v4）:
 grant id / actual request payload digest
 invoking | completed | outcome_unknown
 response digest / optional MODEL_RESPONSE ArtifactRef / updated_at
+
+provider recovery evidence（schema v5）:
+grant id / contiguous sequence / actual request payload digest
+not_started | completed / evidence digest / verifier id / created_at
 ```
 
 记录明确不包含：
@@ -68,12 +73,24 @@ SQLite 位于 Worker 不可访问的 control-plane isolation root。首次创建
 完整事务、`fsync` 和 no-clobber hard link 原子发布；数据库与 bootstrap lock 必须是
 `0600` 普通文件，symlink、宽权限、未知/残缺 schema、额外 trigger/view/index、
 integrity failure 均拒绝启动。既有精确 v1/v2 schema 在一个 SQLite transaction 内
-直接迁移到 v4；半迁移状态不会被自动补齐。
+直接迁移到 v5；半迁移状态不会被自动补齐。
 
-精确 v3 可在单事务内只增 invocation receipt 表并迁移到 v4。v3 consumed grant 没有
-足够证据推断调用结果，在 v4 Broker 中只能恢复为 outcome unknown。Provider wire schema
+精确 v3 可在单事务内增加 invocation receipt 与 recovery evidence 表并迁移到 v5；
+精确 v4 只增加 evidence 表。v3 consumed grant 没有
+足够证据推断调用结果，在 v5 Broker 中只能恢复为 outcome unknown。Provider wire schema
 同时升级到 v2；部署升级前应 drain 最长五分钟的活跃 grant，旧 wire grant 不会被新进程
 猜测补全。
+
+恢复证据只接受部署侧 `RecoverableProviderInvoker` 对稳定 operation ID 的严格查询
+结果。`COMPLETED` 可将 invoking/unknown 收敛为 exact result；`NOT_STARTED` 只允许从
+已持久化的 `outcome_unknown` 通过 CAS 重新 claim，一律不能从原始 `invoking` 重试。
+IN_PROGRESS/UNKNOWN 保持 fail closed。证据原文和 response bytes 不进入 journal，每个
+invocation 最多保留 16 条 digest-only 证据，并随过期 provider grant 原子清理。
+NOT_STARTED evidence digest 在同一 grant 下单次使用，retry 事务会再次检查 grant
+未过期；启动校验拒绝重复 digest、过期 NOT_STARTED、断序或孤儿 evidence。
+
+生产 gateway 必须保证 NOT_STARTED 来自线性一致、单调的幂等 operation ledger，且延迟
+旧请求也按同一 operation ID 去重；参考 journal 只能记录证据，不能自行证明该外部保证。
 
 ## 3. 恢复算法
 

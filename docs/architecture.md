@@ -90,8 +90,10 @@
   tenant/Attempt/request/route/invocation-index 的短期单次 `ProviderAccessGrant`。
   Broker 可将 token digest、逻辑调用唯一键和消费墓碑写入隔离的
   `RemoteExecutionJournal`，跨进程原子发放/消费；completed invocation 可经
-  MODEL_RESPONSE Artifact 重放，但 upstream 已执行、receipt 未提交的窗口仍为
-  outcome unknown，`production_security_ready` 固定 false，不能据此开放 remote Agent；见
+  MODEL_RESPONSE Artifact 重放；部署侧 `RecoverableProviderInvoker` 还可用稳定
+  operation ID 的 NOT_STARTED/COMPLETED 证据收敛部分 unknown 窗口，但参考实现不能
+  证明外部幂等账本或 attestation，`production_security_ready` 固定 false，不能据此
+  开放 remote Agent；见
   `docs/provider-credential-boundary.md`
 - Durable Store、Artifact、GC 和锁必须放在 Agent workspace 外，由独立控制面
   service/OS identity 持有，且不挂载给 legacy 文件、代码或浏览器工具。默认 Web UI 不会
@@ -137,7 +139,9 @@
   digest、消费墓碑和 purge 时间水位，但不保存 bearer、prompt、response 或 provider
   credential；schema v4 增加实际 provider payload digest 与
   invoking/completed/outcome-unknown receipt，completed 可引用 sensitive
-  MODEL_RESPONSE Artifact，但 journal 仍不保存响应正文。控制面重启后可从 exact Store
+  MODEL_RESPONSE Artifact；schema v5 增加有界的 NOT_STARTED/COMPLETED gateway
+  recovery evidence digest 与 verifier id，但 journal 仍不保存响应正文或证据原文。
+  控制面重启后可从 exact Store
   policy Event、当前配置与新鲜 attestation 重建 start/heartbeat/取消/终态 authority；
   Worker 持有的原 read grant 可跨进程只兑换一次，原 output handle 可重放 exact final
   ref，但控制面绝不重新发送 assignment 或自行复活 bearer。Fleet claim 会把无密的

@@ -81,8 +81,9 @@ Round 2：通过。
   response bytes 只存在于按 sensitivity 隔离的 ArtifactStore；
 - `ProviderInvocationResult` 同时隐藏 content 与 ArtifactRef repr；invoker/Store/parser
   异常转换为固定 reason code 且无 cause/context；
-- exact v1/v2 直接原子迁移到 v4，exact v3 只增 receipt 表；v3 consumed grant 因缺失
-  receipt 只能恢复为 unknown，旧 wire v1 fail closed；
+- 当前 exact v1/v2 直接原子迁移到 v5，exact v3 增 receipt/evidence 表，exact v4
+  只增 evidence 表；v3 consumed grant 因缺失 receipt 只能恢复为 unknown，旧 wire
+  v1 fail closed；
 - `durable_result_recovery_ready` 只接受磁盘 journal + 项目内已知 durable 的
   `LocalArtifactStore`，自定义 Protocol 实现不自动提升 readiness；
 - 启动 schema 校验逐行验证 invocation record、关联 grant 必须存在且为 consumed；
@@ -92,16 +93,19 @@ Round 2：通过。
 
 - `test_grant_is_canonical_path_free_and_credential_free`
 - `test_result_store_failure_is_sanitized_and_becomes_unknown`
-- `test_exact_v3_schema_migrates_atomically_to_v4`
+- `test_exact_v3_schema_migrates_atomically_to_v5`
 - `test_orphan_provider_invocation_fails_at_startup`
 - `test_malformed_provider_invocation_fails_at_startup`
 - `test_durable_grant_survives_restart_and_replay_tombstone_does_too`
 
 Round 3：在声明的本机 completed-result replay 范围内通过。
 
-## 剩余工作
+## 后续进展与剩余工作
 
-- upstream idempotency key、查询 API 或可验证 provider operation receipt；
+- schema v5 已加入可信 provider operation recovery 协议与 digest-only evidence
+  journal，详见
+  [Provider Operation Recovery 三轮对抗性审查](provider-operation-recovery-adversarial-review.md)；
+- 仍需生产 gateway 对稳定 operation ID 提供经过 attestation 的线性一致幂等账本；
 - outcome-unknown 的 operator resolution 与费用/外部效果 reconciliation；
 - secret-manager backed、mTLS、egress allowlist 与 attested ProviderInvoker；
 - 跨主机单写者 fencing 或线性一致存储；

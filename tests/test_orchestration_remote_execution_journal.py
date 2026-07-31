@@ -12,6 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from src.orchestration.remote_execution_journal import (
+    MAX_PROVIDER_RECOVERY_EVIDENCE_PER_INVOCATION,
     RemoteArtifactGrantConflict,
     RemoteArtifactGrantUnavailable,
     RemoteArtifactReadGrantRecord,
@@ -23,6 +24,7 @@ from src.orchestration.remote_execution_journal import (
     RemoteExecutionJournalError,
     RemoteProviderGrantRecord,
     RemoteProviderGrantUnavailable,
+    RemoteProviderInvocationConflict,
     RemoteProviderInvocationUnknown,
 )
 
@@ -418,7 +420,7 @@ class RemoteExecutionJournalTests(unittest.TestCase):
             replace(second, updated_at=201.0)
         )
 
-    def test_exact_v1_schema_migrates_atomically_to_v4(self) -> None:
+    def test_exact_v1_schema_migrates_atomically_to_v5(self) -> None:
         connection = sqlite3.connect(self.path)
         connection.executescript(
             """
@@ -477,14 +479,15 @@ class RemoteExecutionJournalTests(unittest.TestCase):
             )
         }
         connection.close()
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
         self.assertIn("remote_artifact_read_grants", tables)
         self.assertIn("remote_artifact_write_grants", tables)
         self.assertIn("remote_provider_grants", tables)
         self.assertIn("remote_provider_grant_clock", tables)
         self.assertIn("remote_provider_invocations", tables)
+        self.assertIn("remote_provider_recovery_evidence", tables)
 
-    def test_exact_v2_schema_migrates_atomically_to_v4(self) -> None:
+    def test_exact_v2_schema_migrates_atomically_to_v5(self) -> None:
         previous = RemoteArtifactReadGrantRecord(
             grant_id="v2-read-grant",
             token_digest="e" * 64,
@@ -500,6 +503,9 @@ class RemoteExecutionJournalTests(unittest.TestCase):
         original.record_read_grant(previous)
         original.close()
         connection = sqlite3.connect(self.path)
+        connection.execute(
+            "DROP TABLE remote_provider_recovery_evidence"
+        )
         connection.execute("DROP TABLE remote_provider_invocations")
         connection.execute("DROP TABLE remote_provider_grants")
         connection.execute("DROP TABLE remote_provider_grant_clock")
@@ -540,12 +546,13 @@ class RemoteExecutionJournalTests(unittest.TestCase):
             )
         }
         connection.close()
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
         self.assertIn("remote_provider_grants", tables)
         self.assertIn("remote_provider_grant_clock", tables)
         self.assertIn("remote_provider_invocations", tables)
+        self.assertIn("remote_provider_recovery_evidence", tables)
 
-    def test_exact_v3_schema_migrates_atomically_to_v4(self) -> None:
+    def test_exact_v3_schema_migrates_atomically_to_v5(self) -> None:
         original = RemoteExecutionJournal(self.path)
         previous = _provider_record()
         original.record_provider_grant(previous)
@@ -559,6 +566,9 @@ class RemoteExecutionJournalTests(unittest.TestCase):
         )
         original.close()
         connection = sqlite3.connect(self.path)
+        connection.execute(
+            "DROP TABLE remote_provider_recovery_evidence"
+        )
         connection.execute("DROP TABLE remote_provider_invocations")
         connection.execute(
             """
@@ -603,8 +613,87 @@ class RemoteExecutionJournalTests(unittest.TestCase):
             )
         }
         connection.close()
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
         self.assertIn("remote_provider_invocations", tables)
+        self.assertIn("remote_provider_recovery_evidence", tables)
+
+    def test_exact_v4_schema_migrates_atomically_to_v5(self) -> None:
+        original = RemoteExecutionJournal(self.path)
+        previous = _provider_record()
+        original.record_provider_grant(previous)
+        original.claim_provider_invocation(
+            grant_id=previous.grant_id,
+            token_digest=previous.token_digest,
+            binding_digest=previous.binding_digest,
+            route_id=previous.route_id,
+            expires_at=previous.expires_at,
+            request_payload_digest="1" * 64,
+            now=101.0,
+        )
+        original.complete_provider_invocation(
+            grant_id=previous.grant_id,
+            token_digest=previous.token_digest,
+            binding_digest=previous.binding_digest,
+            route_id=previous.route_id,
+            expires_at=previous.expires_at,
+            request_payload_digest="1" * 64,
+            response_digest="2" * 64,
+            response_artifact_ref=None,
+            now=102.0,
+        )
+        original.close()
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "DROP TABLE remote_provider_recovery_evidence"
+        )
+        connection.execute(
+            """
+            UPDATE remote_execution_journal_metadata
+            SET schema_version = 4
+            WHERE singleton = 1
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        migrated = RemoteExecutionJournal(self.path)
+        replay = migrated.claim_provider_invocation(
+            grant_id=previous.grant_id,
+            token_digest=previous.token_digest,
+            binding_digest=previous.binding_digest,
+            route_id=previous.route_id,
+            expires_at=previous.expires_at,
+            request_payload_digest="1" * 64,
+            now=103.0,
+        )
+        self.assertFalse(replay.execute)
+        self.assertEqual(replay.record.response_digest, "2" * 64)
+        self.assertEqual(
+            migrated.list_provider_recovery_evidence(
+                previous.grant_id
+            ),
+            (),
+        )
+        migrated.close()
+        connection = sqlite3.connect(self.path)
+        version = connection.execute(
+            """
+            SELECT schema_version
+            FROM remote_execution_journal_metadata
+            """
+        ).fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                """
+            )
+        }
+        connection.close()
+        self.assertEqual(version, 5)
+        self.assertIn("remote_provider_recovery_evidence", tables)
 
     def test_expiry_indexes_exist_and_unexpected_trigger_fails_closed(
         self,
@@ -674,6 +763,26 @@ class RemoteExecutionJournalTests(unittest.TestCase):
         ):
             RemoteExecutionJournal(self.path)
 
+    def test_rebound_expected_index_fails_at_startup(self) -> None:
+        RemoteExecutionJournal(self.path).close()
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "DROP INDEX idx_remote_provider_grants_expires"
+        )
+        connection.execute(
+            """
+            CREATE INDEX idx_remote_provider_grants_expires
+            ON remote_provider_grants(updated_at)
+            """
+        )
+        connection.commit()
+        connection.close()
+        with self.assertRaisesRegex(
+            RemoteExecutionJournalError,
+            "invalid_execution_schema",
+        ):
+            RemoteExecutionJournal(self.path)
+
     def test_orphan_provider_invocation_fails_at_startup(self) -> None:
         RemoteExecutionJournal(self.path).close()
         connection = sqlite3.connect(self.path)
@@ -719,6 +828,411 @@ class RemoteExecutionJournalTests(unittest.TestCase):
         connection.commit()
         connection.close()
 
+        with self.assertRaisesRegex(
+            RemoteExecutionJournalError,
+            "invalid_execution_schema",
+        ):
+            RemoteExecutionJournal(self.path)
+
+    def test_not_started_evidence_only_retries_durable_unknown(
+        self,
+    ) -> None:
+        journal = RemoteExecutionJournal(self.path)
+        grant = _provider_record()
+        journal.record_provider_grant(grant)
+        journal.claim_provider_invocation(
+            grant_id=grant.grant_id,
+            token_digest=grant.token_digest,
+            binding_digest=grant.binding_digest,
+            route_id=grant.route_id,
+            expires_at=grant.expires_at,
+            request_payload_digest="d" * 64,
+            now=101.0,
+        )
+        retry_kwargs = {
+            "grant_id": grant.grant_id,
+            "token_digest": grant.token_digest,
+            "binding_digest": grant.binding_digest,
+            "route_id": grant.route_id,
+            "expires_at": grant.expires_at,
+            "request_payload_digest": "d" * 64,
+            "evidence_digest": "e" * 64,
+            "verifier_id": "provider-verifier",
+            "now": 103.0,
+        }
+        with self.assertRaisesRegex(
+            RemoteProviderInvocationUnknown,
+            "provider_invocation_outcome_unknown",
+        ):
+            journal.claim_provider_retry_from_evidence(**retry_kwargs)
+        self.assertEqual(
+            journal.list_provider_recovery_evidence(grant.grant_id),
+            (),
+        )
+
+        journal.mark_provider_invocation_unknown(
+            grant_id=grant.grant_id,
+            token_digest=grant.token_digest,
+            binding_digest=grant.binding_digest,
+            route_id=grant.route_id,
+            expires_at=grant.expires_at,
+            request_payload_digest="d" * 64,
+            now=102.0,
+        )
+        retry = journal.claim_provider_retry_from_evidence(
+            **retry_kwargs
+        )
+        self.assertTrue(retry.execute)
+        self.assertEqual(retry.record.state, "invoking")
+        evidence = journal.list_provider_recovery_evidence(
+            grant.grant_id
+        )
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].sequence, 1)
+        self.assertEqual(evidence[0].decision, "not_started")
+        with self.assertRaises(RemoteProviderInvocationUnknown):
+            journal.claim_provider_retry_from_evidence(**retry_kwargs)
+        self.assertEqual(
+            journal.list_provider_recovery_evidence(grant.grant_id),
+            evidence,
+        )
+
+    def test_completed_evidence_resolves_invoking_idempotently(
+        self,
+    ) -> None:
+        journal = RemoteExecutionJournal(self.path)
+        grant = _provider_record()
+        journal.record_provider_grant(grant)
+        journal.claim_provider_invocation(
+            grant_id=grant.grant_id,
+            token_digest=grant.token_digest,
+            binding_digest=grant.binding_digest,
+            route_id=grant.route_id,
+            expires_at=grant.expires_at,
+            request_payload_digest="d" * 64,
+            now=101.0,
+        )
+        completed_kwargs = {
+            "grant_id": grant.grant_id,
+            "token_digest": grant.token_digest,
+            "binding_digest": grant.binding_digest,
+            "route_id": grant.route_id,
+            "expires_at": grant.expires_at,
+            "request_payload_digest": "d" * 64,
+            "response_digest": "f" * 64,
+            "response_artifact_ref": None,
+            "evidence_digest": "e" * 64,
+            "verifier_id": "provider-verifier",
+            "now": 102.0,
+        }
+        completed = (
+            journal.complete_provider_invocation_from_evidence(
+                **completed_kwargs
+            )
+        )
+        self.assertEqual(completed.state, "completed")
+        self.assertEqual(completed.response_digest, "f" * 64)
+        journal.complete_provider_invocation_from_evidence(
+            **completed_kwargs
+        )
+        evidence = journal.list_provider_recovery_evidence(
+            grant.grant_id
+        )
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].decision, "completed")
+
+    def test_retry_evidence_cannot_claim_at_or_after_expiry(
+        self,
+    ) -> None:
+        journal = RemoteExecutionJournal(self.path)
+        grant = _provider_record(expires_at=102.0)
+        journal.record_provider_grant(grant)
+        journal.claim_provider_invocation(
+            grant_id=grant.grant_id,
+            token_digest=grant.token_digest,
+            binding_digest=grant.binding_digest,
+            route_id=grant.route_id,
+            expires_at=grant.expires_at,
+            request_payload_digest="d" * 64,
+            now=100.5,
+        )
+        journal.mark_provider_invocation_unknown(
+            grant_id=grant.grant_id,
+            token_digest=grant.token_digest,
+            binding_digest=grant.binding_digest,
+            route_id=grant.route_id,
+            expires_at=grant.expires_at,
+            request_payload_digest="d" * 64,
+            now=101.0,
+        )
+        with self.assertRaisesRegex(
+            RemoteProviderGrantUnavailable,
+            "provider_grant_unavailable",
+        ):
+            journal.claim_provider_retry_from_evidence(
+                grant_id=grant.grant_id,
+                token_digest=grant.token_digest,
+                binding_digest=grant.binding_digest,
+                route_id=grant.route_id,
+                expires_at=grant.expires_at,
+                request_payload_digest="d" * 64,
+                evidence_digest="e" * 64,
+                verifier_id="provider-verifier",
+                now=102.0,
+            )
+        self.assertEqual(
+            journal.list_provider_recovery_evidence(grant.grant_id),
+            (),
+        )
+
+    def test_not_started_evidence_digest_is_single_use(
+        self,
+    ) -> None:
+        journal = RemoteExecutionJournal(self.path)
+        grant = _provider_record()
+        journal.record_provider_grant(grant)
+        common = {
+            "grant_id": grant.grant_id,
+            "token_digest": grant.token_digest,
+            "binding_digest": grant.binding_digest,
+            "route_id": grant.route_id,
+            "expires_at": grant.expires_at,
+            "request_payload_digest": "d" * 64,
+        }
+        journal.claim_provider_invocation(
+            **common,
+            now=101.0,
+        )
+        journal.mark_provider_invocation_unknown(
+            **common,
+            now=102.0,
+        )
+        journal.claim_provider_retry_from_evidence(
+            **common,
+            evidence_digest="e" * 64,
+            verifier_id="provider-verifier",
+            now=103.0,
+        )
+        journal.mark_provider_invocation_unknown(
+            **common,
+            now=104.0,
+        )
+        with self.assertRaisesRegex(
+            RemoteProviderInvocationConflict,
+            "provider_recovery_evidence_replayed",
+        ):
+            journal.claim_provider_retry_from_evidence(
+                **common,
+                evidence_digest="e" * 64,
+                verifier_id="provider-verifier",
+                now=105.0,
+            )
+        self.assertEqual(
+            len(
+                journal.list_provider_recovery_evidence(
+                    grant.grant_id
+                )
+            ),
+            1,
+        )
+        invocation = journal.get_provider_invocation(
+            grant.grant_id
+        )
+        self.assertIsNotNone(invocation)
+        assert invocation is not None
+        self.assertEqual(invocation.state, "outcome_unknown")
+
+    def test_recovery_evidence_is_bounded_and_purged_with_grant(
+        self,
+    ) -> None:
+        journal = RemoteExecutionJournal(self.path)
+        grant = _provider_record()
+        journal.record_provider_grant(grant)
+        journal.claim_provider_invocation(
+            grant_id=grant.grant_id,
+            token_digest=grant.token_digest,
+            binding_digest=grant.binding_digest,
+            route_id=grant.route_id,
+            expires_at=grant.expires_at,
+            request_payload_digest="d" * 64,
+            now=101.0,
+        )
+        base_kwargs = {
+            "grant_id": grant.grant_id,
+            "token_digest": grant.token_digest,
+            "binding_digest": grant.binding_digest,
+            "route_id": grant.route_id,
+            "expires_at": grant.expires_at,
+            "request_payload_digest": "d" * 64,
+            "response_digest": "f" * 64,
+            "response_artifact_ref": None,
+            "verifier_id": "provider-verifier",
+        }
+        for index in range(
+            MAX_PROVIDER_RECOVERY_EVIDENCE_PER_INVOCATION
+        ):
+            journal.complete_provider_invocation_from_evidence(
+                **base_kwargs,
+                evidence_digest=hashlib.sha256(
+                    f"evidence-{index}".encode()
+                ).hexdigest(),
+                now=102.0 + index,
+            )
+        with self.assertRaisesRegex(
+            RemoteExecutionJournalCapacityError,
+            "provider_recovery_evidence_capacity",
+        ):
+            journal.complete_provider_invocation_from_evidence(
+                **base_kwargs,
+                evidence_digest=hashlib.sha256(
+                    b"evidence-overflow"
+                ).hexdigest(),
+                now=150.0,
+            )
+        self.assertEqual(
+            len(
+                journal.list_provider_recovery_evidence(
+                    grant.grant_id
+                )
+            ),
+            MAX_PROVIDER_RECOVERY_EVIDENCE_PER_INVOCATION,
+        )
+        self.assertEqual(
+            journal.purge_expired_provider_grants(now=200.0),
+            1,
+        )
+        self.assertEqual(
+            journal.list_provider_recovery_evidence(grant.grant_id),
+            (),
+        )
+
+    def test_orphan_or_noncontiguous_recovery_evidence_fails_startup(
+        self,
+    ) -> None:
+        RemoteExecutionJournal(self.path).close()
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            """
+            INSERT INTO remote_provider_recovery_evidence(
+                grant_id, sequence, request_payload_digest,
+                decision, evidence_digest, verifier_id, created_at
+            ) VALUES (?, 2, ?, 'not_started', ?, ?, ?)
+            """,
+            (
+                "orphan-provider-grant",
+                "d" * 64,
+                "e" * 64,
+                "provider-verifier",
+                100.0,
+            ),
+        )
+        connection.commit()
+        connection.close()
+        with self.assertRaisesRegex(
+            RemoteExecutionJournalError,
+            "invalid_execution_schema",
+        ):
+            RemoteExecutionJournal(self.path)
+
+    def test_expired_not_started_evidence_fails_startup(
+        self,
+    ) -> None:
+        journal = RemoteExecutionJournal(self.path)
+        grant = _provider_record()
+        journal.record_provider_grant(grant)
+        journal.claim_provider_invocation(
+            grant_id=grant.grant_id,
+            token_digest=grant.token_digest,
+            binding_digest=grant.binding_digest,
+            route_id=grant.route_id,
+            expires_at=grant.expires_at,
+            request_payload_digest="d" * 64,
+            now=101.0,
+        )
+        journal.mark_provider_invocation_unknown(
+            grant_id=grant.grant_id,
+            token_digest=grant.token_digest,
+            binding_digest=grant.binding_digest,
+            route_id=grant.route_id,
+            expires_at=grant.expires_at,
+            request_payload_digest="d" * 64,
+            now=102.0,
+        )
+        journal.claim_provider_retry_from_evidence(
+            grant_id=grant.grant_id,
+            token_digest=grant.token_digest,
+            binding_digest=grant.binding_digest,
+            route_id=grant.route_id,
+            expires_at=grant.expires_at,
+            request_payload_digest="d" * 64,
+            evidence_digest="e" * 64,
+            verifier_id="provider-verifier",
+            now=103.0,
+        )
+        journal.close()
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            """
+            UPDATE remote_provider_recovery_evidence
+            SET created_at = 200
+            WHERE grant_id = ?
+            """,
+            (grant.grant_id,),
+        )
+        connection.commit()
+        connection.close()
+        with self.assertRaisesRegex(
+            RemoteExecutionJournalError,
+            "invalid_execution_schema",
+        ):
+            RemoteExecutionJournal(self.path)
+
+    def test_duplicate_recovery_evidence_digest_fails_startup(
+        self,
+    ) -> None:
+        journal = RemoteExecutionJournal(self.path)
+        grant = _provider_record()
+        journal.record_provider_grant(grant)
+        journal.claim_provider_invocation(
+            grant_id=grant.grant_id,
+            token_digest=grant.token_digest,
+            binding_digest=grant.binding_digest,
+            route_id=grant.route_id,
+            expires_at=grant.expires_at,
+            request_payload_digest="d" * 64,
+            now=101.0,
+        )
+        journal.complete_provider_invocation_from_evidence(
+            grant_id=grant.grant_id,
+            token_digest=grant.token_digest,
+            binding_digest=grant.binding_digest,
+            route_id=grant.route_id,
+            expires_at=grant.expires_at,
+            request_payload_digest="d" * 64,
+            response_digest="f" * 64,
+            response_artifact_ref=None,
+            evidence_digest="e" * 64,
+            verifier_id="provider-verifier",
+            now=102.0,
+        )
+        journal.close()
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            """
+            INSERT INTO remote_provider_recovery_evidence(
+                grant_id, sequence, request_payload_digest,
+                decision, evidence_digest, verifier_id, created_at
+            ) VALUES (?, 2, ?, 'completed', ?, ?, 103)
+            """,
+            (
+                grant.grant_id,
+                "d" * 64,
+                "e" * 64,
+                "provider-verifier",
+            ),
+        )
+        connection.commit()
+        connection.close()
         with self.assertRaisesRegex(
             RemoteExecutionJournalError,
             "invalid_execution_schema",

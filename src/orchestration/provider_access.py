@@ -10,6 +10,7 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Callable, Iterable, Mapping, Protocol, runtime_checkable
 
 from .artifacts import (
@@ -27,6 +28,7 @@ from .remote_execution_journal import (
     RemoteProviderGrantConflict,
     RemoteProviderGrantRecord,
     RemoteProviderGrantUnavailable,
+    RemoteProviderInvocationClaim,
     RemoteProviderInvocationConflict,
     RemoteProviderInvocationRecord,
     RemoteProviderInvocationUnknown,
@@ -37,6 +39,7 @@ from .worker_security import (
 )
 
 PROVIDER_ACCESS_SCHEMA_VERSION = 2
+PROVIDER_OPERATION_RECOVERY_SCHEMA_VERSION = 1
 MAX_PROVIDER_GRANT_TTL_SECONDS = 5 * 60.0
 MAX_PROVIDER_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_PROVIDER_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -72,6 +75,15 @@ class ProviderAccessDenied(RuntimeError):
     def __init__(self, reason_code: str) -> None:
         self.reason_code = _code(reason_code, "invalid_reason_code")
         super().__init__(self.reason_code)
+
+
+class ProviderOperationState(StrEnum):
+    """Trusted gateway view of one stable provider operation id."""
+
+    NOT_STARTED = "not_started"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,6 +460,101 @@ class ProviderInvocationResult:
                 )
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderOperationRecovery:
+    """Strict evidence returned by a deployment-owned provider gateway."""
+
+    operation_id: str
+    route_id: str
+    request_payload_digest: str
+    state: ProviderOperationState
+    evidence_digest: str
+    verifier_id: str
+    response_digest: str | None = None
+    content: bytes | None = field(default=None, repr=False)
+    schema_version: int = PROVIDER_OPERATION_RECOVERY_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "operation_id",
+            _code(
+                self.operation_id,
+                "invalid_provider_operation_recovery",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "route_id",
+            _code(
+                self.route_id,
+                "invalid_provider_operation_recovery",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "request_payload_digest",
+            _digest(
+                self.request_payload_digest,
+                "invalid_provider_operation_recovery",
+            ),
+        )
+        try:
+            state = ProviderOperationState(self.state)
+        except (TypeError, ValueError):
+            raise ProviderAccessDenied(
+                "invalid_provider_operation_recovery"
+            ) from None
+        object.__setattr__(self, "state", state)
+        object.__setattr__(
+            self,
+            "evidence_digest",
+            _digest(
+                self.evidence_digest,
+                "invalid_provider_operation_recovery",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "verifier_id",
+            _code(
+                self.verifier_id,
+                "invalid_provider_operation_recovery",
+            ),
+        )
+        if state is ProviderOperationState.COMPLETED:
+            if self.response_digest is None:
+                raise ProviderAccessDenied(
+                    "invalid_provider_operation_recovery"
+                )
+            response_digest = _digest(
+                self.response_digest,
+                "invalid_provider_operation_recovery",
+            )
+            if (
+                not isinstance(self.content, bytes)
+                or not self.content
+                or len(self.content) > MAX_PROVIDER_RESPONSE_BYTES
+                or hashlib.sha256(self.content).hexdigest()
+                != response_digest
+            ):
+                raise ProviderAccessDenied(
+                    "invalid_provider_operation_recovery"
+                )
+        elif self.response_digest is not None or self.content is not None:
+            raise ProviderAccessDenied(
+                "invalid_provider_operation_recovery"
+            )
+        if (
+            isinstance(self.schema_version, bool)
+            or self.schema_version
+            != PROVIDER_OPERATION_RECOVERY_SCHEMA_VERSION
+        ):
+            raise ProviderAccessDenied(
+                "unsupported_provider_operation_recovery_schema"
+            )
+
+
 @runtime_checkable
 class ProviderInvoker(Protocol):
     """Deployment-owned gateway adapter that holds upstream credentials."""
@@ -459,6 +566,22 @@ class ProviderInvoker(Protocol):
         *,
         request_id: str,
     ) -> bytes: ...
+
+
+@runtime_checkable
+class RecoverableProviderInvoker(ProviderInvoker, Protocol):
+    """Trusted adapter that can verify a stable operation after failure."""
+
+    @property
+    def operation_recovery_ready(self) -> bool: ...
+
+    def recover(
+        self,
+        route: ProviderRouteDescriptor,
+        *,
+        operation_id: str,
+        request_payload_digest: str,
+    ) -> ProviderOperationRecovery: ...
 
 
 class ProviderAccessBroker:
@@ -546,7 +669,7 @@ class ProviderAccessBroker:
 
     @property
     def production_security_ready(self) -> bool:
-        """Upstream idempotency and a hardened gateway are still required."""
+        """External ledger semantics and gateway attestation remain unproven."""
 
         return False
 
@@ -560,6 +683,21 @@ class ProviderAccessBroker:
             self._recovery_journal.durable
             and isinstance(self._result_store, LocalArtifactStore)
         )
+
+    @property
+    def provider_operation_recovery_ready(self) -> bool:
+        try:
+            return (
+                isinstance(
+                    self._invoker,
+                    RecoverableProviderInvoker,
+                )
+                and self._invoker.operation_recovery_ready is True
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            return False
 
     def issue(
         self,
@@ -737,6 +875,7 @@ class ProviderAccessBroker:
             )
         request_payload_digest = hashlib.sha256(payload).hexdigest()
         failure_reason: str | None = None
+        invocation_unknown = False
         claim = None
         try:
             claim = self._recovery_journal.claim_provider_invocation(
@@ -751,13 +890,22 @@ class ProviderAccessBroker:
         except RemoteProviderGrantUnavailable:
             failure_reason = "provider_grant_unavailable"
         except RemoteProviderInvocationUnknown:
-            failure_reason = "provider_invocation_outcome_unknown"
+            invocation_unknown = True
         except RemoteProviderInvocationConflict:
             failure_reason = "provider_grant_registry_unavailable"
         except RemoteExecutionJournalError:
             failure_reason = "provider_grant_registry_unavailable"
         if failure_reason is not None:
             raise ProviderAccessDenied(failure_reason)
+        if invocation_unknown:
+            recovered = self._recover_provider_operation(
+                grant,
+                route,
+                request_payload_digest=request_payload_digest,
+            )
+            if isinstance(recovered, ProviderInvocationResult):
+                return recovered
+            claim = recovered
         if claim is None:
             raise ProviderAccessDenied(
                 "provider_grant_registry_unavailable"
@@ -833,6 +981,221 @@ class ProviderAccessBroker:
             RemoteProviderInvocationUnknown,
             RemoteExecutionJournalError,
         ):
+            completion_failed = True
+        if completion_failed:
+            raise ProviderAccessDenied(
+                "provider_grant_registry_unavailable"
+            )
+        return ProviderInvocationResult(
+            grant_id=grant.grant_id,
+            route_id=route.route_id,
+            response_digest=response_digest,
+            content=response,
+            artifact_ref=artifact_ref,
+        )
+
+    def _recover_provider_operation(
+        self,
+        grant: ProviderAccessGrant,
+        route: ProviderRouteDescriptor,
+        *,
+        request_payload_digest: str,
+    ) -> RemoteProviderInvocationClaim | ProviderInvocationResult:
+        invocation_failed = False
+        try:
+            invocation = self._recovery_journal.get_provider_invocation(
+                grant.grant_id
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            invocation_failed = True
+            invocation = None
+        if invocation_failed:
+            raise ProviderAccessDenied(
+                "provider_grant_registry_unavailable"
+            )
+        if (
+            invocation is None
+            or invocation.request_payload_digest
+            != request_payload_digest
+            or invocation.state
+            not in {"invoking", "outcome_unknown"}
+        ):
+            raise ProviderAccessDenied(
+                "provider_invocation_outcome_unknown"
+            )
+
+        readiness_failed = False
+        try:
+            recoverable = isinstance(
+                self._invoker,
+                RecoverableProviderInvoker,
+            )
+            ready = (
+                recoverable
+                and self._invoker.operation_recovery_ready is True
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            readiness_failed = True
+            recoverable = False
+            ready = False
+        if readiness_failed:
+            raise ProviderAccessDenied(
+                "provider_operation_recovery_failed"
+            )
+        if not ready or not recoverable:
+            raise ProviderAccessDenied(
+                "provider_invocation_outcome_unknown"
+            )
+
+        recovery_failed = False
+        try:
+            recovery = self._invoker.recover(
+                route,
+                operation_id=grant.grant_id,
+                request_payload_digest=request_payload_digest,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            recovery_failed = True
+            recovery = None
+        if recovery_failed:
+            raise ProviderAccessDenied(
+                "provider_operation_recovery_failed"
+            )
+        if (
+            type(recovery) is not ProviderOperationRecovery
+            or recovery.operation_id != grant.grant_id
+            or recovery.route_id != route.route_id
+            or recovery.request_payload_digest
+            != request_payload_digest
+        ):
+            raise ProviderAccessDenied(
+                "invalid_provider_operation_recovery"
+            )
+
+        if recovery.state in {
+            ProviderOperationState.IN_PROGRESS,
+            ProviderOperationState.UNKNOWN,
+        }:
+            raise ProviderAccessDenied(
+                "provider_invocation_outcome_unknown"
+            )
+        if recovery.state is ProviderOperationState.NOT_STARTED:
+            if invocation.state != "outcome_unknown":
+                # A raw `invoking` row may still have a live/zombie caller.
+                raise ProviderAccessDenied(
+                    "provider_invocation_outcome_unknown"
+                )
+            retry_failed = False
+            retry_unknown = False
+            retry_unavailable = False
+            retry_replayed = False
+            try:
+                claim = (
+                    self._recovery_journal
+                    .claim_provider_retry_from_evidence(
+                        grant_id=grant.grant_id,
+                        token_digest=_token_digest(grant.token),
+                        binding_digest=grant.binding_digest,
+                        route_id=route.route_id,
+                        expires_at=grant.expires_at,
+                        request_payload_digest=(
+                            request_payload_digest
+                        ),
+                        evidence_digest=(
+                            recovery.evidence_digest
+                        ),
+                        verifier_id=recovery.verifier_id,
+                        now=_timestamp(self._clock()),
+                    )
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except RemoteProviderInvocationUnknown:
+                retry_unknown = True
+                claim = None
+            except RemoteProviderGrantUnavailable:
+                retry_unavailable = True
+                claim = None
+            except RemoteProviderInvocationConflict as exc:
+                retry_replayed = (
+                    exc.args
+                    == ("provider_recovery_evidence_replayed",)
+                )
+                retry_failed = not retry_replayed
+                claim = None
+            except BaseException:
+                retry_failed = True
+                claim = None
+            if retry_unavailable:
+                raise ProviderAccessDenied(
+                    "provider_grant_unavailable"
+                )
+            if retry_replayed:
+                raise ProviderAccessDenied(
+                    "provider_operation_recovery_replayed"
+                )
+            if retry_unknown:
+                raise ProviderAccessDenied(
+                    "provider_invocation_outcome_unknown"
+                )
+            if retry_failed or claim is None:
+                raise ProviderAccessDenied(
+                    "provider_grant_registry_unavailable"
+                )
+            return claim
+
+        if recovery.state is not ProviderOperationState.COMPLETED:
+            raise ProviderAccessDenied(
+                "invalid_provider_operation_recovery"
+            )
+        response = recovery.content
+        if (
+            not isinstance(response, bytes)
+            or not response
+            or len(response) > route.maximum_response_bytes
+            or recovery.response_digest is None
+            or hashlib.sha256(response).hexdigest()
+            != recovery.response_digest
+        ):
+            raise ProviderAccessDenied(
+                "invalid_provider_operation_recovery"
+            )
+        response_digest = recovery.response_digest
+        artifact_ref = self._persist_provider_result(
+            grant,
+            route,
+            response,
+            response_digest=response_digest,
+            request_payload_digest=request_payload_digest,
+        )
+        completion_failed = False
+        try:
+            self._recovery_journal.complete_provider_invocation_from_evidence(
+                grant_id=grant.grant_id,
+                token_digest=_token_digest(grant.token),
+                binding_digest=grant.binding_digest,
+                route_id=route.route_id,
+                expires_at=grant.expires_at,
+                request_payload_digest=request_payload_digest,
+                response_digest=response_digest,
+                response_artifact_ref=(
+                    None
+                    if artifact_ref is None
+                    else _provider_result_ref_json(artifact_ref)
+                ),
+                evidence_digest=recovery.evidence_digest,
+                verifier_id=recovery.verifier_id,
+                now=_timestamp(self._clock()),
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
             completion_failed = True
         if completion_failed:
             raise ProviderAccessDenied(
@@ -1207,10 +1570,14 @@ __all__ = [
     "MAX_PROVIDER_REQUEST_BYTES",
     "MAX_PROVIDER_RESPONSE_BYTES",
     "PROVIDER_ACCESS_SCHEMA_VERSION",
+    "PROVIDER_OPERATION_RECOVERY_SCHEMA_VERSION",
     "ProviderAccessBroker",
     "ProviderAccessDenied",
     "ProviderAccessGrant",
     "ProviderInvocationResult",
     "ProviderInvoker",
+    "ProviderOperationRecovery",
+    "ProviderOperationState",
     "ProviderRouteDescriptor",
+    "RecoverableProviderInvoker",
 ]

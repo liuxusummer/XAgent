@@ -48,7 +48,7 @@ Round 1：通过。
 - 消费在同类事务中校验 exact route/binding/expiry 和 constant-time token digest，
   再以 `state = 'issued'` 条件更新；
 - 任一绑定不一致统一返回 unavailable，不泄露哪一字段匹配；
-- v1/v2 只在 exact schema/version 校验成功后迁移；当前实现于单事务直接升级到 v4，
+- v1/v2 只在 exact schema/version 校验成功后迁移；当前实现于单事务直接升级到 v5，
   仍覆盖本阶段 v3 grant/clock schema，半迁移或未知 table/index/trigger/view
   fail closed。
 
@@ -56,8 +56,8 @@ Round 1：通过。
 
 - `test_separate_registries_serialize_issue_and_consume`
 - `test_wrong_authorization_and_tampering_do_not_consume`
-- `test_exact_v1_schema_migrates_atomically_to_v4`
-- `test_exact_v2_schema_migrates_atomically_to_v4`
+- `test_exact_v1_schema_migrates_atomically_to_v5`
+- `test_exact_v2_schema_migrates_atomically_to_v5`
 
 Round 2：通过。
 
@@ -99,7 +99,9 @@ Round 3：在声明的本机 anti-replay 范围内通过。
 
 - completed provider invocation/result receipt 与响应重放已在后续阶段完成，见
   [Provider Invocation Receipt 三轮对抗性审查](provider-invocation-receipt-adversarial-review.md)；
-- 明确的上游 idempotency key 和 unknown-outcome operator protocol；
+- provider operation evidence 已在后续阶段完成，见
+  [Provider Operation Recovery 三轮对抗性审查](provider-operation-recovery-adversarial-review.md)；
+- 仍需生产级 upstream idempotency ledger 和 unknown-outcome operator protocol；
 - secret-manager backed、mTLS、egress allowlist 与 attested ProviderInvoker；
 - 跨主机线性一致存储或单写者 fencing；
 - 接入远程 Agent 前，对 request Artifact、逐工具 receipt、最终 Activity receipt 和

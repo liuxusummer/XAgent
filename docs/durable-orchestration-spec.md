@@ -460,10 +460,13 @@ digest、AgentActivityRequest Artifact digest、route 和 invocation index。bea
 token-free binding digest。同一逻辑 invocation 在墓碑窗口内只能签发一次，兑换必须先
 原子标记 consumed 再调用 provider。
 
-当前 `ProviderAccessBroker` 只有进程内 registry，重启后既有 token fail closed，但不能
-恢复签发响应或 provider invocation 结果，也不能跨副本原子消费；因此
-`production_security_ready=false`。生产 remote Agent 必须补齐 durable tombstone、
-invocation receipt、mTLS/attestation、egress policy 和 secret-manager backed invoker。
+当前 `ProviderAccessBroker` 可注入隔离的磁盘 `RemoteExecutionJournal`，跨进程原子
+消费 grant、恢复 completed result，并可接受部署侧
+`RecoverableProviderInvoker` 的 NOT_STARTED/COMPLETED operation evidence。普通
+invoker 和无法验证的状态仍 fail closed；参考实现也不能证明外部 gateway 的线性一致
+幂等账本或 attestation，因此 `production_security_ready=false`。生产 remote Agent
+仍必须补齐 mTLS/attestation、egress policy、secret-manager backed invoker、跨主机
+一致性和完整 Agent receipt 组合。
 完整约束见
 [Provider Credential 与模型网关边界](provider-credential-boundary.md)。
 
