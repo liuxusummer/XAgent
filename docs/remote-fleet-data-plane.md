@@ -39,6 +39,7 @@ from src.orchestration import (
     DeterministicRemoteScheduler,
     DurableFleetReconciler,
     DurableFleetProjector,
+    DurableMaintenanceSupervisor,
     DurableStoreFleetRunSource,
     FleetToolRoutingPolicy,
     FleetWorkerPolicy,
@@ -122,8 +123,24 @@ fleet_reconciler = DurableFleetReconciler(
     run_source,
     durable_schedulers.__getitem__,
 )
-fleet_reconciler.run_once()
+maintenance = DurableMaintenanceSupervisor(
+    scheduler.store,
+    maintenance_scheduler_resolver,
+    fleet_control=fleet_reconciler,
+)
+production_remote_control.bind_maintenance_gate(maintenance)
+if not maintenance.bootstrap().healthy:
+    raise RuntimeError("durable maintenance bootstrap did not converge")
 ```
+
+服务事件循环随后显式、串行调用 `maintenance.run_once()`；绑定后的控制面把
+`maintenance.production_security_ready` 纳入 Worker poll/new-claim 门禁。它不是通用
+HTTP liveness，维护失效时仍需允许已有 authority 的 heartbeat/completion/cancel
+收敛。不能只周期调用 Fleet reconciler 而漏掉 deadline、lease 和 Domain reconcile；
+具体顺序、积压与错误脱敏契约见
+[生产维护循环](orchestration-maintenance.md)。
+`poll_fleet` 和最终 `claim_for_fleet` 都会复验这个 gate；未绑定、尚未 bootstrap、
+轮次失败或 freshness 过期时均返回 `security_not_ready`，且不会创建 Attempt。
 
 `production_remote_control` 仍须满足 HTTPS 文档中的 durable journal、production-ready
 two-phase admission 和 reference fallback 禁用要求。`DurableFleetReconciler` 也不会

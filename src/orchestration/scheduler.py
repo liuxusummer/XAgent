@@ -1981,7 +1981,16 @@ class DurableScheduler:
                 return True
             if node.status is NodeStatus.WAITING_RETRY:
                 due_at = node.metadata.get("retry_due_at")
-                if isinstance(due_at, (int, float)) and now >= float(due_at):
+                if (
+                    isinstance(due_at, bool)
+                    or not isinstance(due_at, (int, float))
+                    or not math.isfinite(float(due_at))
+                    or float(due_at) < 0
+                ):
+                    raise SchedulerStateError(
+                        "persisted retry deadline is invalid"
+                    )
+                if now >= float(due_at):
                     self._transition_node(
                         run_id,
                         node_id,

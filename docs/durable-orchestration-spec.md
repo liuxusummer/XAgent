@@ -938,6 +938,15 @@ Pause 与 Cancel 不同：
 
 恢复器禁止仅依据 Web 聊天状态、`Session.history`、`latest.json` 或 telemetry 判断任务状态。
 
+生产部署使用显式 `DurableMaintenanceSupervisor.bootstrap()` 实现上述启动顺序，并在
+成功后周期调用 `run_once()`。每轮固定为 deadline → lease recovery → 受影响 Run 的
+Domain reconcile → Fleet projection。任一阶段失败或扫描数达到上限时，旧 queued
+Fleet projection 必须 quarantine，且组合 readiness 保持 false；不能因为本轮已经
+安全提交部分恢复结果就开放新 admission。新进程没有可继承的健康状态，必须重新
+bootstrap。监督器不启动线程，进程管理器负责调度频率；超过配置的 monotonic freshness
+窗口同样失去 readiness。完整契约见
+[生产维护循环](orchestration-maintenance.md)。
+
 ## 12. Domain Event 与 Telemetry 分离
 
 | 项目 | Domain Event | Telemetry Event |

@@ -44,6 +44,7 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             "WorkflowCompiler",
             # Deadline / Hierarchy.
             "DurableDeadlineScanner",
+            "DurableMaintenanceSupervisor",
             "DurableHierarchy",
             "WorkflowRegistry",
             # Policy / Executor.

@@ -82,6 +82,15 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "MCPServer",
         "PerContextRateLimiter",
     ),
+    ".maintenance": (
+        "DurableMaintenanceSupervisor",
+        "MaintenanceConfigurationError",
+        "MaintenanceCycleConflict",
+        "MaintenanceCycleReport",
+        "MaintenanceFailure",
+        "MaintenanceFleetControl",
+        "MaintenanceNotBootstrapped",
+    ),
     ".models": (
         "AttemptRecord",
         "AttemptStatus",
@@ -163,7 +172,10 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
     ),
     ".process_backend": ("LocalProcessSupervisorBackend",),
     ".oci_backend": ("OciGvisorSandboxBackend",),
-    ".remote_control": ("RemoteControlPlane",),
+    ".remote_control": (
+        "RemoteAdmissionMaintenanceGate",
+        "RemoteControlPlane",
+    ),
     ".remote_journal": ("RemoteControlJournal",),
     ".remote_execution_journal": (
         "RemoteExecutionBindingRecord",

@@ -197,6 +197,18 @@ class RemoteFleetPoller(Protocol):
     ) -> None: ...
 
 
+@runtime_checkable
+class RemoteAdmissionMaintenanceGate(Protocol):
+    """Fresh fail-closed maintenance readiness for new remote claims."""
+
+    @property
+    def production_security_ready(self) -> bool: ...
+
+    def admission_linearization_guard(self) -> Any: ...
+
+    def admission_linearization_ready(self) -> bool: ...
+
+
 @dataclass(frozen=True, slots=True)
 class RemoteAdmissionAuthorization:
     """Opaque control-local ticket plus digest-only durable policy binding."""
@@ -349,6 +361,7 @@ class RemoteControlPlane:
         self._inflight: dict[tuple[str, str, str], _Inflight] = {}
         self._worker_session_guards: dict[str, _WorkerSessionGuard] = {}
         self._fleet_poller: RemoteFleetPoller | None = None
+        self._maintenance_gate: RemoteAdmissionMaintenanceGate | None = None
 
     @property
     def production_security_ready(self) -> bool:
@@ -371,6 +384,22 @@ class RemoteControlPlane:
                 self.production_security_ready
                 and poller is not None
                 and poller.production_security_ready is True
+                and self.production_maintenance_ready
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            return False
+
+    @property
+    def production_maintenance_ready(self) -> bool:
+        """Whether fresh durable maintenance permits new remote admission."""
+
+        gate = self._maintenance_gate
+        try:
+            return (
+                gate is not None
+                and gate.production_security_ready is True
             )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -413,6 +442,21 @@ class RemoteControlPlane:
             if self._fleet_poller is not None:
                 raise RemoteControlError("already_registered")
             self._fleet_poller = poller
+
+    def bind_maintenance_gate(
+        self,
+        gate: RemoteAdmissionMaintenanceGate,
+    ) -> None:
+        """Bind one fresh maintenance gate before exposing Fleet polls."""
+
+        if not isinstance(gate, RemoteAdmissionMaintenanceGate):
+            raise TypeError(
+                "gate must implement RemoteAdmissionMaintenanceGate"
+            )
+        with self._lock:
+            if self._maintenance_gate is not None:
+                raise RemoteControlError("already_registered")
+            self._maintenance_gate = gate
 
     def handle(
         self,
@@ -901,10 +945,7 @@ class RemoteControlPlane:
     ) -> dict[str, Any]:
         poller = self._fleet_poller
         try:
-            ready = (
-                poller is not None
-                and poller.production_security_ready is True
-            )
+            ready = self.production_fleet_ready
         except (KeyboardInterrupt, SystemExit):
             raise
         except BaseException as exc:
@@ -948,7 +989,10 @@ class RemoteControlPlane:
     ) -> WorkAssignment:
         """Trusted Fleet callback that preserves current session authority."""
 
-        if not self.production_security_ready:
+        if (
+            not self.production_security_ready
+            or not self.production_maintenance_ready
+        ):
             raise RemoteControlError("security_not_ready")
         if (
             isinstance(lease_seconds, bool)
@@ -1020,6 +1064,12 @@ class RemoteControlPlane:
         fleet_admission: Mapping[str, object] | None = None,
         fleet_shard_ownership: Mapping[str, object] | None = None,
     ) -> WorkAssignment | None:
+        gate = self._maintenance_gate
+        if (
+            gate is not None
+            and not self.production_maintenance_ready
+        ):
+            raise RemoteControlError("security_not_ready")
         if not self._authorize_run(identity, run_id):
             raise RemoteControlError("forbidden")
         scheduler = self._scheduler(run_id)
@@ -1200,10 +1250,12 @@ class RemoteControlPlane:
                     fleet_shard_ownership=fleet_shard_ownership,
                     hierarchy_admission=hierarchy_admission,
                     linearization_guard=lambda: (
-                        self._worker_session_guard(identity.worker_id)
+                        self._admission_linearization_guard(
+                            identity.worker_id
+                        )
                     ),
                     linearization_validator=lambda: (
-                        self._registration_is_current(registration)
+                        self._admission_linearization_ready(registration)
                     ),
                 )
             except (KeyboardInterrupt, SystemExit):
@@ -1215,6 +1267,11 @@ class RemoteControlPlane:
                     raise RemoteControlError(
                         "worker_identity_mismatch"
                     )
+                if (
+                    self._maintenance_gate is not None
+                    and not self.production_maintenance_ready
+                ):
+                    raise RemoteControlError("security_not_ready")
                 claim = None
                 authorization = None
             except (
@@ -1550,6 +1607,37 @@ class RemoteControlPlane:
         ):
             raise RemoteControlError("security_not_ready")
         return adapter
+
+    @contextmanager
+    def _admission_linearization_guard(
+        self,
+        worker_id: str,
+    ):
+        """Serialize session and maintenance authority before Store claim."""
+
+        with self._worker_session_guard(worker_id):
+            gate = self._maintenance_gate
+            if gate is None:
+                yield
+                return
+            with gate.admission_linearization_guard():
+                yield
+
+    def _admission_linearization_ready(
+        self,
+        registration: WorkerRegistration,
+    ) -> bool:
+        if not self._registration_is_current(registration):
+            return False
+        gate = self._maintenance_gate
+        if gate is None:
+            return True
+        try:
+            return gate.admission_linearization_ready() is True
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            return False
 
     def _authorize_claim(
         self,
@@ -1981,6 +2069,7 @@ def _detach(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 __all__ = [
+    "RemoteAdmissionMaintenanceGate",
     "RemoteAssignmentAdmitter",
     "RemoteCompletionCandidate",
     "RemoteControlError",

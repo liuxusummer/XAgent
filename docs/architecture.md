@@ -138,6 +138,11 @@
   Store 重新投影，不能把内存队列或 journal 当作 Domain 事实源。完整边界见
   `docs/distributed-execution-adr.md`、
   `docs/remote-execution-recovery.md` 和 `docs/remote-fleet-data-plane.md`。
+- 生产维护由显式 `DurableMaintenanceSupervisor` 串行组合 restart bootstrap、
+  deadline、lease recovery、Domain reconcile 和 Fleet projection。它不启动线程；
+  扫描触顶、任一阶段失败或成功轮次过期都会撤空 queued Fleet projection 并失去
+  readiness。报告只含计数和固定错误码，不携带 Event、ID、异常文本或宿主路径。
+  部署契约见 `docs/orchestration-maintenance.md`。
 
 ## 3. 核心数据流
 

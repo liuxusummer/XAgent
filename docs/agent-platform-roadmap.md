@@ -160,8 +160,14 @@ generation-fenced enable/withdraw authority. A
 control-plane-isolated durable source rehydrates only enabled running routes,
 binds their physical Store identity, and admission schema v2 validates the route
 inside the claim transaction and start trigger. Static routing is explicitly
-reference-only. Shared broker consensus, automated route lifecycle, and
-deployment-grade failure detection remain outside this slice.
+reference-only. An explicit production maintenance supervisor now composes
+restart bootstrap, deadline, lease recovery, Domain reconcile, and Fleet
+projection in fail-closed order. Scan saturation, stage failure, or stale
+success freshness quarantines queued work and removes readiness; reports expose
+only bounded counts and codes. Shared broker consensus, automated route
+lifecycle, and automatic owner failure detection remain outside this slice.
+The three-round recovery/concurrency/restart review is recorded in
+[`orchestration-maintenance-adversarial-review.md`](orchestration-maintenance-adversarial-review.md).
 
 ### Phase 6 — Production and project presentation
 

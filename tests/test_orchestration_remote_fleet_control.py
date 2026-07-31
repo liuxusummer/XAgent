@@ -249,6 +249,148 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
         self.assertEqual(fleet.snapshot().active_assignments, 0)
         self.assertEqual(fleet.snapshot().task_bindings, 0)
 
+    def test_stale_maintenance_gate_blocks_new_fleet_claims(self) -> None:
+        fleet, _poller = self._compose()
+        fleet.admit(self._binding())
+        self.harness.maintenance_gate.set_ready(False)
+
+        with self.assertRaisesRegex(
+            RemoteWorkerError,
+            "security_not_ready",
+        ):
+            self.client.poll_fleet()
+
+        self.assertEqual(
+            self.harness.store.list_attempts("run-remote"),
+            [],
+        )
+        self.assertFalse(self.harness.control.production_fleet_ready)
+
+        self.harness.maintenance_gate.set_ready(True)
+        assignment = self.client.poll_fleet()
+        self.assertIsNotNone(assignment)
+
+    def test_maintenance_revocation_wins_before_claim_linearization(
+        self,
+    ) -> None:
+        admitter = protocol_tests._BlockingAdmitter(
+            self.harness.artifacts
+        )
+        control = RemoteControlPlane(
+            lambda _run_id: self.harness.scheduler,
+            authorize_run=lambda identity, run_id: (
+                identity.tenant_id == "tenant-1"
+                and run_id == "run-remote"
+            ),
+            assignment_admitter=admitter,
+            journal=RemoteControlJournal(
+                self.harness.control_root
+                / "maintenance-linearization.sqlite3"
+            ),
+        )
+        gate = protocol_tests._MaintenanceGate()
+        control.bind_maintenance_gate(gate)
+        client = RemoteWorkerClient(
+            lambda request: control.handle(
+                self.harness.identity,
+                request,
+            ),
+            worker_id="worker-1",
+            instance_id="maintenance-linearization-instance",
+        )
+        client.register(
+            runtime_version="1.0",
+            capabilities=("activity.tool", "artifact.refs"),
+            resource_keys=("workspace:project",),
+            activity_kinds=("tool",),
+            max_concurrency=1,
+        )
+        claimer = RemoteControlFleetClaimer(control)
+        fleet = RemoteFleetCoordinator(
+            lambda: DeterministicRemoteScheduler(),
+            claimer,
+        )
+        poller = SecureRemoteFleetPoller(
+            fleet,
+            StaticFleetWorkerResolver(
+                [
+                    FleetWorkerPolicy(
+                        "worker-1",
+                        "tenant-1",
+                        "pool-a",
+                        frozenset({"inspect"}),
+                        frozenset(
+                            {"activity.tool", "artifact.refs"}
+                        ),
+                        frozenset({"workspace:project"}),
+                    )
+                ]
+            ),
+            claimer,
+        )
+        control.bind_fleet_poller(poller)
+        fleet.admit(self._binding())
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                client.poll_fleet()
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=poll)
+        thread.start()
+        self.assertTrue(admitter.entered.wait(timeout=5))
+        gate.set_ready(False)
+        admitter.release.set()
+        thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RemoteWorkerError)
+        self.assertIn("control_unavailable", str(errors[0]))
+        self.assertEqual(
+            self.harness.store.list_attempts("run-remote"),
+            [],
+        )
+
+    def test_fleet_requires_an_explicit_maintenance_gate(self) -> None:
+        control = RemoteControlPlane(
+            lambda _run_id: self.harness.scheduler,
+            authorize_run=lambda _identity, _run_id: True,
+            assignment_admitter=self.harness.admitter,
+            journal=RemoteControlJournal(
+                self.harness.control_root / "ungated-fleet.sqlite3"
+            ),
+        )
+        claimer = RemoteControlFleetClaimer(control)
+        fleet = RemoteFleetCoordinator(
+            lambda: DeterministicRemoteScheduler(),
+            claimer,
+        )
+        poller = SecureRemoteFleetPoller(
+            fleet,
+            StaticFleetWorkerResolver(
+                [
+                    FleetWorkerPolicy(
+                        "worker-1",
+                        "tenant-1",
+                        "pool-a",
+                        frozenset({"inspect"}),
+                        frozenset(
+                            {"activity.tool", "artifact.refs"}
+                        ),
+                        frozenset({"workspace:project"}),
+                    )
+                ]
+            ),
+            claimer,
+        )
+        control.bind_fleet_poller(poller)
+
+        self.assertFalse(control.production_fleet_ready)
+        self.assertFalse(control.production_maintenance_ready)
+
     def test_route_withdrawal_fences_claimed_work_before_start(
         self,
     ) -> None:
@@ -450,6 +592,7 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
                 self.harness.control_root / "fleet-shards.sqlite3"
             ),
         )
+        control.bind_maintenance_gate(protocol_tests._MaintenanceGate())
         client = RemoteWorkerClient(
             lambda request: control.handle(
                 self.harness.identity,
@@ -582,6 +725,7 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
                 self.harness.control_root / "fleet-two.sqlite3"
             ),
         )
+        control.bind_maintenance_gate(protocol_tests._MaintenanceGate())
         client = RemoteWorkerClient(
             lambda request: control.handle(
                 self.harness.identity,
@@ -705,6 +849,7 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
                 self.harness.control_root / "fleet-target-kind.sqlite3"
             ),
         )
+        control.bind_maintenance_gate(protocol_tests._MaintenanceGate())
         client = RemoteWorkerClient(
             lambda request: control.handle(
                 self.harness.identity,

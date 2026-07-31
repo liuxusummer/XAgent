@@ -73,6 +73,26 @@ class _Clock:
         return self.now
 
 
+class _MaintenanceGate:
+    def __init__(self, ready: bool = True) -> None:
+        self.ready = ready
+        self._lock = threading.Lock()
+
+    @property
+    def production_security_ready(self) -> bool:
+        return self.ready
+
+    def admission_linearization_guard(self):
+        return self._lock
+
+    def admission_linearization_ready(self) -> bool:
+        return self.ready
+
+    def set_ready(self, ready: bool) -> None:
+        with self._lock:
+            self.ready = ready
+
+
 class _TestAdmitter:
     # Protocol harness only. Production signature/sandbox verification is
     # exercised by the worker-security integration tests.
@@ -490,7 +510,7 @@ class RemoteProtocolTests(unittest.TestCase):
         self.client = self._client(self.control)
 
     def _control(self) -> RemoteControlPlane:
-        return RemoteControlPlane(
+        control = RemoteControlPlane(
             lambda run_id: self.scheduler
             if run_id == "run-remote"
             else (_ for _ in ()).throw(KeyError(run_id)),
@@ -500,6 +520,9 @@ class RemoteProtocolTests(unittest.TestCase):
             assignment_admitter=self.admitter,
             journal=RemoteControlJournal(self.journal_path),
         )
+        self.maintenance_gate = _MaintenanceGate()
+        control.bind_maintenance_gate(self.maintenance_gate)
+        return control
 
     def _client(
         self,

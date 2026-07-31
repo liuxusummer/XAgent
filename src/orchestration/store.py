@@ -3472,6 +3472,128 @@ class DurableRunStore:
             ).fetchall()
         return [self._run_from_row(row) for row in rows]
 
+    def list_nonterminal_runs(
+        self,
+        *,
+        limit: int = 1_000,
+    ) -> list[RunRecord]:
+        """Read one bounded point-in-time snapshot of active Run projections."""
+
+        bounded_limit = _bounded_limit(limit, maximum=10_001)
+        active_statuses = tuple(
+            status.value for status in RunStatus if not status.is_terminal
+        )
+        placeholders = ",".join("?" for _ in active_statuses)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM runs
+                WHERE status IN ({placeholders})
+                ORDER BY created_at DESC, run_id
+                LIMIT ?
+                """,
+                (*active_statuses, bounded_limit),
+            ).fetchall()
+        return [self._run_from_row(row) for row in rows]
+
+    def list_runs_with_due_retries(
+        self,
+        *,
+        now: float | None = None,
+        limit: int = 100,
+    ) -> list[RunRecord]:
+        """Return RUNNING Runs with due or malformed retry projections."""
+
+        current_time = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        bounded_limit = _bounded_limit(limit, maximum=1_000)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT r.*
+                FROM runs AS r
+                WHERE r.status = ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM node_runs AS n
+                      WHERE n.run_id = r.run_id
+                        AND n.status = ?
+                        AND (
+                            (
+                                json_type(
+                                    n.metadata_json,
+                                    '$.retry_due_at'
+                                ) IN ('integer', 'real')
+                                AND CAST(
+                                    json_extract(
+                                        n.metadata_json,
+                                        '$.retry_due_at'
+                                    ) AS REAL
+                                ) <= ?
+                            )
+                            OR json_type(
+                                n.metadata_json,
+                                '$.retry_due_at'
+                            ) IS NULL
+                            OR json_type(
+                                n.metadata_json,
+                                '$.retry_due_at'
+                            ) NOT IN ('integer', 'real')
+                            OR CAST(
+                                json_extract(
+                                    n.metadata_json,
+                                    '$.retry_due_at'
+                                ) AS REAL
+                            ) < 0
+                        )
+                  )
+                ORDER BY r.updated_at, r.run_id
+                LIMIT ?
+                """,
+                (
+                    RunStatus.RUNNING.value,
+                    NodeStatus.WAITING_RETRY.value,
+                    current_time,
+                    bounded_limit,
+                ),
+            ).fetchall()
+        return [self._run_from_row(row) for row in rows]
+
+    def list_runs_with_active_hierarchy(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[RunRecord]:
+        """Return RUNNING Runs whose hierarchy controls need observation."""
+
+        bounded_limit = _bounded_limit(limit, maximum=1_000)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT r.*
+                FROM runs AS r
+                WHERE r.status = ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM node_runs AS n
+                      WHERE n.run_id = r.run_id
+                        AND n.status = ?
+                        AND n.node_type IN ('map', 'subworkflow')
+                  )
+                ORDER BY r.updated_at, r.run_id
+                LIMIT ?
+                """,
+                (
+                    RunStatus.RUNNING.value,
+                    NodeStatus.RUNNING.value,
+                    bounded_limit,
+                ),
+            ).fetchall()
+        return [self._run_from_row(row) for row in rows]
+
     def list_child_runs(
         self,
         parent_run_id: str,

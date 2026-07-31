@@ -47,6 +47,7 @@ class DeadlineReport:
     skipped_races: tuple[str, ...]
     triggered_runs: tuple[str, ...]
     runs_to_reconcile: tuple[str, ...]
+    run_deadlines_scanned: int = 0
 
 
 class DurableDeadlineScanner:
@@ -204,6 +205,7 @@ class DurableDeadlineScanner:
             skipped_races=tuple(sorted(set(skipped))),
             triggered_runs=tuple(sorted(triggered_runs)),
             runs_to_reconcile=tuple(sorted(run_ids)),
+            run_deadlines_scanned=len(expired_runs),
         )
 
     def _resolution(

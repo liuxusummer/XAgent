@@ -455,7 +455,7 @@ class DurableFleetReconciler:
             raise
         except BaseException as exc:
             try:
-                self._fleet.reconcile_queued(())
+                self.quarantine()
             except (KeyboardInterrupt, SystemExit):
                 raise
             except BaseException as quarantine_error:
@@ -464,6 +464,11 @@ class DurableFleetReconciler:
                     f"{type(quarantine_error).__name__}"
                 )
             raise
+
+    def quarantine(self) -> FleetQueueReconcileReport:
+        """Withdraw queued projection without revoking active authority."""
+
+        return self._fleet.reconcile_queued(())
 
     def _run_once(self) -> FleetProjectionReconcileReport:
         try:

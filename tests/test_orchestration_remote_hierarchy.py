@@ -11,6 +11,7 @@ from unittest.mock import patch
 from src.orchestration.artifacts import ArtifactKind, LocalArtifactStore
 from src.orchestration.hierarchy import DurableHierarchy, WorkflowRegistry
 from src.orchestration.models import AttemptStatus, RunStatus
+from src.orchestration.maintenance import DurableMaintenanceSupervisor
 from src.orchestration.remote_control import RemoteControlPlane
 from src.orchestration.remote_journal import RemoteControlJournal
 from src.orchestration.remote_protocol import AuthenticatedWorker
@@ -308,6 +309,55 @@ class RemoteHierarchyAdmissionTests(unittest.TestCase):
         )
         for _ in range(8):
             scheduler.reconcile("root-run")
+        self.assertEqual(
+            self.store.get_run("root-run").status,
+            RunStatus.COMPLETED,
+        )
+
+    def test_maintenance_converges_parent_after_remote_child_completion(
+        self,
+    ):
+        hierarchy, scheduler = self._runtime()
+        supervisor = DurableMaintenanceSupervisor(
+            self.store,
+            lambda run: hierarchy.scheduler_for_run(
+                scheduler,
+                run.run_id,
+            ),
+            wall_clock=self.clock,
+            monotonic_clock=self.clock,
+            scan_limit=16,
+        )
+        self.assertTrue(supervisor.bootstrap().healthy)
+        _control, client = self._client(
+            hierarchy,
+            scheduler,
+            journal_name="maintenance-hierarchy.sqlite3",
+        )
+        assignment = client.poll("root-run")
+        assert assignment is not None
+        client.start(assignment.claim)
+        handles = tuple(
+            grant.output_handle
+            for grant in assignment.output_grants
+        )
+        client.complete(
+            assignment.claim,
+            RemoteExecutionOutcome(
+                "succeeded",
+                handles,
+                _runtime_proof(
+                    assignment,
+                    outcome="succeeded",
+                    output_handles=handles,
+                ),
+            ),
+        )
+
+        report = supervisor.run_once()
+
+        self.assertTrue(report.healthy)
+        self.assertEqual(report.hierarchy_runs_scanned, 1)
         self.assertEqual(
             self.store.get_run("root-run").status,
             RunStatus.COMPLETED,
