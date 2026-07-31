@@ -1,0 +1,29 @@
+docs/architecture.md
+  s_72af05a5dabd4c::t_ac94fbb4c72cf3 111-115,133
+docs/durable-orchestration-fault-matrix.md
+  s_72af05a5dabd4c::t_e815779e71a47f 59
+src/orchestration/hierarchy.py
+  s_72af05a5dabd4c::t_f337896c52a46c 25,34-35,349-351,515-694
+src/orchestration/remote_control.py
+  s_72af05a5dabd4c::t_cc2d36550b172e 51,1078,1084,1086-1109,1201,1315-1318,1351-1353
+tests/test_orchestration_store.py
+  s_72af05a5dabd4c::t_d474c0a1e2333a 2585,2645,2719,3200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3416dfc15208e8f6fe30232ec1b5401eed84c975",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
