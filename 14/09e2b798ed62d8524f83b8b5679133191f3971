@@ -1,0 +1,51 @@
+README.md
+  s_72af05a5dabd4c::t_d68e81f336f69c 206-214
+docs/agent-platform-roadmap.md
+  s_72af05a5dabd4c::t_1c0d2e177ea6e2 157-164
+docs/architecture.md
+  s_72af05a5dabd4c::t_56f0f10bde98bd 128-131
+docs/distributed-execution-adr.md
+  s_72af05a5dabd4c::t_44c4fc6d463f6c 346-349
+docs/distributed-execution-quickstart.md
+  s_72af05a5dabd4c::t_082ee56688602e 113
+docs/durable-orchestration-spec.md
+  s_72af05a5dabd4c::t_50e40476eef0df 1211-1214
+docs/remote-fleet-adversarial-review.md
+  s_72af05a5dabd4c::t_1459195d7b9229 1,373,376-436,450-453
+docs/remote-fleet-data-plane.md
+  s_72af05a5dabd4c::t_bdf18f9f6ca3fa 42,108-116,132-148,202-209,217,244-245,290-293,296-298,311-312
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_52e2b7a17c8fab 196,242-244
+src/orchestration/remote_fleet.py
+  s_72af05a5dabd4c::t_21f8c8e4aa7d09 81,113-122,140,536
+src/orchestration/remote_fleet_control.py
+  s_72af05a5dabd4c::t_7358ae45193305 45,401,405-427,532-536,633-634
+src/orchestration/remote_fleet_reconcile.py
+  s_72af05a5dabd4c::t_893d2c7209d5df 29-34,37-64,86-87,108-134,146,148-149,191-364,391,401-411,435-436,444,479-482,552-574,623,655
+src/orchestration/remote_scheduling.py
+  s_72af05a5dabd4c::t_da6a0ea2d52b25 45-46,398-399,402-405,409-415,440-446,463,474-476,1178,1195-1200,1322
+tests/test_orchestration_remote_fleet.py
+  s_72af05a5dabd4c::t_f8a19504a25e22 216
+tests/test_orchestration_remote_fleet_control.py
+  s_72af05a5dabd4c::t_8d46cbd88de5f3 5,7,122-127,233-242,252-337,499-504,623-628,723-728,741,768,909,1076,1262
+tests/test_orchestration_scheduler.py
+  s_72af05a5dabd4c::t_b27e724e4d4c36 201,222,952-1040
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1409e2b798ed62d8524f83b8b5679133191f3971",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
