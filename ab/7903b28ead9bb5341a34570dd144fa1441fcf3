@@ -1,0 +1,45 @@
+docs/agent-execution-manifest.md
+  s_72af05a5dabd4c::t_86b715d8c84add 188-191
+docs/agent-terminal-commit-adversarial-review.md
+  s_72af05a5dabd4c::t_a3384c3ce4fb27 1-54
+docs/agent-terminal-commit.md
+  s_72af05a5dabd4c::t_45338526196a10 1-77
+docs/architecture.md
+  s_72af05a5dabd4c::t_94abcf60f54f38 96-99
+docs/durable-orchestration-spec.md
+  s_72af05a5dabd4c::t_8ee4545206a4f1 344-346,359,749,1253
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_e668c8c59014e9 58-62,340-343
+src/orchestration/agent_terminal.py
+  s_72af05a5dabd4c::t_48750f397068a8 1-569
+src/orchestration/artifacts.py
+  s_72af05a5dabd4c::t_88c08adae8c6dc 5,61,407-410,412-419
+src/orchestration/store.py
+  s_72af05a5dabd4c::t_97febde162c001 1461-1531,8959,8990-9002,9088-9133
+src/orchestration/tool_receipt_artifact.py
+  s_72af05a5dabd4c::t_5d09b307f66d10 1-190
+tests/test_orchestration_agent_terminal.py
+  s_72af05a5dabd4c::t_f4ca06b20b512e 1-544
+tests/test_orchestration_artifacts.py
+  s_72af05a5dabd4c::t_7df0f75ee94870 92,182-183,185,190,198
+tests/test_orchestration_public_api.py
+  s_72af05a5dabd4c::t_404fcaf8a83e79 25-26,125-127,157-159,170-174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ab7903b28ead9bb5341a34570dd144fa1441fcf3",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
