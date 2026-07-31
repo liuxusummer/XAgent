@@ -2,7 +2,7 @@
 
 The event store only keeps :class:`ArtifactRef` metadata.  Artifact bytes are
 installed before an event may reference them, using a temporary file in the
-destination directory followed by an atomic ``os.replace``.  The local store
+destination directory followed by an atomic no-clobber link.  The local store
 does not encrypt content; deployments that need encryption must provide a
 different ``ArtifactStore`` implementation and report that fact in the
 reference metadata.
@@ -58,6 +58,7 @@ class ArtifactKind(StrEnum):
     AGENT_REQUEST = "agent_request"
     AGENT_EXECUTION_MANIFEST = "agent_execution_manifest"
     MODEL_RESPONSE = "model_response"
+    TOOL_RECEIPT = "tool_receipt"
     TOOL_RESULT = "tool_result"
     FILE_SNAPSHOT = "file_snapshot"
     REPORT = "report"
@@ -403,10 +404,19 @@ class LocalArtifactStore:
                 output.flush()
                 os.fsync(output.fileno())
             self._fault("after_temp_fsync", temporary_path)
+            # Preserve the historical fault-stage names while installing with
+            # no-clobber semantics.  Replacing an existing content-addressed
+            # path lets concurrent writers change its mtime, so equal writes
+            # can otherwise return unequal ArtifactRefs.
             self._fault("before_replace", path)
-            os.replace(temporary_path, path)
-            installed = True
-            temporary_path = None
+            try:
+                os.link(temporary_path, path)
+                installed = True
+            except FileExistsError:
+                installed = False
+            if installed:
+                temporary_path.unlink()
+                temporary_path = None
             self._fault("after_replace", path)
             self._fsync_directory(path.parent)
             self._fault("after_directory_fsync", path)

@@ -1458,6 +1458,77 @@ def _validate_agent_execution_manifest_ref(
         )
 
 
+def _verified_agent_completion_payload(
+    receipt: "AgentActivityReceipt",
+) -> dict[str, JsonValue]:
+    return {
+        "kind": "verified_agent_activity_completion",
+        "agent_activity_receipt": receipt.to_dict(),
+        "agent_activity_receipt_digest": receipt.receipt_digest,
+        "execution_manifest_digest": receipt.execution_manifest_digest,
+    }
+
+
+def _validate_verified_agent_completion(
+    *,
+    run_id: str,
+    node_id: str,
+    attempt: AttemptRecord,
+    record: IdempotencyRecord,
+    result: JsonValue,
+    event_payload: dict[str, JsonValue] | None,
+    attempt_status: AttemptStatus,
+    node_status: NodeStatus,
+    run_status: RunStatus | None,
+    receipt: "AgentActivityReceipt",
+) -> None:
+    from .agent_receipt import (
+        AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION,
+        AgentActivityReceipt,
+        AgentActivityVerification,
+        canonical_agent_result_digest,
+    )
+
+    if type(receipt) is not AgentActivityReceipt:
+        raise InvalidStateTransition(
+            "verified Agent completion requires a typed receipt"
+        )
+    if (
+        attempt.activity_kind != "agent"
+        or attempt_status is not AttemptStatus.SUCCEEDED
+        or node_status is not NodeStatus.SUCCEEDED
+        or run_status is not None
+        or receipt.schema_version
+        != AGENT_ACTIVITY_RECEIPT_SCHEMA_VERSION
+        or receipt.verification
+        is not AgentActivityVerification.RUNTIME_OBSERVED
+        or receipt.attempt_status is not AttemptStatus.SUCCEEDED
+        or not receipt.has_manifest_bound_tool_receipt_lineage
+        or receipt.run_id != run_id
+        or receipt.node_id != node_id
+        or receipt.attempt_id != attempt.attempt_id
+        or receipt.effect_class.value != attempt.effect_class
+        or receipt.request_digest != record.request_hash
+        or receipt.result_digest != canonical_agent_result_digest(result)
+        or receipt.result_artifact_digests
+        != _agent_result_ref_digests(result, "artifact_refs")
+        or receipt.tool_receipt_digests
+        != _agent_result_ref_digests(result, "tool_receipt_refs")
+        or not isinstance(result, Mapping)
+        or result.get("schema_version") != 1
+        or result.get("outcome") != "succeeded"
+    ):
+        raise InvalidStateTransition(
+            "verified Agent completion binding is invalid"
+        )
+    _validate_agent_execution_manifest_ref(result, receipt)
+    expected_payload = _verified_agent_completion_payload(receipt)
+    if event_payload != expected_payload:
+        raise InvalidStateTransition(
+            "verified Agent completion Event payload is invalid"
+        )
+
+
 def _canonical_optional_workflow_ref(value: Any) -> ArtifactRef | None:
     if value is None:
         return None
@@ -8885,6 +8956,7 @@ class DurableRunStore:
         attempt_status: AttemptStatus = AttemptStatus.SUCCEEDED,
         node_status: NodeStatus = NodeStatus.SUCCEEDED,
         run_status: RunStatus | None = None,
+        agent_activity_receipt: "AgentActivityReceipt | None" = None,
         now: float | None = None,
     ) -> tuple[IdempotencyRecord, EventRecord]:
         """Atomically persist a receipt, terminal Attempt, Node/Run, and Event."""
@@ -8915,6 +8987,19 @@ class DurableRunStore:
                 owner_id=owner_id,
                 claim_token=claim_token,
             )
+            if agent_activity_receipt is not None:
+                _validate_verified_agent_completion(
+                    run_id=run_id,
+                    node_id=node_id,
+                    attempt=attempt,
+                    record=record,
+                    result=result,
+                    event_payload=event_payload,
+                    attempt_status=attempt_status,
+                    node_status=node_status,
+                    run_status=run_status,
+                    receipt=agent_activity_receipt,
+                )
             if record.status is IdempotencyStatus.COMPLETED:
                 if _json_dump(record.result) != result_json:
                     raise IdempotencyConflictError(
@@ -8999,6 +9084,52 @@ class DurableRunStore:
             updated = self._get_idempotency_tx(conn, run_id, attempt.idempotency_key)
             assert updated is not None
             return updated, event
+
+    def complete_verified_agent_activity(
+        self,
+        run_id: str,
+        node_id: str,
+        attempt_id: str,
+        request_hash: str,
+        owner_id: str,
+        *,
+        claim_token: str,
+        result: JsonValue,
+        receipt: "AgentActivityReceipt",
+        now: float | None = None,
+    ) -> tuple[IdempotencyRecord, EventRecord]:
+        """Atomically accept one manifest-bound successful Agent terminal."""
+
+        from .agent_receipt import AgentActivityReceipt
+
+        if type(receipt) is not AgentActivityReceipt:
+            raise InvalidStateTransition(
+                "verified Agent completion requires a typed receipt"
+            )
+        completion = self.complete_activity(
+            run_id,
+            node_id,
+            attempt_id,
+            request_hash,
+            owner_id,
+            claim_token=claim_token,
+            result=result,
+            event_payload=_verified_agent_completion_payload(receipt),
+            attempt_status=AttemptStatus.SUCCEEDED,
+            node_status=NodeStatus.SUCCEEDED,
+            run_status=None,
+            agent_activity_receipt=receipt,
+            now=now,
+        )
+        durable_receipt = self.get_agent_activity_receipt(
+            run_id,
+            attempt_id,
+        )
+        if durable_receipt != receipt:
+            raise StoreSchemaError(
+                "verified Agent completion receipt was not durable"
+            )
+        return completion
 
     @_audit_stale_activity_rejection
     def complete_retryable_activity(

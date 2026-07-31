@@ -185,10 +185,10 @@ request/receipt/ToolReceipt/ProviderInvocationReceipt 绑定校验。远程接�
 - manifest 不证明 sandbox 禁止了绕过 Tool/Provider gateway 的直接网络或文件副作用；
   远程 Agent runtime 必须由 attested sandbox 和 egress policy 独立证明。
 - `ToolReceipt.verification` 强度必须逐项判断。manifest 完整不等于 write exactly-once。
-- Core Agent Loop、collector、reference `DurableAgentProviderClient` 与
-  `DurableAgentToolHandler` 已分别把真实 provider 调用和已持久 Tool receipt 接到 v2；但
-  动态 Tool child authority issuer、manifest/checkpoint staging 与终态原子提交尚未组成
-  完整 adapter，不能仅靠两个消费子链声称端到端能力已完成。
+- Core Agent Loop、collector、reference `DurableAgentProviderClient`、
+  `DurableAgentToolHandler`、动态 Tool executor 与 `DurableAgentTerminalCommitter` 已组成
+  本地持久证据和父终态提交链；production remote adapter、sandbox attestation 与精确
+  Session history 恢复仍未接线，不能仅凭本地组合声称远程端到端能力已完成。
 - Artifact digest 不是抗 ArtifactStore/数据库管理员的数字签名；生产仍需独立 OS 身份、
   ACL、加密和可选透明日志。
 

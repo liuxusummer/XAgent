@@ -22,6 +22,8 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             "DurableAgentToolHandler",
             "AgentToolExecutionSpec",
             "DurableAgentToolExecutor",
+            "DurableAgentTerminalCommitter",
+            "ToolReceiptArtifactStore",
             "ArtifactGCReport",
             "LocalArtifactGarbageCollector",
             "QuarantinedArtifact",
@@ -120,6 +122,9 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             AgentToolExecutionSpec,
             DurableAgentToolExecutor,
         )
+        from src.orchestration.agent_terminal import (
+            DurableAgentTerminalCommitter,
+        )
         from src.orchestration.artifacts_gc import LocalArtifactGarbageCollector
         from src.orchestration.evaluation import Suite
         from src.orchestration.executor import TrustedActivityExecutor
@@ -149,6 +154,9 @@ class OrchestrationPublicApiTests(unittest.TestCase):
         from src.orchestration.runtime import ExecutorFactory
         from src.orchestration.scheduler import DurableScheduler
         from src.orchestration.store import DurableRunStore
+        from src.orchestration.tool_receipt_artifact import (
+            ToolReceiptArtifactStore,
+        )
         from src.orchestration.workflow import compile_workflow
 
         pairs = (
@@ -159,6 +167,11 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             ("DurableAgentToolHandler", DurableAgentToolHandler),
             ("AgentToolExecutionSpec", AgentToolExecutionSpec),
             ("DurableAgentToolExecutor", DurableAgentToolExecutor),
+            (
+                "DurableAgentTerminalCommitter",
+                DurableAgentTerminalCommitter,
+            ),
+            ("ToolReceiptArtifactStore", ToolReceiptArtifactStore),
             ("ArtifactRef", ArtifactRef),
             ("LocalArtifactGarbageCollector", LocalArtifactGarbageCollector),
             ("DurableRunStore", DurableRunStore),

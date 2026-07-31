@@ -55,6 +55,11 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "AgentToolResultArtifactStore",
         "AgentToolResultError",
     ),
+    ".agent_terminal": (
+        "AgentActivityTerminalCommit",
+        "AgentTerminalCommitError",
+        "DurableAgentTerminalCommitter",
+    ),
     ".agent_request": (
         "AgentActivityRequest",
         "AgentActivityRequestArtifactStore",
@@ -331,6 +336,10 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "StoreSchemaError",
         "WorkflowBindingConflictError",
         "WorkflowBindingRecord",
+    ),
+    ".tool_receipt_artifact": (
+        "ToolReceiptArtifactError",
+        "ToolReceiptArtifactStore",
     ),
     ".worker_security": ("WorkerAuthorizationGate",),
     ".workflow": (

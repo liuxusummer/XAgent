@@ -89,7 +89,7 @@ class LocalArtifactStoreTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertEqual(len(refs), 12)
-        self.assertEqual({ref.artifact_id for ref in refs}, {refs[0].artifact_id})
+        self.assertTrue(all(ref == refs[0] for ref in refs))
         self.assertEqual(self.store.read(refs[0]), content)
         self.assertFalse(list(self.root.rglob("*.tmp")))
 
@@ -179,15 +179,15 @@ class LocalArtifactStoreTests(unittest.TestCase):
         with self.assertRaises(ArtifactValidationError):
             self.store.put_json({"bad": float("nan")})
 
-    def test_replace_failure_leaves_no_final_or_temporary_file(self) -> None:
-        real_replace = os.replace
+    def test_install_failure_leaves_no_final_or_temporary_file(self) -> None:
+        real_link = os.link
 
-        def fail_replace(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+        def fail_link(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
             self.assertTrue(Path(source).exists())
             self.assertFalse(Path(target).exists())
             raise OSError("fault injection")
 
-        with mock.patch("src.orchestration.artifacts.os.replace", side_effect=fail_replace):
+        with mock.patch("src.orchestration.artifacts.os.link", side_effect=fail_link):
             with self.assertRaises(ArtifactWriteError):
                 self.store.put_bytes(b"never visible")
 
@@ -195,7 +195,7 @@ class LocalArtifactStoreTests(unittest.TestCase):
         expected = self.root / "sha256" / digest[:2] / digest[2:4] / digest
         self.assertFalse(expected.exists())
         self.assertFalse(list(self.root.rglob("*.tmp")))
-        self.assertIs(os.replace, real_replace)
+        self.assertIs(os.link, real_link)
 
     def test_fault_before_replace_never_exposes_partial_content(self) -> None:
         stages: list[str] = []

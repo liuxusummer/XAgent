@@ -93,6 +93,10 @@
   缺失、失败、错绑或超限永久降级为 partial。普通本地路径不产生 receipt，不能被观察
   Event 或业务结果自动提升为完整证据；审查见
   `docs/agent-execution-evidence-collector-adversarial-review.md`。
+- `DurableAgentTerminalCommitter` 将完整 collector、Store 中的 child ToolReceipt、
+  ToolReceipt/manifest Artifact 与父 Agent 终态组合为“Artifact 先行、SQLite 单事务引用
+  后置”的提交边界；它禁止内联 Activity 输出、跨作用域 Artifact 和调用方提前结束 Run。
+  契约与三轮审查见 `docs/agent-terminal-commit.md`。
 - Agent Activity 的 task/context 可由 `AgentActivityRequest` 物化为至少 sensitive
   （并继承 context 最高分类）的 content-addressed Artifact，绑定稳定
   Attempt/request/definition/config/input descriptor，但不绑定 Worker/lease/grant。

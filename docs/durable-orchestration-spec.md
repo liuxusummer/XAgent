@@ -341,8 +341,9 @@ lease.acquired / lease.expired / lease.released
 
 ```text
 artifact_id
-kind                 agent_request | model_response | tool_result | file_snapshot |
-                     report | log | generic
+kind                 agent_request | agent_execution_manifest | model_response |
+                     tool_receipt | tool_result | file_snapshot | report | log |
+                     generic
 uri                  运行时管理的相对 URI，不是任意用户路径
 sha256
 size
@@ -355,7 +356,7 @@ created_at
 ```
 
 Event Store 只保存 Artifact 元数据。Artifact 写入必须使用临时文件 + fsync（平台支持时）+
-原子替换，并在内容完成后才允许首个 Domain Event 引用；部署可以额外追加
+原子 no-clobber 安装，并在内容完成后才允许首个 Domain Event 引用；部署可以额外追加
 `artifact.created`，但内核不依赖该专用 Event 才登记引用。孤立但未引用的 Artifact
 由 GC 清理；Event 引用了不存在或 digest 不匹配的 Artifact 时必须报数据完整性错误。
 
@@ -745,7 +746,7 @@ projection 是 `runs`、`node_runs`、`attempts` 等当前状态表。必须提�
 Artifact 文件与 SQLite 也不是共同事务，采用“先内容、后引用”：
 
 1. 写临时 Artifact，计算 digest；
-2. 原子替换为 content-addressed 最终路径；
+2. 原子 no-clobber 安装到 content-addressed 最终路径；
 3. SQLite 事务内登记 Artifact 并引用；
 4. 未被登记的孤立文件允许由 GC 清理。
 
@@ -1249,7 +1250,7 @@ v1 必须满足：
 - SQLite schema/migration、Domain Event append、projection rebuild。
 - Run/NodeRun/Attempt 状态转换 API。
 - 最小本地 Artifact Store：content-addressed 写入、digest/size 校验、临时文件 +
-  原子替换、Artifact 元数据登记，以及孤立文件 GC。Phase 1 的成功结果禁止只存在于调用栈。
+  原子 no-clobber 安装、Artifact 元数据登记，以及孤立文件 GC。Phase 1 的成功结果禁止只存在于调用栈。
 - Legacy Agent Activity adapter；一个旧单 Agent 任务映射为单节点 Workflow。
 
 验收：
