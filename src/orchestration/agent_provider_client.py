@@ -101,6 +101,7 @@ class DurableAgentProviderClient:
         "_maximum_broker_attempts",
         "_request",
         "_request_ref",
+        "_result_artifact_refs",
         "_route",
         "_route_id",
         "_system_messages",
@@ -214,6 +215,7 @@ class DurableAgentProviderClient:
         self._authorization_source = authorization_source
         self._request = request
         self._request_ref = request_ref
+        self._result_artifact_refs: list[ArtifactRef] = []
         self._collector = collector
         self._route = route
         self._route_id = route_id
@@ -255,6 +257,16 @@ class DurableAgentProviderClient:
         """The reference Broker cannot attest a production gateway."""
 
         return False
+
+    @property
+    def result_artifact_refs(self) -> tuple[ArtifactRef, ...]:
+        """Return detached, ordered provider response evidence refs."""
+
+        with self._lock:
+            return tuple(
+                ArtifactRef.from_dict(ref.to_dict())
+                for ref in self._result_artifact_refs
+            )
 
     def chat(
         self,
@@ -355,6 +367,7 @@ class DurableAgentProviderClient:
             current_system=current_system,
             current_messages=current_messages,
             response=durable_response,
+            result_ref=result.artifact_ref,
         )
         return durable_response
 
@@ -530,7 +543,12 @@ class DurableAgentProviderClient:
         current_system: list[dict[str, Any]],
         current_messages: list[dict[str, Any]],
         response: ChatResponse,
+        result_ref: ArtifactRef | None,
     ) -> None:
+        if type(result_ref) is not ArtifactRef:
+            raise AgentProviderClientError(
+                "agent_provider_result_binding_mismatch"
+            )
         assistant: dict[str, Any] = {
             "role": "assistant",
             "content": response.content,
@@ -551,6 +569,9 @@ class DurableAgentProviderClient:
                 self._system_messages = current_system
             self.history.extend(current_messages)
             self.history.append(assistant)
+            self._result_artifact_refs.append(
+                ArtifactRef.from_dict(result_ref.to_dict())
+            )
             self.request_count += 1
             self._bound_history()
 

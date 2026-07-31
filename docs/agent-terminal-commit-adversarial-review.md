@@ -23,10 +23,12 @@ mtime 的 `ArtifactRef`，使 NodeResult digest 分叉并触发幂等冲突。
 ## 第二轮：证据替换、数据泄露与事务撕裂
 
 攻击包括：缺失 provider receipt、伪造 request producer、降低结果敏感级别、引用其他 Run
-的 Artifact、篡改已提交 receipt，以及在 `complete.after_idempotency` 强制数据库异常。
+的 Artifact、只伪造 provider ref digest、替换/额外注入 raw provider response Artifact、
+篡改已提交 receipt，以及在 `complete.after_idempotency` 强制数据库异常。
 
-修复后所有替换均 fail closed；Store 故障会回滚 idempotency、Attempt、Node 和 Event
-的整个事务。随后可用原 Claim 和相同 bundle 重试。
+修复后 terminal 必须重读实际 provider Artifact，且 raw provider ref 集合与 manifest
+receipt lineage 精确相等；所有替换均 fail closed。Store 故障会回滚 idempotency、Attempt、
+Node 和 Event 的整个事务。随后可用原 Claim 和相同 bundle 重试。
 
 审查同时发现内联 `output` 和自由文本 metrics 会绕过 Artifact 边界。最终 API 删除内联
 输出，只允许正文先持久化为 Artifact；metrics 只接受最多 64 个安全名称的有限数值或

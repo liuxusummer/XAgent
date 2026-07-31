@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
-import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -30,6 +30,7 @@ from .agent_request import (
     AgentActivityRequestError,
 )
 from .artifacts import (
+    ArtifactKind,
     ArtifactRef,
     ArtifactSensitivity,
     ArtifactStore,
@@ -145,7 +146,7 @@ class DurableAgentTerminalCommitter:
         self._tool_receipt_artifacts = ToolReceiptArtifactStore(
             artifact_store
         )
-        self._clock = clock or time.time
+        self._clock = clock or scheduler.now
         self._fault_hook = fault_hook
 
     @property
@@ -227,8 +228,9 @@ class DurableAgentTerminalCommitter:
             result_artifact_refs,
             claim=claim,
             manifest_ref=manifest_ref,
-            minimum_sensitivity=request_ref.sensitivity,
+            minimum_sensitivity=manifest.artifact_sensitivity,
         )
+        self._validate_provider_result_refs(manifest, result_refs)
         node_result = self._node_result(
             metrics=metrics,
             result_refs=result_refs,
@@ -422,6 +424,49 @@ class DurableAgentTerminalCommitter:
                 "agent_terminal_artifact_invalid"
             )
         return combined
+
+    @staticmethod
+    def _validate_provider_result_refs(
+        manifest: AgentActivityExecutionManifest,
+        refs: tuple[ArtifactRef, ...],
+    ) -> None:
+        by_identity = {
+            hashlib.sha256(
+                canonical_json_bytes(ref.to_dict())
+            ).hexdigest(): ref
+            for ref in refs
+        }
+        expected = {
+            binding.receipt.response_artifact_ref_digest
+            for binding in manifest.provider_receipts
+        }
+        actual = {
+            identity
+            for identity, ref in by_identity.items()
+            if (
+                ref.kind is ArtifactKind.MODEL_RESPONSE
+                and ref.media_type == "application/octet-stream"
+            )
+        }
+        if actual != expected:
+            raise AgentTerminalCommitError(
+                "agent_terminal_evidence_incomplete"
+            )
+        for binding in manifest.provider_receipts:
+            receipt = binding.receipt
+            ref = by_identity.get(
+                receipt.response_artifact_ref_digest or ""
+            )
+            if (
+                ref is None
+                or ref.kind is not ArtifactKind.MODEL_RESPONSE
+                or ref.media_type != "application/octet-stream"
+                or ref.sha256 != receipt.response_digest
+                or ref.sensitivity is not receipt.response_sensitivity
+            ):
+                raise AgentTerminalCommitError(
+                    "agent_terminal_evidence_incomplete"
+                )
 
     @staticmethod
     def _node_result(

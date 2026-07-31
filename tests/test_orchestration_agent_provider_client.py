@@ -30,6 +30,7 @@ from src.orchestration.artifacts import (
     ArtifactKind,
     ArtifactSensitivity,
     LocalArtifactStore,
+    canonical_json_bytes,
 )
 from src.orchestration.provider_access import (
     ProviderAccessBroker,
@@ -412,6 +413,23 @@ class DurableAgentProviderClientTests(unittest.TestCase):
                     is not None
                     for item in manifest.provider_receipts
                 )
+            )
+            response_refs = client.result_artifact_refs
+            self.assertEqual(len(response_refs), 2)
+            self.assertTrue(
+                all(fixture.store.verify(ref) for ref in response_refs)
+            )
+            self.assertEqual(
+                tuple(
+                    hashlib.sha256(
+                        canonical_json_bytes(ref.to_dict())
+                    ).hexdigest()
+                    for ref in response_refs
+                ),
+                tuple(
+                    item.receipt.response_artifact_ref_digest
+                    for item in manifest.provider_receipts
+                ),
             )
             first_payload = json.loads(
                 invoker.calls[0][1].decode("utf-8")
@@ -796,6 +814,7 @@ class DurableAgentProviderClientTests(unittest.TestCase):
                     self.assertIsNone(raised.exception.__context__)
             self.assertEqual(client.history, [])
             self.assertEqual(client.request_count, 0)
+            self.assertEqual(client.result_artifact_refs, ())
 
     def test_broker_retry_converges_not_started_and_completed(
         self,

@@ -45,8 +45,10 @@ Artifact 阶段失败时不写终态；Artifact 成功而数据库失败时只�
 - 至少观察到一次 provider 调用，provider/tool receipt lineage 必须完整；
 - ToolReceipt 必须从 Store 重读，不能信任调用方提供的业务结果；
 - execution manifest 和每个 ToolReceipt 都写为 content-addressed Artifact；
-- 外部结果 Artifact 必须通过完整性校验、不得低于 request 分类、不得来自其他
+- 外部结果 Artifact 必须通过完整性校验、不得低于整个 manifest 的最高分类、不得来自其他
   Run/Node/Attempt，也不得把自由 metadata 带入 Event Store；
+- provider receipt 必须绑定一个实际可重读的 raw MODEL_RESPONSE Artifact；raw provider
+  ref 集合必须与 receipt lineage 精确相等，缺失、替换和额外注入均拒绝；
 - NodeResult 只包含 ArtifactRef、ToolReceipt ArtifactRef 和数值/布尔 metrics，不接受
   Agent 输出正文、prompt、response、工具参数、错误文本或凭据；
 - Store 的 verified completion 路径只允许结束当前 Attempt/Node。Run 终态必须由

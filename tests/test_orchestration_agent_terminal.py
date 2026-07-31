@@ -21,6 +21,7 @@ from src.orchestration.agent_terminal import (
 from src.orchestration.artifacts import (
     ArtifactKind,
     ArtifactSensitivity,
+    canonical_json_bytes,
 )
 from src.orchestration.artifacts_gc import (
     LocalArtifactGarbageCollector,
@@ -43,7 +44,15 @@ def _digest(label: str) -> str:
 
 
 class _TerminalFixture:
-    def __init__(self, root: Path, *, with_tool: bool = True) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        with_tool: bool = True,
+        provider_sensitivity: ArtifactSensitivity = (
+            ArtifactSensitivity.SENSITIVE
+        ),
+    ) -> None:
         self.runtime = _Fixture(root)
         self.claim = self.runtime.parent
         self.request = AgentActivityRequest(
@@ -74,6 +83,16 @@ class _TerminalFixture:
             request_artifact_digest=self.request_ref.sha256,
             definition_digest=self.runtime.workflow.definition_digest,
             request_sensitivity=self.request_ref.sensitivity,
+        )
+        self.provider_response_ref = self.runtime.artifacts.put_bytes(
+            b"provider response",
+            media_type="application/octet-stream",
+            kind=ArtifactKind.MODEL_RESPONSE,
+            sensitivity=provider_sensitivity,
+            producer_run_id=self.claim.run_id,
+            producer_node_id=self.claim.node_id,
+            producer_attempt_id=self.claim.attempt_id,
+            metadata={},
         )
         self.collector.provider_call_started(turn=1)
         self.collector.provider_call_finished(
@@ -116,11 +135,13 @@ class _TerminalFixture:
             route_id="primary-route",
             route_digest=_digest("primary-route"),
             grant_binding_digest=_digest("provider-grant-1"),
-            response_digest=_digest("provider-response-1"),
-            response_artifact_ref_digest=_digest(
-                "provider-response-ref-1"
-            ),
-            response_sensitivity=ArtifactSensitivity.SENSITIVE,
+            response_digest=self.provider_response_ref.sha256,
+            response_artifact_ref_digest=hashlib.sha256(
+                canonical_json_bytes(
+                    self.provider_response_ref.to_dict()
+                )
+            ).hexdigest(),
+            response_sensitivity=self.provider_response_ref.sensitivity,
             completion_mode=ProviderInvocationCompletionMode.INVOKED,
         )
 
@@ -132,15 +153,20 @@ class _TerminalFixture:
             fault_hook=fault_hook,
         )
 
-    def commit(self, *, committer=None, result_artifact_refs=()):
+    def commit(self, *, committer=None, result_artifact_refs=None):
         target = committer or self.committer()
+        refs = (
+            (self.provider_response_ref,)
+            if result_artifact_refs is None
+            else result_artifact_refs
+        )
         return target.commit_success(
             self.claim,
             self.request_ref,
             self.collector,
             exit_reason="CURRENT_TASK_DONE",
             turns=1,
-            result_artifact_refs=result_artifact_refs,
+            result_artifact_refs=refs,
             metrics={"turns": 1},
         )
 
@@ -314,6 +340,50 @@ class DurableAgentTerminalCommitterTests(unittest.TestCase):
             self.assertIs(attempt.status, AttemptStatus.RUNNING)
             self.assertEqual(fixture.parent_terminal_events(), [])
 
+    def test_missing_or_substituted_provider_artifact_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = _TerminalFixture(Path(directory), with_tool=False)
+            with self.assertRaisesRegex(
+                AgentTerminalCommitError,
+                "agent_terminal_evidence_incomplete",
+            ):
+                fixture.commit(result_artifact_refs=())
+
+            substitute = fixture.runtime.artifacts.put_bytes(
+                b"different provider response",
+                media_type="application/octet-stream",
+                kind=ArtifactKind.MODEL_RESPONSE,
+                sensitivity=ArtifactSensitivity.SENSITIVE,
+                producer_run_id=fixture.claim.run_id,
+                producer_node_id=fixture.claim.node_id,
+                producer_attempt_id=fixture.claim.attempt_id,
+                metadata={},
+            )
+            with self.assertRaisesRegex(
+                AgentTerminalCommitError,
+                "agent_terminal_evidence_incomplete",
+            ):
+                fixture.commit(result_artifact_refs=(substitute,))
+            with self.assertRaisesRegex(
+                AgentTerminalCommitError,
+                "agent_terminal_evidence_incomplete",
+            ):
+                fixture.commit(
+                    result_artifact_refs=(
+                        fixture.provider_response_ref,
+                        substitute,
+                    )
+                )
+
+            attempt = fixture.runtime.store.get_attempt(
+                fixture.claim.attempt_id
+            )
+            self.assertIsNotNone(attempt)
+            assert attempt is not None
+            self.assertIs(attempt.status, AttemptStatus.RUNNING)
+
     def test_request_ref_and_result_sensitivity_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = _TerminalFixture(Path(directory), with_tool=False)
@@ -385,6 +455,31 @@ class DurableAgentTerminalCommitterTests(unittest.TestCase):
             ):
                 fixture.commit(result_artifact_refs=(unscoped_ref,))
 
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = _TerminalFixture(
+                Path(directory),
+                with_tool=False,
+                provider_sensitivity=ArtifactSensitivity.SECRET,
+            )
+            downgraded_ref = fixture.runtime.artifacts.put_bytes(
+                b"downgraded final result",
+                kind=ArtifactKind.REPORT,
+                sensitivity=ArtifactSensitivity.SENSITIVE,
+                producer_run_id=fixture.claim.run_id,
+                producer_node_id=fixture.claim.node_id,
+                producer_attempt_id=fixture.claim.attempt_id,
+            )
+            with self.assertRaisesRegex(
+                AgentTerminalCommitError,
+                "agent_terminal_artifact_invalid",
+            ):
+                fixture.commit(
+                    result_artifact_refs=(
+                        fixture.provider_response_ref,
+                        downgraded_ref,
+                    )
+                )
+
     def test_store_transaction_crash_rolls_back_all_terminal_facts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = _TerminalFixture(Path(directory), with_tool=False)
@@ -442,6 +537,9 @@ class DurableAgentTerminalCommitterTests(unittest.TestCase):
                     fixture.collector,
                     exit_reason="CURRENT_TASK_DONE",
                     turns=1,
+                    result_artifact_refs=(
+                        fixture.provider_response_ref,
+                    ),
                     metrics={"summary": "raw model output must be an Artifact"},
                 )
 

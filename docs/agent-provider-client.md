@@ -54,7 +54,8 @@ SECRET response 仍会被参考 `LocalArtifactStore` 拒绝；生产加密 Store
 9. 重验 Result Artifact、route response bytes 上限、receipt 父绑定、authorization、
    route、sequence 和 payload digest；
 10. 严格解码 response wire，构造 receipt 从 repr 隐藏的 `ChatResponse`；
-11. 只有以上步骤全部成功，才提交 system/history/request count。
+11. 只有以上步骤全部成功，才原子提交 system/history/request count 和 detached response
+    ArtifactRef；终态组合据此重读实际 provider 输出，而不是只相信 receipt 中的 digest。
 
 任何失败都会向 Agent Loop 抛出；Loop 随后调用 `provider_call_failed`，collector 将该链
 永久降级为 partial。provider 已完成但 response 非法时，历史不会伪装为成功推进。
@@ -129,12 +130,12 @@ client 的重试始终复用同一个 grant、同一 authorization 和完全相�
 
 ## 7. 尚未完成
 
-- reference Durable Tool Handler 已能把经 Store 重读的真实 `ToolReceipt` 接到
-  `ActionResult`；本地 reference 动态 child authority 已由 `DurableAgentToolExecutor`
-  实现，但远程 Worker 组合与父终态事务仍未完成；
+- reference Durable Tool Handler、动态 child authority、父终态事务和本地
+  `DurableAgentActivityExecutor` 已形成显式组合，但远程 Worker adapter 仍未接入；
 - provider client 的 history、collector manifest staging 和 checkpoint 尚未组成同一
   crash-consistent transaction；
-- manifest、NodeResult、AgentActivityReceipt 和 Attempt terminal Event 尚未原子提交；
+- 本地组合已经原子提交 manifest、NodeResult、AgentActivityReceipt 和 Attempt terminal
+  Event；跨进程接管仍因 history/collector checkpoint 缺失而不可用；
 - Broker 的参考 `ProviderInvoker` readiness 不能证明 mTLS、attestation、egress 或外部
   operation ledger；
 - reference client 不在进程内线程上伪造可中断 timeout；部署侧 invoker 必须实施有界网络

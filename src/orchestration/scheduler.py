@@ -435,6 +435,11 @@ class DurableScheduler:
             for index, node_id in enumerate(self.workflow.topological_order)
         }
 
+    def now(self) -> float:
+        """Return the Scheduler's validated authoritative timestamp."""
+
+        return self._now()
+
     def create_run(
         self,
         run_id: str,

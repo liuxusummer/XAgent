@@ -95,8 +95,14 @@
   `docs/agent-execution-evidence-collector-adversarial-review.md`。
 - `DurableAgentTerminalCommitter` 将完整 collector、Store 中的 child ToolReceipt、
   ToolReceipt/manifest Artifact 与父 Agent 终态组合为“Artifact 先行、SQLite 单事务引用
-  后置”的提交边界；它禁止内联 Activity 输出、跨作用域 Artifact 和调用方提前结束 Run。
+  后置”的提交边界；它还重读 provider response Artifact，并要求其 ref 集合与 manifest
+  receipts 精确相等；它禁止内联 Activity 输出、跨作用域 Artifact 和调用方提前结束 Run。
   契约与三轮审查见 `docs/agent-terminal-commit.md`。
+- `DurableAgentActivityExecutor` 已提供显式启用的本地参考组合：request 在 Claim 前 stage，
+  所有配置在 RUNNING 前预检，执行中续租父 Claim，并把真实 provider refs、动态 Tool receipts
+  和最终 response Artifact 交给上述终态边界。它不改默认 CLI/Web；因跨进程 Loop resume 与
+  远程 ownership 尚未完成，两个 readiness 均为 false。见
+  `docs/agent-activity-executor.md`。
 - Agent Activity 的 task/context 可由 `AgentActivityRequest` 物化为至少 sensitive
   （并继承 context 最高分类）的 content-addressed Artifact，绑定稳定
   Attempt/request/definition/config/input descriptor，但不绑定 Worker/lease/grant。
@@ -114,9 +120,10 @@
   `docs/provider-credential-boundary.md`
 - `DurableAgentProviderClient` 已把 Core `chat()` 接到上述 Broker：它先按 collector
   sequence 构造 canonical、有界 Chat wire，再取得同一 lineage 的新鲜授权，复用 one-call
-  grant 的 replay/recovery，并只接受带 durable MODEL_RESPONSE Artifact 的 receipt。
-  client 维护 Session-compatible history，但自身 readiness 仍固定 false；durable Tool
-  handler 与 Agent 终态事务完成前不得开放 remote Agent。见
+  grant 的 replay/recovery，并只接受带 durable MODEL_RESPONSE Artifact 的 receipt，同时向
+  本地组合暴露 detached、ordered 的实际 response refs。client 维护 Session-compatible
+  history，但自身 readiness 仍固定 false；即使本地 Tool/终态组合已完成，也不得据此开放
+  remote Agent。见
   `docs/agent-provider-client.md`
 - `DurableAgentToolHandler` 已将 collector 的动态 Tool observation、父 request Artifact、
   durable `ToolReceipt` 与 canonical result Artifact 接到 Core `ActionResult`；
