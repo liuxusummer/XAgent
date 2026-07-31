@@ -34,6 +34,10 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "agent_tool_operation_key",
         "canonical_tool_call_digest",
     ),
+    ".agent_provider_client": (
+        "AgentProviderClientError",
+        "DurableAgentProviderClient",
+    ),
     ".agent_request": (
         "AgentActivityRequest",
         "AgentActivityRequestArtifactStore",

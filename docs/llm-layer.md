@@ -36,6 +36,12 @@ Agent Loop 仅把该对象交给可选 execution-evidence observer。MixinSessio
 重试/故障转移不能被自动提升为一次可验证 provider operation；生产远程 client 必须让
 每个稳定 operation ID 对应一个显式 `ProviderInvocationReceipt`。
 
+orchestration 层的 `DurableAgentProviderClient` 提供 reference remote client：它维护
+Session-compatible history，把 canonical Chat wire 交给 `ProviderAccessBroker`，并只把
+带 durable MODEL_RESPONSE Artifact 的 typed receipt 附到 `ChatResponse`。该 client
+不改变本地 Session，也不持有 upstream credential；完整约束与限制见
+[Durable Agent Provider Client 契约](agent-provider-client.md)。
+
 ### 两种工具协议，两种策略
 
 工具调用有两种完全不同的实现方式：

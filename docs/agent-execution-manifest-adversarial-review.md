@@ -88,8 +88,8 @@
 ## 残余边界
 
 - manifest 是受信 runtime 的有序观察，不是外部系统事务收据。
-- manifest v2 已加入 provider evidence，Core Loop 也有 fail-closed collector observer；
-  生产 remote gateway client、durable Tool handler 与终态原子提交仍未接线。
+- manifest v2、Core Loop collector observer 与 reference provider client 已组成
+  provider 子链；durable Tool handler 与终态原子提交仍未接线。
 - 当前本地 Legacy adapter 继续产生 v2、无 manifest、`complete=false` receipt；它不会被
   误升级为远程 Agent proof。
 - Store receipt API 只验证 manifest ref，不读取 Artifact bytes；接纳执行证据的入口必须

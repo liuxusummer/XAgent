@@ -53,6 +53,10 @@ Artifact 创建。签发时必须同时匹配 WorkerAuthorization 的 tenant、p
 `gateway_binding_digest` 用于绑定部署选择的网关身份/配置，但参考实现不据此完成 mTLS、
 网络出口或网关 attestation；这些仍是生产 `ProviderInvoker` 的责任。
 
+Broker 的 `describe_route()` 只返回同一不可变、无 credential 的 descriptor，供受信
+Agent provider client 在签 grant 前按 route request 上限做预检。它不是远程目录 API，
+不会签发授权或返回 bearer。
+
 ## 4. One-call grant
 
 `ProviderAccessGrant` 绑定：
@@ -222,8 +226,9 @@ prompt、bearer、provider credential 或证据原文；每个 invocation 最多
 - `production_security_ready` 仍固定为 false；
 - 参考实现不提供 mTLS、provider egress allowlist、secret manager、经过 attestation
   的 invoker。
-- typed provider receipt、Agent manifest v2 与 Core Loop observer 已提供组合契约，
-  但生产 remote gateway client、manifest staging/原子提交和接纳状态机尚未完成。
+- typed provider receipt、Agent manifest v2、Core Loop observer 与 reference
+  `DurableAgentProviderClient` 已完成 provider 子链组合，但 durable Tool handler、
+  manifest/checkpoint staging、终态原子提交和生产接纳状态机尚未完成。
 
 生产 remote Agent 仍必须提供经过验证的 upstream idempotency/operation ledger、
 经过 attestation 的 ProviderInvoker 和完整远程 Agent runtime。未完成前禁止把
@@ -239,4 +244,6 @@ invocation result 审查见
 operation 恢复审查见
 [Provider Operation Recovery 三轮对抗性审查](provider-operation-recovery-adversarial-review.md)，
 provider/Agent 组合审查见
-[Provider Receipt 与 Agent Lineage 三轮对抗性审查](provider-agent-lineage-adversarial-review.md)。
+[Provider Receipt 与 Agent Lineage 三轮对抗性审查](provider-agent-lineage-adversarial-review.md)，
+client 接线审查见
+[Durable Agent Provider Client 三轮对抗性审查](agent-provider-client-adversarial-review.md)。

@@ -483,10 +483,11 @@ response/ref、分类与有序 recovery evidence；durable replay 重构相同 d
 response ArtifactRef digest 的 receipt 才能进入 Agent manifest v2。
 
 普通 invoker 和无法验证的状态仍 fail closed；参考实现也不能证明外部 gateway 的线性
-一致幂等账本或 attestation，因此 `production_security_ready=false`。生产 remote
-Agent 仍必须补齐 mTLS/attestation、egress policy、secret-manager backed invoker、
-跨主机一致性，以及 remote gateway client、durable Tool handler、manifest staging 与
-终态原子提交的完整 adapter。
+一致幂等账本或 attestation，因此 `production_security_ready=false`。reference
+`DurableAgentProviderClient` 已完成 canonical Chat wire、同 lineage 授权、durable
+result preflight 和 Provider receipt 接线。生产 remote Agent 仍必须补齐
+mTLS/attestation、egress policy、secret-manager backed invoker、跨主机一致性，以及
+durable Tool handler、manifest/checkpoint staging 与终态原子提交的完整 adapter。
 完整约束见
 [Provider Credential 与模型网关边界](provider-credential-boundary.md)。
 

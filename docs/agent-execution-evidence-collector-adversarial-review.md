@@ -4,7 +4,7 @@
 > `ChatResponse.provider_receipt`、`ActionResult.tool_receipt` 和
 > `AgentExecutionEvidenceCollector`。
 >
-> 结论：真实 Loop 的 fail-closed 观察接线通过；生产 remote gateway client、
+> 结论：真实 Loop 的 fail-closed 观察接线通过；reference provider client 已补齐，
 > durable Tool handler、manifest staging 与终态原子提交仍未完成，因此 remote
 > `agent` capability 保持关闭。
 
@@ -117,8 +117,8 @@ Round 3：通过。
 
 - observer 证明 Core 确实看到了显式 receipt，不证明 receipt 签名或外部 gateway
   attestation；这些仍由 Provider/Tool 安全边界负责。
-- 当前仓库尚无生产 `ProviderAccessBroker → ChatResponse` client wrapper，也没有
-  `TrustedActivityExecutor → ActionResult` remote Handler。
+- 当前已有 fail-closed 的 `ProviderAccessBroker → ChatResponse` reference client，但
+  尚无 `TrustedActivityExecutor → ActionResult` remote Handler。
 - collector 只构造 manifest；尚未与 AgentActivityRequest load、Artifact staging、
   NodeResult、AgentActivityReceipt 和 terminal Store transaction 组合为单一 adapter。
 - MixinSession 的内部 retry/failover 是本地兼容行为，不能自动对应一个稳定 provider

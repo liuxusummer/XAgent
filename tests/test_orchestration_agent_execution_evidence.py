@@ -125,6 +125,41 @@ def _tool_receipt(sequence: int) -> ToolReceipt:
 
 
 class AgentExecutionEvidenceCollectorTests(unittest.TestCase):
+    def test_parent_binding_validation_is_exact_and_sanitized(
+        self,
+    ) -> None:
+        collector = _collector()
+        collector.validate_parent_binding(
+            run_id="run-1",
+            node_id="agent-node",
+            attempt_id="agent-attempt",
+            request_digest=_digest("request"),
+            request_artifact_digest=_digest("request-artifact"),
+            definition_digest=_digest("definition"),
+            request_sensitivity=ArtifactSensitivity.SENSITIVE,
+        )
+        with self.assertRaises(
+            AgentExecutionEvidenceCollectorError
+        ) as raised:
+            collector.validate_parent_binding(
+                run_id="run-1",
+                node_id="agent-node",
+                attempt_id="agent-attempt",
+                request_digest=_digest("other-request"),
+                request_artifact_digest=_digest(
+                    "request-artifact"
+                ),
+                definition_digest=_digest("definition"),
+                request_sensitivity=object(),
+            )
+
+        self.assertEqual(
+            str(raised.exception),
+            "execution_evidence_parent_mismatch",
+        )
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+
     def test_real_loop_wires_typed_receipts_into_manifest(self) -> None:
         collector = _collector()
         tool_receipt = _tool_receipt(1)

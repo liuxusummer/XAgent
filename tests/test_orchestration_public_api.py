@@ -15,6 +15,8 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             "ArtifactRef",
             "ArtifactStore",
             "LocalArtifactStore",
+            "AgentProviderClientError",
+            "DurableAgentProviderClient",
             "ArtifactGCReport",
             "LocalArtifactGarbageCollector",
             "QuarantinedArtifact",
@@ -100,6 +102,10 @@ class OrchestrationPublicApiTests(unittest.TestCase):
 
     def test_entries_are_the_objects_from_their_defining_modules(self) -> None:
         from src.orchestration.artifacts import ArtifactRef
+        from src.orchestration.agent_provider_client import (
+            AgentProviderClientError,
+            DurableAgentProviderClient,
+        )
         from src.orchestration.artifacts_gc import LocalArtifactGarbageCollector
         from src.orchestration.evaluation import Suite
         from src.orchestration.executor import TrustedActivityExecutor
@@ -132,6 +138,8 @@ class OrchestrationPublicApiTests(unittest.TestCase):
         from src.orchestration.workflow import compile_workflow
 
         pairs = (
+            ("AgentProviderClientError", AgentProviderClientError),
+            ("DurableAgentProviderClient", DurableAgentProviderClient),
             ("ArtifactRef", ArtifactRef),
             ("LocalArtifactGarbageCollector", LocalArtifactGarbageCollector),
             ("DurableRunStore", DurableRunStore),

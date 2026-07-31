@@ -299,6 +299,19 @@ class ProviderAccessBrokerTests(unittest.TestCase):
             ttl_seconds=30.0,
         )
 
+    def test_route_description_is_credential_free_and_exact(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self.broker.describe_route("primary-route"),
+            _route(),
+        )
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "provider_route_unavailable",
+        ):
+            self.broker.describe_route("missing-route")
+
     def test_grant_is_canonical_path_free_and_credential_free(
         self,
     ) -> None:

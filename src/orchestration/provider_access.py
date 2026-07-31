@@ -1106,6 +1106,20 @@ class ProviderAccessBroker:
         except BaseException:
             return False
 
+    def describe_route(
+        self,
+        route_id: str,
+    ) -> ProviderRouteDescriptor:
+        """Return immutable credential-free limits for request preflight."""
+
+        route_key = _code(route_id, "invalid_provider_route")
+        route = self._routes.get(route_key)
+        if route is None:
+            raise ProviderAccessDenied(
+                "provider_route_unavailable"
+            )
+        return route
+
     def issue(
         self,
         authorization: WorkerAuthorization,

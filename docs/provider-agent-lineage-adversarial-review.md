@@ -5,7 +5,8 @@
 > `AgentExecutionManifestArtifactStore`。
 >
 > 结论：payload-free provider receipt 与 durable Agent manifest 的组合契约通过；
-> 真实远程 Agent Loop 尚未接线，生产 `agent` capability 继续关闭。
+> Core Loop observer 和 reference provider client 已接线；durable Tool 与终态事务仍
+> 未完成，生产 `agent` capability 继续关闭。
 
 ## Round 1：正文、凭据与 schema 注入
 

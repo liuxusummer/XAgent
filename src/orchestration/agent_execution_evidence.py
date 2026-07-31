@@ -159,6 +159,42 @@ class AgentExecutionEvidenceCollector:
         with self._lock:
             return self._observed_tool_calls
 
+    def validate_parent_binding(
+        self,
+        *,
+        run_id: str,
+        node_id: str,
+        attempt_id: str,
+        request_digest: str,
+        request_artifact_digest: str,
+        definition_digest: str,
+        request_sensitivity: ArtifactSensitivity | str,
+    ) -> None:
+        invalid_sensitivity = False
+        try:
+            sensitivity = ArtifactSensitivity(request_sensitivity)
+        except (TypeError, ValueError):
+            invalid_sensitivity = True
+            sensitivity = None
+        if invalid_sensitivity:
+            raise AgentExecutionEvidenceCollectorError(
+                "execution_evidence_parent_mismatch"
+            ) from None
+        with self._lock:
+            if (
+                run_id != self._run_id
+                or node_id != self._node_id
+                or attempt_id != self._attempt_id
+                or request_digest != self._request_digest
+                or request_artifact_digest
+                != self._request_artifact_digest
+                or definition_digest != self._definition_digest
+                or sensitivity is not self._request_sensitivity
+            ):
+                raise AgentExecutionEvidenceCollectorError(
+                    "execution_evidence_parent_mismatch"
+                )
+
     def active_provider_invocation(
         self,
     ) -> AgentProviderInvocationContext:
