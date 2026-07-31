@@ -1,0 +1,45 @@
+docs/agent-activity-receipt.md
+  s_72af05a5dabd4c::t_19f6fd75479afa 83-87
+docs/agent-execution-manifest.md
+  s_72af05a5dabd4c::t_6dbf0424b039be 15-16,30-31,66,68,95-117,128,145-147,153-154,163-164,169-171
+docs/architecture.md
+  s_72af05a5dabd4c::t_60db08efea2e66 85-88,100-103
+docs/durable-orchestration-spec.md
+  s_72af05a5dabd4c::t_13a8e4370749d5 419-424,473-481
+docs/provider-agent-lineage-adversarial-review.md
+  s_72af05a5dabd4c::t_9d2866b507aadd 1-118
+docs/provider-credential-boundary.md
+  s_72af05a5dabd4c::t_266033db34ba66 156-172,225-226,240-242
+docs/provider-invocation-receipt-adversarial-review.md
+  s_72af05a5dabd4c::t_73030e2f30ec66 3-5,7-9,84-90,104-105,123-125
+docs/provider-operation-recovery-adversarial-review.md
+  s_72af05a5dabd4c::t_0932e409ed7135 128-130
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_7e7ff43203f0a7 26,156-157,162
+src/orchestration/agent_execution_manifest.py
+  s_72af05a5dabd4c::t_6ed7b94f877cb5 8,19-22,29-30,36,38-45,232-320,337-339,491-494,499-609,618-620,631-646,665-694,726-733,767,785-800,825-841,858-865,867,873-883,911-922,987-991,1020-1024,1026-1032,1068-1078,1098-1102,1111-1116,1233-1241,1248
+src/orchestration/provider_access.py
+  s_72af05a5dabd4c::t_2c359cd9b44abb 25,36,45,92-98,423-803,812,853-867,1396-1400,1611-1714,1719,1722-1727,1830-1836,2092,2097-2098,2103
+tests/test_orchestration_agent_execution_manifest.py
+  s_72af05a5dabd4c::t_a92a99cb80b217 15,42-45,90-131,426-637,716-727,736-737,757
+tests/test_orchestration_provider_access.py
+  s_72af05a5dabd4c::t_7c0d8bcc7e8d88 16-17,20,353-434,448-539,896-906,934-941,1526-1529
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ea890cdc6b538c6f575636285acca43023bea501",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
