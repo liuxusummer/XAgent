@@ -37,13 +37,16 @@ import hashlib
 
 from src.orchestration import (
     DeterministicRemoteScheduler,
+    DurableFleetReconciler,
     DurableFleetProjector,
+    FleetRunRoute,
     FleetToolRoutingPolicy,
     FleetWorkerPolicy,
     RemoteControlFleetClaimer,
     RemoteFleetCoordinator,
     SecureRemoteFleetPoller,
     StaticFleetToolPolicyResolver,
+    StaticFleetRunSource,
     StaticFleetWorkerResolver,
 )
 
@@ -51,16 +54,12 @@ fleet_owner_id = "control-a"
 ownership_policy_digest = hashlib.sha256(
     b"fleet-ownership-policy:v1"
 ).hexdigest()
-shard_ownership = scheduler.store.claim_fleet_shard(
+scheduler.store.claim_fleet_shard(
     "analysis-shard",
     fleet_owner_id,
     ownership_policy_digest,
     pool_id="analysis",
 )
-fairness_cursor = scheduler.store.get_fleet_fairness_cursor("analysis")
-if fairness_cursor is None:
-    raise RuntimeError("owned Fleet pool has no durable fairness cursor")
-
 tool_policies = StaticFleetToolPolicyResolver(
     [
         FleetToolRoutingPolicy(
@@ -99,7 +98,6 @@ fleet = RemoteFleetCoordinator(
     require_durable_ownership=True,
     fleet_owner_id=fleet_owner_id,
 )
-fleet.restore_fairness_cursor(fairness_cursor)
 poller = SecureRemoteFleetPoller(
     fleet,
     worker_policies,
@@ -108,20 +106,40 @@ poller = SecureRemoteFleetPoller(
 production_remote_control.bind_fleet_poller(poller)
 
 projector = DurableFleetProjector(tool_policies)
-for binding in projector.project_ready(
-    scheduler,
-    run_id,
-    tenant_id="tenant-a",
-    pool_id="analysis",
-    shard_ownership=shard_ownership,
-):
-    fleet.admit(binding)
+run_source = StaticFleetRunSource(
+    [FleetRunRoute(run_id, "tenant-a", "analysis")]
+)
+fleet_reconciler = DurableFleetReconciler(
+    fleet,
+    poller,
+    projector,
+    run_source,
+    durable_schedulers.__getitem__,
+)
+fleet_reconciler.run_once()
 ```
 
 `production_remote_control` 仍须满足 HTTPS 文档中的 durable journal、production-ready
-two-phase admission 和 reference fallback 禁用要求。绑定 poller 不会启动线程、
-扫描 Store 或隐式 reconcile；部署负责在可信控制循环中投影已经由
-reconciler 推进到 `READY` 的 Run。
+two-phase admission 和 reference fallback 禁用要求。`DurableFleetReconciler` 也不会
+启动线程、扫描任意 Store 或推进 Domain Run；部署显式周期调用 `run_once()`，并通过
+`FleetRunSource` 与 scheduler resolver 注入已经授权的 Run/tenant/pool 路由。示例的
+`StaticFleetRunSource` 适合固定目录和测试；生产实现应读取受保护、已认证的控制面 Run
+registry，不能从 Run input、Worker 声明或 Fleet snapshot 猜 tenant。独立 durable
+reconciler 仍负责先把 Run/Node 推进到 `RUNNING/READY`。
+
+每次 `run_once()` 先完整解析有界 route snapshot、scheduler、pool authority 和 READY
+投影，再进入 Coordinator 的单锁 queue linearization。陈旧 queued binding 先
+withdraw，随后才 admit 新 binding；因此 Tool routing policy 变更不会把旧排队策略
+留到下一次 Worker poll。已经 active 的 binding 代表 durable authority 已产生，只
+报告 `deferred_active_tasks` 并等待 terminal/lease recovery，不能由队列控制器伪装
+撤销。capacity 不足只拒绝新投影，绝不驱逐 active binding。report 始终带
+`execution_truth=false`。
+
+route source 动态失去 production-ready、snapshot/resolver/Store/projector 出错或
+strict authority 不一致时，控制轮次不会保留旧 queue 继续赌可用性：它先以空 desired
+执行同一个 queue reconciliation，撤回全部 queued binding，再向运维抛出原错误。
+active assignment 不受内存 quarantine 伪造撤销，仍由 terminal/lease recovery
+收敛。修复控制源后下一轮可幂等重建 queue。
 
 `claim_fleet_shard()` 对同一 owner、pool 和 policy 是幂等恢复，不是租约续期。每个
 `pool_id` 在一个 Store 中只能对应一个 shard；该 owner 可以调度池内多个 tenant，
@@ -131,6 +149,12 @@ reconciler 推进到 `READY` 的 Run。
 owner 名称后来 A→B→A 回到原值，旧 epoch 也不会重新有效。epoch 不依赖 wall clock；
 `assigned_at` 仅用于审计。自动故障检测和何时接管由部署层决定，模块不会用超时猜测
 leader 已死亡。
+
+`DurableFleetReconciler` 可幂等恢复同一 authority，也能在 pool 已完全 idle 时安装
+transfer 后的新 cursor；它不会替部署猜测旧 leader 是否死亡。planned transfer
+必须先让旧 route snapshot 撤回该 pool 的 queued binding，并等待 active assignment
+terminal。只要本地 queue/active 尚存，cursor authority 切换就以
+`Fleet pool must be idle before cursor restore` fail closed。
 
 生产中的 `fleet_owner_id` 必须代表一个控制进程世代（例如部署实例 ID），不能让两个
 存活副本共用同一个服务名。相同 owner 的幂等恢复只适用于外部已经确认旧进程死亡的
@@ -224,8 +248,9 @@ resources 一致，否则不发送给 Worker；已经发生的 durable claim 由
 
 正常 completion、terminal replay 和 cancellation acknowledgement 在 durable terminal
 提交后释放 Fleet projection。若释放过程崩溃或 observer 失败，terminal 响应不回滚；
-控制循环调用 `poller.reconcile_terminals()`，逐项读取 exact durable Attempt，只有
-确认 terminal 才释放容量。
+控制循环调用 `fleet_reconciler.run_once()`；其内部先执行
+`poller.reconcile_terminals()`，逐项读取 exact durable Attempt，只有确认 terminal
+才释放容量。
 
 ## 重启与 reconcile
 
@@ -233,18 +258,15 @@ resources 一致，否则不发送给 Worker；已经发生的 durable claim 由
 
 1. 从可信 Run registry 解析各 Run 的 `DurableScheduler`；
 2. 先执行独立 durable reconciler；
-3. 读取本进程负责 pool 的当前 shard ownership 和 `FleetFairnessCursor`，确认二者的
-   shard/owner/epoch/policy 完全一致且 owner 等于本进程配置；
-4. 先调用 `fleet.restore_fairness_cursor(cursor)`，再对 `RUNNING` Run 调用
-   `project_ready(..., shard_ownership=ownership)` 并逐项 `admit()`；或者在无 active
-   Fleet assignment 时一次调用
-   `fleet.rebuild(tasks, workers, fairness_cursors=cursors)`；
-5. Worker 重新通过 mTLS register，session journal 恢复或 fencing 旧 instance；
-6. lease reaper 处理崩溃前的 durable claims；
-7. 新进程的 Fleet active projection 从空状态开始，不从 Worker 响应推断旧 authority；
+3. 构造受信 `FleetRunSource`，调用 `DurableFleetReconciler.run_once()`；它先读取本
+   进程负责 pool 的 current ownership/cursor，验证 shard/owner/epoch/policy，
+   恢复 cursor，再差量收敛 READY binding；
+4. Worker 重新通过 mTLS register，session journal 恢复或 fencing 旧 instance；
+5. lease reaper 处理崩溃前的 durable claims；
+6. 新进程的 Fleet active projection 从空状态开始，不从 Worker 响应推断旧 authority；
    新 claim 的配额检查直接读取 Store 中旧 active Attempt 的 durable scope。
    exact claim 的控制权限可由 `RemoteExecutionJournal` + Store + 新鲜 attestation
-   重建；projection 随后由 completion 或周期 `reconcile_terminals()` 收敛。
+   重建；projection 随后由 completion 或周期 `run_once()` 收敛。
 
 不要从 Fleet snapshot 推断 Attempt 状态，也不要把 `execution_truth=false` 的报告写回
 Domain Store。Artifact grant/finalization 已通过 token-digest-only journal 跨进程
@@ -263,6 +285,7 @@ TLS-extension server 和生产 Sandbox 也仍需独立验证。
 .venv/bin/python -m unittest -q \
   tests.test_orchestration_remote_fleet_control \
   tests.test_orchestration_remote_fleet \
+  tests.test_orchestration_remote_fleet_reconcile \
   tests.test_orchestration_remote_scheduling \
   tests.test_orchestration_remote_protocol \
   tests.test_orchestration_remote_execution \

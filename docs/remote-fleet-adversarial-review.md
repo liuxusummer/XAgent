@@ -290,6 +290,89 @@ cursor，再接纳任务；缺 cursor、重复 pool 或陈旧 identity 会在交
 共享 broker、跨 Store 共识/cursor、自动接管与在线无损 queue handoff 仍是明确残余
 边界。
 
+## 第八轮：受信 Run 投影与撤销优先控制循环
+
+### 第一遍：policy 撤销、Run 退出与 queue 竞态
+
+只提供 `rebuild()` 会留下一个执行窗口：Tool routing policy 已变化或 Run 已退出，
+但旧 queued binding 在部署手写 rebuild 前仍可被 Worker 领取。新的
+`reconcile_queued()` 先完整验证 desired snapshot，再在 Coordinator 同一把锁内完成
+withdraw-old / admit-new。与 Worker poll 并发时只有两个合法线性化结果：poll 先赢则
+旧 binding 已成为 active durable authority，reconcile 报延期；reconcile 先赢则
+Worker 只能看到新 binding。不存在旧、新队列同时可领取的中间态。
+
+`DurableFleetReconciler` 不从 Fleet snapshot 猜 Run，而从 production-ready
+`FleetRunSource` 获取有界 Run/tenant/pool 路由，经 scheduler resolver 和
+`DurableFleetProjector` 重新读取 current Store。Run 不再 `RUNNING` 时 desired 为空，
+旧 queued binding 被主动撤回；policy digest 改变但 task id 相同时，旧 binding 先撤回
+再以新 exact binding 入队。
+
+证据：
+
+- `test_queue_reconcile_replaces_stale_policy_binding`
+- `test_policy_reconcile_and_poll_have_one_queue_linearization`
+- `test_policy_change_withdraws_old_queue_before_replacement`
+- `test_run_exit_withdraws_queued_projection`
+- `test_run_source_converges_queue_idempotently`
+
+### 第二遍：active authority、容量压力与未知结果
+
+active assignment 已经越过队列线性化点，可能已提交 durable claim，不能因 route 删除
+或 policy 变化被内存控制循环伪装撤销。`WithdrawalOutcome.ACTIVE` 因此保留 exact
+binding 并计入 `deferred_active_tasks`；terminal callback、exact terminal probe 或
+lease recovery 释放后，下一轮再收敛。这个语义同时覆盖 callback “Store 已提交但返回
+失败”的未知结果窗口。
+
+对抗容量压力时，stale queued 仍优先撤销，但 active binding 永不驱逐。每次新 admit
+前重新检查当前 binding registry；“active old + desired new”不能绕过
+`max_task_bindings`。新项因 registry/tenant/pool/queue capacity 被拒绝时只增加
+`rejected_tasks`，旧 policy queued item 不会为了可用性被复活。telemetry 更新在锁外
+best-effort 执行，不影响 queue 事实。
+
+证据：
+
+- `test_queue_reconcile_defers_active_authority_until_terminal`
+- `test_queue_reconcile_never_evicts_active_binding_for_capacity`
+- `test_queue_reconcile_validates_entire_projection_before_mutation`
+- `test_queue_reconcile_ignores_observer_failures`
+- `test_terminal_probe_and_retry_projection_converge_together`
+- `test_reconciler_probe_failure_retains_projection`
+
+### 第三遍：route authority、边界与 restart bootstrap
+
+Run route source 是受保护控制面 authority，必须显式声明 production-ready；route 值只
+包含有界 run/tenant/pool 标识，不允许 Worker、Run input 或任意 metadata 扩权。
+reconciler 以 `max_routes + 1` 请求 snapshot，拒绝静默截断、重复 Run、resolver
+异常、缺失 durable Run、重复 task 和 coordinator capacity 溢出。任何动态 readiness
+撤销或非中断异常都会先把 desired 视为空并撤回所有 queued binding，再暴露原错误；
+active authority 仍只等待 terminal。因此 route authority 不可用时停止新执行，而不是
+静默沿用旧 policy。所有失败路径都禁止新 admission，quarantine 自身仍使用同一个
+queue linearization。
+
+strict 模式对每个 route 从对应 Store 读取 current pool ownership/cursor，校验本控制
+世代 owner，并在接纳 task 前幂等恢复 cursor。同一个调度 pool 不能跨两个独立 Store：
+否则两个 Store-local owner/cursor 都无法代表合并后的公平域，控制循环在任何 queue
+mutation 前拒绝。合法 epoch transfer 只有在该 pool 本地 queue/active 已 drain 时才
+能替换 cursor authority；有 queued task 时首轮先 quarantine 并报错，下一轮 idle
+retry 安装新 authority；有 active task 时继续等待 terminal。
+
+证据：
+
+- `test_strict_bootstrap_restores_cursor_once`
+- `test_cursor_progress_during_multi_route_snapshot_is_allowed`
+- `test_strict_pool_cannot_span_independent_stores`
+- `test_source_overflow_fails_before_queue_mutation`
+- `test_scheduler_resolution_failure_quarantines_queued_work`
+- `test_non_production_run_source_is_rejected`
+- `test_revoked_run_source_quarantines_queued_work`
+- `test_authority_change_quarantines_old_queue_then_retries`
+- `test_concurrent_control_rounds_converge_to_one_binding`
+- `test_shard_transfer_fences_stale_queue_then_new_epoch_claims`
+
+结论：显式 Fleet projection 控制轮次的 policy/Run 收敛、active authority 保留和
+restart bootstrap P0/P1=0。生产 Run registry、自动 failure detector/接管、共享 broker
+与跨 Store 共识仍是部署或后续阶段边界。
+
 ## 残余边界
 
 - Fleet queue、Worker registry 和 active routing 是单进程 projection，不是共享
@@ -303,8 +386,9 @@ cursor，再接纳任务；缺 cursor、重复 pool 或陈旧 identity 会在交
   隔离 Store，不能绕过该安全门。
 - Store claim 已提交、assignment 返回前进程崩溃时，Worker 不获得执行权；lease
   recovery 会收敛该 claim。该窗口不能伪装成零 mutation。
-- ready Run 的发现、周期投影、策略变更后的 rebuild 和 terminal reconcile 由部署的
-  可信控制循环调用；本模块不隐式启动后台线程。
+- ready Run route、tenant/pool 归属仍来自部署注入的受保护 registry；参考实现提供
+  `StaticFleetRunSource` 和显式 `DurableFleetReconciler.run_once()`，但不隐式启动
+  后台线程、不从 Run input 猜身份，也不负责 Domain scheduler reconcile。
 - digest-only execution binding 已可跨重启从 Store/当前配置/新鲜 attestation 重建，
   且不会从 Worker 候选结果恢复 bearer。Artifact broker 只持久化 token digest、消费/
   失败墓碑和 exact finalized ref；持有原 grant/handle 的 Worker 可跨 broker 重启完成

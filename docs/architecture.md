@@ -122,8 +122,11 @@
   Worker registry 与 active routing 仍为进程内 projection；多控制面部署可启用
   Store 本地 pool shard 单写者，显式控制面 owner、单调 epoch 和持久 tenant 公平游标
   在同一 claim 事务中 fencing 陈旧投影并记录最后成功选择。重启/接管必须在接纳任务
-  前恢复该 pool 游标。它不使用 wall-clock leader lease，也不提供跨 Store 共识或自动
-  故障转移。fleet claim 准入后失败必须从
+  前恢复该 pool 游标。显式 `DurableFleetReconciler` 从受信 Run route source 解析
+  scheduler/tenant/pool，先收敛 terminal projection，再以撤销优先的锁内差量替换
+  READY queue；policy 变化后旧 queued binding 不再等待 Worker 触发失败，active
+  durable authority 则只延期到 terminal。它不使用 wall-clock leader lease，也不
+  提供跨 Store 共识或自动故障转移。fleet claim 准入后失败必须从
   Store 重新投影，不能把内存队列或 journal 当作 Domain 事实源。完整边界见
   `docs/distributed-execution-adr.md`、
   `docs/remote-execution-recovery.md` 和 `docs/remote-fleet-data-plane.md`。

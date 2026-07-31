@@ -1189,6 +1189,15 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             new_policy_digest="b" * 64,
             now=11,
         )
+        transferred_cursor = (
+            self.harness.store.get_fleet_fairness_cursor("pool-a")
+        )
+        assert transferred_cursor is not None
+        with self.assertRaisesRegex(
+            RemoteFleetConflict,
+            "must be idle",
+        ):
+            fleet.restore_fairness_cursor(transferred_cursor)
 
         with self.assertRaisesRegex(
             RemoteWorkerError,

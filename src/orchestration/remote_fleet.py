@@ -27,12 +27,14 @@ from .remote_scheduling import (
     PollOutcome,
     ReleaseOutcome,
     RemoteAssignment,
+    RemoteSchedulingConflict,
     RemoteTask,
     TouchOutcome,
     WorkerDescriptor,
     WorkerLifecycle,
     WorkerSnapshot,
     WorkerSweepReport,
+    WithdrawalOutcome,
 )
 from .store import FleetFairnessCursor, FleetShardOwnership
 
@@ -157,6 +159,18 @@ class FleetAssignment:
 class FleetRebuildReport:
     workers: int
     tasks: int
+    execution_truth: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class FleetQueueReconcileReport:
+    desired_tasks: int
+    retained_tasks: int
+    withdrawn_tasks: int
+    admitted_tasks: int
+    deferred_active_tasks: int
+    rejected_tasks: int
+    task_bindings: int
     execution_truth: bool = False
 
 
@@ -321,6 +335,14 @@ class RemoteFleetCoordinator:
         self,
         cursor: FleetFairnessCursor,
     ) -> None:
+        self.ensure_fairness_cursor(cursor)
+
+    def ensure_fairness_cursor(
+        self,
+        cursor: FleetFairnessCursor,
+    ) -> bool:
+        """Install one cursor once, or verify its immutable authority."""
+
         if not isinstance(cursor, FleetFairnessCursor):
             raise RemoteFleetValidationError(
                 "cursor must be a FleetFairnessCursor"
@@ -333,11 +355,27 @@ class RemoteFleetCoordinator:
                 "Fleet cursor belongs to another control owner"
             )
         with self._lock:
-            self._scheduler.restore_tenant_cursor(
-                cursor.pool_id,
-                cursor.last_served_tenant,
-            )
+            existing = self._fairness_cursors.get(cursor.pool_id)
+            if existing is not None:
+                if self._same_cursor_authority(existing, cursor):
+                    if not self._scheduler.pool_cursor_is_restored(
+                        cursor.pool_id
+                    ):
+                        raise RemoteFleetConflict(
+                            "Fleet cursor registry is inconsistent"
+                        )
+                    return False
+            try:
+                self._scheduler.restore_tenant_cursor(
+                    cursor.pool_id,
+                    cursor.last_served_tenant,
+                )
+            except RemoteSchedulingConflict as exc:
+                raise RemoteFleetConflict(
+                    "Fleet pool must be idle before cursor restore"
+                ) from exc
             self._fairness_cursors[cursor.pool_id] = cursor
+            return True
 
     def register_worker(self, descriptor: WorkerDescriptor) -> WorkerSnapshot:
         with self._lock:
@@ -726,6 +764,129 @@ class RemoteFleetCoordinator:
             )
         return FleetRebuildReport(workers=len(workers), tasks=len(tasks))
 
+    def reconcile_queued(
+        self,
+        tasks: Sequence[FleetTaskBinding],
+    ) -> FleetQueueReconcileReport:
+        """Converge queued bindings without revoking active authority."""
+
+        if not isinstance(tasks, Sequence) or isinstance(
+            tasks,
+            (str, bytes),
+        ):
+            raise RemoteFleetValidationError(
+                "tasks must be a bounded sequence"
+            )
+        if len(tasks) > self.max_task_bindings:
+            raise RemoteFleetValidationError(
+                "tasks exceed max_task_bindings"
+            )
+        desired: dict[str, FleetTaskBinding] = {}
+        ordered: list[FleetTaskBinding] = []
+        for binding in tasks:
+            if not isinstance(binding, FleetTaskBinding):
+                raise RemoteFleetValidationError(
+                    "tasks must contain FleetTaskBinding values"
+                )
+            task_id = binding.task.task_id
+            if task_id in desired:
+                raise RemoteFleetConflict(
+                    "duplicate task in queue projection"
+                )
+            desired[task_id] = binding
+            ordered.append(binding)
+
+        retained = 0
+        withdrawn = 0
+        admitted = 0
+        rejected = 0
+        deferred_ids: set[str] = set()
+        observed_pools = {
+            binding.task.pool_id for binding in ordered
+        }
+        with self._lock:
+            for binding in ordered:
+                if (
+                    self.require_durable_ownership
+                    or binding.shard_ownership is not None
+                ) and not self._cursor_authorizes_binding(
+                    self._fairness_cursors.get(binding.task.pool_id),
+                    binding,
+                ):
+                    raise RemoteFleetConflict(
+                        "owned queue projection has a stale pool cursor"
+                    )
+
+            for task_id, current in tuple(
+                self._task_bindings.items()
+            ):
+                observed_pools.add(current.task.pool_id)
+                replacement = desired.get(task_id)
+                if replacement == current:
+                    retained += 1
+                    continue
+                outcome = self._scheduler.withdraw(task_id)
+                if outcome is WithdrawalOutcome.WITHDRAWN:
+                    if self._task_bindings.get(task_id) is current:
+                        self._task_bindings.pop(task_id, None)
+                        withdrawn += 1
+                    continue
+                if outcome is WithdrawalOutcome.ACTIVE:
+                    deferred_ids.add(task_id)
+                    continue
+                raise RemoteFleetConflict(
+                    "Fleet binding registry is inconsistent"
+                )
+
+            for binding in ordered:
+                task_id = binding.task.task_id
+                current = self._task_bindings.get(task_id)
+                if current == binding:
+                    continue
+                if current is not None:
+                    deferred_ids.add(task_id)
+                    continue
+                if (
+                    len(self._task_bindings)
+                    >= self.max_task_bindings
+                ):
+                    rejected += 1
+                    continue
+                decision = self._scheduler.admit(binding.task)
+                if decision.outcome is AdmissionOutcome.ADMITTED:
+                    self._task_bindings[task_id] = binding
+                    admitted += 1
+                    continue
+                if decision.outcome is AdmissionOutcome.DUPLICATE:
+                    raise RemoteFleetConflict(
+                        "routing task exists without a trusted Run binding"
+                    )
+                rejected += 1
+            task_bindings = len(self._task_bindings)
+            queue_depths = {
+                pool_id: self._scheduler.queue_depth(
+                    pool_id=pool_id
+                )
+                for pool_id in observed_pools
+            }
+
+        for pool_id, queue_depth in queue_depths.items():
+            self._observe(
+                "observe_queue_depth",
+                pool_id,
+                queue_depth,
+            )
+
+        return FleetQueueReconcileReport(
+            desired_tasks=len(ordered),
+            retained_tasks=retained,
+            withdrawn_tasks=withdrawn,
+            admitted_tasks=admitted,
+            deferred_active_tasks=len(deferred_ids),
+            rejected_tasks=rejected,
+            task_bindings=task_bindings,
+        )
+
     @staticmethod
     def _cursor_authorizes_binding(
         cursor: FleetFairnessCursor | None,
@@ -740,6 +901,19 @@ class RemoteFleetCoordinator:
             and cursor.owner_id == ownership.owner_id
             and cursor.fencing_epoch == ownership.fencing_epoch
             and cursor.policy_digest == ownership.policy_digest
+        )
+
+    @staticmethod
+    def _same_cursor_authority(
+        left: FleetFairnessCursor,
+        right: FleetFairnessCursor,
+    ) -> bool:
+        return (
+            left.shard_id == right.shard_id
+            and left.pool_id == right.pool_id
+            and left.owner_id == right.owner_id
+            and left.fencing_epoch == right.fencing_epoch
+            and left.policy_digest == right.policy_digest
         )
 
     def snapshot(self) -> FleetSnapshot:
@@ -886,6 +1060,7 @@ def _run_id(value: object) -> str:
 
 __all__ = [
     "FleetAssignment",
+    "FleetQueueReconcileReport",
     "FleetRebuildReport",
     "FleetSnapshot",
     "FleetTaskBinding",

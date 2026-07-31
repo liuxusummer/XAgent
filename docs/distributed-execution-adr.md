@@ -342,8 +342,11 @@ strict shard ownership：一个 `pool` 只允许一个 shard，控制器配置�
 `selection_sequence`。接管是显式 CAS，不依赖 wall clock；A→B→A 也不会复活旧 epoch。
 重启或接管先恢复持久 cursor 再接纳队列，避免长驻 tenant 总从默认排序位置重新开始。
 不同 Store shard 的配额和所有权仍彼此独立。ready Run 发现、周期投影、策略变更后的
-rebuild、显式所有权接管和 terminal reconcile 由部署控制循环驱动。claim callback
-失败后 binding 可丢弃，并由 Store reconciler 重新投影、重新准入。完整组合与审查证据见
+queue 收敛和 terminal reconcile 已由显式 `DurableFleetReconciler.run_once()` 组合；
+受保护 Run registry 仍通过 `FleetRunSource` 注入，Domain reconcile、调用周期和显式
+所有权接管由部署驱动。控制循环先撤销陈旧 queued binding，再加入新 policy projection；
+active durable authority 只延期到 terminal，不由内存 projection 撤销。claim callback
+失败后 binding 可丢弃，并由下一轮 Store 投影重新准入。完整组合与审查证据见
 [remote-fleet-data-plane.md](remote-fleet-data-plane.md) 和
 [remote-fleet-adversarial-review.md](remote-fleet-adversarial-review.md)。
 

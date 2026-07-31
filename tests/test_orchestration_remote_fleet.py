@@ -548,6 +548,194 @@ class RemoteFleetCoordinatorTests(unittest.TestCase):
         with self.assertRaisesRegex(RemoteFleetConflict, "active routing"):
             fleet.rebuild(tasks, workers)
 
+    def test_queue_reconcile_replaces_stale_policy_binding(self) -> None:
+        fleet = self._coordinator(
+            lambda run_id, worker_id: _work_assignment(
+                run_id,
+                worker_id,
+            )
+        )
+        stale = _binding("task-1", "run-1")
+        current = replace(
+            stale,
+            routing_policy_digest=_digest("routing-policy-v2"),
+        )
+        fleet.admit(stale)
+
+        changed = fleet.reconcile_queued([current])
+        repeated = fleet.reconcile_queued([current])
+
+        self.assertEqual(changed.desired_tasks, 1)
+        self.assertEqual(changed.withdrawn_tasks, 1)
+        self.assertEqual(changed.admitted_tasks, 1)
+        self.assertEqual(changed.deferred_active_tasks, 0)
+        self.assertEqual(changed.rejected_tasks, 0)
+        self.assertEqual(changed.task_bindings, 1)
+        self.assertEqual(repeated.retained_tasks, 1)
+        self.assertEqual(repeated.withdrawn_tasks, 0)
+        self.assertFalse(changed.execution_truth)
+
+    def test_queue_reconcile_defers_active_authority_until_terminal(
+        self,
+    ) -> None:
+        fleet = self._coordinator(
+            lambda run_id, worker_id: _work_assignment(
+                run_id,
+                worker_id,
+            )
+        )
+        worker = fleet.register_worker(_worker("worker-1"))
+        fleet.admit(_binding("task-1", "run-1"))
+        assignment = fleet.assign_next(
+            "worker-1",
+            worker_generation=worker.generation,
+            session_id=worker.descriptor.session_id,
+        )
+        assert assignment is not None
+
+        deferred = fleet.reconcile_queued([])
+
+        self.assertEqual(deferred.deferred_active_tasks, 1)
+        self.assertEqual(deferred.withdrawn_tasks, 0)
+        self.assertEqual(deferred.task_bindings, 1)
+        self.assertEqual(
+            fleet.release_terminal(assignment),
+            ReleaseOutcome.RELEASED,
+        )
+        converged = fleet.reconcile_queued([])
+        self.assertEqual(converged.task_bindings, 0)
+
+    def test_queue_reconcile_validates_entire_projection_before_mutation(
+        self,
+    ) -> None:
+        fleet = self._coordinator(
+            lambda run_id, worker_id: _work_assignment(
+                run_id,
+                worker_id,
+            )
+        )
+        existing = _binding("task-1", "run-1")
+        fleet.admit(existing)
+
+        with self.assertRaisesRegex(
+            RemoteFleetConflict,
+            "duplicate task",
+        ):
+            fleet.reconcile_queued([existing, existing])
+
+        self.assertEqual(fleet.snapshot().queued_tasks, 1)
+        self.assertEqual(fleet.snapshot().task_bindings, 1)
+
+    def test_queue_reconcile_never_evicts_active_binding_for_capacity(
+        self,
+    ) -> None:
+        fleet = self._coordinator(
+            lambda run_id, worker_id: _work_assignment(
+                run_id,
+                worker_id,
+            ),
+            max_task_bindings=1,
+        )
+        worker = fleet.register_worker(_worker("worker-1"))
+        fleet.admit(_binding("active-task", "active-run"))
+        assignment = fleet.assign_next(
+            "worker-1",
+            worker_generation=worker.generation,
+            session_id=worker.descriptor.session_id,
+        )
+        assert assignment is not None
+
+        report = fleet.reconcile_queued(
+            [_binding("new-task", "new-run")]
+        )
+
+        self.assertEqual(report.deferred_active_tasks, 1)
+        self.assertEqual(report.rejected_tasks, 1)
+        self.assertEqual(report.task_bindings, 1)
+        self.assertEqual(fleet.snapshot().active_assignments, 1)
+        self.assertEqual(
+            fleet.release_terminal(assignment),
+            ReleaseOutcome.RELEASED,
+        )
+
+    def test_policy_reconcile_and_poll_have_one_queue_linearization(
+        self,
+    ) -> None:
+        fleet = self._coordinator(
+            lambda run_id, worker_id: _work_assignment(
+                run_id,
+                worker_id,
+            ),
+            max_task_bindings=1,
+        )
+        worker = fleet.register_worker(_worker("worker-1"))
+        stale = _binding("task-1", "run-1")
+        current = replace(
+            stale,
+            routing_policy_digest=_digest("routing-policy-v2"),
+        )
+        fleet.admit(stale)
+        barrier = threading.Barrier(2)
+
+        def assign():
+            barrier.wait(timeout=5)
+            return fleet.assign_next(
+                "worker-1",
+                worker_generation=worker.generation,
+                session_id=worker.descriptor.session_id,
+            )
+
+        def reconcile():
+            barrier.wait(timeout=5)
+            return fleet.reconcile_queued([current])
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            assignment_future = executor.submit(assign)
+            reconcile_future = executor.submit(reconcile)
+            assignment = assignment_future.result(timeout=5)
+            report = reconcile_future.result(timeout=5)
+
+        assert assignment is not None
+        self.assertEqual(fleet.snapshot().active_assignments, 1)
+        self.assertEqual(fleet.snapshot().task_bindings, 1)
+        self.assertEqual(report.rejected_tasks, 0)
+        self.assertIn(
+            (
+                report.deferred_active_tasks,
+                report.withdrawn_tasks,
+                report.admitted_tasks,
+            ),
+            {
+                (1, 0, 0),
+                (0, 1, 1),
+            },
+        )
+        self.assertEqual(
+            fleet.release_terminal(assignment),
+            ReleaseOutcome.RELEASED,
+        )
+
+    def test_queue_reconcile_ignores_observer_failures(self) -> None:
+        fleet = self._coordinator(
+            lambda run_id, worker_id: _work_assignment(
+                run_id,
+                worker_id,
+            ),
+            observability=_ExplodingObservability(),
+        )
+        stale = _binding("task-1", "run-1")
+        current = replace(
+            stale,
+            routing_policy_digest=_digest("routing-policy-v2"),
+        )
+        fleet.admit(stale)
+
+        report = fleet.reconcile_queued([current])
+
+        self.assertEqual(report.withdrawn_tasks, 1)
+        self.assertEqual(report.admitted_tasks, 1)
+        self.assertEqual(fleet.snapshot().queued_tasks, 1)
+
     def test_rebuild_rejects_during_inflight_durable_claim(self) -> None:
         entered = threading.Event()
         release = threading.Event()

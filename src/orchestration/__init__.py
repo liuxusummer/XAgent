@@ -174,7 +174,10 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "SecureRemoteAssignmentAdmitter",
         "SecureRemoteExecutionAdapter",
     ),
-    ".remote_fleet": ("RemoteFleetCoordinator",),
+    ".remote_fleet": (
+        "FleetQueueReconcileReport",
+        "RemoteFleetCoordinator",
+    ),
     ".remote_fleet_control": (
         "DurableFleetProjector",
         "FleetControlSnapshot",
@@ -187,6 +190,13 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "SecureRemoteFleetPoller",
         "StaticFleetToolPolicyResolver",
         "StaticFleetWorkerResolver",
+    ),
+    ".remote_fleet_reconcile": (
+        "DurableFleetReconciler",
+        "FleetProjectionReconcileReport",
+        "FleetRunRoute",
+        "FleetRunSource",
+        "StaticFleetRunSource",
     ),
     ".remote_http": (
         "AsgiTlsPeerAuthenticator",
