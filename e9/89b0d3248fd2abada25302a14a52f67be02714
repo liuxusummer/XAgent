@@ -1,0 +1,49 @@
+docs/agent-activity-receipt-adversarial-review.md
+  s_72af05a5dabd4c::t_8bc735f6cf8e8a 110-113
+docs/agent-activity-receipt.md
+  s_72af05a5dabd4c::t_ec7e6e7832ca7b 36-38,40,56,58,76-84,101-102
+docs/agent-execution-manifest-adversarial-review.md
+  s_72af05a5dabd4c::t_52441d9d60af10 1-96
+docs/agent-execution-manifest.md
+  s_72af05a5dabd4c::t_f8189c4f7c6294 1-140
+docs/architecture.md
+  s_72af05a5dabd4c::t_75cb128de130bd 84-87
+docs/durable-orchestration-spec.md
+  s_72af05a5dabd4c::t_7921baf46032a1 74,406,416-420
+docs/tool-layer.md
+  s_72af05a5dabd4c::t_25180a394e8fb2 294-297
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_b811dc1b235c6b 22-29
+src/orchestration/agent_execution_manifest.py
+  s_72af05a5dabd4c::t_77942ad6b9b9e8 1-869
+src/orchestration/agent_receipt.py
+  s_72af05a5dabd4c::t_c49659a8f621c1 15,20-25,63,167-212,223-227,238-266,268,291-295,306-318,338-339,376-378
+src/orchestration/agent_request.py
+  s_72af05a5dabd4c::t_3e2991ea10e0d5 626,647,677,689
+src/orchestration/artifacts.py
+  s_72af05a5dabd4c::t_98e53875f0cfa5 59
+src/orchestration/store.py
+  s_72af05a5dabd4c::t_9794b41b2b16e1 1293-1345,5740-5743
+tests/test_orchestration_agent_execution_manifest.py
+  s_72af05a5dabd4c::t_de478b8a2c8e37 1-633
+tests/test_orchestration_agent_receipt.py
+  s_72af05a5dabd4c::t_f3a869616c2d26 58,95,99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e989b0d3248fd2abada25302a14a52f67be02714",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
