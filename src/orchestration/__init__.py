@@ -19,6 +19,12 @@ from typing import Any
 
 
 _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
+    ".agent_execution_evidence": (
+        "AgentExecutionEvidenceCollector",
+        "AgentExecutionEvidenceCollectorError",
+        "AgentProviderInvocationContext",
+        "AgentToolInvocationContext",
+    ),
     ".agent_execution_manifest": (
         "AgentActivityExecutionManifest",
         "AgentExecutionManifestArtifactStore",

@@ -108,8 +108,9 @@ Round 3：通过。
 ## 残余边界
 
 - 当前代码提供的是受信 Broker/runtime 的证据契约，不是 provider 的数字签名。
-- 真实 Agent Loop 尚未收集逐次 provider receipt、stage manifest 并原子提交
-  AgentActivityReceipt；远程 `agent` capability 不得因此开放。
+- Core Agent Loop 已能通过 fail-closed observer 收集显式 provider receipt；但生产
+  gateway client、manifest staging 与 AgentActivityReceipt 原子提交尚未组合，远程
+  `agent` capability 不得因此开放。
 - reference Broker 不能证明部署 gateway 的 mTLS、attestation、跨主机共识或 upstream
   exactly-once；`production_security_ready` 继续固定为 false。
 - response ArtifactRef digest 证明 receipt 当时绑定的引用身份；需要读取模型响应的审计

@@ -96,7 +96,7 @@ v2 保留所有 v1 字段，并增加：
 
 | 字段 | 约束 |
 |---|---|
-| `observed_provider_invocations` | runtime 观察到的 provider 调用数，最多 64 |
+| `observed_provider_invocations` | runtime 观察到的 provider 调用数，最多 1,000,000 |
 | `provider_receipts_complete` | 是否逐项完整覆盖 |
 | `provider_receipts[]` | 有序 `AgentProviderReceiptBinding` |
 
@@ -114,6 +114,31 @@ digest 不得重复。
 完整证明。
 
 v1 继续 exact-field 解析，但没有 provider 字段，也不能声明 provider 完整性。
+
+### 4.1 AgentExecutionEvidenceCollector
+
+`AgentExecutionEvidenceCollector` 实现 Agent Loop 的可选 execution-evidence observer：
+
+1. provider/tool start 先递增 observed count；
+2. finish 只接受 `ChatResponse.provider_receipt` /
+   `ActionResult.tool_receipt` 中显式传入的精确 typed receipt；
+3. receipt 为空、调用失败、父绑定错误、乱序或超过 64 项持久集合上限时，将相应链永久
+   标记为 partial，不从业务结果、Event 或日志补猜；
+4. finalization 要求没有进行中的调用，terminal turns 不得早于最后观察 turn；同一终态
+   可幂等重取，冲突终态被拒绝；
+5. provider evidence 缺失时 manifest 保守升级为 secret，避免未知 response 分类被降级；
+6. receipt 集合最多保存连续的前 64 项，observed count 仍记录真实有界总数。
+
+collector 在 start 与 finish 之间提供只读 `AgentProviderInvocationContext` /
+`AgentToolInvocationContext`。remote gateway client 从前者取得 invocation sequence；
+durable Handler 从后者取得 sequence 和父派生 operation key，再交给真正的
+Provider/Tool executor。operation key 从 repr 隐藏，finish 后 context 立即不可用。
+执行者与证据收集器因此共享一个序列分配点，不需要各自维护可能漂移的计数器。
+
+Core 只定义 observer 协议和不透明、`repr=False` 的 receipt 槽，不反向依赖 orchestration
+类型。现有本地 Session/Handler 不产生 typed receipt，因此挂载 collector 后得到的仍是
+partial manifest。只有显式使用 `ProviderAccessBroker` 和 durable Tool executor 的未来
+adapter 才可能形成 complete lineage。
 
 ## 5. AgentActivityReceipt v2
 
@@ -160,12 +185,15 @@ request/receipt/ToolReceipt/ProviderInvocationReceipt 绑定校验。远程接�
 - manifest 不证明 sandbox 禁止了绕过 Tool/Provider gateway 的直接网络或文件副作用；
   远程 Agent runtime 必须由 attested sandbox 和 egress policy 独立证明。
 - `ToolReceipt.verification` 强度必须逐项判断。manifest 完整不等于 write exactly-once。
-- v2 已绑定 provider invocation receipt/operation evidence，但真实 Agent Loop 还未把每次
-  provider 调用接到该清单；不能仅靠数据类型声称端到端能力已完成。
+- Core Agent Loop 已提供 fail-closed observer 接线，collector 可把显式 receipt 组装进
+  v2；但生产 remote gateway client、durable Tool handler、manifest staging 与终态原子
+  提交尚未组成完整 adapter，不能仅靠 observer 声称端到端能力已完成。
 - Artifact digest 不是抗 ArtifactStore/数据库管理员的数字签名；生产仍需独立 OS 身份、
   ACL、加密和可选透明日志。
 
 三轮攻击复现、修复与测试见
 [Agent Execution Manifest 三轮对抗性审查](agent-execution-manifest-adversarial-review.md)
 与
-[Provider Receipt 与 Agent Lineage 三轮对抗性审查](provider-agent-lineage-adversarial-review.md)。
+[Provider Receipt 与 Agent Lineage 三轮对抗性审查](provider-agent-lineage-adversarial-review.md)，
+runtime 接线审查见
+[Agent Execution Evidence Collector 三轮对抗性审查](agent-execution-evidence-collector-adversarial-review.md)。

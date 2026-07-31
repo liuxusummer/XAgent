@@ -222,8 +222,8 @@ prompt、bearer、provider credential 或证据原文；每个 invocation 最多
 - `production_security_ready` 仍固定为 false；
 - 参考实现不提供 mTLS、provider egress allowlist、secret manager、经过 attestation
   的 invoker。
-- typed provider receipt 与 Agent manifest v2 已提供组合契约，但真实远程 Agent Loop
-  尚未逐调用接线，也未完成生产接纳状态机。
+- typed provider receipt、Agent manifest v2 与 Core Loop observer 已提供组合契约，
+  但生产 remote gateway client、manifest staging/原子提交和接纳状态机尚未完成。
 
 生产 remote Agent 仍必须提供经过验证的 upstream idempotency/operation ledger、
 经过 attestation 的 ProviderInvoker 和完整远程 Agent runtime。未完成前禁止把

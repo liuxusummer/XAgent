@@ -22,12 +22,19 @@ ChatResponse
 ├── content     # 文本回复
 ├── tool_calls  # 工具调用列表（可能为空）
 ├── stop_reason # 停止原因
-└── usage       # provider 返回的真实 token 用量（可能为空）
+├── usage       # provider 返回的真实 token 用量（可能为空）
+└── provider_receipt # 可选 out-of-band receipt，不进入 repr/消息历史
 ```
 
 无论底层是 Claude content-block 还是 OpenAI delta，上层拿到的都是同一个形状。新增模型支持时，只需要实现 Session 的协议转换逻辑，不触碰上层代码。
 
 `usage` 只保存归一化后的元数据：输入、输出、总量、缓存创建、缓存读取和 reasoning token。provider 未返回 usage 时保持为空，不用字符数估算。
+
+`provider_receipt` 只为受信远程 gateway client 预留。现有本地 Session、文本/原生
+ToolClient 和 MixinSession 都保持 `None`；LLM 层不导入、解析或序列化编排 receipt。
+Agent Loop 仅把该对象交给可选 execution-evidence observer。MixinSession 内部的透明
+重试/故障转移不能被自动提升为一次可验证 provider operation；生产远程 client 必须让
+每个稳定 operation ID 对应一个显式 `ProviderInvocationReceipt`。
 
 ### 两种工具协议，两种策略
 

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from src.config import SessionConfig
 from src.core.XAgent import XAgent
-from src.core.agent_loop import AgentContext
+from src.core.agent_loop import ActionResult, AgentContext
 from src.core.llm import (
     BaseSession,
     ChatResponse,
@@ -76,7 +76,13 @@ class ProviderCredentialRepresentationTests(unittest.TestCase):
             AgentContext(
                 file_index_embedding={
                     "file_index_embedding": {"apikey": _SECRET}
-                }
+                },
+                execution_evidence_observer=_SECRET,
+            ),
+            ActionResult(
+                data={"status": "safe"},
+                next_prompt=None,
+                tool_receipt={"token": _SECRET},
             ),
             ToolCall(name="tool-safe", args={"token": _SECRET}, id="1"),
             ChatResponse(
@@ -84,6 +90,7 @@ class ProviderCredentialRepresentationTests(unittest.TestCase):
                 content="safe",
                 tool_calls=[],
                 raw={"authorization": _SECRET},
+                provider_receipt={"token": _SECRET},
             ),
         )
 

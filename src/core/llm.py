@@ -187,6 +187,11 @@ class ChatResponse:
     raw: Any = field(default=None, repr=False)
     stop_reason: str = "end_turn"
     usage: TokenUsage | None = None
+    provider_receipt: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass

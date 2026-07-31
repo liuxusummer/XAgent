@@ -38,6 +38,7 @@ class ActionResult:
     next_prompt: Optional[str]  # 下一轮注入的 prompt；None = 任务完成
     should_exit: bool           # True = 立即中断
     flags: FrozenSet[str] = frozenset()  # 循环控制信号，有限枚举
+    tool_receipt: object | None = None    # 仅受信编排 observer 消费，不进业务结果
 ```
 
 四个字段各自承载一个维度的信息：
@@ -46,6 +47,9 @@ class ActionResult:
 - **next_prompt**：意图——下一轮应该关注什么（工作记忆、历史摘要、SOP 提示都在这里注入）。只承载语义内容，不承载控制信号
 - **should_exit**：控制——是否需要立即打断循环
 - **flags**：信号——循环级控制指令，合法值为 `reset_tools`（重置工具描述）、`retry`（请求重试）。不承载语义信息
+- **tool_receipt**：可选的 out-of-band durable `ToolReceipt`。本地 Handler 默认为空；
+  只有受信 durable Tool adapter 可以设置。字段从 repr 和业务 `tool_results` 中排除，
+  Core 不解释其类型。
 
 `next_prompt` 的语义简化为三种：
 
@@ -114,6 +118,28 @@ class ActionResult:
 - **no_tool 不走 Handler 分发**。当 LLM 一轮回复中没有调用任何工具时，这是循环级事件，不是工具级事件。`handle_no_tool_call` 作为主循环的内部函数处理空响应检测、流异常检测、代码块未调用检测等循环级关注点。
 - **flags 在主循环中处理**。控制信号（如 `reset_tools`）由主循环消费，不传递给 Handler 或 Session。
 - **turn_end_hooks 是唯一的后处理入口**。周期性注入（防重试警告、全局记忆刷新、强制 ask_user）都在这里统一处理，不在循环体里散落。
+
+### 3.1 执行证据 observer
+
+`AgentContext.execution_evidence_observer` 是可选、fail-closed 的 out-of-band 观察边界：
+
+- 每次 `client.chat()` 前后调用 `provider_call_started/finished`；异常调用
+  `provider_call_failed`；
+- 每个真实 tool call 分发前后调用 `tool_call_started/finished`；异常调用
+  `tool_call_failed`；
+- `ChatResponse.provider_receipt` 与 `ActionResult.tool_receipt` 只传给 observer，不进入
+  prompt、checkpoint、Event data 或返回给用户的 tool result；
+- observer start 失败发生在副作用前，会阻止调用；finish 失败发生在调用后，会使 Agent
+  Attempt 失败关闭，不能假装 evidence 完整；
+- observer 异常映射为固定 `ExecutionEvidenceObservationError`，不保留回调异常正文或
+  cause/context。
+
+orchestration 层的 `AgentExecutionEvidenceCollector` 只接受显式 typed receipt。普通本地
+Session/Handler 的 receipt 均为空，因此即使挂载 collector 也只能得到 partial
+manifest；它不会从 `ActionResult.data`、Event 或日志猜测执行证明。
+受信 gateway client 可在 `chat()` 内读取 active provider invocation sequence；durable
+Handler 可在 dispatch 内读取 active Tool sequence 和父派生 operation key。这样执行者与
+collector 使用同一个计数事实源，不需要复制易漂移的本地计数器。
 
 ## 4. Handler 分发机制
 

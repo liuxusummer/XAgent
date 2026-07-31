@@ -7,6 +7,7 @@ from src.core.agent_loop import (
     ActionResult,
     AgentContext,
     BaseHandler,
+    ExecutionEvidenceObservationError,
     exhaust,
     run_agent_loop,
 )
@@ -44,6 +45,65 @@ class DummyHandler(BaseHandler):
     def exec_interrupt(self, args):
         _ = args
         return ActionResult(data={"status": "INTERRUPT"}, next_prompt="")
+
+
+class RecordingEvidenceObserver:
+    def __init__(self) -> None:
+        self.events: list[tuple] = []
+
+    def provider_call_started(self, *, turn: int) -> None:
+        self.events.append(("provider_start", turn))
+
+    def provider_call_finished(
+        self,
+        *,
+        turn: int,
+        receipt,
+    ) -> None:
+        self.events.append(("provider_finish", turn, receipt))
+
+    def provider_call_failed(self, *, turn: int) -> None:
+        self.events.append(("provider_failed", turn))
+
+    def tool_call_started(
+        self,
+        *,
+        turn: int,
+        tool_name: str,
+        tool_call_id: str,
+    ) -> None:
+        self.events.append(
+            ("tool_start", turn, tool_name, tool_call_id)
+        )
+
+    def tool_call_finished(
+        self,
+        *,
+        turn: int,
+        tool_name: str,
+        tool_call_id: str,
+        receipt,
+    ) -> None:
+        self.events.append(
+            (
+                "tool_finish",
+                turn,
+                tool_name,
+                tool_call_id,
+                receipt,
+            )
+        )
+
+    def tool_call_failed(
+        self,
+        *,
+        turn: int,
+        tool_name: str,
+        tool_call_id: str,
+    ) -> None:
+        self.events.append(
+            ("tool_failed", turn, tool_name, tool_call_id)
+        )
 
 
 class AgentLoopTests(unittest.TestCase):
@@ -103,6 +163,362 @@ class AgentLoopTests(unittest.TestCase):
             result["usage"],
             {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
         )
+
+    def test_receipts_are_observed_out_of_band_not_in_tool_result(
+        self,
+    ) -> None:
+        provider_receipt_1 = object()
+        provider_receipt_2 = object()
+        tool_receipt = object()
+        observer = RecordingEvidenceObserver()
+
+        class ReceiptedHandler(DummyHandler):
+            def exec_echo(self, args):
+                return ActionResult(
+                    data={"echo": args["value"]},
+                    next_prompt="continue",
+                    tool_receipt=tool_receipt,
+                )
+
+        client = DummyClient(
+            [
+                ChatResponse(
+                    thinking="",
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            name="echo",
+                            args={"value": "safe"},
+                            id="call-1",
+                        )
+                    ],
+                    provider_receipt=provider_receipt_1,
+                ),
+                ChatResponse(
+                    thinking="",
+                    content="done",
+                    tool_calls=[],
+                    provider_receipt=provider_receipt_2,
+                ),
+            ]
+        )
+        handler = ReceiptedHandler()
+        handler.ctx.execution_evidence_observer = observer
+
+        result = run_agent_loop(
+            client=client,
+            system_prompt="sys",
+            user_input="go",
+            handler=handler,
+            tools_schema=[],
+            max_turns=3,
+        )
+
+        self.assertEqual(
+            observer.events,
+            [
+                ("provider_start", 1),
+                ("provider_finish", 1, provider_receipt_1),
+                ("tool_start", 1, "echo", "call-1"),
+                (
+                    "tool_finish",
+                    1,
+                    "echo",
+                    "call-1",
+                    tool_receipt,
+                ),
+                ("provider_start", 2),
+                ("provider_finish", 2, provider_receipt_2),
+            ],
+        )
+        self.assertNotIn("tool_receipt", result["tool_results"][0])
+        self.assertNotIn(
+            repr(tool_receipt),
+            repr(result["tool_results"]),
+        )
+        self.assertNotIn(
+            repr(provider_receipt_1),
+            repr(client.responses[0]),
+        )
+        self.assertNotIn(
+            repr(tool_receipt),
+            repr(
+                ActionResult(
+                    data={"status": "OK"},
+                    next_prompt=None,
+                    tool_receipt=tool_receipt,
+                )
+            ),
+        )
+
+    def test_evidence_observer_failure_is_sanitized_before_provider(
+        self,
+    ) -> None:
+        secret = "observer-secret"
+
+        class ExplodingObserver(RecordingEvidenceObserver):
+            def provider_call_started(self, *, turn: int) -> None:
+                del turn
+                raise RuntimeError(secret)
+
+        client = DummyClient(
+            [
+                ChatResponse(
+                    thinking="",
+                    content="done",
+                    tool_calls=[],
+                )
+            ]
+        )
+        handler = DummyHandler()
+        handler.ctx.execution_evidence_observer = ExplodingObserver()
+
+        with self.assertRaises(
+            ExecutionEvidenceObservationError
+        ) as raised:
+            run_agent_loop(
+                client=client,
+                system_prompt="sys",
+                user_input="go",
+                handler=handler,
+                tools_schema=[],
+                max_turns=1,
+            )
+
+        self.assertEqual(
+            str(raised.exception),
+            "execution_evidence_observation_failed",
+        )
+        self.assertNotIn(secret, repr(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        self.assertEqual(client.calls, 0)
+
+        class LookupExplodingObserver:
+            def __getattribute__(self, name):
+                if name == "provider_call_started":
+                    raise RuntimeError(secret)
+                return super().__getattribute__(name)
+
+        lookup_client = DummyClient(
+            [
+                ChatResponse(
+                    thinking="",
+                    content="done",
+                    tool_calls=[],
+                )
+            ]
+        )
+        lookup_handler = DummyHandler()
+        lookup_handler.ctx.execution_evidence_observer = (
+            LookupExplodingObserver()
+        )
+        with self.assertRaises(
+            ExecutionEvidenceObservationError
+        ) as lookup_raised:
+            run_agent_loop(
+                client=lookup_client,
+                system_prompt="sys",
+                user_input="go",
+                handler=lookup_handler,
+                tools_schema=[],
+                max_turns=1,
+            )
+
+        self.assertEqual(
+            str(lookup_raised.exception),
+            "execution_evidence_observation_failed",
+        )
+        self.assertNotIn(secret, repr(lookup_raised.exception))
+        self.assertIsNone(lookup_raised.exception.__cause__)
+        self.assertIsNone(lookup_raised.exception.__context__)
+        self.assertEqual(lookup_client.calls, 0)
+
+    def test_process_control_exceptions_bypass_evidence_callbacks(
+        self,
+    ) -> None:
+        class InterruptingClient(DummyClient):
+            def chat(self, messages, tools):
+                del messages, tools
+                self.calls += 1
+                raise KeyboardInterrupt
+
+        observer = RecordingEvidenceObserver()
+        handler = DummyHandler()
+        handler.ctx.execution_evidence_observer = observer
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_agent_loop(
+                client=InterruptingClient([]),
+                system_prompt="sys",
+                user_input="go",
+                handler=handler,
+                tools_schema=[],
+                max_turns=1,
+            )
+
+        self.assertEqual(observer.events, [("provider_start", 1)])
+
+    def test_provider_and_tool_failures_close_observations(self) -> None:
+        class FailingClient(DummyClient):
+            def chat(self, messages, tools):
+                del messages, tools
+                self.calls += 1
+                raise RuntimeError("provider failed")
+
+        provider_observer = RecordingEvidenceObserver()
+        provider_handler = DummyHandler()
+        provider_handler.ctx.execution_evidence_observer = (
+            provider_observer
+        )
+        with self.assertRaisesRegex(RuntimeError, "provider failed"):
+            run_agent_loop(
+                client=FailingClient([]),
+                system_prompt="sys",
+                user_input="go",
+                handler=provider_handler,
+                tools_schema=[],
+                max_turns=1,
+            )
+        self.assertEqual(
+            provider_observer.events,
+            [
+                ("provider_start", 1),
+                ("provider_failed", 1),
+            ],
+        )
+
+        class FailingHandler(DummyHandler):
+            def exec_boom(self, args):
+                del args
+                raise RuntimeError("tool failed")
+
+        tool_observer = RecordingEvidenceObserver()
+        tool_handler = FailingHandler()
+        tool_handler.ctx.execution_evidence_observer = tool_observer
+        with self.assertRaisesRegex(RuntimeError, "tool failed"):
+            run_agent_loop(
+                client=DummyClient(
+                    [
+                        ChatResponse(
+                            thinking="",
+                            content="",
+                            tool_calls=[
+                                ToolCall(
+                                    name="boom",
+                                    args={},
+                                    id="call-1",
+                                )
+                            ],
+                        )
+                    ]
+                ),
+                system_prompt="sys",
+                user_input="go",
+                handler=tool_handler,
+                tools_schema=[],
+                max_turns=1,
+            )
+        self.assertEqual(
+            tool_observer.events,
+            [
+                ("provider_start", 1),
+                ("provider_finish", 1, None),
+                ("tool_start", 1, "boom", "call-1"),
+                ("tool_failed", 1, "boom", "call-1"),
+            ],
+        )
+
+    def test_dual_failures_do_not_retain_sensitive_exception_context(
+        self,
+    ) -> None:
+        provider_secret = "provider-sensitive-detail"
+        tool_secret = "tool-sensitive-detail"
+        observer_secret = "observer-sensitive-detail"
+
+        class FailingClient(DummyClient):
+            def chat(self, messages, tools):
+                del messages, tools
+                self.calls += 1
+                raise RuntimeError(provider_secret)
+
+        class FailingHandler(DummyHandler):
+            def exec_boom(self, args):
+                del args
+                raise RuntimeError(tool_secret)
+
+        class DualFailureObserver(RecordingEvidenceObserver):
+            def provider_call_failed(self, *, turn: int) -> None:
+                del turn
+                raise RuntimeError(observer_secret)
+
+            def tool_call_failed(
+                self,
+                *,
+                turn: int,
+                tool_name: str,
+                tool_call_id: str,
+            ) -> None:
+                del turn, tool_name, tool_call_id
+                raise RuntimeError(observer_secret)
+
+        provider_handler = DummyHandler()
+        provider_handler.ctx.execution_evidence_observer = (
+            DualFailureObserver()
+        )
+        with self.assertRaises(
+            ExecutionEvidenceObservationError
+        ) as provider_raised:
+            run_agent_loop(
+                client=FailingClient([]),
+                system_prompt="sys",
+                user_input="go",
+                handler=provider_handler,
+                tools_schema=[],
+                max_turns=1,
+            )
+
+        tool_handler = FailingHandler()
+        tool_handler.ctx.execution_evidence_observer = DualFailureObserver()
+        with self.assertRaises(
+            ExecutionEvidenceObservationError
+        ) as tool_raised:
+            run_agent_loop(
+                client=DummyClient(
+                    [
+                        ChatResponse(
+                            thinking="",
+                            content="",
+                            tool_calls=[
+                                ToolCall(
+                                    name="boom",
+                                    args={},
+                                    id="call-1",
+                                )
+                            ],
+                        )
+                    ]
+                ),
+                system_prompt="sys",
+                user_input="go",
+                handler=tool_handler,
+                tools_schema=[],
+                max_turns=1,
+            )
+
+        for raised in (provider_raised, tool_raised):
+            self.assertEqual(
+                str(raised.exception),
+                "execution_evidence_observation_failed",
+            )
+            self.assertIsNone(raised.exception.__cause__)
+            self.assertIsNone(raised.exception.__context__)
+            for secret in (
+                provider_secret,
+                tool_secret,
+                observer_secret,
+            ):
+                self.assertNotIn(secret, repr(raised.exception))
 
     def test_run_agent_loop_resets_tools_on_unknown_tool(self) -> None:
         client = DummyClient(

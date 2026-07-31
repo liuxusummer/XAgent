@@ -500,7 +500,7 @@ class AgentActivityExecutionManifest:
             self.observed_provider_invocations,
             "invalid_observed_provider_invocation_count",
             minimum=0,
-            maximum=MAX_AGENT_EXECUTION_PROVIDER_RECEIPTS,
+            maximum=MAX_AGENT_EXECUTION_TURNS,
         )
         object.__setattr__(
             self,

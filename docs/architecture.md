@@ -87,6 +87,12 @@
   只有 v2 receipt 实际加载并验证该 manifest，且显式要求完整 provider lineage 后，
   才具备远程 Agent 所需的工具/provider lineage 前置证据。见
   `docs/agent-execution-manifest.md`
+- Core Agent Loop 通过可选 execution-evidence observer 在每次 provider/tool 调用前后
+  发出 out-of-band 观察；`AgentExecutionEvidenceCollector` 只接收
+  `ChatResponse.provider_receipt` / `ActionResult.tool_receipt` 的精确 typed receipt，
+  缺失、失败、错绑或超限永久降级为 partial。普通本地路径不产生 receipt，不能被观察
+  Event 或业务结果自动提升为完整证据；审查见
+  `docs/agent-execution-evidence-collector-adversarial-review.md`。
 - Agent Activity 的 task/context 可由 `AgentActivityRequest` 物化为至少 sensitive
   （并继承 context 最高分类）的 content-addressed Artifact，绑定稳定
   Attempt/request/definition/config/input descriptor，但不绑定 Worker/lease/grant。

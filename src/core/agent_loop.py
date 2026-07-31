@@ -9,7 +9,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from types import GeneratorType
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from src.core.agent_kernel import ContextKind, ContextManifest, Principal, TrustLevel
 from src.core.context_builder import (
@@ -55,6 +55,55 @@ class ActionResult:
     next_prompt: str | None
     should_exit: bool = False
     flags: frozenset[str] = frozenset()
+    tool_receipt: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+
+class ExecutionEvidenceObservationError(RuntimeError):
+    """A configured runtime evidence observer failed closed."""
+
+
+class AgentExecutionEvidenceObserver(Protocol):
+    """Out-of-band typed-receipt observation boundary for Agent Loop."""
+
+    def provider_call_started(self, *, turn: int) -> None: ...
+
+    def provider_call_finished(
+        self,
+        *,
+        turn: int,
+        receipt: object | None,
+    ) -> None: ...
+
+    def provider_call_failed(self, *, turn: int) -> None: ...
+
+    def tool_call_started(
+        self,
+        *,
+        turn: int,
+        tool_name: str,
+        tool_call_id: str,
+    ) -> None: ...
+
+    def tool_call_finished(
+        self,
+        *,
+        turn: int,
+        tool_name: str,
+        tool_call_id: str,
+        receipt: object | None,
+    ) -> None: ...
+
+    def tool_call_failed(
+        self,
+        *,
+        turn: int,
+        tool_name: str,
+        tool_call_id: str,
+    ) -> None: ...
 
 
 def _default_display(msg: str) -> None:
@@ -107,6 +156,9 @@ class AgentContext:
     last_policy_decision: dict[str, Any] = field(default_factory=dict)
     pending_approval: dict[str, Any] | None = None
     last_checkpoint_snapshot: dict[str, Any] = field(default_factory=dict)
+    execution_evidence_observer: (
+        AgentExecutionEvidenceObserver | None
+    ) = field(default=None, repr=False)
 
 
 @dataclass
@@ -122,6 +174,43 @@ def exhaust(generator: GeneratorType) -> Any:
             next(generator)
     except StopIteration as stop:
         return stop.value
+
+
+def _observe_execution_evidence(
+    ctx: AgentContext,
+    method_name: str,
+    **kwargs: Any,
+) -> None:
+    observer = ctx.execution_evidence_observer
+    if observer is None:
+        return
+    lookup_failed = False
+    try:
+        callback = getattr(observer, method_name, None)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        lookup_failed = True
+        callback = None
+    if lookup_failed:
+        raise ExecutionEvidenceObservationError(
+            "execution_evidence_observation_failed"
+        ) from None
+    if not callable(callback):
+        raise ExecutionEvidenceObservationError(
+            "execution_evidence_observer_invalid"
+        )
+    failed = False
+    try:
+        callback(**kwargs)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        failed = True
+    if failed:
+        raise ExecutionEvidenceObservationError(
+            "execution_evidence_observation_failed"
+        ) from None
 
 
 def _context_limits(client: Any) -> tuple[int, int]:
@@ -1053,7 +1142,33 @@ def run_agent_loop(
             client=client,
             turn=turn,
         )
-        response = client.chat(messages=llm_messages, tools=tools_schema)
+        _observe_execution_evidence(
+            handler.ctx,
+            "provider_call_started",
+            turn=turn,
+        )
+        provider_failure: Exception | None = None
+        try:
+            response = client.chat(
+                messages=llm_messages,
+                tools=tools_schema,
+            )
+        except Exception as exc:
+            provider_failure = exc
+            response = None
+        if provider_failure is not None:
+            _observe_execution_evidence(
+                handler.ctx,
+                "provider_call_failed",
+                turn=turn,
+            )
+            raise provider_failure
+        _observe_execution_evidence(
+            handler.ctx,
+            "provider_call_finished",
+            turn=turn,
+            receipt=getattr(response, "provider_receipt", None),
+        )
         backend = getattr(client, "backend", None)
         history_compaction = getattr(backend, "history_compaction", None)
         if isinstance(history_compaction, list):
@@ -1122,11 +1237,43 @@ def run_agent_loop(
                 _mark_interrupted()
                 break
             handler.ctx.display_fn(f"  tool: {tool_call.name}")
-            dispatched = handler.dispatch(tool_call.name, tool_call.args, response=response)
-            if isinstance(dispatched, GeneratorType):
-                result = exhaust(dispatched)
-            else:
-                result = dispatched
+            observation = {
+                "turn": turn,
+                "tool_name": tool_call.name,
+                "tool_call_id": tool_call.id,
+            }
+            _observe_execution_evidence(
+                handler.ctx,
+                "tool_call_started",
+                **observation,
+            )
+            tool_failure: Exception | None = None
+            try:
+                dispatched = handler.dispatch(
+                    tool_call.name,
+                    tool_call.args,
+                    response=response,
+                )
+                if isinstance(dispatched, GeneratorType):
+                    result = exhaust(dispatched)
+                else:
+                    result = dispatched
+            except Exception as exc:
+                tool_failure = exc
+                result = None
+            if tool_failure is not None:
+                _observe_execution_evidence(
+                    handler.ctx,
+                    "tool_call_failed",
+                    **observation,
+                )
+                raise tool_failure
+            _observe_execution_evidence(
+                handler.ctx,
+                "tool_call_finished",
+                receipt=result.tool_receipt,
+                **observation,
+            )
             if "reset_tools" in result.flags and hasattr(client, "last_tools"):
                 client.last_tools = ""
 

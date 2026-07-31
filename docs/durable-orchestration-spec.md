@@ -423,6 +423,13 @@ recovery evidence；远程接纳必须显式要求 provider receipt 精确覆盖
 attestation 仍须分别判断，禁止据此宣称通用 exactly-once。v1 的完整标志仅为历史
 count-only 语义。
 
+Core Loop 的 execution-evidence observer 在 provider/tool 调用前先记录 observed，再把
+`ChatResponse.provider_receipt` / `ActionResult.tool_receipt` 交给 orchestration
+collector。collector 不解析业务 payload：receipt 缺失、失败、父绑定不符、回调乱序或
+超过 64 项持久集合上限时只允许 partial manifest；provider 缺证时分类保守提升为
+secret。observer start 失败阻止副作用，finish 失败使 Attempt 失败关闭。现有本地
+Session/Handler 的 receipt 为空，不具备远程接纳资格。
+
 成功 Attempt 必须是 `runtime_observed`；`OUTCOME_UNKNOWN` 和 `ABANDONED` 必须是
 `unverified`。Store 查询必须在同一 SQLite read transaction 中校验终态 Event、
 Attempt、已完成 idempotency request/result、规范 NodeResult digest、两组 Artifact
@@ -478,7 +485,8 @@ response ArtifactRef digest 的 receipt 才能进入 Agent manifest v2。
 普通 invoker 和无法验证的状态仍 fail closed；参考实现也不能证明外部 gateway 的线性
 一致幂等账本或 attestation，因此 `production_security_ready=false`。生产 remote
 Agent 仍必须补齐 mTLS/attestation、egress policy、secret-manager backed invoker、
-跨主机一致性和真实 Loop 接线后的完整 Agent receipt 组合。
+跨主机一致性，以及 remote gateway client、durable Tool handler、manifest staging 与
+终态原子提交的完整 adapter。
 完整约束见
 [Provider Credential 与模型网关边界](provider-credential-boundary.md)。
 
