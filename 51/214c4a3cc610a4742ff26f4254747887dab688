@@ -1,0 +1,47 @@
+docs/architecture.md
+  s_72af05a5dabd4c::t_708d8be40fe983 122-125
+docs/distributed-execution-adr.md
+  s_72af05a5dabd4c::t_774227222d6e34 338-344
+docs/distributed-execution-quickstart.md
+  s_72af05a5dabd4c::t_88d4b923a5b1b2 113,151
+docs/durable-orchestration-spec.md
+  s_72af05a5dabd4c::t_89d0b10abf5baf 1206-1209
+docs/remote-fleet-adversarial-review.md
+  s_72af05a5dabd4c::t_79c4013b7d4363 1,152-219,223-228
+docs/remote-fleet-data-plane.md
+  s_72af05a5dabd4c::t_84afe71d056720 7-8,35-36,49-60,91,96-97,112,122-147,189-191,198-200,223-225,227-229,237-242
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_b9306fc795ae3e 230-232
+src/orchestration/remote_control.py
+  s_72af05a5dabd4c::t_c1e56b30da4cae 946,987,1020,1175
+src/orchestration/remote_fleet.py
+  s_72af05a5dabd4c::t_59e7a2d4dae00f 37,44,79,110-119,129-137,184-185,207-223,250-272,274-289,298-304,454-462,497-529
+src/orchestration/remote_fleet_control.py
+  s_72af05a5dabd4c::t_9aefa3e4360ddb 10,45,52,400,404-427,509,551,566-572,575,581-584,591,604-608,621-625
+src/orchestration/scheduler.py
+  s_72af05a5dabd4c::t_226f960b656572 834,913
+src/orchestration/store.py
+  s_72af05a5dabd4c::t_1856c0c4a9be0e 56,65-67,304-311,352-436,612-624,1550-1662,1964-2149,4791,4817-4844,4849,4924-4946,5040-5068,5206,5301-5305,5519-5521,5574-5577,7778-7795
+tests/test_orchestration_remote_fleet_control.py
+  s_72af05a5dabd4c::t_006e9a9c936efc 153-154,156-157,161,166-167,967-1297
+tests/test_orchestration_store.py
+  s_72af05a5dabd4c::t_cbc79436e99e04 19-20,1880-2171,2202-2204,2230,2247,2265-2310,2628
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "51214c4a3cc610a4742ff26f4254747887dab688",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
