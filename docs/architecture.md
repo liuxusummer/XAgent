@@ -88,7 +88,9 @@
   `docs/agent-activity-request.md`
 - 远程 Agent 的长期 provider credential 必须留在部署侧模型网关；Worker 只能获得绑定
   tenant/Attempt/request/route/invocation-index 的短期单次 `ProviderAccessGrant`。
-  当前 Broker 仅有内存消费墓碑，readiness 固定 false，不能据此开放 remote Agent；见
+  Broker 可将 token digest、逻辑调用唯一键和消费墓碑写入隔离的
+  `RemoteExecutionJournal`，跨进程原子发放/消费；这仍缺少 invocation result receipt，
+  `production_security_ready` 固定 false，不能据此开放 remote Agent；见
   `docs/provider-credential-boundary.md`
 - Durable Store、Artifact、GC 和锁必须放在 Agent workspace 外，由独立控制面
   service/OS identity 持有，且不挂载给 legacy 文件、代码或浏览器工具。默认 Web UI 不会
@@ -130,7 +132,9 @@
   assignment 返回前还会写入独立的 digest-only `RemoteExecutionJournal`；它不保存
   claim/grant token、脚本、环境值、Artifact 内容或 raw plan。schema v2 额外保存
   token digest、canonical safe grant metadata、单次消费/失败墓碑和 exact finalized
-  `ArtifactRef`，但不保存 bearer 明文或 staged bytes。控制面重启后可从 exact Store
+  `ArtifactRef`；schema v3 再增加 provider grant 的逻辑调用唯一键、token/binding
+  digest、消费墓碑和 purge 时间水位，但不保存 bearer、prompt、response 或 provider
+  credential。控制面重启后可从 exact Store
   policy Event、当前配置与新鲜 attestation 重建 start/heartbeat/取消/终态 authority；
   Worker 持有的原 read grant 可跨进程只兑换一次，原 output handle 可重放 exact final
   ref，但控制面绝不重新发送 assignment 或自行复活 bearer。Fleet claim 会把无密的

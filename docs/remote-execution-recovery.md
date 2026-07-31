@@ -1,6 +1,7 @@
 # Remote Execution Authority Recovery
 
-> 状态：digest-only execution authority 与 bearer-free Artifact grant recovery 已实现
+> 状态：digest-only execution authority、bearer-free Artifact grant recovery 与
+> provider grant anti-replay journal 已实现
 > 依赖：`distributed-execution-adr.md`、`durable-orchestration-spec.md`
 
 ## 1. 问题
@@ -19,8 +20,8 @@ completion 之前重启。Domain Store 能恢复 claim/lease/fencing，但旧实
 ## 2. 决策
 
 控制面在返回 assignment 前，向独立的 `RemoteExecutionJournal` 原子写入一条不可变、
-digest-only 的 authorization binding。schema v2 还为 Artifact broker 增加两种有界
-记录：
+digest-only 的 authorization binding。schema v2 为 Artifact broker 增加两种有界
+记录，schema v3 为 provider gateway 增加单次调用墓碑：
 
 ```text
 run / node / attempt / fencing generation
@@ -39,14 +40,19 @@ issued | consumed / expires_at
 write grant:
 grant id / token digest / canonical safe metadata
 issued | finalized | failed / staging digest / final ArtifactRef / expires_at
+
+provider grant:
+grant id / logical invocation digest / token digest / binding digest / route id
+issued | consumed / expires_at / purge watermark
 ```
 
 记录明确不包含：
 
 ```text
 claim token plaintext
-Artifact bearer token（只保存 SHA-256 digest）
+Artifact/provider gateway bearer token（只保存 SHA-256 digest）
 input/output content
+provider prompt/response/credential/endpoint
 script bytes
 environment values
 runtime proof or response body
@@ -56,8 +62,8 @@ raw execution plan / argv
 SQLite 位于 Worker 不可访问的 control-plane isolation root。首次创建使用同目录临时库、
 完整事务、`fsync` 和 no-clobber hard link 原子发布；数据库与 bootstrap lock 必须是
 `0600` 普通文件，symlink、宽权限、未知/残缺 schema、额外 trigger/view/index、
-integrity failure 均拒绝启动。既有精确 v1 schema 在一个 SQLite transaction 内迁移到
-v2；半迁移状态不会被自动补齐。
+integrity failure 均拒绝启动。既有精确 v1/v2 schema 在一个 SQLite transaction 内
+迁移到 v3；半迁移状态不会被自动补齐。
 
 ## 3. 恢复算法
 

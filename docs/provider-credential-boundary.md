@@ -14,7 +14,8 @@ API key。真正的 provider credential 必须留在部署侧模型网关；Work
 - **durable evidence**：route/request/authorization digest 和消费墓碑，不含上述任一明文
   secret。
 
-`ProviderAccessBroker` 是该契约的单进程参考实现，不会开启生产 remote Agent。
+`ProviderAccessBroker` 是该契约的参考实现。它可注入 durable
+`RemoteExecutionJournal`，但仍不会开启生产 remote Agent。
 
 ## 2. 既有本地 LLM 路径
 
@@ -78,7 +79,8 @@ Broker 的调用顺序固定为：
 1. 使用受信 verifier 重验新鲜 WorkerAuthorization；
 2. 重验 route、tenant、worker、Attempt、action、authorization 和 request binding；
 3. 校验 payload 是非空 bytes 且不超过 route 上限；
-4. 在锁内用 constant-time token digest 比较并把 grant 标记 consumed；
+4. 在 SQLite `BEGIN IMMEDIATE` 事务中用 constant-time token digest 比较，并以
+   `issued → consumed` CAS 提交墓碑；
 5. 仅把 credential-free route、raw request bytes 和 grant ID 交给部署侧
    `ProviderInvoker`；
 6. 将 invoker 的有界 bytes 包装成 repr-safe `ProviderInvocationResult`。
@@ -89,22 +91,46 @@ Broker 的调用顺序固定为：
 `ProviderInvoker` 自己持有或从 secret manager 临时解析 upstream credential。Broker、
 grant、route、Worker 和 orchestration Store 均不接触 API key。
 
-## 6. 当前 fail-closed 限制
+## 6. Durable grant registry
 
-参考 Broker 的 grant/tombstone registry 仅在内存中，因此：
+默认 Broker 使用进程内 SQLite，仅用于本地参考。部署方可注入位于 Worker 不可访问的
+durable `RemoteExecutionJournal`。schema v3 保存：
 
-- `production_security_ready` 与 `durable_recovery_ready` 固定为 false；
-- 进程重启后既有 token 因服务端记录丢失而不可兑换，安全上 fail closed、可用性上丢失；
+```text
+grant id / logical invocation digest / token digest / binding digest
+route id / issued|consumed / expires_at / updated_at
+provider purge watermark
+```
+
+它不保存 token、request/prompt、response、provider credential、endpoint 或完整
+authorization。逻辑调用唯一索引和 `BEGIN IMMEDIATE` 使共享同一数据库的多个 Broker
+实例只能签发一次、消费一次。consumed tombstone 在 TTL 内不得因容量压力被淘汰。
+
+过期删除只允许经显式 purge 事务发生。journal 同时持久化 purge 时间水位；发生时钟
+回拨后，早于水位的签发、消费和清理全部 fail closed，避免“先前跳删除、再回拨复活”。
+这要求所有共享 journal 的 Broker 使用一致、可信的 wall clock。水位导致的拒绝需要
+operator 修复时钟，不能通过清空安全数据库绕过。
+
+`durable_recovery_ready` 只表示 grant/tombstone 可跨 Broker 重启恢复：内存 journal
+返回 false，磁盘 journal 返回 true。它不等价于端到端生产 readiness。
+
+## 7. 当前 fail-closed 限制
+
 - 签发响应丢失后无法重取同一个 token，只能等待墓碑过期或由 operator 处理；
-- provider 已执行但响应丢失、随后网关重启时，当前实现没有 durable invocation receipt，
-  不能证明是否已经产生费用；
-- 多副本网关不能共享消费墓碑或逻辑调用唯一性；
-- 参考实现不提供 mTLS、provider egress allowlist、secret manager 或上游 idempotency。
+- token 在调用 invoker 前消费，因此“已消费但未调用”会安全地丢失一次可用性；
+- provider 已执行但响应丢失时，当前实现没有 durable invocation receipt，重启后只能
+  拒绝重放，不能证明是否已经产生费用或恢复响应；
+- 同一 SQLite 文件可跨本机进程线性化，但不提供跨主机共识、复制或自动故障转移；
+- `production_security_ready` 仍固定为 false；
+- 参考实现不提供 mTLS、provider egress allowlist、secret manager、经过 attestation
+  的 invoker 或上游 idempotency。
 
-生产 remote Agent 必须先提供受保护的 durable provider-grant journal、跨副本原子消费、
-invocation receipt/恢复语义和经过 attestation 的 ProviderInvoker。未完成前禁止把
+生产 remote Agent 仍必须提供 invocation receipt/恢复语义、经过 attestation 的
+ProviderInvoker 和完整远程 Agent runtime。未完成前禁止把
 `agent` 加入 `SecureRemoteAssignmentAdmitter`、`SecureRemoteExecutionAdapter`、
 Fleet projector 或 Worker daemon 的 `supported_activity_kinds`。
 
-三轮审查证据见
-[Provider Credential 三轮对抗性审查](provider-credential-adversarial-review.md)。
+credential 基线审查见
+[Provider Credential 三轮对抗性审查](provider-credential-adversarial-review.md)，
+durable journal 审查见
+[Provider Grant Journal 三轮对抗性审查](provider-grant-journal-adversarial-review.md)。

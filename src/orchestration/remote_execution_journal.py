@@ -23,10 +23,11 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Iterator
 
-REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION = 2
+REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION = 3
 DEFAULT_EXECUTION_JOURNAL_BUSY_TIMEOUT_MS = 10_000
 MAX_EXECUTION_JOURNAL_RECORDS = 100_000
 MAX_ARTIFACT_GRANT_JOURNAL_RECORDS = 100_000
+MAX_PROVIDER_GRANT_JOURNAL_RECORDS = 100_000
 MAX_ARTIFACT_GRANT_METADATA_BYTES = 16 * 1024
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,254}")
@@ -59,7 +60,7 @@ _V1_SCHEMA_COLUMNS = {
         ("created_at", "REAL", 1, 0),
     ),
 }
-_SCHEMA_COLUMNS = {
+_V2_SCHEMA_COLUMNS = {
     **_V1_SCHEMA_COLUMNS,
     "remote_artifact_read_grants": (
         ("grant_id", "TEXT", 1, 1),
@@ -81,7 +82,7 @@ _SCHEMA_COLUMNS = {
         ("updated_at", "REAL", 1, 0),
     ),
 }
-_SCHEMA_INDEXES = {
+_V2_SCHEMA_INDEXES = {
     "idx_remote_artifact_read_grants_expires": (
         "remote_artifact_read_grants",
         0,
@@ -89,6 +90,36 @@ _SCHEMA_INDEXES = {
     ),
     "idx_remote_artifact_write_grants_expires": (
         "remote_artifact_write_grants",
+        0,
+        ("expires_at",),
+    ),
+}
+_SCHEMA_COLUMNS = {
+    **_V2_SCHEMA_COLUMNS,
+    "remote_provider_grants": (
+        ("grant_id", "TEXT", 1, 1),
+        ("logical_invocation_digest", "TEXT", 1, 0),
+        ("token_digest", "TEXT", 1, 0),
+        ("binding_digest", "TEXT", 1, 0),
+        ("route_id", "TEXT", 1, 0),
+        ("state", "TEXT", 1, 0),
+        ("expires_at", "REAL", 1, 0),
+        ("updated_at", "REAL", 1, 0),
+    ),
+    "remote_provider_grant_clock": (
+        ("singleton", "INTEGER", 0, 1),
+        ("purge_watermark", "REAL", 1, 0),
+    ),
+}
+_SCHEMA_INDEXES = {
+    **_V2_SCHEMA_INDEXES,
+    "idx_remote_provider_grants_logical": (
+        "remote_provider_grants",
+        1,
+        ("logical_invocation_digest",),
+    ),
+    "idx_remote_provider_grants_expires": (
+        "remote_provider_grants",
         0,
         ("expires_at",),
     ),
@@ -166,10 +197,43 @@ _SCHEMA_STATEMENTS = (
     CREATE INDEX idx_remote_artifact_write_grants_expires
     ON remote_artifact_write_grants(expires_at)
     """,
+    """
+    CREATE TABLE remote_provider_grants(
+        grant_id TEXT NOT NULL PRIMARY KEY,
+        logical_invocation_digest TEXT NOT NULL,
+        token_digest TEXT NOT NULL,
+        binding_digest TEXT NOT NULL,
+        route_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('issued', 'consumed')),
+        expires_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX idx_remote_provider_grants_logical
+    ON remote_provider_grants(logical_invocation_digest)
+    """,
+    """
+    CREATE INDEX idx_remote_provider_grants_expires
+    ON remote_provider_grants(expires_at)
+    """,
+    """
+    CREATE TABLE remote_provider_grant_clock(
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        purge_watermark REAL NOT NULL CHECK(purge_watermark >= 0)
+    )
+    """,
+    """
+    INSERT INTO remote_provider_grant_clock(
+        singleton, purge_watermark
+    ) VALUES (1, 0)
+    """,
 )
-_ARTIFACT_SCHEMA_STATEMENTS = _SCHEMA_STATEMENTS[2:]
+_V1_UPGRADE_SCHEMA_STATEMENTS = _SCHEMA_STATEMENTS[2:]
+_V2_UPGRADE_SCHEMA_STATEMENTS = _SCHEMA_STATEMENTS[-5:]
 _READ_GRANT_STATES = frozenset({"issued", "consumed"})
 _WRITE_GRANT_STATES = frozenset({"issued", "finalized", "failed"})
+_PROVIDER_GRANT_STATES = frozenset({"issued", "consumed"})
 
 
 class RemoteExecutionJournalError(RuntimeError):
@@ -190,6 +254,14 @@ class RemoteArtifactGrantUnavailable(RemoteExecutionJournalError):
 
 class RemoteArtifactGrantConflict(RemoteExecutionJournalError):
     """A grant id or finalization was rebound to different metadata."""
+
+
+class RemoteProviderGrantUnavailable(RemoteExecutionJournalError):
+    """A provider grant is absent, consumed, mismatched, or expired."""
+
+
+class RemoteProviderGrantConflict(RemoteExecutionJournalError):
+    """A provider grant or logical invocation was rebound."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +393,40 @@ class RemoteArtifactWriteGrantRecord:
             raise RemoteExecutionJournalError("invalid_write_grant_time")
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteProviderGrantRecord:
+    """Bearer-free durable state for one logical provider invocation."""
+
+    grant_id: str
+    logical_invocation_digest: str
+    token_digest: str
+    binding_digest: str
+    route_id: str
+    state: str
+    expires_at: float
+    updated_at: float
+
+    def __post_init__(self) -> None:
+        _identifier(self.grant_id, "grant_id")
+        _identifier(self.route_id, "route_id")
+        for name in (
+            "logical_invocation_digest",
+            "token_digest",
+            "binding_digest",
+        ):
+            _digest(getattr(self, name), name)
+        if self.state not in _PROVIDER_GRANT_STATES:
+            raise RemoteExecutionJournalError(
+                "invalid_provider_grant_state"
+            )
+        expires_at = _finite_time(self.expires_at)
+        updated_at = _finite_time(self.updated_at)
+        if expires_at <= 0 or updated_at > expires_at:
+            raise RemoteExecutionJournalError(
+                "invalid_provider_grant_time"
+            )
+
+
 class RemoteExecutionJournal:
     """SQLite-backed exact authorization binding registry.
 
@@ -338,6 +444,9 @@ class RemoteExecutionJournal:
         maximum_artifact_grants: int = (
             MAX_ARTIFACT_GRANT_JOURNAL_RECORDS
         ),
+        maximum_provider_grants: int = (
+            MAX_PROVIDER_GRANT_JOURNAL_RECORDS
+        ),
         busy_timeout_ms: int = DEFAULT_EXECUTION_JOURNAL_BUSY_TIMEOUT_MS,
     ) -> None:
         self.path = str(path)
@@ -354,6 +463,12 @@ class RemoteExecutionJournal:
             "maximum_artifact_grants",
             1,
             MAX_ARTIFACT_GRANT_JOURNAL_RECORDS,
+        )
+        self.maximum_provider_grants = _bounded_int(
+            maximum_provider_grants,
+            "maximum_provider_grants",
+            1,
+            MAX_PROVIDER_GRANT_JOURNAL_RECORDS,
         )
         self.busy_timeout_ms = _bounded_int(
             busy_timeout_ms,
@@ -902,6 +1017,187 @@ class RemoteExecutionJournal:
                 now=current,
             )
 
+    def record_provider_grant(
+        self,
+        record: RemoteProviderGrantRecord,
+    ) -> RemoteProviderGrantRecord:
+        if not isinstance(record, RemoteProviderGrantRecord):
+            raise TypeError(
+                "record must be a RemoteProviderGrantRecord"
+            )
+        if record.state != "issued" or record.updated_at >= record.expires_at:
+            raise RemoteExecutionJournalError(
+                "invalid_provider_grant_state"
+            )
+        with self._transaction() as connection:
+            self._require_provider_time_floor_locked(
+                connection,
+                now=record.updated_at,
+            )
+            existing = self._provider_grant_locked(
+                connection,
+                record.grant_id,
+            )
+            if existing is not None:
+                if existing != record:
+                    raise RemoteProviderGrantConflict(
+                        "provider_grant_conflict"
+                    )
+                return existing
+            logical = self._provider_grant_by_logical_locked(
+                connection,
+                record.logical_invocation_digest,
+            )
+            if logical is not None:
+                raise RemoteProviderGrantConflict(
+                    "provider_invocation_already_issued"
+                )
+            count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM remote_provider_grants"
+                ).fetchone()[0]
+            )
+            if count >= self.maximum_provider_grants:
+                raise RemoteExecutionJournalCapacityError(
+                    "provider_grant_capacity"
+                )
+            connection.execute(
+                """
+                INSERT INTO remote_provider_grants(
+                    grant_id, logical_invocation_digest, token_digest,
+                    binding_digest, route_id, state, expires_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                tuple(
+                    getattr(record, item.name)
+                    for item in fields(record)
+                ),
+            )
+            return record
+
+    def get_provider_grant(
+        self,
+        grant_id: str,
+    ) -> RemoteProviderGrantRecord | None:
+        _identifier(grant_id, "grant_id")
+        try:
+            with self._connection() as connection:
+                return self._provider_grant_locked(
+                    connection,
+                    grant_id,
+                )
+        except sqlite3.Error as exc:
+            raise RemoteExecutionJournalError(
+                "execution_journal_unavailable"
+            ) from exc
+
+    def consume_provider_grant(
+        self,
+        *,
+        grant_id: str,
+        token_digest: str,
+        binding_digest: str,
+        route_id: str,
+        expires_at: float,
+        now: float,
+    ) -> RemoteProviderGrantRecord:
+        _identifier(grant_id, "grant_id")
+        _digest(token_digest, "token_digest")
+        _digest(binding_digest, "binding_digest")
+        _identifier(route_id, "route_id")
+        expected_expires_at = _finite_time(expires_at)
+        current = _finite_time(now)
+        consumed: RemoteProviderGrantRecord | None = None
+        expired = False
+        with self._transaction() as connection:
+            self._require_provider_time_floor_locked(
+                connection,
+                now=current,
+            )
+            record = self._provider_grant_locked(
+                connection,
+                grant_id,
+            )
+            if record is None:
+                raise RemoteProviderGrantUnavailable(
+                    "provider_grant_unavailable"
+                )
+            if current >= record.expires_at:
+                expired = True
+            elif (
+                record.state != "issued"
+                or record.route_id != route_id
+                or record.binding_digest != binding_digest
+                or record.expires_at != expected_expires_at
+                or not hmac.compare_digest(
+                    record.token_digest,
+                    token_digest,
+                )
+            ):
+                raise RemoteProviderGrantUnavailable(
+                    "provider_grant_unavailable"
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    UPDATE remote_provider_grants
+                    SET state = 'consumed', updated_at = ?
+                    WHERE grant_id = ? AND state = 'issued'
+                    """,
+                    (current, grant_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RemoteProviderGrantUnavailable(
+                        "provider_grant_unavailable"
+                    )
+                consumed = RemoteProviderGrantRecord(
+                    grant_id=record.grant_id,
+                    logical_invocation_digest=(
+                        record.logical_invocation_digest
+                    ),
+                    token_digest=record.token_digest,
+                    binding_digest=record.binding_digest,
+                    route_id=record.route_id,
+                    state="consumed",
+                    expires_at=record.expires_at,
+                    updated_at=current,
+                )
+        if expired:
+            raise RemoteProviderGrantUnavailable(
+                "provider_grant_unavailable"
+            )
+        if consumed is None:
+            raise RemoteExecutionJournalError(
+                "invalid_provider_grant_record"
+            )
+        return consumed
+
+    def purge_expired_provider_grants(self, *, now: float) -> int:
+        current = _finite_time(now)
+        with self._transaction() as connection:
+            self._require_provider_time_floor_locked(
+                connection,
+                now=current,
+            )
+            deleted = self._delete_expired_provider_grants_locked(
+                connection,
+                now=current,
+            )
+            cursor = connection.execute(
+                """
+                UPDATE remote_provider_grant_clock
+                SET purge_watermark = ?
+                WHERE singleton = 1
+                """,
+                (current,),
+            )
+            if cursor.rowcount != 1:
+                raise RemoteExecutionJournalError(
+                    "invalid_provider_grant_clock"
+                )
+            return deleted
+
     def _require_artifact_capacity_locked(
         self,
         connection: sqlite3.Connection,
@@ -944,6 +1240,53 @@ class RemoteExecutionJournal:
         return read_cursor.rowcount + write_cursor.rowcount
 
     @staticmethod
+    def _delete_expired_provider_grants_locked(
+        connection: sqlite3.Connection,
+        *,
+        now: float,
+    ) -> int:
+        cursor = connection.execute(
+            """
+            DELETE FROM remote_provider_grants
+            WHERE expires_at <= ?
+            """,
+            (now,),
+        )
+        return cursor.rowcount
+
+    @staticmethod
+    def _require_provider_time_floor_locked(
+        connection: sqlite3.Connection,
+        *,
+        now: float,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT purge_watermark
+            FROM remote_provider_grant_clock
+            WHERE singleton = 1
+            """
+        ).fetchone()
+        if row is None:
+            raise RemoteExecutionJournalError(
+                "invalid_provider_grant_clock"
+            )
+        watermark = row["purge_watermark"]
+        if (
+            isinstance(watermark, bool)
+            or not isinstance(watermark, (int, float))
+            or not math.isfinite(float(watermark))
+            or float(watermark) < 0
+        ):
+            raise RemoteExecutionJournalError(
+                "invalid_provider_grant_clock"
+            )
+        if now < float(watermark):
+            raise RemoteExecutionJournalError(
+                "provider_grant_clock_rollback"
+            )
+
+    @staticmethod
     def _read_grant_locked(
         connection: sqlite3.Connection,
         grant_id: str,
@@ -972,6 +1315,36 @@ class RemoteExecutionJournal:
             (grant_id,),
         ).fetchone()
         return None if row is None else _write_grant_from_row(row)
+
+    @staticmethod
+    def _provider_grant_locked(
+        connection: sqlite3.Connection,
+        grant_id: str,
+    ) -> RemoteProviderGrantRecord | None:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM remote_provider_grants
+            WHERE grant_id = ?
+            """,
+            (grant_id,),
+        ).fetchone()
+        return None if row is None else _provider_grant_from_row(row)
+
+    @staticmethod
+    def _provider_grant_by_logical_locked(
+        connection: sqlite3.Connection,
+        logical_invocation_digest: str,
+    ) -> RemoteProviderGrantRecord | None:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM remote_provider_grants
+            WHERE logical_invocation_digest = ?
+            """,
+            (logical_invocation_digest,),
+        ).fetchone()
+        return None if row is None else _provider_grant_from_row(row)
 
     @staticmethod
     def _get_locked(
@@ -1017,13 +1390,41 @@ class RemoteExecutionJournal:
             if existing_tables == frozenset(_V1_SCHEMA_COLUMNS):
                 self._validate_schema(connection, _V1_SCHEMA_COLUMNS)
                 self._require_schema_version(connection, expected=1)
-                for statement in _ARTIFACT_SCHEMA_STATEMENTS:
+                for statement in _V1_UPGRADE_SCHEMA_STATEMENTS:
                     connection.execute(statement)
                 cursor = connection.execute(
                     """
                     UPDATE remote_execution_journal_metadata
                     SET schema_version = ?
                     WHERE singleton = 1 AND schema_version = 1
+                    """,
+                    (REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION,),
+                )
+                if cursor.rowcount != 1:
+                    raise RemoteExecutionJournalError(
+                        "unsupported_execution_schema"
+                    )
+                self._validate_schema(
+                    connection,
+                    _SCHEMA_COLUMNS,
+                    schema_indexes=_SCHEMA_INDEXES,
+                )
+                return
+
+            if existing_tables == frozenset(_V2_SCHEMA_COLUMNS):
+                self._validate_schema(
+                    connection,
+                    _V2_SCHEMA_COLUMNS,
+                    schema_indexes=_V2_SCHEMA_INDEXES,
+                )
+                self._require_schema_version(connection, expected=2)
+                for statement in _V2_UPGRADE_SCHEMA_STATEMENTS:
+                    connection.execute(statement)
+                cursor = connection.execute(
+                    """
+                    UPDATE remote_execution_journal_metadata
+                    SET schema_version = ?
+                    WHERE singleton = 1 AND schema_version = 2
                     """,
                     (REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION,),
                 )
@@ -1226,6 +1627,16 @@ class RemoteExecutionJournal:
             if tables == frozenset(_V1_SCHEMA_COLUMNS):
                 self._validate_schema(connection, _V1_SCHEMA_COLUMNS)
                 self._require_schema_version(connection, expected=1)
+            elif tables == frozenset(_V2_SCHEMA_COLUMNS):
+                self._validate_schema(
+                    connection,
+                    _V2_SCHEMA_COLUMNS,
+                    schema_indexes=_V2_SCHEMA_INDEXES,
+                )
+                self._require_schema_version(
+                    connection,
+                    expected=2,
+                )
             elif tables == frozenset(_SCHEMA_COLUMNS):
                 self._validate_schema(
                     connection,
@@ -1305,6 +1716,29 @@ class RemoteExecutionJournal:
             expected_index_columns,
         ) in expected_indexes.items():
             if auxiliary[index_name] != ("index", expected_table):
+                raise RemoteExecutionJournalError(
+                    "invalid_execution_schema"
+                )
+        if "remote_provider_grant_clock" in schema_columns:
+            clock_rows = connection.execute(
+                """
+                SELECT singleton, purge_watermark
+                FROM remote_provider_grant_clock
+                """
+            ).fetchall()
+            if len(clock_rows) != 1:
+                raise RemoteExecutionJournalError(
+                    "invalid_execution_schema"
+                )
+            clock_row = clock_rows[0]
+            watermark = clock_row["purge_watermark"]
+            if (
+                clock_row["singleton"] != 1
+                or isinstance(watermark, bool)
+                or not isinstance(watermark, (int, float))
+                or not math.isfinite(float(watermark))
+                or float(watermark) < 0
+            ):
                 raise RemoteExecutionJournalError(
                     "invalid_execution_schema"
                 )
@@ -1454,6 +1888,22 @@ def _write_grant_from_row(
         ) from exc
 
 
+def _provider_grant_from_row(
+    row: sqlite3.Row,
+) -> RemoteProviderGrantRecord:
+    try:
+        return RemoteProviderGrantRecord(
+            **{
+                item.name: row[item.name]
+                for item in fields(RemoteProviderGrantRecord)
+            }
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RemoteExecutionJournalError(
+            "invalid_provider_grant_record"
+        ) from exc
+
+
 def _canonical_json_text(value: object, name: str) -> str:
     if not isinstance(value, str):
         raise RemoteExecutionJournalError(f"invalid_{name}")
@@ -1523,6 +1973,7 @@ def _bounded_int(
 __all__ = [
     "MAX_ARTIFACT_GRANT_JOURNAL_RECORDS",
     "MAX_EXECUTION_JOURNAL_RECORDS",
+    "MAX_PROVIDER_GRANT_JOURNAL_RECORDS",
     "REMOTE_EXECUTION_JOURNAL_SCHEMA_VERSION",
     "RemoteArtifactGrantConflict",
     "RemoteArtifactGrantUnavailable",
@@ -1533,4 +1984,7 @@ __all__ = [
     "RemoteExecutionJournalCapacityError",
     "RemoteExecutionJournalConflict",
     "RemoteExecutionJournalError",
+    "RemoteProviderGrantConflict",
+    "RemoteProviderGrantRecord",
+    "RemoteProviderGrantUnavailable",
 ]

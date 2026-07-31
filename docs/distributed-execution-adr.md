@@ -388,9 +388,10 @@ active durable authority 只延期到 terminal，不由内存 projection 撤销�
 目前由本地 `LegacyAgentLoopAdapter` 按整体 `non_idempotent_write` 的保守恢复契约执行；
 typed `AgentActivityRequest` task/context Artifact 和 `AgentActivityReceipt` 整体回执
 基础契约已经存在，credential-free route + one-call `ProviderAccessGrant` 也提供了
-单进程参考边界，但都尚未接入安全 remote adapter；ProviderAccessBroker 的内存墓碑使
-readiness 固定为 false。未来仍必须提供独立、可验证的 Agent runtime、durable provider
-grant/receipt、逐工具 receipt 聚合及完整 completion/recovery 组合后，才能把 `agent`
+参考边界，但都尚未接入安全 remote adapter；ProviderAccessBroker 虽可持久化
+anti-replay 墓碑，仍没有 invocation result receipt，生产 readiness 固定为 false。
+未来仍必须提供独立、可验证的 Agent runtime、durable provider result receipt、逐工具
+receipt 聚合及完整 completion/recovery 组合后，才能把 `agent`
 加入两侧的 `supported_activity_kinds`，禁止仅修改注册字符串或 Fleet 路由绕过该门禁。
 输入契约见 [agent-activity-request.md](agent-activity-request.md)，credential 边界见
 [provider-credential-boundary.md](provider-credential-boundary.md)。
@@ -415,6 +416,12 @@ broker 重启后通过 SQLite CAS 只兑换一次；已 finalize 的原 output h
 ref。Store 已写而 journal 尚未 commit 的崩溃窗口只允许留下未引用 orphan，不能写入
 Domain Event；仅内存 staging 仍需调用方重新发送原内容。过期 tombstone 有硬容量和
 索引清理，不允许 LRU 淘汰未过期防重放证据。
+
+schema v3 为 provider gateway 增加逻辑调用唯一 digest、gateway token/binding digest、
+`issued/consumed` 墓碑和 purge 时间水位。共享同一本机 SQLite 的 Broker 以
+`BEGIN IMMEDIATE` 串行化签发与消费；journal 不保存 prompt、response、upstream
+credential 或 endpoint。该能力只恢复 one-call grant 的 anti-replay 状态，不恢复
+provider 调用结果，也不提供跨主机共识，因此不能独立提升 remote Agent readiness。
 完整契约见 [remote-execution-recovery.md](remote-execution-recovery.md)。
 
 ## 8. Observability

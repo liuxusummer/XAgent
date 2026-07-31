@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import math
 import re
 import secrets
-import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Protocol, runtime_checkable
 
+from .remote_execution_journal import (
+    RemoteExecutionJournal,
+    RemoteExecutionJournalCapacityError,
+    RemoteExecutionJournalError,
+    RemoteProviderGrantConflict,
+    RemoteProviderGrantRecord,
+    RemoteProviderGrantUnavailable,
+)
 from .worker_security import (
     WorkerAuthorization,
     WorkerAuthorizationVerifier,
@@ -396,18 +402,8 @@ class ProviderInvoker(Protocol):
     ) -> bytes: ...
 
 
-@dataclass(slots=True)
-class _ProviderGrantRecord:
-    token_digest: str
-    binding_digest: str
-    logical_invocation_digest: str
-    route_id: str
-    expires_at: float
-    consumed: bool = False
-
-
 class ProviderAccessBroker:
-    """Reference one-call model gateway broker with in-memory tombstones."""
+    """Reference one-call model gateway broker with durable tombstones."""
 
     def __init__(
         self,
@@ -420,6 +416,7 @@ class ProviderAccessBroker:
             MAX_PROVIDER_GRANT_TTL_SECONDS
         ),
         maximum_active_grants: int = MAX_ACTIVE_PROVIDER_GRANTS,
+        recovery_journal: RemoteExecutionJournal | None = None,
     ) -> None:
         if not isinstance(
             authorization_verifier,
@@ -461,20 +458,33 @@ class ProviderAccessBroker:
         self._invoker = invoker
         self._clock = clock
         self._maximum_grant_ttl_seconds = requested_ttl
-        self._maximum_active_grants = maximum_active_grants
-        self._records: dict[str, _ProviderGrantRecord] = {}
-        self._logical_grants: dict[str, str] = {}
-        self._lock = threading.Lock()
+        if recovery_journal is None:
+            recovery_journal = RemoteExecutionJournal(
+                maximum_provider_grants=maximum_active_grants,
+            )
+        elif not isinstance(recovery_journal, RemoteExecutionJournal):
+            raise ProviderAccessDenied(
+                "invalid_provider_recovery_journal"
+            )
+        elif (
+            maximum_active_grants != MAX_ACTIVE_PROVIDER_GRANTS
+            and recovery_journal.maximum_provider_grants
+            != maximum_active_grants
+        ):
+            raise ProviderAccessDenied(
+                "provider_grant_capacity_mismatch"
+            )
+        self._recovery_journal = recovery_journal
 
     @property
     def production_security_ready(self) -> bool:
-        """The in-memory replay registry is deliberately not restart-safe."""
+        """A durable result receipt and hardened gateway are still required."""
 
         return False
 
     @property
     def durable_recovery_ready(self) -> bool:
-        return False
+        return self._recovery_journal.durable
 
     def issue(
         self,
@@ -549,27 +559,32 @@ class ProviderAccessBroker:
                 "invocation_index": grant.invocation_index,
             }
         )
-        record = _ProviderGrantRecord(
+        record = RemoteProviderGrantRecord(
+            grant_id=grant.grant_id,
             token_digest=_token_digest(token),
             binding_digest=grant.binding_digest,
             logical_invocation_digest=logical_invocation_digest,
             route_id=route.route_id,
+            state="issued",
             expires_at=grant.expires_at,
+            updated_at=now,
         )
-        with self._lock:
-            self._purge_locked(now)
-            if logical_invocation_digest in self._logical_grants:
-                raise ProviderAccessDenied(
-                    "provider_invocation_already_issued"
-                )
-            if len(self._records) >= self._maximum_active_grants:
-                raise ProviderAccessDenied(
-                    "active_provider_grant_limit_reached"
-                )
-            self._records[grant.grant_id] = record
-            self._logical_grants[
-                logical_invocation_digest
-            ] = grant.grant_id
+        failure_reason: str | None = None
+        try:
+            self._recovery_journal.record_provider_grant(record)
+        except RemoteProviderGrantConflict as exc:
+            failure_reason = (
+                "provider_invocation_already_issued"
+                if exc.args
+                == ("provider_invocation_already_issued",)
+                else "provider_grant_registry_conflict"
+            )
+        except RemoteExecutionJournalCapacityError:
+            failure_reason = "active_provider_grant_limit_reached"
+        except RemoteExecutionJournalError:
+            failure_reason = "provider_grant_registry_unavailable"
+        if failure_reason is not None:
+            raise ProviderAccessDenied(failure_reason)
         return grant
 
     def invoke(
@@ -611,22 +626,22 @@ class ProviderAccessBroker:
             raise ProviderAccessDenied(
                 "provider_request_exceeds_policy"
             )
-        with self._lock:
-            record = self._records.get(grant.grant_id)
-            if (
-                record is None
-                or record.consumed
-                or record.route_id != route.route_id
-                or record.binding_digest != grant.binding_digest
-                or not hmac.compare_digest(
-                    record.token_digest,
-                    _token_digest(grant.token),
-                )
-            ):
-                raise ProviderAccessDenied(
-                    "provider_grant_unavailable"
-                )
-            record.consumed = True
+        failure_reason: str | None = None
+        try:
+            self._recovery_journal.consume_provider_grant(
+                grant_id=grant.grant_id,
+                token_digest=_token_digest(grant.token),
+                binding_digest=grant.binding_digest,
+                route_id=route.route_id,
+                expires_at=grant.expires_at,
+                now=now,
+            )
+        except RemoteProviderGrantUnavailable:
+            failure_reason = "provider_grant_unavailable"
+        except RemoteExecutionJournalError:
+            failure_reason = "provider_grant_registry_unavailable"
+        if failure_reason is not None:
+            raise ProviderAccessDenied(failure_reason)
         invocation_failed = False
         try:
             response = self._invoker.invoke(
@@ -660,8 +675,19 @@ class ProviderAccessBroker:
 
     def purge_expired(self) -> int:
         now = _timestamp(self._clock())
-        with self._lock:
-            return self._purge_locked(now)
+        purge_failed = False
+        try:
+            purged = self._recovery_journal.purge_expired_provider_grants(
+                now=now,
+            )
+        except RemoteExecutionJournalError:
+            purge_failed = True
+            purged = 0
+        if purge_failed:
+            raise ProviderAccessDenied(
+                "provider_grant_registry_unavailable"
+            )
+        return purged
 
     def _verify_authorization(
         self,
@@ -691,27 +717,6 @@ class ProviderAccessBroker:
             raise ProviderAccessDenied(
                 "worker_authorization_invalid"
             )
-
-    def _purge_locked(self, now: float) -> int:
-        expired = [
-            grant_id
-            for grant_id, record in self._records.items()
-            if now >= record.expires_at
-        ]
-        for grant_id in expired:
-            record = self._records.pop(grant_id, None)
-            if (
-                record is not None
-                and self._logical_grants.get(
-                    record.logical_invocation_digest
-                )
-                == grant_id
-            ):
-                self._logical_grants.pop(
-                    record.logical_invocation_digest,
-                    None,
-                )
-        return len(expired)
 
 
 def _bounded_text(value: Any, reason_code: str) -> str:

@@ -3,7 +3,8 @@
 > 审查对象：本地 LLM credential 诊断边界、ProviderRouteDescriptor、
 > ProviderAccessGrant、ProviderAccessBroker
 >
-> 结论：单进程参考契约范围通过；生产 remote Agent 仍未开放。
+> 结论：credential 基线契约通过；后续 durable journal 不改变生产 remote Agent
+> 仍未开放的结论。
 
 ## Round 1：credential 与诊断泄露
 
@@ -77,7 +78,7 @@ Round 2：通过。
 - invoker failure 和 invalid response 均保留 consumed 墓碑；
 - request、response、TTL、invocation index 和 active grants 全部有硬上限；
 - verifier/invoker 异常被固定 reason code 替换且无 cause/context；
-- readiness 固定 false，文档明确内存墓碑的响应丢失、重启与多副本限制。
+- 当时的 readiness 固定 false，文档明确内存墓碑的响应丢失、重启与多副本限制。
 
 对应测试：
 
@@ -86,12 +87,13 @@ Round 2：通过。
 - `test_request_response_and_expiry_limits_fail_closed`
 - `test_capacity_and_verifier_errors_are_bounded`
 
-Round 3：参考契约通过；durable registry 完成前不具备生产 readiness。
+Round 3：参考契约通过。
 
-## 剩余工作
+## 后续状态
 
-- durable token-digest/logic-key/consumed tombstone journal；
-- 多副本网关的原子签发和消费；
+- durable token-digest/logic-key/consumed tombstone journal 与共享同一本机 SQLite
+  的跨 Broker 原子签发/消费已在后续阶段完成，审查证据见
+  [Provider Grant Journal 三轮对抗性审查](provider-grant-journal-adversarial-review.md)；
 - provider invocation receipt、响应丢失与上游 idempotency；
 - mTLS/attestation、egress allowlist 和 secret-manager backed invoker；
 - 与 AgentActivityRequest、远程 Agent runtime、逐工具 receipt、AgentActivityReceipt
