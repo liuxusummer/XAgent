@@ -112,6 +112,7 @@ class _FakeClock:
 class _RemoteAdmitter:
     production_security_ready = True
     reference_admission_only = True
+    supported_activity_kinds = frozenset({"tool"})
     runtime_attestation_digest = hashlib.sha256(b"matrix-runtime").hexdigest()
 
     def __init__(self, artifacts: LocalArtifactStore) -> None:

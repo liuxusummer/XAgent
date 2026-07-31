@@ -78,6 +78,7 @@ class RemoteAssignmentAdmitter(Protocol):
     """
 
     production_security_ready: bool
+    supported_activity_kinds: frozenset[str]
 
     def preflight(
         self,
@@ -368,11 +369,13 @@ class RemoteControlPlane:
         """Whether a network transport may expose this control composition."""
 
         adapter = self._assignment_admitter
+        supported_activity_kinds = _supported_activity_kinds(adapter)
         return (
             self._journal.durable
             and adapter is not None
             and getattr(adapter, "production_security_ready", None) is True
             and getattr(adapter, "secure_two_phase_admission", None) is True
+            and supported_activity_kinds is not None
             and not self._allow_reference_admission
         )
 
@@ -830,6 +833,21 @@ class RemoteControlPlane:
         request: RemoteRequest,
     ) -> dict[str, Any]:
         body = request.body
+        supported_activity_kinds = _supported_activity_kinds(
+            self._assignment_admitter
+        )
+        if supported_activity_kinds is None:
+            raise RemoteControlError("security_not_ready")
+        registered_activity_kinds = frozenset(body["activity_kinds"])
+        if (
+            not registered_activity_kinds.issubset(
+                supported_activity_kinds
+            )
+            or not {
+                f"activity.{kind}" for kind in registered_activity_kinds
+            }.issubset(body["capabilities"])
+        ):
+            raise RemoteControlError("unsupported_activity")
         now = self._now()
         with self._lock:
             self._expire_registrations_locked(now)
@@ -1090,8 +1108,13 @@ class RemoteControlPlane:
         required_capabilities = {
             f"activity.{activity_kind}" for activity_kind in required_kinds
         }
+        supported_activity_kinds = _supported_activity_kinds(
+            self._assignment_admitter
+        )
         if (
-            not required_kinds.issubset(registration.activity_kinds)
+            supported_activity_kinds is None
+            or not required_kinds.issubset(supported_activity_kinds)
+            or not required_kinds.issubset(registration.activity_kinds)
             or not required_capabilities.issubset(registration.capabilities)
         ):
             raise RemoteControlError("unsupported_activity")
@@ -1150,6 +1173,8 @@ class RemoteControlPlane:
         candidate = target.candidate
         if (
             candidate.claim.activity_kind
+            not in supported_activity_kinds
+            or candidate.claim.activity_kind
             not in registration.activity_kinds
             or f"activity.{candidate.claim.activity_kind}"
             not in registration.capabilities
@@ -2016,6 +2041,34 @@ def _registration_digest(registration: WorkerRegistration) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _supported_activity_kinds(
+    adapter: object | None,
+) -> frozenset[str] | None:
+    """Return an adapter's exact, immutable execution capability proof."""
+
+    if adapter is None:
+        return None
+    try:
+        kinds = adapter.supported_activity_kinds
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        return None
+    if not isinstance(kinds, frozenset) or not kinds:
+        return None
+    try:
+        if any(
+            type(kind) is not str or kind not in ACTIVITY_KINDS
+            for kind in kinds
+        ):
+            return None
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        return None
+    return kinds
 
 
 def _session_binding_digest(

@@ -48,7 +48,10 @@ from src.orchestration.remote_protocol import (
     canonical_digest,
     runtime_binding_digest,
 )
-from src.orchestration.remote_worker import RemoteExecutionContext
+from src.orchestration.remote_worker import (
+    RemoteExecutionContext,
+    RemoteExecutionGrant,
+)
 from src.orchestration.remote_worker import (
     RemoteExecutionOutcome,
     RemoteWorkerClient,
@@ -691,6 +694,90 @@ class SecureRemoteExecutionTests(unittest.TestCase):
             self.store.get_attempt(claim.attempt_id).status,
             AttemptStatus.SUCCEEDED,
         )
+
+    def test_secure_worker_adapter_rejects_unproven_agent_assignment(self):
+        claim = self._claim("unsupported-agent")
+        admitter = self._admitter()
+        authorization = admitter.admit(
+            self.identity,
+            self.registration,
+            self.scheduler,
+            claim,
+        )
+        assignment = WorkAssignment(
+            claim=self._binding(claim, authorization),
+            worker_id=self.identity.worker_id,
+            attempt_number=claim.attempt_number,
+            lease_expires_at=claim.lease_expires_at,
+            activity_kind="agent",
+            effect_class=claim.effect_class,
+            resource_keys=claim.resource_keys,
+            activity_descriptor=RemoteActivityDescriptor(
+                activity_name="main",
+                config_digest=canonical_digest(dict(claim.config)),
+            ),
+            execution_plan=authorization.execution_plan,
+            input_grants=authorization.input_grants,
+            output_grants=authorization.output_grants,
+        )
+        worker = SecureRemoteExecutionAdapter(
+            _WorkerArtifactTransport(
+                admitter,
+                self.identity,
+                self.registration,
+                self.scheduler,
+                claim,
+                authorization,
+            ),
+            _WorkerSandboxAdapter(
+                authorization.runtime_attestation_digest,
+            ),
+            _WorkerProofSigner(self.runtime_verifier),
+        )
+        self.assertEqual(
+            worker.supported_activity_kinds,
+            frozenset({"tool"}),
+        )
+        self.assertEqual(
+            admitter.supported_activity_kinds,
+            frozenset({"tool"}),
+        )
+        with self.assertRaises(AttributeError):
+            worker.supported_activity_kinds = frozenset({"agent"})
+        with self.assertRaises(AttributeError):
+            admitter.supported_activity_kinds = frozenset({"agent"})
+
+        with self.assertRaisesRegex(
+            SecureRemoteExecutionError,
+            "worker_assignment_mismatch",
+        ):
+            worker.prepare(assignment)
+        direct_grant = RemoteExecutionGrant(
+            assignment=assignment,
+            action_digest=assignment.claim.action_digest,
+            authorization_digest=(
+                assignment.claim.authorization_digest
+            ),
+            profile_digest=assignment.claim.profile_digest,
+            request_digest=assignment.claim.request_digest,
+            session_binding_digest=(
+                assignment.claim.session_binding_digest
+            ),
+            grant_binding_digest=(
+                assignment.claim.grant_binding_digest
+            ),
+            execution_plan_digest=(
+                assignment.claim.execution_plan_digest
+            ),
+            runtime_attestation_digest=(
+                assignment.claim.runtime_attestation_digest
+            ),
+        )
+        with self.assertRaisesRegex(
+            SecureRemoteExecutionError,
+            "worker_security_not_ready",
+        ):
+            worker.execute(direct_grant, object())
 
     def test_terminal_completion_replays_after_cache_eviction_and_restart(self):
         admitter = self._admitter()

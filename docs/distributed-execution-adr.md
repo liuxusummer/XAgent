@@ -129,6 +129,9 @@ no-clobber 原子发布到最终路径；崩溃或多进程并发初始化不能
 - JSON 最深 32 层，容器 item 最多 4096；
 - unknown field、bool-as-int、NaN/Infinity、重复语义字段全部拒绝；
 - identifier、capability、tool、runtime version 均有字符和数量上限；
+- Worker 声明的每个 Activity kind 必须同时具有 `activity.<kind>` capability，并且
+  属于控制面 Admitter 与 Worker execution adapter 各自公开的不可变
+  `supported_activity_kinds`；缺失、空集合、可疑类型或不一致均在注册/执行前拒绝；
 - error 只返回固定 code 和有界安全摘要，不回显原请求。
 
 ### 3.2 操作
@@ -177,6 +180,7 @@ attestation_digest
 ```text
 identity 是否能注册声明的 tenant/pool/capability？
 identity 是否能执行该 tenant 下该 Tool/EffectClass？
+控制面 Admitter 与 Worker adapter 是否都证明支持该 Activity kind？
 identity 是否能读取或写入该 Attempt 的指定 Artifact？
 identity 是否仍处于有效期且没有被 drain/revoke？
 ```
@@ -251,6 +255,10 @@ Worker 必须同时满足：
 - tenant、pool、tool、resource key 配额。
 
 任一信息缺失时不 claim，不能“先领取再发现不兼容”。
+Activity kind 的能力证明在三个位置独立校验：控制面写入 session journal 前、Store
+claim 前，以及 Worker prepare/start 前。注册 capability 只能缩小受信 adapter 的证明，
+不能把 `activity.agent` 字符串变成真实 Agent 执行能力；adapter 证明发生漂移时，新的
+claim 立即 fail closed。
 
 Workflow v2 通过 Activity Node 的保留 metadata 字段声明 Worker runtime
 兼容范围：`min_runtime_version`（缺省 `"0"`）和可选
@@ -374,6 +382,16 @@ active durable authority 只延期到 terminal，不由内存 projection 撤销�
 [remote-fleet-data-plane.md](remote-fleet-data-plane.md) 和
 [remote-fleet-adversarial-review.md](remote-fleet-adversarial-review.md)。
 
+当前生产 `SecureRemoteAssignmentAdmitter`、`SecureRemoteExecutionAdapter` 和
+`DurableFleetProjector` 只证明 Tool Activity；`RemoteWorkerDaemon` 因此默认也只注册
+`tool`。协议保留 `agent` 枚举不代表参考安全组合已经支持远程 Agent。Agent Activity
+目前由本地 `LegacyAgentLoopAdapter` 按整体 `non_idempotent_write` 的保守恢复契约执行；
+未来远程实现必须提供独立、可验证的 Agent runtime、整体结果回执和 task/context
+Artifact 边界后，才能把 `agent` 加入两侧的 `supported_activity_kinds`，禁止仅修改注册
+字符串或 Fleet 路由绕过该门禁。
+三轮能力真实性审查及可执行回归见
+[remote-activity-capability-adversarial-review.md](remote-activity-capability-adversarial-review.md)。
+
 旧单阶段 adapter 只有在控制面显式设置
 `allow_reference_admission=true` 且 adapter 同时声明 `reference_admission_only=true`
 时才可进入开发兼容路径；任一条件缺失均在 Store mutation 前 fail closed。
@@ -421,6 +439,8 @@ per-tenant active and quota rejection
 - `src.orchestration` 导入仍不启动 server、Worker、线程或网络；
 - 本地 `TrustedActivityExecutor` 和 F01–F30 行为不变；
 - 远程能力显式组合，没有 transport/authenticator/authorizer 时 fail closed；
+- Worker/Admitter 的 Activity kind 必须有执行适配器证明；默认参考远程链只证明
+  `tool`，旧代码依赖 Worker 默认宣告 `agent` 的行为不具兼容保证；
 - secure remote composition 必须显式注入受保护的持久 `RemoteControlJournal`；
   内存 journal 不能进入 assignment/poll/complete 路径；
 - Store schema migration 必须支持旧数据库，并拒绝未知更高版本；

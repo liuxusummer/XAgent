@@ -329,6 +329,7 @@ class _ReferenceWorkerAdapter:
     """Worker-side reference adapter using authenticated in-process broker RPC."""
 
     production_security_ready = True
+    supported_activity_kinds = frozenset({"tool"})
 
     def __init__(
         self,

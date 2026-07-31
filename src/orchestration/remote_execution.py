@@ -87,6 +87,7 @@ MAX_PREPARED_REMOTE_EXECUTIONS = 4_096
 MAX_PREPARED_TTL_SECONDS = 5 * 60.0
 MAX_PREPARED_MATERIALIZED_BYTES = 64 * 1024 * 1024
 MAX_RUNTIME_ATTESTATION_TTL_SECONDS = 5 * 60.0
+_TOOL_ACTIVITY_KINDS = frozenset({"tool"})
 
 
 class SecureRemoteExecutionError(RuntimeError):
@@ -529,10 +530,15 @@ class SecureRemoteExecutionAdapter:
     def runtime_attestation_digest(self) -> str:
         return self.sandbox_adapter.runtime_attestation_digest
 
+    @property
+    def supported_activity_kinds(self) -> frozenset[str]:
+        return _TOOL_ACTIVITY_KINDS
+
     def prepare(self, assignment) -> RemoteExecutionGrant:
         authorization = assignment.claim
         if (
-            authorization.runtime_attestation_digest
+            assignment.activity_kind not in self.supported_activity_kinds
+            or authorization.runtime_attestation_digest
             != self.runtime_attestation_digest
             or assignment.execution_plan.plan_digest
             != authorization.execution_plan_digest
@@ -681,6 +687,8 @@ class SecureRemoteExecutionAdapter:
         if (
             not self.production_security_ready
             or not isinstance(grant, RemoteExecutionGrant)
+            or grant.assignment.activity_kind
+            not in self.supported_activity_kinds
             or grant.runtime_attestation_digest
             != self.runtime_attestation_digest
         ):
@@ -779,6 +787,10 @@ class SecureRemoteAssignmentAdmitter:
         )
 
     @property
+    def supported_activity_kinds(self) -> frozenset[str]:
+        return _TOOL_ACTIVITY_KINDS
+
+    @property
     def durable_recovery_ready(self) -> bool:
         """Whether claim and Artifact authority survive process restart."""
 
@@ -866,6 +878,13 @@ class SecureRemoteAssignmentAdmitter:
             or registration.worker_id != identity.worker_id
             or registration.tenant_id != identity.tenant_id
             or registration.identity_digest != identity.identity_digest
+            or not frozenset(registration.activity_kinds).issubset(
+                self.supported_activity_kinds
+            )
+            or not {
+                f"activity.{kind}"
+                for kind in registration.activity_kinds
+            }.issubset(registration.capabilities)
         ):
             raise SecureRemoteExecutionError("control_context_mismatch")
         now = self._now()
@@ -2399,6 +2418,10 @@ class SecureRemoteAssignmentAdmitter:
             or registration.tenant_id != identity.tenant_id
             or registration.identity_digest != identity.identity_digest
             or claim.worker_id != registration.session_owner_id
+            or claim.activity_kind not in self.supported_activity_kinds
+            or claim.activity_kind not in registration.activity_kinds
+            or f"activity.{claim.activity_kind}"
+            not in registration.capabilities
             or (
                 require_durable_claim
                 and (

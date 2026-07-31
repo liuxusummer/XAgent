@@ -286,6 +286,11 @@ output handle 与签名 runtime proof，最终 ArtifactRef 和 ToolReceipt 仍�
 attestation 与 HMAC proof 只演示验证链，不等同于真实 mTLS 或 gVisor 隔离。生产部署
 必须提供独立传输、持久 broker 状态和真实隔离 backend；详见
 `distributed-execution-adr.md`。
+当前这条可信执行与 ToolReceipt 链只证明 `tool` Activity。控制面 Admitter 和 Worker
+adapter 都通过不可变 `supported_activity_kinds` 声明真实能力，注册、claim 和 Worker
+start 前逐层验证；协议存在 `agent` 枚举或调用方声明 `activity.agent` 都不能扩大能力。
+完整 Agent Loop 的远程执行必须另行证明整体副作用、上下文 Artifact 和 Agent 级回执，
+不能把内部单次 ToolReceipt 冒充为整个 Agent Activity 的结果。
 
 进程内 Artifact broker 除单 Artifact 上限外，还对所有 staged/finalizing 内容实施
 全局驻留字节硬上限；超限的新增 stage 必须 fail closed，不能淘汰已接受的旧 stage。

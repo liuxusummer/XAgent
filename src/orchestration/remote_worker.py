@@ -33,6 +33,7 @@ class RemoteExecutionAdapter(Protocol):
 
     production_security_ready: bool
     runtime_attestation_digest: str
+    supported_activity_kinds: frozenset[str]
 
     def prepare(
         self,
@@ -347,7 +348,7 @@ class RemoteWorkerDaemon:
         runtime_version: str,
         capabilities: tuple[str, ...],
         resource_keys: tuple[str, ...],
-        activity_kinds: tuple[str, ...] = ("agent", "tool"),
+        activity_kinds: tuple[str, ...] = ("tool",),
         max_concurrency: int = 1,
         lease_seconds: float = 60.0,
     ) -> None:
@@ -364,6 +365,7 @@ class RemoteWorkerDaemon:
         self._registered = False
 
     def register(self) -> None:
+        self._require_adapter()
         self.client.register(
             runtime_version=self.runtime_version,
             capabilities=self.capabilities,
@@ -376,7 +378,7 @@ class RemoteWorkerDaemon:
     def execute_one(self, run_id: str) -> bool:
         """Execute at most one assignment and commit only a bounded receipt."""
 
-        adapter = self._require_adapter()
+        self._require_adapter()
         if not self._registered:
             self.register()
         assignment = self.client.poll(
@@ -385,10 +387,16 @@ class RemoteWorkerDaemon:
         )
         if assignment is None:
             return False
-        if adapter.runtime_attestation_digest != (
-            assignment.claim.runtime_attestation_digest
-        ):
+        # Poll may block while deployment configuration changes. Re-read the
+        # adapter contract immediately before validating and preparing work.
+        adapter, runtime_digest, supported = self._require_adapter()
+        if runtime_digest != assignment.claim.runtime_attestation_digest:
             raise RemoteWorkerError("runtime_attestation_mismatch")
+        if (
+            assignment.activity_kind not in self.activity_kinds
+            or assignment.activity_kind not in supported
+        ):
+            raise RemoteWorkerError("unsupported_activity")
         try:
             grant = adapter.prepare(assignment)
         except BaseException as exc:
@@ -460,23 +468,52 @@ class RemoteWorkerDaemon:
             self.client.complete(assignment.claim, outcome)
         return True
 
-    def _require_adapter(self) -> RemoteExecutionAdapter:
+    def _require_adapter(
+        self,
+    ) -> tuple[RemoteExecutionAdapter, str, frozenset[str]]:
         adapter = self._adapter
-        if (
-            adapter is None
-            or getattr(adapter, "production_security_ready", None) is not True
-        ):
+        if adapter is None:
+            raise RemoteWorkerError("security_not_ready")
+        try:
+            ready = adapter.production_security_ready
+            runtime_digest = adapter.runtime_attestation_digest
+            supported = adapter.supported_activity_kinds
+            configured = frozenset(self.activity_kinds)
+            configured_count = len(self.activity_kinds)
+            capabilities = frozenset(self.capabilities)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            raise RemoteWorkerError("security_not_ready") from None
+        if ready is not True:
             raise RemoteWorkerError("security_not_ready")
         if (
-            not isinstance(adapter.runtime_attestation_digest, str)
+            not isinstance(runtime_digest, str)
             or re.fullmatch(
                 r"[0-9a-f]{64}",
-                adapter.runtime_attestation_digest,
+                runtime_digest,
             )
             is None
         ):
             raise RemoteWorkerError("runtime_attestation_invalid")
-        return adapter
+        if (
+            not isinstance(supported, frozenset)
+            or not supported
+            or any(
+                type(kind) is not str
+                or kind not in {"agent", "tool"}
+                for kind in supported
+            )
+            or not configured
+            or len(configured) != configured_count
+            or any(type(kind) is not str for kind in configured)
+            or not configured.issubset(supported)
+            or not {
+                f"activity.{kind}" for kind in configured
+            }.issubset(capabilities)
+        ):
+            raise RemoteWorkerError("unsupported_activity")
+        return adapter, runtime_digest, supported
 
 
 __all__ = [

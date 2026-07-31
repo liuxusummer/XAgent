@@ -98,6 +98,7 @@ class _TestAdmitter:
     # exercised by the worker-security integration tests.
     production_security_ready = True
     secure_two_phase_admission = True
+    supported_activity_kinds = frozenset({"tool"})
     runtime_attestation_digest = hashlib.sha256(b"test-runtime").hexdigest()
 
     def __init__(self, artifacts: LocalArtifactStore | None = None) -> None:
@@ -321,6 +322,7 @@ class _TestAdmitter:
 
 class _TestExecutionAdapter:
     production_security_ready = True
+    supported_activity_kinds = frozenset({"tool"})
     runtime_attestation_digest = _TestAdmitter.runtime_attestation_digest
 
     def __init__(self, execute):
@@ -356,6 +358,12 @@ class _TestExecutionAdapter:
         )
 
 
+class _ExplodingCapabilityAdapter(_TestExecutionAdapter):
+    @property
+    def supported_activity_kinds(self):
+        raise RuntimeError("internal capability source must not leak")
+
+
 class _NoCommitAdmitter(_TestAdmitter):
     def complete(
         self,
@@ -379,6 +387,10 @@ class _DenyPreflightAdmitter(_TestAdmitter):
 class _UnmarkedLegacyAdmitter(_TestAdmitter):
     secure_two_phase_admission = False
     reference_admission_only = False
+
+
+class _InvalidCapabilityAdmitter(_TestAdmitter):
+    supported_activity_kinds = ("tool",)
 
 
 class _MarkedLegacyAdmitter(_TestAdmitter):
@@ -1180,9 +1192,8 @@ class RemoteProtocolTests(unittest.TestCase):
         )
         self.assertFalse(unguarded_control.production_security_ready)
         unguarded_client = self._client(unguarded_control)
-        self._register(unguarded_client)
         with self.assertRaisesRegex(RemoteWorkerError, "security_not_ready"):
-            unguarded_client.poll("run-remote")
+            self._register(unguarded_client)
         self.assertEqual(self.store.list_attempts("run-remote"), [])
 
         legacy_control = RemoteControlPlane(
@@ -1278,6 +1289,142 @@ class RemoteProtocolTests(unittest.TestCase):
                 capabilities=("activity.tool",),
                 resource_keys=("workspace:project",),
             )
+
+    def test_registration_rejects_unproven_activity_kind_before_publish(self) -> None:
+        client = self._client(
+            self.control,
+            instance_id="unsupported-agent-instance",
+        )
+
+        with self.assertRaisesRegex(
+            RemoteWorkerError,
+            "unsupported_activity",
+        ):
+            client.register(
+                runtime_version="worker-runtime/1.0",
+                capabilities=("activity.agent",),
+                resource_keys=("workspace:project",),
+                activity_kinds=("agent",),
+                max_concurrency=1,
+            )
+
+        self.assertIsNone(self.control.get_registration("worker-1"))
+        self.assertEqual(self.store.list_attempts("run-remote"), [])
+
+    def test_malformed_control_capability_proof_is_not_production_ready(
+        self,
+    ) -> None:
+        control = RemoteControlPlane(
+            lambda _run_id: self.scheduler,
+            authorize_run=lambda _identity, _run_id: True,
+            assignment_admitter=_InvalidCapabilityAdmitter(
+                self.artifacts
+            ),
+            journal=RemoteControlJournal(
+                self.control_root / "invalid-kinds.sqlite3"
+            ),
+        )
+        client = self._client(
+            control,
+            instance_id="invalid-kinds-instance",
+        )
+
+        self.assertFalse(control.production_security_ready)
+        with self.assertRaisesRegex(
+            RemoteWorkerError,
+            "security_not_ready",
+        ):
+            self._register(client)
+        self.assertIsNone(control.get_registration("worker-1"))
+
+    def test_claim_rechecks_adapter_activity_kind_after_registration(self) -> None:
+        admitter = _TestAdmitter(self.artifacts)
+        control = RemoteControlPlane(
+            lambda _run_id: self.scheduler,
+            authorize_run=lambda _identity, _run_id: True,
+            assignment_admitter=admitter,
+            journal=RemoteControlJournal(
+                self.control_root / "mutable-kinds.sqlite3"
+            ),
+        )
+        client = self._client(
+            control,
+            instance_id="mutable-kinds-instance",
+        )
+        self._register(client)
+        admitter.supported_activity_kinds = frozenset({"agent"})
+
+        with self.assertRaisesRegex(
+            RemoteWorkerError,
+            "unsupported_activity",
+        ):
+            client.poll("run-remote")
+
+        self.assertEqual(self.store.list_attempts("run-remote"), [])
+
+    def test_worker_rejects_configured_kind_not_proven_by_adapter(self) -> None:
+        calls = []
+        client = RemoteWorkerClient(
+            lambda request: calls.append(request) or {},
+            worker_id="worker-local-check",
+            instance_id="worker-local-check-instance",
+        )
+        daemon = RemoteWorkerDaemon(
+            client,
+            _TestExecutionAdapter(lambda _assignment, _context: None),
+            runtime_version="worker-runtime/1.0",
+            capabilities=("activity.agent",),
+            resource_keys=(),
+            activity_kinds=("agent",),
+        )
+
+        with self.assertRaisesRegex(
+            RemoteWorkerError,
+            "unsupported_activity",
+        ):
+            daemon.register()
+
+        self.assertEqual(calls, [])
+
+    def test_worker_reduces_adapter_capability_failure_to_safe_error(self) -> None:
+        calls = []
+        client = RemoteWorkerClient(
+            lambda request: calls.append(request) or {},
+            worker_id="worker-exploding-capability",
+            instance_id="worker-exploding-capability-instance",
+        )
+        daemon = RemoteWorkerDaemon(
+            client,
+            _ExplodingCapabilityAdapter(
+                lambda _assignment, _context: None
+            ),
+            runtime_version="worker-runtime/1.0",
+            capabilities=("activity.tool",),
+            resource_keys=(),
+        )
+
+        with self.assertRaisesRegex(
+            RemoteWorkerError,
+            "^security_not_ready$",
+        ):
+            daemon.register()
+
+        self.assertEqual(calls, [])
+
+    def test_worker_default_activity_kind_matches_secure_reference_adapter(
+        self,
+    ) -> None:
+        daemon = RemoteWorkerDaemon(
+            self.client,
+            _TestExecutionAdapter(
+                lambda _assignment, _context: None
+            ),
+            runtime_version="worker-runtime/1.0",
+            capabilities=("activity.tool",),
+            resource_keys=(),
+        )
+
+        self.assertEqual(daemon.activity_kinds, ("tool",))
 
     def test_control_never_commits_unverified_worker_completion_candidate(self) -> None:
         control = RemoteControlPlane(
@@ -1393,15 +1540,14 @@ class RemoteProtocolTests(unittest.TestCase):
             worker_id="worker-1",
             instance_id="instance-unsupported",
         )
-        unsupported.register(
-            runtime_version="runtime/1",
-            capabilities=("artifact.refs",),
-            resource_keys=("workspace:project",),
-            activity_kinds=("tool",),
-            max_concurrency=1,
-        )
         with self.assertRaisesRegex(RemoteWorkerError, "unsupported_activity"):
-            unsupported.poll("run-remote")
+            unsupported.register(
+                runtime_version="runtime/1",
+                capabilities=("artifact.refs",),
+                resource_keys=("workspace:project",),
+                activity_kinds=("tool",),
+                max_concurrency=1,
+            )
 
     def test_registration_cache_has_capacity_and_idle_ttl(self) -> None:
         session_clock = _Clock(10.0)
