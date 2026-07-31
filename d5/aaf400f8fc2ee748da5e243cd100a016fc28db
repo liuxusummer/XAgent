@@ -1,0 +1,45 @@
+docs/architecture.md
+  s_72af05a5dabd4c::t_1382ef40bfcb29 93-96,142-144
+docs/distributed-execution-adr.md
+  s_72af05a5dabd4c::t_8de9b12b863862 391-397,434-441
+docs/durable-orchestration-spec.md
+  s_72af05a5dabd4c::t_149af90113e988 463-469
+docs/provider-credential-boundary.md
+  s_72af05a5dabd4c::t_5f43c61acdfc74 99-102,156-196,200-203,207,209-210,219-221
+docs/provider-grant-journal-adversarial-review.md
+  s_72af05a5dabd4c::t_ffacf9a879d88d 51,59-60,102-104
+docs/provider-invocation-receipt-adversarial-review.md
+  s_72af05a5dabd4c::t_59b5a2f7a89d02 84-86,96,103,105-108
+docs/provider-operation-recovery-adversarial-review.md
+  s_72af05a5dabd4c::t_ec7b8ef8b7812b 1-129
+docs/remote-execution-recovery.md
+  s_72af05a5dabd4c::t_c2033551568591 4-5,53-56,76,78-80,84-94
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_644731c90ab870 149-150,152
+src/orchestration/provider_access.py
+  s_72af05a5dabd4c::t_703388aa9bbac0 13,31,42,80-88,463-557,571-586,672,687-701,878,893,900-908,997-1211,1573,1579-1580,1582
+src/orchestration/remote_execution_journal.py
+  s_72af05a5dabd4c::t_178b0eda66f3f3 26,31,128,139-152,278-290,294-295,302-304,570-606,1633-1873,1962-1972,2133-2215,2337-2364,2573-2582,2665-2688,2700-2711,2734-2757,2759-2820,2975-2992,3063,3081
+tests/test_orchestration_provider_access.py
+  s_72af05a5dabd4c::t_d737dbe6f57bff 6,16-17,90-204,284-298,322-324,486-1061
+tests/test_orchestration_remote_execution_journal.py
+  s_72af05a5dabd4c::t_42f0dd4eac2f56 15,27,423,482,488,490,506-508,549,553,555,569-571,616,618-696,766-785,833-1237
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d5aaf400f8fc2ee748da5e243cd100a016fc28db",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
