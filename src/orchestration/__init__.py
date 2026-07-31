@@ -227,6 +227,7 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "ActivityAdmissionDenied",
         "ArtifactGCReferenceConflictError",
         "DurableRunStore",
+        "FleetFairnessCursor",
         "FleetShardOwnership",
         "FleetShardOwnershipCapacityError",
         "FleetShardOwnershipConflict",

@@ -34,7 +34,7 @@ from .remote_scheduling import (
     WorkerSnapshot,
     WorkerSweepReport,
 )
-from .store import FleetShardOwnership
+from .store import FleetFairnessCursor, FleetShardOwnership
 
 MAX_FLEET_TASK_BINDINGS = 1_000_000
 MAX_FLEET_WORKERS = 4096
@@ -131,7 +131,6 @@ class FleetTaskBinding:
         return (
             self.exact_for_production
             and self.shard_ownership is not None
-            and self.shard_ownership.tenant_id == self.task.tenant_id
             and self.shard_ownership.pool_id == self.task.pool_id
         )
 
@@ -225,6 +224,7 @@ class RemoteFleetCoordinator:
         self._lock = threading.RLock()
         self._scheduler = scheduler
         self._task_bindings: dict[str, FleetTaskBinding] = {}
+        self._fairness_cursors: dict[str, FleetFairnessCursor] = {}
         self._inflight_durable_claims = 0
 
     @property
@@ -269,6 +269,12 @@ class RemoteFleetCoordinator:
                             None,
                         )
                         == self.fleet_owner_id
+                        and getattr(
+                            self._claim_run,
+                            "durable_fleet_fairness_ready",
+                            None,
+                        )
+                        is True
                     )
                 bindings_ready = all(
                     (
@@ -279,6 +285,15 @@ class RemoteFleetCoordinator:
                                 and binding.exact_for_multi_control
                                 and binding.shard_ownership.owner_id
                                 == self.fleet_owner_id
+                                and self._scheduler.pool_cursor_is_restored(
+                                    binding.task.pool_id
+                                )
+                                and self._cursor_authorizes_binding(
+                                    self._fairness_cursors.get(
+                                        binding.task.pool_id
+                                    ),
+                                    binding,
+                                )
                             )
                             if (
                                 self.require_durable_ownership
@@ -301,6 +316,28 @@ class RemoteFleetCoordinator:
             self.require_durable_ownership
             and self.production_security_ready
         )
+
+    def restore_fairness_cursor(
+        self,
+        cursor: FleetFairnessCursor,
+    ) -> None:
+        if not isinstance(cursor, FleetFairnessCursor):
+            raise RemoteFleetValidationError(
+                "cursor must be a FleetFairnessCursor"
+            )
+        if (
+            self.fleet_owner_id is None
+            or cursor.owner_id != self.fleet_owner_id
+        ):
+            raise RemoteFleetConflict(
+                "Fleet cursor belongs to another control owner"
+            )
+        with self._lock:
+            self._scheduler.restore_tenant_cursor(
+                cursor.pool_id,
+                cursor.last_served_tenant,
+            )
+            self._fairness_cursors[cursor.pool_id] = cursor
 
     def register_worker(self, descriptor: WorkerDescriptor) -> WorkerSnapshot:
         with self._lock:
@@ -569,6 +606,8 @@ class RemoteFleetCoordinator:
         self,
         tasks: Sequence[FleetTaskBinding],
         workers: Sequence[WorkerDescriptor],
+        *,
+        fairness_cursors: Sequence[FleetFairnessCursor] = (),
     ) -> FleetRebuildReport:
         """Atomically rebuild from caller-supplied Store/identity projections."""
 
@@ -580,6 +619,14 @@ class RemoteFleetCoordinator:
             raise RemoteFleetValidationError("tasks exceed max_task_bindings")
         if len(workers) > MAX_FLEET_WORKERS:
             raise RemoteFleetValidationError("workers exceed fleet registry bound")
+        if (
+            not isinstance(fairness_cursors, Sequence)
+            or isinstance(fairness_cursors, (str, bytes))
+            or len(fairness_cursors) > MAX_FLEET_WORKERS
+        ):
+            raise RemoteFleetValidationError(
+                "fairness_cursors must be a bounded sequence"
+            )
         with self._lock:
             if self._inflight_durable_claims:
                 raise RemoteFleetConflict(
@@ -596,6 +643,28 @@ class RemoteFleetCoordinator:
             )
         task_bindings: dict[str, FleetTaskBinding] = {}
         worker_ids: set[str] = set()
+        cursors_by_pool: dict[str, FleetFairnessCursor] = {}
+        for cursor in fairness_cursors:
+            if not isinstance(cursor, FleetFairnessCursor):
+                raise RemoteFleetValidationError(
+                    "fairness_cursors must contain FleetFairnessCursor values"
+                )
+            if (
+                self.fleet_owner_id is None
+                or cursor.owner_id != self.fleet_owner_id
+            ):
+                raise RemoteFleetConflict(
+                    "Fleet cursor belongs to another control owner"
+                )
+            if cursor.pool_id in cursors_by_pool:
+                raise RemoteFleetConflict(
+                    "duplicate pool cursor in rebuild projection"
+                )
+            candidate.restore_tenant_cursor(
+                cursor.pool_id,
+                cursor.last_served_tenant,
+            )
+            cursors_by_pool[cursor.pool_id] = cursor
         for descriptor in workers:
             if not isinstance(descriptor, WorkerDescriptor):
                 raise RemoteFleetValidationError(
@@ -610,6 +679,22 @@ class RemoteFleetCoordinator:
                 raise RemoteFleetValidationError(
                     "tasks must contain FleetTaskBinding values"
                 )
+            if (
+                self.require_durable_ownership
+                or binding.shard_ownership is not None
+            ):
+                cursor = cursors_by_pool.get(binding.task.pool_id)
+                if cursor is None:
+                    raise RemoteFleetConflict(
+                        "owned rebuild lacks durable pool cursor"
+                    )
+                if not self._cursor_authorizes_binding(
+                    cursor,
+                    binding,
+                ):
+                    raise RemoteFleetConflict(
+                        "owned rebuild has a stale pool cursor"
+                    )
             task_id = binding.task.task_id
             existing = task_bindings.get(task_id)
             if existing is not None:
@@ -632,6 +717,7 @@ class RemoteFleetCoordinator:
                 )
             self._scheduler = candidate
             self._task_bindings = task_bindings
+            self._fairness_cursors = cursors_by_pool
         for descriptor in workers:
             self._observe(
                 "record_worker_registration",
@@ -639,6 +725,22 @@ class RemoteFleetCoordinator:
                 WorkerLifecycle.ACTIVE,
             )
         return FleetRebuildReport(workers=len(workers), tasks=len(tasks))
+
+    @staticmethod
+    def _cursor_authorizes_binding(
+        cursor: FleetFairnessCursor | None,
+        binding: FleetTaskBinding,
+    ) -> bool:
+        ownership = binding.shard_ownership
+        return (
+            cursor is not None
+            and ownership is not None
+            and cursor.shard_id == ownership.shard_id
+            and cursor.pool_id == ownership.pool_id
+            and cursor.owner_id == ownership.owner_id
+            and cursor.fencing_epoch == ownership.fencing_epoch
+            and cursor.policy_digest == ownership.policy_digest
+        )
 
     def snapshot(self) -> FleetSnapshot:
         with self._lock:

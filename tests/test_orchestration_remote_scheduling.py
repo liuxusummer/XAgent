@@ -4,6 +4,7 @@ import dataclasses
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 from src.orchestration.remote_scheduling import (
     AdmissionOutcome,
@@ -288,6 +289,51 @@ class RemoteSchedulingTests(unittest.TestCase):
         self.assertIn("tenant-b", served[2:])
         for left, right in zip(served, served[1:]):
             self.assertFalse(left == right == "tenant-a")
+
+    def test_restored_pool_cursor_preserves_restart_fairness(self) -> None:
+        restarted = DeterministicRemoteScheduler(clock=_FakeClock())
+        restarted.restore_tenant_cursor("pool-a", "tenant-a")
+        restarted.register_worker(worker("worker-1"))
+        restarted.admit(task("a-after-restart", "tenant-a"))
+        restarted.admit(task("b-after-restart", "tenant-b"))
+
+        decision = poll_current(restarted, "worker-1")
+
+        assert decision.assignment is not None
+        self.assertEqual(
+            decision.assignment.task.task_id,
+            "b-after-restart",
+        )
+        self.assertTrue(restarted.pool_cursor_is_restored("pool-a"))
+
+    def test_cursor_restore_requires_an_idle_pool(self) -> None:
+        scheduler = DeterministicRemoteScheduler(clock=_FakeClock())
+        scheduler.admit(task("queued", "tenant-a"))
+
+        with self.assertRaisesRegex(
+            RemoteSchedulingConflict,
+            "before queue admission",
+        ):
+            scheduler.restore_tenant_cursor("pool-a", "tenant-a")
+
+    def test_restored_pool_cursor_registry_is_bounded(self) -> None:
+        scheduler = DeterministicRemoteScheduler(clock=_FakeClock())
+
+        with patch(
+            "src.orchestration.remote_scheduling."
+            "MAX_RESTORED_POOL_CURSORS",
+            1,
+        ):
+            scheduler.restore_tenant_cursor("pool-a", "tenant-a")
+            scheduler.restore_tenant_cursor("pool-a", "tenant-b")
+            with self.assertRaisesRegex(
+                RemoteSchedulingConflict,
+                "registry is full",
+            ):
+                scheduler.restore_tenant_cursor("pool-b", "tenant-a")
+
+        self.assertTrue(scheduler.pool_cursor_is_restored("pool-a"))
+        self.assertFalse(scheduler.pool_cursor_is_restored("pool-b"))
 
     def test_unrelated_pool_claims_cannot_reset_another_pools_fair_cursor(self) -> None:
         scheduler = DeterministicRemoteScheduler(clock=_FakeClock())

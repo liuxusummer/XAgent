@@ -972,7 +972,6 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             "pool-a-shard",
             "control-a",
             "a" * 64,
-            tenant_id="tenant-1",
             pool_id="pool-a",
             now=10,
         )
@@ -986,6 +985,11 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
         fleet, _poller = self._compose(
             require_durable_ownership=True,
         )
+        cursor = self.harness.store.get_fleet_fairness_cursor(
+            "pool-a"
+        )
+        assert cursor is not None
+        fleet.restore_fairness_cursor(cursor)
         fleet.admit(binding)
 
         self.assertTrue(fleet.production_multi_control_ready)
@@ -999,6 +1003,12 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             attempt.metadata["fleet_shard_ownership"],
             ownership.to_metadata(),
         )
+        advanced = self.harness.store.get_fleet_fairness_cursor(
+            "pool-a"
+        )
+        assert advanced is not None
+        self.assertEqual(advanced.last_served_tenant, "tenant-1")
+        self.assertEqual(advanced.selection_sequence, 1)
 
     def test_shard_transfer_fences_claimed_but_not_started_work(
         self,
@@ -1007,7 +1017,6 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             "claim-start-shard",
             "control-a",
             "a" * 64,
-            tenant_id="tenant-1",
             pool_id="pool-a",
             now=10,
         )
@@ -1021,6 +1030,11 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
         fleet, _poller = self._compose(
             require_durable_ownership=True,
         )
+        cursor = self.harness.store.get_fleet_fairness_cursor(
+            "pool-a"
+        )
+        assert cursor is not None
+        fleet.restore_fairness_cursor(cursor)
         fleet.admit(binding)
         assignment = self.client.poll_fleet()
         assert assignment is not None
@@ -1044,7 +1058,6 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             "running-transfer-shard",
             "control-a",
             "a" * 64,
-            tenant_id="tenant-1",
             pool_id="pool-a",
             now=10,
         )
@@ -1058,6 +1071,11 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
         fleet, _poller = self._compose(
             require_durable_ownership=True,
         )
+        cursor = self.harness.store.get_fleet_fairness_cursor(
+            "pool-a"
+        )
+        assert cursor is not None
+        fleet.restore_fairness_cursor(cursor)
         fleet.admit(binding)
         assignment = self.client.poll_fleet()
         assert assignment is not None
@@ -1085,14 +1103,13 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             "other-scope-shard",
             "control-a",
             "a" * 64,
-            tenant_id="tenant-other",
-            pool_id="pool-a",
+            pool_id="pool-other",
             now=10,
         )
 
         with self.assertRaisesRegex(
             RemoteFleetControlConflict,
-            "another routing scope",
+            "another pool",
         ):
             self._projector().project_ready(
                 self.harness.scheduler,
@@ -1108,8 +1125,7 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             "other-tenant-shard",
             "control-a",
             "a" * 64,
-            tenant_id="tenant-other",
-            pool_id="pool-a",
+            pool_id="pool-other",
             now=10,
         )
         registration = self.harness.control.get_registration("worker-1")
@@ -1148,7 +1164,6 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             "pool-a-failover",
             "control-a",
             "b" * 64,
-            tenant_id="tenant-1",
             pool_id="pool-a",
             now=10,
         )
@@ -1162,6 +1177,11 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
         fleet, _poller = self._compose(
             require_durable_ownership=True,
         )
+        cursor = self.harness.store.get_fleet_fairness_cursor(
+            "pool-a"
+        )
+        assert cursor is not None
+        fleet.restore_fairness_cursor(cursor)
         fleet.admit(old_binding)
         second = self.harness.store.transfer_fleet_shard(
             first,
@@ -1198,6 +1218,13 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             pool_id="pool-a",
             shard_ownership=second,
         )[0]
+        next_cursor = self.harness.store.get_fleet_fairness_cursor(
+            "pool-a"
+        )
+        assert next_cursor is not None
+        self.assertIsNone(next_cursor.last_served_tenant)
+        self.assertEqual(next_cursor.selection_sequence, 0)
+        fleet.restore_fairness_cursor(next_cursor)
         fleet.admit(new_binding)
         assignment = self.client.poll_fleet()
         assert assignment is not None
@@ -1215,7 +1242,6 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
             "control-b-shard",
             "control-b",
             "b" * 64,
-            tenant_id="tenant-1",
             pool_id="pool-a",
             now=10,
         )
@@ -1256,12 +1282,119 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
                 require_durable_ownership=True,
             )
 
+    def test_strict_multi_control_readiness_requires_durable_cursor(
+        self,
+    ) -> None:
+        ownership = self.harness.store.claim_fleet_shard(
+            "cursor-required-shard",
+            "control-a",
+            "b" * 64,
+            pool_id="pool-a",
+            now=10,
+        )
+        binding = self._projector().project_ready(
+            self.harness.scheduler,
+            "run-remote",
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            shard_ownership=ownership,
+        )[0]
+        fleet, _poller = self._compose(
+            require_durable_ownership=True,
+        )
+        fleet.admit(binding)
+
+        self.assertFalse(fleet.production_multi_control_ready)
+        with self.assertRaisesRegex(
+            RemoteWorkerError,
+            "security_not_ready",
+        ):
+            self.client.poll_fleet()
+
+    def test_strict_rebuild_restores_matching_pool_cursor_atomically(
+        self,
+    ) -> None:
+        ownership = self.harness.store.claim_fleet_shard(
+            "rebuild-cursor-shard",
+            "control-a",
+            "b" * 64,
+            pool_id="pool-a",
+            now=10,
+        )
+        binding = self._projector().project_ready(
+            self.harness.scheduler,
+            "run-remote",
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            shard_ownership=ownership,
+        )[0]
+        cursor = self.harness.store.get_fleet_fairness_cursor(
+            "pool-a"
+        )
+        assert cursor is not None
+        fleet, _poller = self._compose(
+            require_durable_ownership=True,
+        )
+
+        report = fleet.rebuild(
+            [binding],
+            [],
+            fairness_cursors=[cursor],
+        )
+
+        self.assertEqual((report.tasks, report.workers), (1, 0))
+        self.assertTrue(fleet.production_multi_control_ready)
+        self.assertEqual(fleet.snapshot().queued_tasks, 1)
+
+    def test_strict_rebuild_rejects_stale_cursor_before_state_swap(
+        self,
+    ) -> None:
+        first = self.harness.store.claim_fleet_shard(
+            "stale-rebuild-shard",
+            "control-a",
+            "b" * 64,
+            pool_id="pool-a",
+            now=10,
+        )
+        stale_cursor = self.harness.store.get_fleet_fairness_cursor(
+            "pool-a"
+        )
+        assert stale_cursor is not None
+        current = self.harness.store.transfer_fleet_shard(
+            first,
+            new_owner_id="control-a",
+            new_policy_digest="c" * 64,
+            now=11,
+        )
+        binding = self._projector().project_ready(
+            self.harness.scheduler,
+            "run-remote",
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            shard_ownership=current,
+        )[0]
+        fleet, _poller = self._compose(
+            require_durable_ownership=True,
+        )
+
+        with self.assertRaisesRegex(
+            RemoteFleetConflict,
+            "stale pool cursor",
+        ):
+            fleet.rebuild(
+                [binding],
+                [],
+                fairness_cursors=[stale_cursor],
+            )
+
+        self.assertEqual(fleet.snapshot().queued_tasks, 0)
+        self.assertEqual(fleet.snapshot().task_bindings, 0)
+
     def test_owned_scope_blocks_legacy_control_claims(self) -> None:
         self.harness.store.claim_fleet_shard(
             "upgraded-shard",
             "control-a",
             "b" * 64,
-            tenant_id="tenant-1",
             pool_id="pool-a",
             now=10,
         )

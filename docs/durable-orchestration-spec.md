@@ -1204,9 +1204,10 @@ gVisor 或持久 broker registry。其后新增了严格、有界的
 客户端，以及由服务端 policy 驱动的
 [跨 Run Fleet 数据面](remote-fleet-data-plane.md)。同一 Store 内的 Fleet
 global/tenant/pool quota 已与 Attempt claim 原子持久化；可选 strict 模式还通过
-Store 本地 `(tenant,pool)` 单写 shard owner 和单调 fencing epoch 拒绝陈旧控制面。
+Store 本地 pool 单写 shard owner、单调 fencing epoch 和事务性 tenant 公平游标拒绝
+陈旧控制面，并在重启/接管后延续轮转位置。
 生产化仍需验证 TLS-extension server/PKI 部署、共享 broker 或显式接管控制循环、
-跨 Store quota 与公平游标持久化，并在 fleet claim 失败后从 Store 重新投影。
+跨 Store quota/ownership/cursor，并在 fleet claim 失败后从 Store 重新投影。
 
 ## 18. 故障注入矩阵
 

@@ -5,7 +5,8 @@
 执行事实。Fleet 的队列、Worker 和 active assignment 都只是有界、可重建
 projection。执行中的 Fleet tenant/pool/global 配额占用则随 Attempt 持久化，并在
 同一个 Store claim 事务中线性化。多控制面部署还可启用 Store 本地的 routing-scope
-单写者所有权；每次 claim 在同一事务中校验 owner 与单调 fencing epoch。
+单写者所有权；每个 pool 只有一个 owner，每次 claim 在同一事务中校验 owner、
+单调 fencing epoch，并推进该 pool 的持久公平游标。
 
 ## 数据流与事实边界
 
@@ -51,12 +52,14 @@ ownership_policy_digest = hashlib.sha256(
     b"fleet-ownership-policy:v1"
 ).hexdigest()
 shard_ownership = scheduler.store.claim_fleet_shard(
-    "tenant-a-analysis",
+    "analysis-shard",
     fleet_owner_id,
     ownership_policy_digest,
-    tenant_id="tenant-a",
     pool_id="analysis",
 )
+fairness_cursor = scheduler.store.get_fleet_fairness_cursor("analysis")
+if fairness_cursor is None:
+    raise RuntimeError("owned Fleet pool has no durable fairness cursor")
 
 tool_policies = StaticFleetToolPolicyResolver(
     [
@@ -96,6 +99,7 @@ fleet = RemoteFleetCoordinator(
     require_durable_ownership=True,
     fleet_owner_id=fleet_owner_id,
 )
+fleet.restore_fairness_cursor(fairness_cursor)
 poller = SecureRemoteFleetPoller(
     fleet,
     worker_policies,
@@ -119,8 +123,9 @@ two-phase admission 和 reference fallback 禁用要求。绑定 poller 不会�
 扫描 Store 或隐式 reconcile；部署负责在可信控制循环中投影已经由
 reconciler 推进到 `READY` 的 Run。
 
-`claim_fleet_shard()` 对同一 owner、scope 和 policy 是幂等恢复，不是租约续期。每个
-`(tenant_id, pool_id)` 在一个 Store 中只能对应一个 shard。计划接管时，运维控制器
+`claim_fleet_shard()` 对同一 owner、pool 和 policy 是幂等恢复，不是租约续期。每个
+`pool_id` 在一个 Store 中只能对应一个 shard；该 owner 可以调度池内多个 tenant，
+不能把同一公平队列拆给多个控制器。计划接管时，运维控制器
 必须读取当前值并调用 `transfer_fleet_shard(current, ...)`；成功 CAS 会增加
 `fencing_epoch`。旧控制器的已排队 binding 随后在 Store claim 事务中被拒绝，哪怕
 owner 名称后来 A→B→A 回到原值，旧 epoch 也不会重新有效。epoch 不依赖 wall clock；
@@ -137,13 +142,18 @@ leader 已死亡。
 recovery。已经 `RUNNING` 的 Attempt 可提交 terminal 结果，因为执行权仍由它自己的
 Activity lease/fencing 校验，ownership 不能替代或伪造该执行 lease。
 
-创建某个 scope 的第一条 ownership 记录也是持久化的升级开关：此后该
-`(tenant_id, pool_id)` 的任何 Fleet claim 若不带 ownership，Store 都以
+创建某个 pool 的第一条 ownership 记录也是持久化的升级开关：此后该 pool 的任何
+Fleet claim 若不带 ownership，Store 都以
 `fleet_shard_ownership_required` 拒绝。因此尚未升级或误配为 non-strict 的控制器
 不能绕过 fencing。启用前应先确认新控制器可读取 owner；已有无 scope active claim
-仍须按下述滚动升级规则 drain。schema v5 同时在 `attempts` 的 active
+仍须按下述滚动升级规则 drain。schema v6 同时在 `attempts` 的 active
 INSERT/UPDATE 上安装数据库触发器；已在迁移前打开 Store 的旧进程即使不重新运行
 版本检查，也不能写入缺失或陈旧的 ownership。
+
+schema v5 的 ownership 是 `(tenant,pool)`。升级到 v6 时，同一 pool 的旧记录只有在
+owner 与 policy digest 完全一致时才会合并；新 epoch 取旧最大值加一，从而 fencing
+所有 v5 envelope。若一个 pool 已经出现不同 owner 或 policy，迁移会原子失败并保留
+v5 数据，要求运维先消除 split ownership；epoch 已耗尽时同样 fail closed。
 
 ## 路由信封
 
@@ -187,7 +197,7 @@ policy digest 和本次生效的 global/tenant/pool 上限。控制面再次检�
 - Policy、Artifact、runtime attestation 和 durable candidate CAS；
 - 当前 Store 内 active Fleet Attempt 的 global/tenant/pool 配额与 quota policy
   generation；
-- strict multi-control 模式下，本控制面 `fleet_owner_id`、routing scope、ownership
+- strict multi-control 模式下，本控制面 `fleet_owner_id`、pool、ownership
   policy digest 与 Store 当前 fencing epoch。
 
 scope 不含 token、参数、脚本、环境或 Artifact 内容。Store 在 `BEGIN IMMEDIATE`
@@ -195,7 +205,10 @@ scope 不含 token、参数、脚本、环境或 Artifact 内容。Store 在 `BE
 畸形 scope 或任一容量已满都会在 schedule/claim/policy Event 一起提交前回滚。成功
 claim 把 exact scope 写入 Attempt metadata，因此新控制进程无需恢复旧的 Fleet
 active registry，也能继续计数；Attempt 终态后自然退出 active 集合。
-严格模式还把无密的 exact shard ownership 写入 Attempt metadata。字段使用
+严格模式还把无密的 exact shard ownership 写入 Attempt metadata，并在同一事务中把
+`last_served_tenant` 与单调 `selection_sequence` 写入 pool owner row。配额拒绝、
+claim CAS 冲突或后续事务失败会连同游标一起回滚；控制面重启必须先恢复该游标，再接纳
+该 pool 的任务。字段使用
 `fencing_epoch`，不是 bearer 或秘密；任何含 credential-shaped key 的 metadata
 仍按原规则拒绝，不为所有权机制增加例外。
 
@@ -220,13 +233,15 @@ resources 一致，否则不发送给 Worker；已经发生的 durable claim 由
 
 1. 从可信 Run registry 解析各 Run 的 `DurableScheduler`；
 2. 先执行独立 durable reconciler；
-3. 读取本进程负责 scope 的当前 shard ownership，确认 owner 等于本进程配置；
-4. 对 `RUNNING` Run 调用 `project_ready(..., shard_ownership=ownership)`；
-5. 在无 active Fleet assignment 时调用 `fleet.rebuild(tasks, workers)`，或逐项
-   `admit()`；
-6. Worker 重新通过 mTLS register，session journal 恢复或 fencing 旧 instance；
-7. lease reaper 处理崩溃前的 durable claims；
-8. 新进程的 Fleet active projection 从空状态开始，不从 Worker 响应推断旧 authority；
+3. 读取本进程负责 pool 的当前 shard ownership 和 `FleetFairnessCursor`，确认二者的
+   shard/owner/epoch/policy 完全一致且 owner 等于本进程配置；
+4. 先调用 `fleet.restore_fairness_cursor(cursor)`，再对 `RUNNING` Run 调用
+   `project_ready(..., shard_ownership=ownership)` 并逐项 `admit()`；或者在无 active
+   Fleet assignment 时一次调用
+   `fleet.rebuild(tasks, workers, fairness_cursors=cursors)`；
+5. Worker 重新通过 mTLS register，session journal 恢复或 fencing 旧 instance；
+6. lease reaper 处理崩溃前的 durable claims；
+7. 新进程的 Fleet active projection 从空状态开始，不从 Worker 响应推断旧 authority；
    新 claim 的配额检查直接读取 Store 中旧 active Attempt 的 durable scope。
    exact claim 的控制权限可由 `RemoteExecutionJournal` + Store + 新鲜 attestation
    重建；projection 随后由 completion 或周期 `reconcile_terminals()` 收敛。
@@ -234,11 +249,12 @@ resources 一致，否则不发送给 Worker；已经发生的 durable claim 由
 不要从 Fleet snapshot 推断 Attempt 状态，也不要把 `execution_truth=false` 的报告写回
 Domain Store。Artifact grant/finalization 已通过 token-digest-only journal 跨进程
 恢复。Fleet quota admission 在共享同一 Store 的控制进程间已经原子化，但 queue、
-Worker registry、公平游标和 active routing projection 仍非共享共识队列。严格模式
-通过每个 `(tenant, pool)` 的显式单写 shard owner 防止两个可信控制器同时消费同一
-scope，但不等价于共享 broker：跨 Store quota、自动 leader 故障检测、跨进程公平游标
-和在线无损 queue handoff 仍是部署/后续实现边界。所有权表有 4096 条硬上限且不自动
-删除；scope 生命周期和容量规划必须由运维控制，禁止通过删除记录重置 epoch。真实
+Worker registry 和 active routing projection 仍非共享共识队列。严格模式通过每个
+pool 的显式单写 shard owner 防止两个可信控制器同时消费同一公平队列；持久 cursor
+保证同 Store、显式接管或重启后的 tenant round-robin 不从默认位置重新开始，但不等价
+于共享 broker：跨 Store quota/ownership/cursor、自动 leader 故障检测和在线无损
+queue handoff 仍是部署/后续实现边界。所有权表有 4096 个 pool 的硬上限且不自动
+删除；pool 生命周期和容量规划必须由运维控制，禁止通过删除记录重置 epoch。真实
 TLS-extension server 和生产 Sandbox 也仍需独立验证。
 
 ## 验证

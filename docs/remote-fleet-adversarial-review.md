@@ -214,17 +214,90 @@ ownership trigger；缺失或陈旧 envelope 由 SQLite 自身拒绝。
 - `test_owned_scope_blocks_legacy_control_claims`
 - `test_strict_multi_control_readiness_rejects_unowned_binding`
 
-结论：共享同一 Store、按 `(tenant,pool)` 分配的 strict Fleet 单写者 P0/P1=0。共享
-broker、跨 Store 共识、自动接管和公平游标持久化仍是明确残余边界。
+结论：schema v5 已证明共享同一 Store、按 `(tenant,pool)` 分配的 strict Fleet
+单写者不会被 scope alias 绕过；但同一 pool 的 tenant 由不同控制器持有时，进程内
+round-robin 仍可能形成多个互不知情的公平域。第七轮通过 pool authority 和持久 cursor
+关闭该设计缺口。
+
+## 第七轮：pool authority 与事务性公平恢复
+
+### 第一遍：公平域、双写与迁移对抗
+
+第一性约束是“谁能推进一个公平队列，谁就必须拥有这个完整队列”。tenant
+round-robin 的状态按 pool 维护，因此 `(tenant,pool)` owner 无法阻止两个控制器分别
+持有同池不同 tenant，并各自从本地默认 cursor 调度。schema v6 把唯一约束提升为
+`pool_id`：同一 pool 只能有一个 shard/owner，ownership envelope schema v2 不再包含
+tenant，而 Projector 允许该 owner 为池内多个 tenant 生成 binding，但拒绝另一 pool。
+
+v5→v6 迁移按 pool 分组。只有 owner 与 policy digest 全部一致时才合并，选择确定性
+最小 shard id，并把 epoch 提升到旧最大值加一以 fencing 所有旧 envelope；split
+owner、split policy 或耗尽的 epoch 使整个迁移事务回滚，不发布半迁移表。旧 trigger
+缺失也可幂等升级，不会因不完整旧安装卡死。
+
+证据：
+
+- `test_pool_owner_authorizes_multiple_tenants_but_not_another_pool`
+- `test_concurrent_shard_aliases_cannot_share_a_routing_scope`
+- `test_version_five_pool_owners_consolidate_and_fence_legacy`
+- `test_version_five_split_pool_ownership_fails_migration`
+- `test_version_five_exhausted_epoch_fails_migration_atomically`
+- `test_version_five_malformed_owner_fails_migration_atomically`
+
+### 第二遍：失败窗口、事务回滚与 epoch 对抗
+
+持久 cursor 与 owner 共表，记录 `last_served_tenant` 和单调
+`selection_sequence`。Store 在验证 exact shard/pool/owner/epoch/policy 后、写入
+Attempt 的同一 `BEGIN IMMEDIATE` 事务中推进 cursor。因此 quota 满、claim CAS
+冲突、Event 写入失败或进程在 commit 前崩溃时，cursor 与 Attempt 一起回滚；成功
+claim 后即使 assignment 返回前崩溃，cursor 与已存在的 durable claim 一致。sequence
+耗尽时拒绝新 claim，不允许整数回绕。
+
+transfer 保留 tenant/sequence，但同时提升 epoch 并替换 owner/policy，故新控制器可
+延续公平位置，旧 cursor identity 又不能通过就绪门。两个并发 Store writer 仍由
+SQLite 写事务线性化；cursor 表不是跨 Store 共识。
+
+证据：
+
+- `test_fleet_cursor_advances_only_with_successful_durable_claim`
+- `test_exhausted_fleet_cursor_fails_before_durable_claim`
+- `test_fleet_shard_transfer_is_clock_free_monotonic_and_aba_safe`
+- `test_concurrent_fleet_shard_transfer_has_one_winner`
+- `test_shard_transfer_fences_stale_queue_then_new_epoch_claims`
+
+### 第三遍：恢复顺序、陈旧投影与有界性
+
+strict production-ready 不只要求 callback 声明 durable quota/ownership/fairness，
+还要求每个 binding 的 pool cursor 已恢复，且 cursor 与 binding 的
+shard/pool/owner/epoch/policy 完全相同。`rebuild()` 先在候选 scheduler 恢复全部
+cursor，再接纳任务；缺 cursor、重复 pool 或陈旧 identity 会在交换内存状态前拒绝。
+直接组合也必须先 `restore_fairness_cursor()` 再 `admit()`。这样重启不会因任务先入队
+而覆盖持久轮转位置。
+
+恢复 registry 上限为 4096，与 Store pool owner 上限一致；已恢复 pool 的 cursor 不会
+因暂时没有 Worker/任务被清除。它是 durable restart continuity，不把 Fleet snapshot
+升级为执行事实，也不恢复 queue、Worker session 或 active routing。
+
+证据：
+
+- `test_restored_pool_cursor_preserves_restart_fairness`
+- `test_cursor_restore_requires_an_idle_pool`
+- `test_restored_pool_cursor_registry_is_bounded`
+- `test_strict_multi_control_readiness_requires_durable_cursor`
+- `test_strict_rebuild_restores_matching_pool_cursor_atomically`
+- `test_strict_rebuild_rejects_stale_cursor_before_state_swap`
+
+结论：共享同一 Store 的 strict pool 单写者、fencing 和重启公平连续性 P0/P1=0。
+共享 broker、跨 Store 共识/cursor、自动接管与在线无损 queue handoff 仍是明确残余
+边界。
 
 ## 残余边界
 
-- Fleet queue、Worker registry、active routing 和公平游标是单进程 projection，
-  不是共享 broker。同一 Store 的 quota 已原子化，strict `(tenant,pool)` shard
-  ownership 可保证可信控制器单写；不同 Store shard 的 quota 与 ownership 不会自动
-  合并。
-- 自动 failure detector、接管编排、跨进程公平游标和在线无损 queue handoff 尚未
-  实现。所有权记录不自动删除，以免 epoch 重置产生 ABA；部署必须规划 4096-scope
+- Fleet queue、Worker registry 和 active routing 是单进程 projection，不是共享
+  broker。同一 Store 的 quota 与 pool fairness cursor 已原子化，strict pool shard
+  ownership 可保证可信控制器单写；不同 Store shard 的 quota、ownership 与 cursor
+  不会自动合并。
+- 自动 failure detector、接管编排和在线无损 queue handoff 尚未实现。所有权记录
+  不自动删除，以免 epoch 重置产生 ABA；部署必须规划 4096-pool
   上限。
 - 升级前存在的无 scope 远程 active claim 会阻塞新 Fleet admission；必须 drain 或
   隔离 Store，不能绕过该安全门。

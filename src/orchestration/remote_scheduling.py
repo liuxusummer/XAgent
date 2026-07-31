@@ -50,6 +50,7 @@ MAX_AUTHORIZED_TENANTS = 64
 MAX_RESOURCE_KEYS = 128
 MAX_WORKER_CAPACITY = 256
 MAX_QUOTA_ENTRIES = 4096
+MAX_RESTORED_POOL_CURSORS = 4096
 MAX_SEQUENCE = (1 << 63) - 1
 MAX_WORKER_IDLE_TTL_SECONDS = 7 * 24 * 60 * 60
 
@@ -652,6 +653,7 @@ class DeterministicRemoteScheduler:
         self._active_by_tenant: dict[str, int] = {}
         self._active_by_pool: dict[str, int] = {}
         self._last_served_tenant_by_pool: dict[str, str] = {}
+        self._restored_cursor_pools: set[str] = set()
         self._worker_generation_sequence = 0
         self._task_sequence = 0
         self._assignment_sequence = 0
@@ -1169,6 +1171,48 @@ class DeterministicRemoteScheduler:
             pool_concurrency=self._pool_quota(task.pool_id),
         )
 
+    def restore_tenant_cursor(
+        self,
+        pool_id: str,
+        last_served_tenant: str | None,
+    ) -> None:
+        """Restore one durable pool cursor before queue admission."""
+
+        pool_id = _identifier(pool_id, "pool_id")
+        if last_served_tenant is not None:
+            last_served_tenant = _identifier(
+                last_served_tenant,
+                "last_served_tenant",
+            )
+        with self._lock:
+            if (
+                self._queued_by_pool.get(pool_id, 0)
+                or self._active_by_pool.get(pool_id, 0)
+            ):
+                raise RemoteSchedulingConflict(
+                    "pool cursor must be restored before queue admission"
+                )
+            if (
+                pool_id not in self._restored_cursor_pools
+                and len(self._restored_cursor_pools)
+                >= MAX_RESTORED_POOL_CURSORS
+            ):
+                raise RemoteSchedulingConflict(
+                    "restored pool cursor registry is full"
+                )
+            if last_served_tenant is None:
+                self._last_served_tenant_by_pool.pop(pool_id, None)
+            else:
+                self._last_served_tenant_by_pool[pool_id] = (
+                    last_served_tenant
+                )
+            self._restored_cursor_pools.add(pool_id)
+
+    def pool_cursor_is_restored(self, pool_id: str) -> bool:
+        pool_id = _identifier(pool_id, "pool_id")
+        with self._lock:
+            return pool_id in self._restored_cursor_pools
+
     def _tenant_scan_order(self, pool_id: str) -> tuple[str, ...]:
         tenants = sorted(
             tenant_id
@@ -1213,6 +1257,8 @@ class DeterministicRemoteScheduler:
                 for state in self._workers.values()
             )
         ):
+            return
+        if pool_id in self._restored_cursor_pools:
             return
         self._last_served_tenant_by_pool.pop(pool_id, None)
 

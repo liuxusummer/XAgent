@@ -48,6 +48,37 @@ class DurableRunStoreTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def _install_v5_fleet_owners(self, rows) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executescript(
+                """
+                DROP TRIGGER attempts_fleet_ownership_insert;
+                DROP TRIGGER attempts_fleet_ownership_update;
+                DROP TABLE fleet_shard_owners;
+                CREATE TABLE fleet_shard_owners (
+                    shard_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    pool_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    fencing_epoch INTEGER NOT NULL,
+                    policy_digest TEXT NOT NULL,
+                    assigned_at REAL NOT NULL,
+                    UNIQUE(tenant_id, pool_id)
+                );
+                DELETE FROM schema_migrations WHERE version = 6;
+                PRAGMA user_version = 5;
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO fleet_shard_owners(
+                    shard_id, tenant_id, pool_id, owner_id,
+                    fencing_epoch, policy_digest, assigned_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
     def _create_running_run(self, run_id: str = "run-1") -> RunRecord:
         created = self.store.create_run(
             RunRecord(run_id, "workflow", definition_digest=TEST_DEFINITION_DIGEST)
@@ -1885,7 +1916,6 @@ class DurableRunStoreTests(unittest.TestCase):
             "shard-a",
             "control-a",
             policy,
-            tenant_id="tenant-a",
             pool_id="pool-a",
             now=10,
         )
@@ -1893,7 +1923,6 @@ class DurableRunStoreTests(unittest.TestCase):
             "shard-a",
             "control-a",
             policy,
-            tenant_id="tenant-a",
             pool_id="pool-a",
             now=11,
         )
@@ -1927,7 +1956,6 @@ class DurableRunStoreTests(unittest.TestCase):
                 "shard-a",
                 "control-a",
                 policy,
-                tenant_id="tenant-a",
                 pool_id="pool-a",
                 now=8,
             ),
@@ -1944,7 +1972,6 @@ class DurableRunStoreTests(unittest.TestCase):
                 "shard-alias",
                 "control-a",
                 policy,
-                tenant_id="tenant-a",
                 pool_id="pool-a",
                 now=15,
             )
@@ -1962,7 +1989,6 @@ class DurableRunStoreTests(unittest.TestCase):
                     shard_id,
                     f"owner-{shard_id}",
                     "b" * 64,
-                    tenant_id="tenant-shared",
                     pool_id="pool-shared",
                     now=10,
                 )
@@ -1984,7 +2010,6 @@ class DurableRunStoreTests(unittest.TestCase):
             "shard-race",
             "control-a",
             "c" * 64,
-            tenant_id="tenant-a",
             pool_id="pool-a",
             now=10,
         )
@@ -2030,7 +2055,6 @@ class DurableRunStoreTests(unittest.TestCase):
             "trigger-shard",
             "control-a",
             "c" * 64,
-            tenant_id="tenant-a",
             pool_id="pool-a",
             now=10,
         )
@@ -2073,6 +2097,21 @@ class DurableRunStoreTests(unittest.TestCase):
             "ownership is required or stale",
         ):
             legacy_claim(missing)
+        legacy_v1 = dict(missing)
+        legacy_v1["fleet_shard_ownership"] = {
+            "schema_version": 1,
+            "shard_id": first.shard_id,
+            "tenant_id": "tenant-a",
+            "pool_id": first.pool_id,
+            "owner_id": first.owner_id,
+            "fencing_epoch": first.fencing_epoch,
+            "policy_digest": first.policy_digest,
+        }
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "ownership is required or stale",
+        ):
+            legacy_claim(legacy_v1)
 
         second = self.store.transfer_fleet_shard(
             first,
@@ -2106,7 +2145,6 @@ class DurableRunStoreTests(unittest.TestCase):
                 "shard-fault",
                 "control-a",
                 "d" * 64,
-                tenant_id="tenant-a",
                 pool_id="pool-a",
                 now=10,
             )
@@ -2118,7 +2156,6 @@ class DurableRunStoreTests(unittest.TestCase):
             "shard-transfer-fault",
             "control-a",
             "d" * 64,
-            tenant_id="tenant-transfer",
             pool_id="pool-transfer",
             now=10,
         )
@@ -2151,7 +2188,6 @@ class DurableRunStoreTests(unittest.TestCase):
                 "shard-retained",
                 "control-a",
                 "d" * 64,
-                tenant_id="tenant-a",
                 pool_id="pool-a",
                 now=11,
             )
@@ -2160,7 +2196,6 @@ class DurableRunStoreTests(unittest.TestCase):
                     "shard-overflow",
                     "control-b",
                     "d" * 64,
-                    tenant_id="tenant-b",
                     pool_id="pool-b",
                     now=12,
                 )
@@ -2227,7 +2262,7 @@ class DurableRunStoreTests(unittest.TestCase):
                 "SELECT first_run_id FROM artifact_references WHERE sha256 = ?",
                 (ref.sha256,),
             ).fetchone()
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 6)
         self.assertEqual(indexed[0], "migration-ref-run")
 
     def test_version_three_migration_rejects_legacy_raw_run_input(self) -> None:
@@ -2269,7 +2304,7 @@ class DurableRunStoreTests(unittest.TestCase):
                 DROP TRIGGER attempts_fleet_ownership_insert;
                 DROP TRIGGER attempts_fleet_ownership_update;
                 DROP TABLE fleet_shard_owners;
-                DELETE FROM schema_migrations WHERE version = 5;
+                DELETE FROM schema_migrations WHERE version >= 5;
                 PRAGMA user_version = 4;
                 """
             )
@@ -2279,7 +2314,6 @@ class DurableRunStoreTests(unittest.TestCase):
             "shard-migrated",
             "control-a",
             "e" * 64,
-            tenant_id="tenant-a",
             pool_id="pool-a",
             now=10,
         )
@@ -2299,7 +2333,7 @@ class DurableRunStoreTests(unittest.TestCase):
                     """
                 )
             }
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 6)
         self.assertEqual(
             triggers,
             {
@@ -2307,6 +2341,161 @@ class DurableRunStoreTests(unittest.TestCase):
                 "attempts_fleet_ownership_update",
             },
         )
+
+    def test_version_five_pool_owners_consolidate_and_fence_legacy(
+        self,
+    ) -> None:
+        self._install_v5_fleet_owners(
+            (
+                (
+                    "shard-b",
+                    "tenant-b",
+                    "pool-a",
+                    "control-a",
+                    3,
+                    "a" * 64,
+                    12,
+                ),
+                (
+                    "shard-a",
+                    "tenant-a",
+                    "pool-a",
+                    "control-a",
+                    1,
+                    "a" * 64,
+                    10,
+                ),
+            )
+        )
+
+        migrated = DurableRunStore(self.db_path)
+        ownership = migrated.get_fleet_pool_ownership("pool-a")
+        cursor = migrated.get_fleet_fairness_cursor("pool-a")
+
+        assert ownership is not None and cursor is not None
+        self.assertEqual(ownership.shard_id, "shard-a")
+        self.assertEqual(ownership.fencing_epoch, 4)
+        self.assertEqual(ownership.schema_version, 2)
+        self.assertIsNone(cursor.last_served_tenant)
+        self.assertEqual(cursor.selection_sequence, 0)
+        self.assertEqual(
+            migrated.get_fleet_shard_ownership("shard-b"),
+            None,
+        )
+
+    def test_version_five_split_pool_ownership_fails_migration(
+        self,
+    ) -> None:
+        self._install_v5_fleet_owners(
+            (
+                (
+                    "shard-a",
+                    "tenant-a",
+                    "pool-a",
+                    "control-a",
+                    1,
+                    "a" * 64,
+                    10,
+                ),
+                (
+                    "shard-b",
+                    "tenant-b",
+                    "pool-a",
+                    "control-b",
+                    1,
+                    "a" * 64,
+                    10,
+                ),
+            )
+        )
+
+        with self.assertRaisesRegex(
+            StoreSchemaError,
+            "split ownership",
+        ):
+            DurableRunStore(self.db_path)
+        with sqlite3.connect(self.db_path) as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(fleet_shard_owners)"
+                )
+            }
+            owners = conn.execute(
+                "SELECT COUNT(*) FROM fleet_shard_owners"
+            ).fetchone()[0]
+        self.assertEqual(version, 5)
+        self.assertIn("tenant_id", columns)
+        self.assertEqual(owners, 2)
+
+    def test_version_five_exhausted_epoch_fails_migration_atomically(
+        self,
+    ) -> None:
+        self._install_v5_fleet_owners(
+            (
+                (
+                    "shard-a",
+                    "tenant-a",
+                    "pool-a",
+                    "control-a",
+                    (1 << 63) - 1,
+                    "a" * 64,
+                    10,
+                ),
+            )
+        )
+
+        with self.assertRaisesRegex(
+            StoreSchemaError,
+            "epoch is exhausted",
+        ):
+            DurableRunStore(self.db_path)
+        with sqlite3.connect(self.db_path) as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            epoch = conn.execute(
+                """
+                SELECT fencing_epoch
+                FROM fleet_shard_owners
+                WHERE shard_id = 'shard-a'
+                """
+            ).fetchone()[0]
+        self.assertEqual(version, 5)
+        self.assertEqual(epoch, (1 << 63) - 1)
+
+    def test_version_five_malformed_owner_fails_migration_atomically(
+        self,
+    ) -> None:
+        self._install_v5_fleet_owners(
+            (
+                (
+                    "shard-a",
+                    "tenant-a",
+                    "pool-a",
+                    "control-a",
+                    1,
+                    "not-a-sha256-digest",
+                    10,
+                ),
+            )
+        )
+
+        with self.assertRaisesRegex(
+            StoreSchemaError,
+            "ownership is malformed",
+        ):
+            DurableRunStore(self.db_path)
+        with sqlite3.connect(self.db_path) as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            policy = conn.execute(
+                """
+                SELECT policy_digest
+                FROM fleet_shard_owners
+                WHERE shard_id = 'shard-a'
+                """
+            ).fetchone()[0]
+        self.assertEqual(version, 5)
+        self.assertEqual(policy, "not-a-sha256-digest")
 
     def test_workflow_binding_is_idempotent_and_conflicts_fail_closed(self) -> None:
         artifacts = LocalArtifactStore(
@@ -2625,7 +2814,7 @@ class DurableRunStoreTests(unittest.TestCase):
             indexes = {
                 row[1] for row in conn.execute("PRAGMA index_list(attempts)")
             }
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 6)
         self.assertIn("content_digest", event_columns)
         self.assertIn("intent_digest", event_columns)
         self.assertIn("schema_version", idempotency_columns)

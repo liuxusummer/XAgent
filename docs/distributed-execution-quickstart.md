@@ -110,7 +110,7 @@ from src.orchestration import (
 | Execution recovery | digest-only authorization journal；重建 Store policy/plan/workload/runtime binding；start、heartbeat、取消及有/无输出终态可跨控制面重启 | 自动重发 assignment、跨过 grant expiry 恢复 |
 | Artifact | path-free grant、跨进程单次读取 CAS、受绑定的 staging/finalize、token-digest-only 持久 registry、exact final-ref replay、完整性复验、硬容量与过期索引 | 远程对象服务、传输加密、durable staged bytes |
 | Sandbox | 限制性 OCI spec、精确 attestation/proof binding、缺证据 fail closed | 本机真实 gVisor/Kubernetes 部署与部署 attestation |
-| 调度 | 有界、确定性 tenant round-robin、drain、session/generation 防 ABA；`poll_fleet` 端到端绑定服务端 Tool/Worker policy、资源、精确节点和 durable claim；同一 Store 内 global/tenant/pool quota 随 Attempt 原子持久化；可选 strict `(tenant,pool)` 单写 shard ownership、控制面 owner 与单调 epoch | 跨控制面共享 broker/共识队列、跨 Store quota/ownership、自动接管、持久公平游标和 Run discovery/rebuild 控制循环 |
+| 调度 | 有界、确定性 tenant round-robin、drain、session/generation 防 ABA；`poll_fleet` 端到端绑定服务端 Tool/Worker policy、资源、精确节点和 durable claim；同一 Store 内 global/tenant/pool quota 随 Attempt 原子持久化；可选 strict pool 单写 shard ownership、控制面 owner、单调 epoch 与事务性持久公平游标 | 跨控制面共享 broker/共识队列、跨 Store quota/ownership/cursor、自动接管和 Run discovery/rebuild 控制循环 |
 | 观测 | 低基数、best-effort、明确 `execution_truth=false` | 生产 exporter、告警与容量规划 |
 
 还必须保留以下残余边界：

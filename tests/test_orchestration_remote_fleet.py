@@ -28,6 +28,7 @@ from src.orchestration.remote_scheduling import (
     WorkerDescriptor,
     WorkerLifecycle,
 )
+from src.orchestration.store import FleetShardOwnership
 
 
 class _Clock:
@@ -189,6 +190,49 @@ class RemoteFleetCoordinatorTests(unittest.TestCase):
             claim_run,
             max_task_bindings=max_task_bindings,
             observability=observability,
+        )
+
+    def test_pool_owner_authorizes_multiple_tenants_but_not_another_pool(
+        self,
+    ) -> None:
+        ownership = FleetShardOwnership(
+            shard_id="pool-a-shard",
+            pool_id="pool-a",
+            owner_id="control-a",
+            fencing_epoch=1,
+            policy_digest=_digest("ownership-policy"),
+        )
+
+        def exact_binding(
+            task_id: str,
+            tenant_id: str,
+            pool_id: str,
+        ) -> FleetTaskBinding:
+            return FleetTaskBinding(
+                run_id=f"run-{task_id}",
+                node_id="node-1",
+                activity_config_digest=_digest("config"),
+                routing_policy_digest=_digest("routing"),
+                shard_ownership=ownership,
+                task=RemoteTask(
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                    pool_id=pool_id,
+                    tool_name="file.read",
+                ),
+            )
+
+        self.assertTrue(
+            exact_binding("tenant-a-task", "tenant-a", "pool-a")
+            .exact_for_multi_control
+        )
+        self.assertTrue(
+            exact_binding("tenant-b-task", "tenant-b", "pool-a")
+            .exact_for_multi_control
+        )
+        self.assertFalse(
+            exact_binding("other-pool-task", "tenant-a", "pool-b")
+            .exact_for_multi_control
         )
 
     def test_three_workers_claim_durable_runs_in_parallel(self) -> None:

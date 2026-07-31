@@ -53,7 +53,7 @@ from .recovery import UnknownOutcomeDecision, UnknownOutcomeResolution
 if TYPE_CHECKING:
     from .executor import ToolReceipt
 
-STORE_SCHEMA_VERSION = 5
+STORE_SCHEMA_VERSION = 6
 DEFAULT_BUSY_TIMEOUT_MS = 10_000
 DEFAULT_EVENT_LIMIT = 1_000
 MAX_EVENT_LIMIT = 10_000
@@ -64,7 +64,9 @@ MAX_PROJECTION_REPLAY_PAGE = 1_000
 MAX_ACTIVITY_LEASE_SECONDS = 24 * 60 * 60
 MAX_FLEET_SHARD_OWNERS = 4_096
 MAX_FLEET_FENCING_EPOCH = (1 << 63) - 1
-FLEET_SHARD_OWNERSHIP_SCHEMA_VERSION = 1
+MAX_FLEET_SELECTION_SEQUENCE = (1 << 63) - 1
+FLEET_SHARD_OWNERSHIP_SCHEMA_VERSION = 2
+FLEET_FAIRNESS_CURSOR_SCHEMA_VERSION = 1
 _SAFE_RECEIPT_CODE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
 _SHA256_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _FLEET_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
@@ -354,7 +356,6 @@ class FleetShardOwnership:
     """Store-local, clock-free single-writer fencing authority."""
 
     shard_id: str
-    tenant_id: str
     pool_id: str
     owner_id: str
     fencing_epoch: int
@@ -368,7 +369,6 @@ class FleetShardOwnership:
             )
         for field_name in (
             "shard_id",
-            "tenant_id",
             "pool_id",
             "owner_id",
         ):
@@ -400,7 +400,6 @@ class FleetShardOwnership:
         return {
             "schema_version": self.schema_version,
             "shard_id": self.shard_id,
-            "tenant_id": self.tenant_id,
             "pool_id": self.pool_id,
             "owner_id": self.owner_id,
             "fencing_epoch": self.fencing_epoch,
@@ -415,7 +414,6 @@ class FleetShardOwnership:
         required = {
             "schema_version",
             "shard_id",
-            "tenant_id",
             "pool_id",
             "owner_id",
             "fencing_epoch",
@@ -426,12 +424,62 @@ class FleetShardOwnership:
         return cls(
             schema_version=value["schema_version"],
             shard_id=value["shard_id"],
-            tenant_id=value["tenant_id"],
             pool_id=value["pool_id"],
             owner_id=value["owner_id"],
             fencing_epoch=value["fencing_epoch"],
             policy_digest=value["policy_digest"],
         )
+
+
+@dataclass(frozen=True, slots=True)
+class FleetFairnessCursor:
+    """Durable last-successful tenant selection for one owned pool."""
+
+    shard_id: str
+    pool_id: str
+    owner_id: str
+    fencing_epoch: int
+    policy_digest: str
+    last_served_tenant: str | None
+    selection_sequence: int
+    schema_version: int = FLEET_FAIRNESS_CURSOR_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != FLEET_FAIRNESS_CURSOR_SCHEMA_VERSION:
+            raise ValueError(
+                "unsupported Fleet fairness cursor schema version"
+            )
+        FleetShardOwnership(
+            shard_id=self.shard_id,
+            pool_id=self.pool_id,
+            owner_id=self.owner_id,
+            fencing_epoch=self.fencing_epoch,
+            policy_digest=self.policy_digest,
+        )
+        if self.last_served_tenant is not None and (
+            not isinstance(self.last_served_tenant, str)
+            or _FLEET_IDENTIFIER.fullmatch(
+                self.last_served_tenant
+            )
+            is None
+        ):
+            raise ValueError(
+                "last_served_tenant must be a bounded Fleet identifier"
+            )
+        if (
+            isinstance(self.selection_sequence, bool)
+            or not isinstance(self.selection_sequence, int)
+            or not 0
+            <= self.selection_sequence
+            <= MAX_FLEET_SELECTION_SEQUENCE
+        ):
+            raise ValueError("Fleet selection_sequence is invalid")
+        if (self.last_served_tenant is None) != (
+            self.selection_sequence == 0
+        ):
+            raise ValueError(
+                "Fleet fairness cursor tenant and sequence disagree"
+            )
 
 
 def _json_dump(value: JsonValue) -> str:
@@ -1661,6 +1709,207 @@ class DurableRunStore:
             )
 
     @staticmethod
+    def _migrate_5_to_6(conn: sqlite3.Connection) -> None:
+        legacy_rows = conn.execute(
+            """
+            SELECT shard_id, pool_id, owner_id, fencing_epoch,
+                   policy_digest, assigned_at
+            FROM fleet_shard_owners
+            ORDER BY pool_id, shard_id
+            """
+        ).fetchall()
+        by_pool: dict[str, list[sqlite3.Row]] = {}
+        for row in legacy_rows:
+            by_pool.setdefault(row["pool_id"], []).append(row)
+        consolidated: list[
+            tuple[str, str, str, int, str, float]
+        ] = []
+        for pool_id, rows in by_pool.items():
+            owners = {row["owner_id"] for row in rows}
+            policies = {row["policy_digest"] for row in rows}
+            if len(owners) != 1 or len(policies) != 1:
+                raise StoreSchemaError(
+                    "cannot migrate: Fleet pool has split ownership"
+                )
+            try:
+                maximum_epoch = max(
+                    int(row["fencing_epoch"]) for row in rows
+                )
+                assigned_at = _finite_timestamp(
+                    max(float(row["assigned_at"]) for row in rows),
+                    "assigned_at",
+                )
+            except (TypeError, ValueError) as exc:
+                raise StoreSchemaError(
+                    "cannot migrate: Fleet pool ownership is malformed"
+                ) from exc
+            if maximum_epoch >= MAX_FLEET_FENCING_EPOCH:
+                raise StoreSchemaError(
+                    "cannot migrate: Fleet fencing epoch is exhausted"
+                )
+            try:
+                migrated = FleetShardOwnership(
+                    shard_id=min(row["shard_id"] for row in rows),
+                    pool_id=pool_id,
+                    owner_id=next(iter(owners)),
+                    fencing_epoch=maximum_epoch + 1,
+                    policy_digest=next(iter(policies)),
+                )
+            except (TypeError, ValueError) as exc:
+                raise StoreSchemaError(
+                    "cannot migrate: Fleet pool ownership is malformed"
+                ) from exc
+            consolidated.append(
+                (
+                    migrated.shard_id,
+                    migrated.pool_id,
+                    migrated.owner_id,
+                    migrated.fencing_epoch,
+                    migrated.policy_digest,
+                    assigned_at,
+                )
+            )
+
+        conn.execute(
+            "DROP TRIGGER IF EXISTS attempts_fleet_ownership_insert"
+        )
+        conn.execute(
+            "DROP TRIGGER IF EXISTS attempts_fleet_ownership_update"
+        )
+        conn.execute(
+            """
+            CREATE TABLE fleet_pool_shard_owners (
+                shard_id TEXT PRIMARY KEY,
+                pool_id TEXT NOT NULL UNIQUE,
+                owner_id TEXT NOT NULL,
+                fencing_epoch INTEGER NOT NULL
+                    CHECK(fencing_epoch >= 1),
+                policy_digest TEXT NOT NULL
+                    CHECK(length(policy_digest) = 64),
+                last_served_tenant TEXT,
+                selection_sequence INTEGER NOT NULL
+                    CHECK(selection_sequence >= 0),
+                assigned_at REAL NOT NULL,
+                CHECK(
+                    (last_served_tenant IS NULL AND selection_sequence = 0)
+                    OR (
+                        last_served_tenant IS NOT NULL
+                        AND selection_sequence >= 1
+                    )
+                )
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO fleet_pool_shard_owners(
+                shard_id, pool_id, owner_id, fencing_epoch,
+                policy_digest, last_served_tenant,
+                selection_sequence, assigned_at
+            ) VALUES (?, ?, ?, ?, ?, NULL, 0, ?)
+            """,
+            consolidated,
+        )
+        conn.execute("DROP TABLE fleet_shard_owners")
+        conn.execute(
+            """
+            ALTER TABLE fleet_pool_shard_owners
+            RENAME TO fleet_shard_owners
+            """
+        )
+
+        ownership_guard = """
+            NEW.status IN ('claimed', 'running')
+            AND (
+                (
+                    json_type(
+                        NEW.metadata_json,
+                        '$.fleet_admission'
+                    ) IS NOT NULL
+                    AND json_type(
+                        NEW.metadata_json,
+                        '$.fleet_admission'
+                    ) IS NOT 'object'
+                    AND EXISTS (
+                        SELECT 1 FROM fleet_shard_owners
+                    )
+                )
+                OR (
+                    json_type(
+                        NEW.metadata_json,
+                        '$.fleet_admission'
+                    ) = 'object'
+                    AND EXISTS (
+                        SELECT 1
+                        FROM fleet_shard_owners AS scoped_owner
+                        WHERE scoped_owner.pool_id = json_extract(
+                            NEW.metadata_json,
+                            '$.fleet_admission.pool_id'
+                        )
+                    )
+                    AND (
+                        json_type(
+                            NEW.metadata_json,
+                            '$.fleet_shard_ownership'
+                        ) IS NOT 'object'
+                        OR json_extract(
+                            NEW.metadata_json,
+                            '$.fleet_shard_ownership.schema_version'
+                        ) IS NOT 2
+                        OR NOT EXISTS (
+                            SELECT 1
+                            FROM fleet_shard_owners AS exact_owner
+                            WHERE exact_owner.shard_id = json_extract(
+                                NEW.metadata_json,
+                                '$.fleet_shard_ownership.shard_id'
+                            )
+                              AND exact_owner.pool_id = json_extract(
+                                NEW.metadata_json,
+                                '$.fleet_shard_ownership.pool_id'
+                            )
+                              AND exact_owner.owner_id = json_extract(
+                                NEW.metadata_json,
+                                '$.fleet_shard_ownership.owner_id'
+                            )
+                              AND exact_owner.fencing_epoch = json_extract(
+                                NEW.metadata_json,
+                                '$.fleet_shard_ownership.fencing_epoch'
+                            )
+                              AND exact_owner.policy_digest = json_extract(
+                                NEW.metadata_json,
+                                '$.fleet_shard_ownership.policy_digest'
+                            )
+                        )
+                    )
+                )
+                OR (
+                    NEW.worker_id LIKE 'remote-session:%'
+                    AND json_type(
+                        NEW.metadata_json,
+                        '$.fleet_admission'
+                    ) IS NULL
+                    AND EXISTS (
+                        SELECT 1 FROM fleet_shard_owners
+                    )
+                )
+            )
+        """
+        for operation in ("INSERT", "UPDATE"):
+            conn.execute(
+                f"""
+                CREATE TRIGGER attempts_fleet_ownership_{operation.lower()}
+                BEFORE {operation} ON attempts
+                WHEN {ownership_guard}
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'Fleet shard ownership is required or stale'
+                    );
+                END
+                """
+            )
+
+    @staticmethod
     def _prepare_new_run(
         run: RunRecord,
     ) -> tuple[RunRecord, EventRecord, str]:
@@ -1967,7 +2216,6 @@ class DurableRunStore:
         owner_id: str,
         policy_digest: str,
         *,
-        tenant_id: str,
         pool_id: str,
         now: float | None = None,
     ) -> FleetShardOwnership:
@@ -1975,7 +2223,6 @@ class DurableRunStore:
 
         requested = FleetShardOwnership(
             shard_id=shard_id,
-            tenant_id=tenant_id,
             pool_id=pool_id,
             owner_id=owner_id,
             fencing_epoch=1,
@@ -1988,7 +2235,7 @@ class DurableRunStore:
         with self._write_transaction() as conn:
             row = conn.execute(
                 """
-                SELECT shard_id, tenant_id, pool_id, owner_id,
+                SELECT shard_id, pool_id, owner_id,
                        fencing_epoch, policy_digest
                 FROM fleet_shard_owners
                 WHERE shard_id = ?
@@ -1999,7 +2246,6 @@ class DurableRunStore:
                 current = self._fleet_shard_ownership_from_row(row)
                 if (
                     current.owner_id != requested.owner_id
-                    or current.tenant_id != requested.tenant_id
                     or current.pool_id != requested.pool_id
                     or current.policy_digest != requested.policy_digest
                 ):
@@ -2011,13 +2257,13 @@ class DurableRunStore:
                 """
                 SELECT shard_id
                 FROM fleet_shard_owners
-                WHERE tenant_id = ? AND pool_id = ?
+                WHERE pool_id = ?
                 """,
-                (requested.tenant_id, requested.pool_id),
+                (requested.pool_id,),
             ).fetchone()
             if scope_row is not None:
                 raise FleetShardOwnershipConflict(
-                    "Fleet routing scope already has another shard"
+                    "Fleet pool already has another shard"
                 )
             count_row = conn.execute(
                 "SELECT COUNT(*) AS owner_count FROM fleet_shard_owners"
@@ -2029,13 +2275,13 @@ class DurableRunStore:
             conn.execute(
                 """
                 INSERT INTO fleet_shard_owners(
-                    shard_id, tenant_id, pool_id, owner_id, fencing_epoch,
-                    policy_digest, assigned_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    shard_id, pool_id, owner_id, fencing_epoch,
+                    policy_digest, last_served_tenant,
+                    selection_sequence, assigned_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, 0, ?)
                 """,
                 (
                     requested.shard_id,
-                    requested.tenant_id,
                     requested.pool_id,
                     requested.owner_id,
                     requested.fencing_epoch,
@@ -2064,7 +2310,6 @@ class DurableRunStore:
             )
         replacement = FleetShardOwnership(
             shard_id=current.shard_id,
-            tenant_id=current.tenant_id,
             pool_id=current.pool_id,
             owner_id=new_owner_id,
             fencing_epoch=current.fencing_epoch + 1,
@@ -2077,7 +2322,7 @@ class DurableRunStore:
         with self._write_transaction() as conn:
             row = conn.execute(
                 """
-                SELECT shard_id, tenant_id, pool_id, owner_id, fencing_epoch,
+                SELECT shard_id, pool_id, owner_id, fencing_epoch,
                        policy_digest, assigned_at
                 FROM fleet_shard_owners
                 WHERE shard_id = ?
@@ -2098,8 +2343,7 @@ class DurableRunStore:
                 UPDATE fleet_shard_owners
                 SET owner_id = ?, fencing_epoch = ?,
                     policy_digest = ?, assigned_at = ?
-                WHERE shard_id = ? AND tenant_id = ? AND pool_id = ?
-                  AND owner_id = ?
+                WHERE shard_id = ? AND pool_id = ? AND owner_id = ?
                   AND fencing_epoch = ? AND policy_digest = ?
                 """,
                 (
@@ -2108,7 +2352,6 @@ class DurableRunStore:
                     replacement.policy_digest,
                     assigned_at,
                     current.shard_id,
-                    current.tenant_id,
                     current.pool_id,
                     current.owner_id,
                     current.fencing_epoch,
@@ -2134,7 +2377,7 @@ class DurableRunStore:
         with closing(self._connect()) as conn:
             row = conn.execute(
                 """
-                SELECT shard_id, tenant_id, pool_id, owner_id,
+                SELECT shard_id, pool_id, owner_id,
                        fencing_epoch, policy_digest
                 FROM fleet_shard_owners
                 WHERE shard_id = ?
@@ -2145,6 +2388,57 @@ class DurableRunStore:
             None
             if row is None
             else self._fleet_shard_ownership_from_row(row)
+        )
+
+    def get_fleet_pool_ownership(
+        self,
+        pool_id: str,
+    ) -> FleetShardOwnership | None:
+        if (
+            not isinstance(pool_id, str)
+            or _FLEET_IDENTIFIER.fullmatch(pool_id) is None
+        ):
+            raise ValueError("pool_id must be a bounded Fleet identifier")
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT shard_id, pool_id, owner_id,
+                       fencing_epoch, policy_digest
+                FROM fleet_shard_owners
+                WHERE pool_id = ?
+                """,
+                (pool_id,),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else self._fleet_shard_ownership_from_row(row)
+        )
+
+    def get_fleet_fairness_cursor(
+        self,
+        pool_id: str,
+    ) -> FleetFairnessCursor | None:
+        if (
+            not isinstance(pool_id, str)
+            or _FLEET_IDENTIFIER.fullmatch(pool_id) is None
+        ):
+            raise ValueError("pool_id must be a bounded Fleet identifier")
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT shard_id, pool_id, owner_id, fencing_epoch,
+                       policy_digest, last_served_tenant,
+                       selection_sequence
+                FROM fleet_shard_owners
+                WHERE pool_id = ?
+                """,
+                (pool_id,),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else self._fleet_fairness_cursor_from_row(row)
         )
 
     def bind_workflow(
@@ -4926,13 +5220,10 @@ class DurableRunStore:
                     """
                     SELECT 1
                     FROM fleet_shard_owners
-                    WHERE tenant_id = ? AND pool_id = ?
+                    WHERE pool_id = ?
                     LIMIT 1
                     """,
-                    (
-                        normalized_fleet_admission["tenant_id"],
-                        normalized_fleet_admission["pool_id"],
-                    ),
+                    (normalized_fleet_admission["pool_id"],),
                 ).fetchone()
                 if owner_row is not None:
                     raise ActivityAdmissionDenied(
@@ -5047,8 +5338,8 @@ class DurableRunStore:
         assert scope is not None
         row = conn.execute(
             """
-            SELECT tenant_id, pool_id, owner_id,
-                   fencing_epoch, policy_digest
+            SELECT pool_id, owner_id, fencing_epoch, policy_digest,
+                   selection_sequence
             FROM fleet_shard_owners
             WHERE shard_id = ?
             """,
@@ -5056,15 +5347,41 @@ class DurableRunStore:
         ).fetchone()
         if (
             row is None
-            or ownership["tenant_id"] != scope["tenant_id"]
             or ownership["pool_id"] != scope["pool_id"]
-            or row["tenant_id"] != ownership["tenant_id"]
             or row["pool_id"] != ownership["pool_id"]
             or row["owner_id"] != ownership["owner_id"]
             or row["fencing_epoch"] != ownership["fencing_epoch"]
             or row["policy_digest"] != ownership["policy_digest"]
         ):
             raise ActivityAdmissionDenied("fleet_shard_fenced")
+        selection_sequence = int(row["selection_sequence"])
+        if selection_sequence >= MAX_FLEET_SELECTION_SEQUENCE:
+            raise ActivityAdmissionDenied(
+                "fleet_fairness_sequence_exhausted"
+            )
+        advanced = conn.execute(
+            """
+            UPDATE fleet_shard_owners
+            SET last_served_tenant = ?, selection_sequence = ?
+            WHERE shard_id = ? AND pool_id = ? AND owner_id = ?
+              AND fencing_epoch = ? AND policy_digest = ?
+              AND selection_sequence = ?
+            """,
+            (
+                scope["tenant_id"],
+                selection_sequence + 1,
+                ownership["shard_id"],
+                ownership["pool_id"],
+                ownership["owner_id"],
+                ownership["fencing_epoch"],
+                ownership["policy_digest"],
+                selection_sequence,
+            ),
+        )
+        if advanced.rowcount != 1:
+            raise ActivityAdmissionDenied(
+                "fleet_fairness_cursor_changed"
+            )
 
     def claim_activity(
         self,
@@ -7782,7 +8099,6 @@ class DurableRunStore:
         try:
             return FleetShardOwnership(
                 shard_id=row["shard_id"],
-                tenant_id=row["tenant_id"],
                 pool_id=row["pool_id"],
                 owner_id=row["owner_id"],
                 fencing_epoch=row["fencing_epoch"],
@@ -7791,6 +8107,25 @@ class DurableRunStore:
         except (TypeError, ValueError) as exc:
             raise StoreSchemaError(
                 "Fleet shard ownership is malformed"
+            ) from exc
+
+    @staticmethod
+    def _fleet_fairness_cursor_from_row(
+        row: sqlite3.Row,
+    ) -> FleetFairnessCursor:
+        try:
+            return FleetFairnessCursor(
+                shard_id=row["shard_id"],
+                pool_id=row["pool_id"],
+                owner_id=row["owner_id"],
+                fencing_epoch=row["fencing_epoch"],
+                policy_digest=row["policy_digest"],
+                last_served_tenant=row["last_served_tenant"],
+                selection_sequence=row["selection_sequence"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise StoreSchemaError(
+                "Fleet fairness cursor is malformed"
             ) from exc
 
     @staticmethod

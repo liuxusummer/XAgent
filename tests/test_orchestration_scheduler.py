@@ -197,6 +197,7 @@ class DurableSchedulerTests(unittest.TestCase):
         tenant_id: str = "tenant-a",
         pool_id: str = "pool-a",
         quota_scheduler: DeterministicRemoteScheduler | None = None,
+        fleet_shard_ownership=None,
     ):
         candidate = scheduler.prepare_next_admission(
             run_id,
@@ -225,6 +226,11 @@ class DurableSchedulerTests(unittest.TestCase):
             admission_expires_at=200.0,
             policy_binding=self._allow_policy(task_id),
             fleet_admission=scope.to_metadata(),
+            fleet_shard_ownership=(
+                None
+                if fleet_shard_ownership is None
+                else fleet_shard_ownership.to_metadata()
+            ),
         )
 
     def test_create_run_persists_definition_and_pending_nodes_fail_closed(self) -> None:
@@ -506,6 +512,13 @@ class DurableSchedulerTests(unittest.TestCase):
         for scheduler, run_id in zip(schedulers, run_ids, strict=True):
             scheduler.create_run(run_id)
             scheduler.reconcile(run_id)
+        ownership = schedulers[0].store.claim_fleet_shard(
+            "pool-a-shard",
+            "control-a",
+            "c" * 64,
+            pool_id="pool-a",
+            now=10,
+        )
         barrier = threading.Barrier(2)
 
         def compete(index: int):
@@ -540,6 +553,7 @@ class DurableSchedulerTests(unittest.TestCase):
                         f"fleet-task-{index}"
                     ),
                     fleet_admission=scope.to_metadata(),
+                    fleet_shard_ownership=ownership.to_metadata(),
                 )
                 return claim
             except ActivityAdmissionDenied as exc:
@@ -572,6 +586,12 @@ class DurableSchedulerTests(unittest.TestCase):
             stored.metadata["fleet_admission"]["tenant_id"],
             "tenant-shared",
         )
+        cursor = schedulers[winner].store.get_fleet_fairness_cursor(
+            "pool-a"
+        )
+        assert cursor is not None
+        self.assertEqual(cursor.last_served_tenant, "tenant-shared")
+        self.assertEqual(cursor.selection_sequence, 1)
 
         restarted = DurableScheduler(
             DurableRunStore(store_path),
@@ -594,6 +614,7 @@ class DurableSchedulerTests(unittest.TestCase):
                 "worker-restarted",
                 task_id=f"fleet-task-{loser}",
                 tenant_id="tenant-shared",
+                fleet_shard_ownership=ownership,
             )
 
         schedulers[winner].start_claim(winner_claim)
@@ -604,8 +625,167 @@ class DurableSchedulerTests(unittest.TestCase):
             "worker-restarted",
             task_id=f"fleet-task-{loser}",
             tenant_id="tenant-shared",
+            fleet_shard_ownership=ownership,
         )
         self.assertIsNotNone(released)
+        advanced = restarted.store.get_fleet_fairness_cursor("pool-a")
+        assert advanced is not None
+        self.assertEqual(advanced.selection_sequence, 2)
+
+    def test_fleet_cursor_advances_only_with_successful_durable_claim(
+        self,
+    ) -> None:
+        store, scheduler = self.scheduler(
+            [_agent("a"), _agent("b")],
+            max_active_attempts=8,
+        )
+        scheduler.create_run("fleet-fairness")
+        scheduler.reconcile("fleet-fairness")
+        ownership = store.claim_fleet_shard(
+            "pool-a-shard",
+            "control-a",
+            "c" * 64,
+            pool_id="pool-a",
+            now=10,
+        )
+        quotas = DeterministicRemoteScheduler(
+            max_active_tasks=1,
+            default_tenant_concurrency=8,
+            default_pool_concurrency=8,
+        )
+
+        def claim(node_id: str, tenant_id: str, task_id: str):
+            candidate = scheduler.prepare_next_admission(
+                "fleet-fairness",
+                f"worker-{tenant_id}",
+                target_node_id=node_id,
+            )
+            assert candidate is not None
+            scope = quotas.durable_admission_scope(
+                RemoteTask(
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                    pool_id="pool-a",
+                    tool_name="agent",
+                ),
+                routing_policy_digest=hashlib.sha256(
+                    b"routing-policy"
+                ).hexdigest(),
+            )
+            return scheduler.claim_admitted(
+                candidate,
+                lease_seconds=30.0,
+                capacity=8,
+                admission_expires_at=200.0,
+                policy_binding=self._allow_policy(task_id),
+                fleet_admission=scope.to_metadata(),
+                fleet_shard_ownership=ownership.to_metadata(),
+            )
+
+        first, _event = claim("a", "tenant-a", "fairness-a")
+        assert first is not None
+        cursor = store.get_fleet_fairness_cursor("pool-a")
+        assert cursor is not None
+        self.assertEqual(cursor.last_served_tenant, "tenant-a")
+        self.assertEqual(cursor.selection_sequence, 1)
+
+        with self.assertRaisesRegex(
+            ActivityAdmissionDenied,
+            "fleet_global_capacity",
+        ):
+            claim("b", "tenant-b", "fairness-b")
+        rolled_back = store.get_fleet_fairness_cursor("pool-a")
+        self.assertEqual(rolled_back, cursor)
+
+        scheduler.start_claim(first)
+        scheduler.complete_claim(first, {"done": True})
+        second, _event = claim("b", "tenant-b", "fairness-b")
+        self.assertIsNotNone(second)
+        advanced = store.get_fleet_fairness_cursor("pool-a")
+        assert advanced is not None
+        self.assertEqual(advanced.last_served_tenant, "tenant-b")
+        self.assertEqual(advanced.selection_sequence, 2)
+
+        transferred = store.transfer_fleet_shard(
+            ownership,
+            new_owner_id="control-b",
+            new_policy_digest="d" * 64,
+            now=20,
+        )
+        preserved = store.get_fleet_fairness_cursor("pool-a")
+        assert preserved is not None
+        self.assertEqual(preserved.last_served_tenant, "tenant-b")
+        self.assertEqual(preserved.selection_sequence, 2)
+        self.assertEqual(preserved.owner_id, transferred.owner_id)
+        self.assertEqual(
+            preserved.fencing_epoch,
+            transferred.fencing_epoch,
+        )
+        self.assertEqual(
+            preserved.policy_digest,
+            transferred.policy_digest,
+        )
+
+    def test_exhausted_fleet_cursor_fails_before_durable_claim(
+        self,
+    ) -> None:
+        store, scheduler = self.scheduler([_agent("a")])
+        scheduler.create_run("fleet-fairness-exhausted")
+        scheduler.reconcile("fleet-fairness-exhausted")
+        ownership = store.claim_fleet_shard(
+            "pool-a-shard",
+            "control-a",
+            "c" * 64,
+            pool_id="pool-a",
+            now=10,
+        )
+        quotas = DeterministicRemoteScheduler()
+        candidate = scheduler.prepare_next_admission(
+            "fleet-fairness-exhausted",
+            "worker-tenant-a",
+            target_node_id="a",
+        )
+        assert candidate is not None
+        scope = quotas.durable_admission_scope(
+            RemoteTask(
+                task_id="fairness-exhausted",
+                tenant_id="tenant-a",
+                pool_id="pool-a",
+                tool_name="agent",
+            ),
+            routing_policy_digest=hashlib.sha256(
+                b"routing-policy"
+            ).hexdigest(),
+        )
+
+        with patch(
+            "src.orchestration.store.MAX_FLEET_SELECTION_SEQUENCE",
+            0,
+        ):
+            with self.assertRaisesRegex(
+                ActivityAdmissionDenied,
+                "fleet_fairness_sequence_exhausted",
+            ):
+                scheduler.claim_admitted(
+                    candidate,
+                    lease_seconds=30.0,
+                    capacity=8,
+                    admission_expires_at=200.0,
+                    policy_binding=self._allow_policy(
+                        "fairness-exhausted"
+                    ),
+                    fleet_admission=scope.to_metadata(),
+                    fleet_shard_ownership=ownership.to_metadata(),
+                )
+
+        self.assertEqual(
+            store.get_fleet_fairness_cursor("pool-a").selection_sequence,
+            0,
+        )
+        self.assertEqual(
+            store.list_attempts("fleet-fairness-exhausted"),
+            [],
+        )
 
     def test_fleet_quota_policy_drift_fails_closed_while_active(self) -> None:
         _store, scheduler = self.scheduler(

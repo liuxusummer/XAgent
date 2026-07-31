@@ -419,11 +419,10 @@ class DurableFleetProjector:
                     "Fleet shard ownership is stale"
                 )
             if (
-                shard_ownership.tenant_id != tenant_id
-                or shard_ownership.pool_id != pool_id
+                shard_ownership.pool_id != pool_id
             ):
                 raise RemoteFleetControlConflict(
-                    "Fleet shard ownership has another routing scope"
+                    "Fleet shard ownership belongs to another pool"
                 )
         run = scheduler.store.get_run(run_id)
         if run is None or run.status is not RunStatus.RUNNING:
@@ -542,6 +541,7 @@ class RemoteControlFleetClaimer:
     """Production-marked callback preserving control session authority."""
 
     durable_fleet_admission_ready = True
+    durable_fleet_fairness_ready = True
 
     def __init__(
         self,
