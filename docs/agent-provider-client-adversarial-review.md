@@ -3,8 +3,9 @@
 > 审查对象：`DurableAgentProviderClient`、provider wire、
 > `ProviderAccessBroker.describe_route()` 与 collector 父绑定。
 >
-> 结论：provider 子链通过三轮审查；Tool 消费 Handler 已单独完成，但动态 child authority、
-> crash-consistent staging 和终态原子提交仍未完成，`production_security_ready=false`，
+> 结论：provider 子链通过三轮审查；Tool 消费 Handler 与本地 reference 动态 child authority
+> 已单独完成，但跨子链 crash-consistent staging 和父终态原子提交仍未完成，
+> `production_security_ready=false`，
 > remote `agent` capability 保持关闭。
 
 ## Round 1：授权、调用顺序与秘密泄露

@@ -89,7 +89,8 @@
 
 - manifest 是受信 runtime 的有序观察，不是外部系统事务收据。
 - manifest v2、Core Loop collector observer 与 reference provider client 已组成
-  provider 子链；Tool 消费 Handler 已接线，但动态 child authority 与终态原子提交仍缺失。
+  provider 子链；Tool 消费 Handler 与本地 reference 动态 child authority 已接线，但父终态
+  原子提交仍缺失。
 - 当前本地 Legacy adapter 继续产生 v2、无 manifest、`complete=false` receipt；它不会被
   误升级为远程 Agent proof。
 - Store receipt API 只验证 manifest ref，不读取 Artifact bytes；接纳执行证据的入口必须

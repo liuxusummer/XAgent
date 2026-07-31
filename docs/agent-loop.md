@@ -143,8 +143,9 @@ collector 使用同一个计数事实源，不需要复制易漂移的本地计�
 
 参考 `DurableAgentToolHandler` 已实现 allowlist、父 request Artifact 重读、参数深冻结、
 durable receipt 重读与 result Artifact 校验，并把合法 receipt 放入 `ActionResult` 的
-out-of-band 槽。它仍不签发动态 child authority，readiness 固定 false；完整边界见
-[Durable Agent Tool Handler 契约](agent-tool-handler.md)。
+out-of-band 槽。`DurableAgentToolExecutor` 再以独立 Store ledger 签发动态 child authority，
+不改变静态 Workflow 拓扑；完整边界见 [Durable Agent Tool Handler 契约](agent-tool-handler.md)
+与[动态 Agent Tool 执行器契约](agent-tool-executor.md)。
 
 ## 4. Handler 分发机制
 

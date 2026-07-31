@@ -50,8 +50,11 @@ class AgentContext:
 Durable Orchestration 的参考 Handler 是一个额外的消费边界：它不直接调用上述本地工具，
 而是把 collector 当前 observation 交给 deployment-owned executor，只接受已经写入 Store
 的 `ToolReceipt` 与 canonical `AgentToolResult` Artifact。成功结果的控制 envelope 必须由
-受信 adapter 生成，sandbox/stdout 仍是不可信 `data`。该边界不包含动态 child authority
-issuer，不能单独声明 production-ready；见 [Durable Agent Tool Handler 契约](agent-tool-handler.md)。
+受信 adapter 生成，sandbox/stdout 仍是不可信 `data`。动态 child authority 由独立的
+`DurableAgentToolExecutor` ledger 签发，而不是由 Handler 或静态 Workflow Node 冒充；
+reference executor 仍依赖部署侧隔离与认证，不能单独声明 production-ready；见
+[Durable Agent Tool Handler 契约](agent-tool-handler.md)和
+[动态 Agent Tool 执行器契约](agent-tool-executor.md)。
 
 ### 执行在隔离区，结果要截断
 

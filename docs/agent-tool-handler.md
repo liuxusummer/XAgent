@@ -15,9 +15,11 @@
 Handler 不执行 shell、浏览器或文件操作，也不自行授予能力。真正的策略判定、child Attempt
 创建、sandbox 启动、幂等账本和 durable terminal commit 属于部署侧 `AgentToolExecutor`。
 
-本类的 `production_security_ready` 固定为 false。当前 Workflow executor 只接受定义中预编译
-的 Tool Node，尚不能为 Agent Loop 运行时新产生的 tool call 签发同一 Run 内的 child
-authority；因此本阶段是严格的消费/组合边界，不是完整的动态执行发行器。
+本类的 `production_security_ready` 固定为 false，因为 Handler 本身只负责消费。
+`DurableAgentToolExecutor` 现已通过独立的 `agent_tool_invocations` 账本为 Agent Loop
+运行时产生的 tool call 签发同一 Run 内的 child authority；它不伪造 Workflow DAG Node，
+并把 policy、sandbox、Artifact、receipt 与 child terminal Event 串成可重放链。完整发行契约见
+[动态 Agent Tool 执行器](agent-tool-executor.md)。
 
 ## 2. 构造前置条件
 
@@ -106,16 +108,21 @@ receipt 的 action、execution binding、policy、profile 和 sandbox 字段仍�
 恢复并不意味着 Handler 自己重跑 Tool。executor 必须通过 durable ledger 判断 replay、
 NOT_STARTED 或 COMPLETED；Handler 只消费收敛后的唯一终态。
 
-## 7. 尚未完成
+## 7. 已完成与剩余边界
 
-- 缺少可从父 Agent Attempt 安全签发动态 child Tool claim 的 durable authority issuer；
-- 缺少该 issuer 与 `TrustedActivityExecutor`/远程 Worker 的生产组合实现；
+- reference control plane 已实现动态 child identity、策略拒绝、ALLOW authority、短期 claim
+  lease、sandbox dispatch、terminal receipt/result 原子提交和 durable replay；
+- 进程在授权后崩溃时不会重放未知副作用；租约到期后原子收敛为 `OUTCOME_UNKNOWN`，迟到
+  receipt 被 fencing 拒绝；
+- preflight 失败会以无执行权限的 `ABANDONED` 终态清理 reservation，避免永久阻塞父 Attempt；
+- 仍缺少该 issuer 与远程 Worker 的 mTLS/attestation/egress/secret-manager 生产组合；
 - provider history、tool result、manifest、checkpoint、NodeResult、Agent receipt 与 terminal Event
   尚未组成单一 crash-consistent transaction；
 - reference Store 不提供 encrypted secret Artifact；
 - reference executor readiness 不证明 mTLS、attestation、egress、外部幂等账本或跨主机共识；
 - result 控制 envelope 的生产者身份尚未由独立签名或 attestation 证明。
 
-因此该 Handler 可以阻止错绑、替换、明文 secret 和未持久 receipt 被接纳，但不能单独开放
-remote `agent` capability。三轮攻击复现与验证见
-[Durable Agent Tool Handler 三轮对抗性审查](agent-tool-handler-adversarial-review.md)。
+因此 Handler + reference executor 已消除动态 child authority 缺口，但不能单独开放 remote
+`agent` capability。消费边界审查见
+[Durable Agent Tool Handler 三轮对抗性审查](agent-tool-handler-adversarial-review.md)，发行与恢复审查见
+[Durable Agent Tool Executor 三轮对抗性审查](agent-tool-executor-adversarial-review.md)。

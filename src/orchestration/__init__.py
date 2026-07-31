@@ -45,6 +45,11 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "AgentToolSpec",
         "DurableAgentToolHandler",
     ),
+    ".agent_tool_executor": (
+        "AgentToolExecutionError",
+        "AgentToolExecutionSpec",
+        "DurableAgentToolExecutor",
+    ),
     ".agent_tool_result": (
         "AgentToolResult",
         "AgentToolResultArtifactStore",
@@ -303,6 +308,9 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
     ),
     ".store": (
         "ActivityAdmissionDenied",
+        "AgentToolExecutionClaim",
+        "AgentToolInvocationConflict",
+        "AgentToolInvocationRecord",
         "ArtifactGCReferenceConflictError",
         "DurableRunStore",
         "FleetFairnessCursor",

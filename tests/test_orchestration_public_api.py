@@ -20,6 +20,8 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             "AgentToolInvocationRequest",
             "AgentToolInvocationResult",
             "DurableAgentToolHandler",
+            "AgentToolExecutionSpec",
+            "DurableAgentToolExecutor",
             "ArtifactGCReport",
             "LocalArtifactGarbageCollector",
             "QuarantinedArtifact",
@@ -114,6 +116,10 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             AgentToolInvocationResult,
             DurableAgentToolHandler,
         )
+        from src.orchestration.agent_tool_executor import (
+            AgentToolExecutionSpec,
+            DurableAgentToolExecutor,
+        )
         from src.orchestration.artifacts_gc import LocalArtifactGarbageCollector
         from src.orchestration.evaluation import Suite
         from src.orchestration.executor import TrustedActivityExecutor
@@ -151,6 +157,8 @@ class OrchestrationPublicApiTests(unittest.TestCase):
             ("AgentToolInvocationRequest", AgentToolInvocationRequest),
             ("AgentToolInvocationResult", AgentToolInvocationResult),
             ("DurableAgentToolHandler", DurableAgentToolHandler),
+            ("AgentToolExecutionSpec", AgentToolExecutionSpec),
+            ("DurableAgentToolExecutor", DurableAgentToolExecutor),
             ("ArtifactRef", ArtifactRef),
             ("LocalArtifactGarbageCollector", LocalArtifactGarbageCollector),
             ("DurableRunStore", DurableRunStore),

@@ -17,6 +17,7 @@ import inspect
 import json
 import math
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -26,7 +27,7 @@ from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Sequence
 
-from .artifacts import ArtifactRef
+from .artifacts import ArtifactRef, ArtifactSensitivity
 from .event_types import DURABLE_EVENT_TYPES
 from .models import (
     MODEL_SCHEMA_VERSION,
@@ -54,7 +55,7 @@ if TYPE_CHECKING:
     from .agent_receipt import AgentActivityReceipt
     from .executor import ToolReceipt
 
-STORE_SCHEMA_VERSION = 8
+STORE_SCHEMA_VERSION = 9
 DEFAULT_BUSY_TIMEOUT_MS = 10_000
 DEFAULT_EVENT_LIMIT = 1_000
 MAX_EVENT_LIMIT = 10_000
@@ -73,6 +74,10 @@ FLEET_FAIRNESS_CURSOR_SCHEMA_VERSION = 1
 FLEET_RUN_ROUTE_SCHEMA_VERSION = 1
 HIERARCHY_ADMISSION_SCHEMA_VERSION = 1
 MAX_HIERARCHY_ADMISSION_DEPTH = 64
+AGENT_TOOL_INVOCATION_SCHEMA_VERSION = 1
+MAX_AGENT_TOOL_INVOCATIONS_PER_ATTEMPT = 64
+MAX_AGENT_TOOL_LEASE_SECONDS = 24 * 60 * 60
+DEFAULT_AGENT_TOOL_LEASE_SECONDS = 5 * 60
 _SAFE_RECEIPT_CODE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
 _SHA256_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _FLEET_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
@@ -334,6 +339,28 @@ class ActivityAdmissionDenied(OrchestrationStoreError):
         super().__init__(reason_code)
 
 
+class AgentToolInvocationConflict(OrchestrationStoreError, ValueError):
+    """A dynamic Agent Tool child lost or violated durable authority."""
+
+    _REASON_CODES = frozenset(
+        {
+            "agent_tool_active",
+            "agent_tool_binding_mismatch",
+            "agent_tool_capacity",
+            "agent_tool_claim_mismatch",
+            "agent_tool_parent_inactive",
+            "agent_tool_receipt_invalid",
+            "agent_tool_state_conflict",
+        }
+    )
+
+    def __init__(self, reason_code: str) -> None:
+        if reason_code not in self._REASON_CODES:
+            raise ValueError("invalid Agent Tool invocation reason code")
+        self.reason_code = reason_code
+        super().__init__(reason_code)
+
+
 _SCHEMA_LOCK = threading.Lock()
 
 
@@ -366,6 +393,93 @@ class WorkflowBindingRecord:
         }
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class AgentToolInvocationRecord:
+    """Digest-only durable projection for one Agent-internal Tool call."""
+
+    invocation_id: str
+    run_id: str
+    parent_node_id: str
+    parent_attempt_id: str
+    sequence: int
+    turn: int
+    child_node_id: str
+    child_attempt_id: str
+    tool_name: str
+    tool_call_id_digest: str
+    request_digest: str
+    request_artifact_digest: str
+    invocation_digest: str
+    args_digest: str
+    operation_key_digest: str
+    sensitivity: ArtifactSensitivity
+    status: AttemptStatus
+    owner_id: str | None
+    claim_token_digest: str | None
+    action_digest: str | None
+    execution_binding_digest: str | None
+    effect_class: str | None
+    policy_outcome: str | None
+    policy_version: str | None
+    policy_digest: str | None
+    profile_id: str | None
+    profile_digest: str | None
+    decision_digest: str | None
+    lease_expires_at: float | None
+    receipt_digest: str | None
+    result_artifact_ref: ArtifactRef | None
+    created_at: float
+    updated_at: float
+    schema_version: int = AGENT_TOOL_INVOCATION_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        try:
+            object.__setattr__(
+                self,
+                "sensitivity",
+                ArtifactSensitivity(self.sensitivity),
+            )
+            object.__setattr__(
+                self,
+                "status",
+                AttemptStatus(self.status),
+            )
+        except ValueError as exc:
+            raise ValueError("invalid Agent Tool invocation enum") from exc
+
+    def __repr__(self) -> str:
+        return (
+            "AgentToolInvocationRecord("
+            f"invocation_id={self.invocation_id!r}, "
+            f"run_id={self.run_id!r}, "
+            f"parent_attempt_id={self.parent_attempt_id!r}, "
+            f"sequence={self.sequence}, "
+            f"turn={self.turn}, "
+            f"tool_name={self.tool_name!r}, "
+            f"status={self.status.value!r})"
+        )
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status.is_terminal
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class AgentToolExecutionClaim:
+    """Live Store authority; the raw claim token is never persisted."""
+
+    invocation: AgentToolInvocationRecord
+    owner_id: str
+    claim_token: str
+
+    def __repr__(self) -> str:
+        return (
+            "AgentToolExecutionClaim("
+            f"invocation_id={self.invocation.invocation_id!r}, "
+            f"owner_id={self.owner_id!r})"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class FleetShardOwnership:
     """Store-local, clock-free single-writer fencing authority."""
@@ -382,6 +496,7 @@ class FleetShardOwnership:
             raise ValueError(
                 "unsupported Fleet shard ownership schema version"
             )
+
         for field_name in (
             "shard_id",
             "pool_id",
@@ -1630,6 +1745,53 @@ class DurableRunStore:
                     "PRAGMA table_info(idempotency_records)"
                 ).fetchall()
             }
+            agent_tool_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(agent_tool_invocations)"
+                ).fetchall()
+            }
+            expected_agent_tool_columns = {
+                "schema_version",
+                "invocation_id",
+                "run_id",
+                "parent_node_id",
+                "parent_attempt_id",
+                "sequence",
+                "turn",
+                "child_node_id",
+                "child_attempt_id",
+                "tool_name",
+                "tool_call_id_digest",
+                "request_digest",
+                "request_artifact_digest",
+                "invocation_digest",
+                "args_digest",
+                "operation_key_digest",
+                "sensitivity",
+                "status",
+                "owner_id",
+                "claim_token_digest",
+                "action_digest",
+                "execution_binding_digest",
+                "effect_class",
+                "policy_outcome",
+                "policy_version",
+                "policy_digest",
+                "profile_id",
+                "profile_digest",
+                "decision_digest",
+                "lease_expires_at",
+                "receipt_digest",
+                "result_artifact_ref_json",
+                "tool_receipt_json",
+                "created_at",
+                "updated_at",
+            }
+            if agent_tool_columns != expected_agent_tool_columns:
+                raise StoreSchemaError(
+                    "Agent Tool invocation ledger schema is incomplete"
+                )
             if {
                 "status",
                 "metadata_json",
@@ -2623,6 +2785,86 @@ class DurableRunStore:
                 END
                 """
             )
+
+    @staticmethod
+    def _migrate_8_to_9(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE agent_tool_invocations (
+                schema_version INTEGER NOT NULL,
+                invocation_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                parent_node_id TEXT NOT NULL,
+                parent_attempt_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL
+                    CHECK(sequence BETWEEN 1 AND 64),
+                turn INTEGER NOT NULL
+                    CHECK(turn BETWEEN 1 AND 1000000),
+                child_node_id TEXT NOT NULL,
+                child_attempt_id TEXT NOT NULL UNIQUE,
+                tool_name TEXT NOT NULL,
+                tool_call_id_digest TEXT NOT NULL
+                    CHECK(length(tool_call_id_digest) = 64),
+                request_digest TEXT NOT NULL
+                    CHECK(length(request_digest) = 64),
+                request_artifact_digest TEXT NOT NULL
+                    CHECK(length(request_artifact_digest) = 64),
+                invocation_digest TEXT NOT NULL
+                    CHECK(length(invocation_digest) = 64),
+                args_digest TEXT NOT NULL
+                    CHECK(length(args_digest) = 64),
+                operation_key_digest TEXT NOT NULL
+                    CHECK(length(operation_key_digest) = 64),
+                sensitivity TEXT NOT NULL
+                    CHECK(sensitivity IN ('sensitive', 'secret')),
+                status TEXT NOT NULL
+                    CHECK(status IN (
+                        'scheduled', 'running', 'succeeded', 'failed',
+                        'timed_out', 'cancelled', 'abandoned',
+                        'outcome_unknown'
+                    )),
+                owner_id TEXT,
+                claim_token_digest TEXT,
+                action_digest TEXT,
+                execution_binding_digest TEXT,
+                effect_class TEXT,
+                policy_outcome TEXT,
+                policy_version TEXT,
+                policy_digest TEXT,
+                profile_id TEXT,
+                profile_digest TEXT,
+                decision_digest TEXT,
+                lease_expires_at REAL,
+                receipt_digest TEXT,
+                result_artifact_ref_json TEXT,
+                tool_receipt_json TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(run_id, parent_attempt_id, sequence),
+                UNIQUE(run_id, operation_key_digest),
+                FOREIGN KEY(run_id)
+                    REFERENCES runs(run_id)
+                    ON DELETE RESTRICT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX agent_tool_invocations_parent_idx
+            ON agent_tool_invocations(
+                run_id, parent_attempt_id, sequence
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX agent_tool_invocations_active_idx
+            ON agent_tool_invocations(
+                status, lease_expires_at, updated_at, run_id
+            )
+            WHERE status IN ('scheduled', 'running')
+            """
+        )
 
     @staticmethod
     def _prepare_new_run(
@@ -5559,6 +5801,1031 @@ class DurableRunStore:
                 attempt_projection=target_attempt,
             )
 
+    def reserve_agent_tool_invocation(
+        self,
+        request: object,
+        *,
+        now: float | None = None,
+    ) -> AgentToolInvocationRecord:
+        """Atomically reserve one digest-only dynamic Tool child identity."""
+
+        from .agent_execution_manifest import (
+            AgentExecutionManifestError,
+            agent_tool_operation_key,
+        )
+        from .agent_tool_handler import AgentToolInvocationRequest
+
+        if type(request) is not AgentToolInvocationRequest:
+            raise AgentToolInvocationConflict(
+                "agent_tool_binding_mismatch"
+            )
+        occurred_at = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        operation_key_digest = hashlib.sha256(
+            request.operation_key.encode("utf-8")
+        ).hexdigest()
+        try:
+            expected_operation_key = agent_tool_operation_key(
+                run_id=request.run_id,
+                node_id=request.node_id,
+                attempt_id=request.attempt_id,
+                request_digest=request.request_digest,
+                sequence=request.sequence,
+            )
+        except AgentExecutionManifestError:
+            raise AgentToolInvocationConflict(
+                "agent_tool_binding_mismatch"
+            ) from None
+        if request.operation_key != expected_operation_key:
+            raise AgentToolInvocationConflict(
+                "agent_tool_binding_mismatch"
+            )
+        identity_digest = hashlib.sha256(
+            _json_dump(
+                {
+                    "schema": "agent_tool_child_identity_v1",
+                    "run_id": request.run_id,
+                    "parent_node_id": request.node_id,
+                    "parent_attempt_id": request.attempt_id,
+                    "sequence": request.sequence,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        invocation_id = f"agent-tool-invocation-{identity_digest}"
+        child_node_id = f"agent-tool-node-{identity_digest}"
+        child_attempt_id = f"agent-tool-attempt-{identity_digest}"
+        event_id = f"evt_agent_tool_scheduled_{identity_digest}"
+
+        with self._write_transaction() as conn:
+            run = self._validate_agent_tool_parent_tx(
+                conn,
+                run_id=request.run_id,
+                node_id=request.node_id,
+                attempt_id=request.attempt_id,
+                request_digest=request.request_digest,
+            )
+            existing_row = conn.execute(
+                """
+                SELECT * FROM agent_tool_invocations
+                WHERE run_id = ? AND parent_attempt_id = ?
+                  AND sequence = ?
+                """,
+                (
+                    request.run_id,
+                    request.attempt_id,
+                    request.sequence,
+                ),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._agent_tool_invocation_from_row(
+                    existing_row
+                )
+                if not _agent_tool_request_matches_record(
+                    request,
+                    existing,
+                    operation_key_digest=operation_key_digest,
+                ):
+                    raise AgentToolInvocationConflict(
+                        "agent_tool_binding_mismatch"
+                    )
+                return existing
+
+            conn.execute(
+                """
+                INSERT INTO agent_tool_invocations(
+                    schema_version, invocation_id, run_id,
+                    parent_node_id, parent_attempt_id,
+                    sequence, turn, child_node_id, child_attempt_id,
+                    tool_name, tool_call_id_digest,
+                    request_digest, request_artifact_digest,
+                    invocation_digest, args_digest,
+                    operation_key_digest, sensitivity, status,
+                    owner_id, claim_token_digest,
+                    action_digest, execution_binding_digest,
+                    effect_class, policy_outcome, policy_version,
+                    policy_digest, profile_id, profile_digest,
+                    decision_digest, lease_expires_at, receipt_digest,
+                    result_artifact_ref_json, tool_receipt_json,
+                    created_at, updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL, NULL, NULL, ?, ?
+                )
+                """,
+                (
+                    AGENT_TOOL_INVOCATION_SCHEMA_VERSION,
+                    invocation_id,
+                    request.run_id,
+                    request.node_id,
+                    request.attempt_id,
+                    request.sequence,
+                    request.turn,
+                    child_node_id,
+                    child_attempt_id,
+                    request.tool_name,
+                    request.tool_call_id_digest,
+                    request.request_digest,
+                    request.request_artifact_digest,
+                    request.invocation_digest,
+                    request.args_digest,
+                    operation_key_digest,
+                    request.sensitivity.value,
+                    AttemptStatus.SCHEDULED.value,
+                    occurred_at,
+                    occurred_at,
+                ),
+            )
+            self._fault("agent_tool.reserve.after_insert")
+            self._commit_event_tx(
+                conn,
+                run,
+                "agent_tool.scheduled",
+                payload={
+                    "kind": "agent_tool_invocation",
+                    "schema_version": (
+                        AGENT_TOOL_INVOCATION_SCHEMA_VERSION
+                    ),
+                    "invocation_id": invocation_id,
+                    "parent_node_id": request.node_id,
+                    "parent_attempt_id": request.attempt_id,
+                    "sequence": request.sequence,
+                    "turn": request.turn,
+                    "tool_name": request.tool_name,
+                    "tool_call_id_digest": request.tool_call_id_digest,
+                    "invocation_digest": request.invocation_digest,
+                    "args_digest": request.args_digest,
+                    "operation_key_digest": operation_key_digest,
+                    "request_artifact_digest": (
+                        request.request_artifact_digest
+                    ),
+                    "sensitivity": request.sensitivity.value,
+                },
+                event_id=event_id,
+                occurred_at=occurred_at,
+                node_id=child_node_id,
+                attempt_id=child_attempt_id,
+                run_projection=run,
+                node_projection=None,
+                attempt_projection=None,
+            )
+            row = conn.execute(
+                "SELECT * FROM agent_tool_invocations "
+                "WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            assert row is not None
+            return self._agent_tool_invocation_from_row(row)
+
+    def start_agent_tool_invocation(
+        self,
+        invocation_id: str,
+        invocation_digest: str,
+        owner_id: str,
+        *,
+        action_digest: str,
+        execution_binding_digest: str,
+        effect_class: str,
+        policy_version: str,
+        policy_digest: str,
+        profile_id: str,
+        profile_digest: str,
+        decision_digest: str,
+        lease_seconds: float = DEFAULT_AGENT_TOOL_LEASE_SECONDS,
+        now: float | None = None,
+    ) -> AgentToolExecutionClaim:
+        """Persist exact ALLOW authority before any sandbox side effect."""
+
+        invocation_id = _agent_tool_text(
+            invocation_id,
+            "invocation_id",
+        )
+        invocation_digest = _sha256_digest(
+            invocation_digest,
+            "invocation_digest",
+        )
+        owner_id = _agent_tool_text(owner_id, "owner_id")
+        action_digest = _sha256_digest(action_digest, "action_digest")
+        execution_binding_digest = _sha256_digest(
+            execution_binding_digest,
+            "execution_binding_digest",
+        )
+        effect_class = _agent_tool_effect_class(effect_class)
+        policy_digest = _sha256_digest(policy_digest, "policy_digest")
+        if policy_version != f"sha256:{policy_digest}":
+            raise AgentToolInvocationConflict(
+                "agent_tool_binding_mismatch"
+            )
+        profile_id = _agent_tool_text(profile_id, "profile_id")
+        profile_digest = _sha256_digest(
+            profile_digest,
+            "profile_digest",
+        )
+        decision_digest = _sha256_digest(
+            decision_digest,
+            "decision_digest",
+        )
+        lease_seconds = _agent_tool_lease_seconds(lease_seconds)
+        occurred_at = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        lease_expires_at = occurred_at + lease_seconds
+        claim_token = secrets.token_urlsafe(32)
+        claim_token_digest = hashlib.sha256(
+            claim_token.encode("utf-8")
+        ).hexdigest()
+
+        with self._write_transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM agent_tool_invocations "
+                "WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise AgentToolInvocationConflict(
+                    "agent_tool_state_conflict"
+                )
+            current = self._agent_tool_invocation_from_row(row)
+            if (
+                current.invocation_digest != invocation_digest
+                or current.status is not AttemptStatus.SCHEDULED
+                or occurred_at < current.updated_at
+            ):
+                raise AgentToolInvocationConflict(
+                    "agent_tool_state_conflict"
+                )
+            run = self._validate_agent_tool_parent_tx(
+                conn,
+                run_id=current.run_id,
+                node_id=current.parent_node_id,
+                attempt_id=current.parent_attempt_id,
+                request_digest=current.request_digest,
+            )
+            updated = conn.execute(
+                """
+                UPDATE agent_tool_invocations
+                SET status = 'running', owner_id = ?,
+                    claim_token_digest = ?, action_digest = ?,
+                    execution_binding_digest = ?, effect_class = ?,
+                    policy_outcome = 'allow', policy_version = ?,
+                    policy_digest = ?, profile_id = ?,
+                    profile_digest = ?, decision_digest = ?,
+                    lease_expires_at = ?, updated_at = ?
+                WHERE invocation_id = ? AND status = 'scheduled'
+                  AND invocation_digest = ?
+                """,
+                (
+                    owner_id,
+                    claim_token_digest,
+                    action_digest,
+                    execution_binding_digest,
+                    effect_class,
+                    policy_version,
+                    policy_digest,
+                    profile_id,
+                    profile_digest,
+                    decision_digest,
+                    lease_expires_at,
+                    occurred_at,
+                    invocation_id,
+                    invocation_digest,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise AgentToolInvocationConflict(
+                    "agent_tool_active"
+                )
+            self._fault("agent_tool.start.after_update")
+            self._commit_event_tx(
+                conn,
+                run,
+                "agent_tool.started",
+                payload={
+                    "kind": "agent_tool_authorization",
+                    "invocation_id": invocation_id,
+                    "invocation_digest": invocation_digest,
+                    "owner_id": owner_id,
+                    "claim_token_digest": claim_token_digest,
+                    "action_digest": action_digest,
+                    "execution_binding_digest": (
+                        execution_binding_digest
+                    ),
+                    "effect_class": effect_class,
+                    "policy_outcome": "allow",
+                    "policy_version": policy_version,
+                    "policy_digest": policy_digest,
+                    "profile_id": profile_id,
+                    "profile_digest": profile_digest,
+                    "decision_digest": decision_digest,
+                    "lease_expires_at": lease_expires_at,
+                },
+                event_id=f"evt_agent_tool_started_{invocation_id}",
+                occurred_at=occurred_at,
+                node_id=current.child_node_id,
+                attempt_id=current.child_attempt_id,
+                run_projection=run,
+                node_projection=None,
+                attempt_projection=None,
+            )
+            stored_row = conn.execute(
+                "SELECT * FROM agent_tool_invocations "
+                "WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            assert stored_row is not None
+            stored = self._agent_tool_invocation_from_row(stored_row)
+            return AgentToolExecutionClaim(
+                invocation=stored,
+                owner_id=owner_id,
+                claim_token=claim_token,
+            )
+
+    def complete_agent_tool_invocation(
+        self,
+        claim: AgentToolExecutionClaim,
+        receipt: object,
+        *,
+        result_artifact_ref: ArtifactRef | None,
+        now: float | None = None,
+    ) -> AgentToolInvocationRecord:
+        """Commit one exact terminal receipt and result in the Run chain."""
+
+        from .executor import ToolReceipt
+
+        if (
+            type(claim) is not AgentToolExecutionClaim
+            or type(receipt) is not ToolReceipt
+        ):
+            raise AgentToolInvocationConflict(
+                "agent_tool_claim_mismatch"
+            )
+        occurred_at = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        claim_token_digest = hashlib.sha256(
+            claim.claim_token.encode("utf-8")
+        ).hexdigest()
+        ref = _canonical_agent_tool_result_ref(result_artifact_ref)
+
+        with self._write_transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM agent_tool_invocations "
+                "WHERE invocation_id = ?",
+                (claim.invocation.invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise AgentToolInvocationConflict(
+                    "agent_tool_state_conflict"
+                )
+            current = self._agent_tool_invocation_from_row(row)
+            if (
+                current.owner_id != claim.owner_id
+                or current.claim_token_digest != claim_token_digest
+                or current.invocation_digest
+                != claim.invocation.invocation_digest
+            ):
+                raise AgentToolInvocationConflict(
+                    "agent_tool_claim_mismatch"
+                )
+            if current.is_terminal:
+                stored_receipt = self._agent_tool_receipt_from_row(row)
+                if (
+                    stored_receipt != receipt
+                    or current.result_artifact_ref != ref
+                ):
+                    raise AgentToolInvocationConflict(
+                        "agent_tool_state_conflict"
+                    )
+                return current
+            if current.status is not AttemptStatus.RUNNING:
+                raise AgentToolInvocationConflict(
+                    "agent_tool_state_conflict"
+                )
+            if (
+                occurred_at < current.updated_at
+                or current.lease_expires_at is None
+                or current.lease_expires_at <= occurred_at
+            ):
+                raise AgentToolInvocationConflict(
+                    "agent_tool_claim_mismatch"
+                )
+            _validate_agent_tool_terminal_binding(
+                current,
+                receipt,
+                ref,
+            )
+            receipt_json = _json_dump(receipt.to_dict())
+            ref_json = (
+                None if ref is None else _json_dump(ref.to_dict())
+            )
+            updated = conn.execute(
+                """
+                UPDATE agent_tool_invocations
+                SET status = ?, receipt_digest = ?,
+                    result_artifact_ref_json = ?,
+                    tool_receipt_json = ?, updated_at = ?
+                WHERE invocation_id = ? AND status = 'running'
+                  AND claim_token_digest = ?
+                """,
+                (
+                    receipt.attempt_status.value,
+                    receipt.receipt_digest,
+                    ref_json,
+                    receipt_json,
+                    occurred_at,
+                    current.invocation_id,
+                    claim_token_digest,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise AgentToolInvocationConflict(
+                    "agent_tool_state_conflict"
+                )
+            self._fault("agent_tool.complete.after_update")
+            run_row = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (current.run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise RunNotFoundError(current.run_id)
+            run = self._run_from_row(run_row)
+            self._commit_event_tx(
+                conn,
+                run,
+                f"agent_tool.{receipt.attempt_status.value}",
+                payload={
+                    "kind": "agent_tool_terminal",
+                    "invocation_id": current.invocation_id,
+                    "invocation_digest": current.invocation_digest,
+                    "receipt_digest": receipt.receipt_digest,
+                    "tool_receipt": receipt.to_dict(),
+                    "result_artifact_ref": (
+                        None if ref is None else ref.to_dict()
+                    ),
+                },
+                event_id=(
+                    "evt_agent_tool_terminal_"
+                    f"{current.invocation_id}"
+                ),
+                occurred_at=occurred_at,
+                node_id=current.child_node_id,
+                attempt_id=current.child_attempt_id,
+                run_projection=run,
+                node_projection=None,
+                attempt_projection=None,
+            )
+            stored_row = conn.execute(
+                "SELECT * FROM agent_tool_invocations "
+                "WHERE invocation_id = ?",
+                (current.invocation_id,),
+            ).fetchone()
+            assert stored_row is not None
+            return self._agent_tool_invocation_from_row(stored_row)
+
+    def reject_agent_tool_invocation(
+        self,
+        invocation_id: str,
+        invocation_digest: str,
+        *,
+        action_digest: str,
+        execution_binding_digest: str,
+        effect_class: str,
+        policy_outcome: str,
+        policy_version: str,
+        policy_digest: str,
+        profile_id: str,
+        profile_digest: str,
+        decision_digest: str,
+        now: float | None = None,
+    ) -> AgentToolInvocationRecord:
+        """Durably reject an exact unstarted child before sandbox dispatch."""
+
+        from .executor import ToolReceipt, ToolReceiptVerification
+
+        invocation_id = _agent_tool_text(
+            invocation_id,
+            "invocation_id",
+        )
+        invocation_digest = _sha256_digest(
+            invocation_digest,
+            "invocation_digest",
+        )
+        action_digest = _sha256_digest(action_digest, "action_digest")
+        execution_binding_digest = _sha256_digest(
+            execution_binding_digest,
+            "execution_binding_digest",
+        )
+        effect_class = _agent_tool_effect_class(effect_class)
+        if policy_outcome not in {"deny", "require_approval"}:
+            raise AgentToolInvocationConflict(
+                "agent_tool_binding_mismatch"
+            )
+        policy_digest = _sha256_digest(policy_digest, "policy_digest")
+        if policy_version != f"sha256:{policy_digest}":
+            raise AgentToolInvocationConflict(
+                "agent_tool_binding_mismatch"
+            )
+        profile_id = _agent_tool_text(profile_id, "profile_id")
+        profile_digest = _sha256_digest(
+            profile_digest,
+            "profile_digest",
+        )
+        decision_digest = _sha256_digest(
+            decision_digest,
+            "decision_digest",
+        )
+        occurred_at = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        error_code = (
+            "agent_tool_approval_required"
+            if policy_outcome == "require_approval"
+            else "agent_tool_policy_denied"
+        )
+        absence_reason = (
+            "approval_required_before_backend"
+            if policy_outcome == "require_approval"
+            else "policy_denied_before_backend"
+        )
+
+        with self._write_transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM agent_tool_invocations "
+                "WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise AgentToolInvocationConflict(
+                    "agent_tool_state_conflict"
+                )
+            current = self._agent_tool_invocation_from_row(row)
+            if current.invocation_digest != invocation_digest:
+                raise AgentToolInvocationConflict(
+                    "agent_tool_binding_mismatch"
+                )
+            if current.is_terminal:
+                if (
+                    current.status is AttemptStatus.FAILED
+                    and current.action_digest == action_digest
+                    and current.execution_binding_digest
+                    == execution_binding_digest
+                    and current.effect_class == effect_class
+                    and current.policy_outcome == policy_outcome
+                    and current.policy_version == policy_version
+                    and current.policy_digest == policy_digest
+                    and current.profile_id == profile_id
+                    and current.profile_digest == profile_digest
+                    and current.decision_digest == decision_digest
+                ):
+                    return current
+                raise AgentToolInvocationConflict(
+                    "agent_tool_state_conflict"
+                )
+            if (
+                current.status is not AttemptStatus.SCHEDULED
+                or occurred_at < current.updated_at
+            ):
+                raise AgentToolInvocationConflict("agent_tool_active")
+            run = self._validate_agent_tool_parent_tx(
+                conn,
+                run_id=current.run_id,
+                node_id=current.parent_node_id,
+                attempt_id=current.parent_attempt_id,
+                request_digest=current.request_digest,
+            )
+            receipt = ToolReceipt(
+                run_id=current.run_id,
+                node_id=current.child_node_id,
+                attempt_id=current.child_attempt_id,
+                tool_name=current.tool_name,
+                effect_class=effect_class,
+                attempt_status=AttemptStatus.FAILED,
+                args_digest=current.args_digest,
+                action_digest=action_digest,
+                execution_binding_digest=execution_binding_digest,
+                operation_key_digest=current.operation_key_digest,
+                idempotency_key_digest=current.operation_key_digest,
+                policy_version=policy_version,
+                policy_digest=policy_digest,
+                profile_id=profile_id,
+                profile_digest=profile_digest,
+                verification=ToolReceiptVerification.UNVERIFIED,
+                sandbox_receipt_absence_reason=absence_reason,
+                error_code=error_code,
+            )
+            updated = conn.execute(
+                """
+                UPDATE agent_tool_invocations
+                SET status = 'failed', action_digest = ?,
+                    execution_binding_digest = ?, effect_class = ?,
+                    policy_outcome = ?, policy_version = ?,
+                    policy_digest = ?, profile_id = ?,
+                    profile_digest = ?, decision_digest = ?,
+                    receipt_digest = ?, tool_receipt_json = ?,
+                    updated_at = ?
+                WHERE invocation_id = ? AND status = 'scheduled'
+                  AND invocation_digest = ?
+                """,
+                (
+                    action_digest,
+                    execution_binding_digest,
+                    effect_class,
+                    policy_outcome,
+                    policy_version,
+                    policy_digest,
+                    profile_id,
+                    profile_digest,
+                    decision_digest,
+                    receipt.receipt_digest,
+                    _json_dump(receipt.to_dict()),
+                    occurred_at,
+                    invocation_id,
+                    invocation_digest,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise AgentToolInvocationConflict("agent_tool_active")
+            self._fault("agent_tool.reject.after_update")
+            self._commit_event_tx(
+                conn,
+                run,
+                "agent_tool.failed",
+                payload={
+                    "kind": "agent_tool_terminal",
+                    "invocation_id": current.invocation_id,
+                    "invocation_digest": current.invocation_digest,
+                    "policy_outcome": policy_outcome,
+                    "decision_digest": decision_digest,
+                    "receipt_digest": receipt.receipt_digest,
+                    "tool_receipt": receipt.to_dict(),
+                    "result_artifact_ref": None,
+                },
+                event_id=(
+                    "evt_agent_tool_terminal_"
+                    f"{current.invocation_id}"
+                ),
+                occurred_at=occurred_at,
+                node_id=current.child_node_id,
+                attempt_id=current.child_attempt_id,
+                run_projection=run,
+                node_projection=None,
+                attempt_projection=None,
+            )
+            stored_row = conn.execute(
+                "SELECT * FROM agent_tool_invocations "
+                "WHERE invocation_id = ?",
+                (current.invocation_id,),
+            ).fetchone()
+            assert stored_row is not None
+            return self._agent_tool_invocation_from_row(stored_row)
+
+    def abandon_scheduled_agent_tool_invocation(
+        self,
+        invocation_id: str,
+        invocation_digest: str,
+        *,
+        now: float | None = None,
+    ) -> AgentToolInvocationRecord:
+        """Close a child that failed before any execution authority existed."""
+
+        invocation_id = _agent_tool_text(
+            invocation_id,
+            "invocation_id",
+        )
+        invocation_digest = _sha256_digest(
+            invocation_digest,
+            "invocation_digest",
+        )
+        occurred_at = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        with self._write_transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM agent_tool_invocations "
+                "WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise AgentToolInvocationConflict(
+                    "agent_tool_state_conflict"
+                )
+            current = self._agent_tool_invocation_from_row(row)
+            if current.invocation_digest != invocation_digest:
+                raise AgentToolInvocationConflict(
+                    "agent_tool_binding_mismatch"
+                )
+            if (
+                current.status is AttemptStatus.ABANDONED
+                and current.action_digest is None
+            ):
+                return current
+            if (
+                current.status is not AttemptStatus.SCHEDULED
+                or occurred_at < current.updated_at
+            ):
+                raise AgentToolInvocationConflict(
+                    "agent_tool_state_conflict"
+                )
+            run = self._validate_agent_tool_parent_tx(
+                conn,
+                run_id=current.run_id,
+                node_id=current.parent_node_id,
+                attempt_id=current.parent_attempt_id,
+                request_digest=current.request_digest,
+            )
+            stored, _run = self._abandon_scheduled_agent_tool_tx(
+                conn,
+                run,
+                current,
+                occurred_at=occurred_at,
+                recovery_reason="preflight_failed",
+            )
+            return stored
+
+    def expire_agent_tool_invocation(
+        self,
+        invocation_id: str,
+        invocation_digest: str,
+        *,
+        now: float | None = None,
+    ) -> AgentToolInvocationRecord:
+        """Resolve an expired RUNNING child without trusting worker output."""
+
+        invocation_id = _agent_tool_text(
+            invocation_id,
+            "invocation_id",
+        )
+        invocation_digest = _sha256_digest(
+            invocation_digest,
+            "invocation_digest",
+        )
+        occurred_at = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        with self._write_transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM agent_tool_invocations "
+                "WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise AgentToolInvocationConflict(
+                    "agent_tool_state_conflict"
+                )
+            current = self._agent_tool_invocation_from_row(row)
+            if current.invocation_digest != invocation_digest:
+                raise AgentToolInvocationConflict(
+                    "agent_tool_binding_mismatch"
+                )
+            if current.is_terminal:
+                return current
+            if (
+                current.status is not AttemptStatus.RUNNING
+                or current.lease_expires_at is None
+                or current.lease_expires_at > occurred_at
+            ):
+                raise AgentToolInvocationConflict(
+                    "agent_tool_active"
+                )
+            run_row = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (current.run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise RunNotFoundError(current.run_id)
+            run = self._run_from_row(run_row)
+            stored, _run = self._expire_agent_tool_tx(
+                conn,
+                run,
+                current,
+                occurred_at=occurred_at,
+                recovery_reason="lease_expired",
+            )
+            return stored
+
+    def _abandon_scheduled_agent_tool_tx(
+        self,
+        conn: sqlite3.Connection,
+        run: RunRecord,
+        current: AgentToolInvocationRecord,
+        *,
+        occurred_at: float,
+        recovery_reason: str,
+    ) -> tuple[AgentToolInvocationRecord, RunRecord]:
+        updated = conn.execute(
+            """
+            UPDATE agent_tool_invocations
+            SET status = 'abandoned', updated_at = ?
+            WHERE invocation_id = ? AND status = 'scheduled'
+              AND invocation_digest = ?
+            """,
+            (
+                occurred_at,
+                current.invocation_id,
+                current.invocation_digest,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise AgentToolInvocationConflict(
+                "agent_tool_state_conflict"
+            )
+        self._fault("agent_tool.abandon_scheduled.after_update")
+        self._commit_event_tx(
+            conn,
+            run,
+            "agent_tool.abandoned",
+            payload={
+                "kind": "agent_tool_terminal",
+                "invocation_id": current.invocation_id,
+                "invocation_digest": current.invocation_digest,
+                "receipt_digest": None,
+                "tool_receipt": None,
+                "result_artifact_ref": None,
+                "recovery_reason": recovery_reason,
+            },
+            event_id=(
+                "evt_agent_tool_terminal_"
+                f"{current.invocation_id}"
+            ),
+            occurred_at=occurred_at,
+            node_id=current.child_node_id,
+            attempt_id=current.child_attempt_id,
+            run_projection=run,
+            node_projection=None,
+            attempt_projection=None,
+        )
+        return self._agent_tool_state_after_event_tx(conn, current)
+
+    def _expire_agent_tool_tx(
+        self,
+        conn: sqlite3.Connection,
+        run: RunRecord,
+        current: AgentToolInvocationRecord,
+        *,
+        occurred_at: float,
+        recovery_reason: str,
+    ) -> tuple[AgentToolInvocationRecord, RunRecord]:
+        from .executor import ToolReceipt, ToolReceiptVerification
+
+        receipt = ToolReceipt(
+            run_id=current.run_id,
+            node_id=current.child_node_id,
+            attempt_id=current.child_attempt_id,
+            tool_name=current.tool_name,
+            effect_class=current.effect_class,
+            attempt_status=AttemptStatus.OUTCOME_UNKNOWN,
+            args_digest=current.args_digest,
+            action_digest=current.action_digest,
+            execution_binding_digest=current.execution_binding_digest,
+            operation_key_digest=current.operation_key_digest,
+            idempotency_key_digest=current.operation_key_digest,
+            policy_version=current.policy_version,
+            policy_digest=current.policy_digest,
+            profile_id=current.profile_id,
+            profile_digest=current.profile_digest,
+            verification=ToolReceiptVerification.UNVERIFIED,
+            sandbox_receipt_absence_reason="agent_tool_lease_expired",
+            error_code="agent_tool_lease_expired",
+        )
+        updated = conn.execute(
+            """
+            UPDATE agent_tool_invocations
+            SET status = 'outcome_unknown', receipt_digest = ?,
+                tool_receipt_json = ?, updated_at = ?
+            WHERE invocation_id = ? AND status = 'running'
+              AND invocation_digest = ? AND lease_expires_at <= ?
+            """,
+            (
+                receipt.receipt_digest,
+                _json_dump(receipt.to_dict()),
+                occurred_at,
+                current.invocation_id,
+                current.invocation_digest,
+                occurred_at,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise AgentToolInvocationConflict("agent_tool_active")
+        self._fault("agent_tool.expire.after_update")
+        self._commit_event_tx(
+            conn,
+            run,
+            "agent_tool.outcome_unknown",
+            payload={
+                "kind": "agent_tool_terminal",
+                "invocation_id": current.invocation_id,
+                "invocation_digest": current.invocation_digest,
+                "receipt_digest": receipt.receipt_digest,
+                "tool_receipt": receipt.to_dict(),
+                "result_artifact_ref": None,
+                "recovery_reason": recovery_reason,
+            },
+            event_id=(
+                "evt_agent_tool_terminal_"
+                f"{current.invocation_id}"
+            ),
+            occurred_at=occurred_at,
+            node_id=current.child_node_id,
+            attempt_id=current.child_attempt_id,
+            run_projection=run,
+            node_projection=None,
+            attempt_projection=None,
+        )
+        return self._agent_tool_state_after_event_tx(conn, current)
+
+    def _agent_tool_state_after_event_tx(
+        self,
+        conn: sqlite3.Connection,
+        current: AgentToolInvocationRecord,
+    ) -> tuple[AgentToolInvocationRecord, RunRecord]:
+        stored_row = conn.execute(
+            "SELECT * FROM agent_tool_invocations "
+            "WHERE invocation_id = ?",
+            (current.invocation_id,),
+        ).fetchone()
+        run_row = conn.execute(
+            "SELECT * FROM runs WHERE run_id = ?",
+            (current.run_id,),
+        ).fetchone()
+        assert stored_row is not None and run_row is not None
+        return (
+            self._agent_tool_invocation_from_row(stored_row),
+            self._run_from_row(run_row),
+        )
+
+    def _resolve_agent_tool_children_for_parent_recovery_tx(
+        self,
+        conn: sqlite3.Connection,
+        run: RunRecord,
+        parent_attempt_id: str,
+        *,
+        occurred_at: float,
+    ) -> tuple[RunRecord, bool]:
+        rows = conn.execute(
+            """
+            SELECT * FROM agent_tool_invocations
+            WHERE run_id = ? AND parent_attempt_id = ?
+              AND status IN ('scheduled', 'running')
+            ORDER BY sequence
+            """,
+            (run.run_id, parent_attempt_id),
+        ).fetchall()
+        child_outcome_unknown = False
+        for row in rows:
+            child = self._agent_tool_invocation_from_row(row)
+            if child.status is AttemptStatus.SCHEDULED:
+                _stored, run = self._abandon_scheduled_agent_tool_tx(
+                    conn,
+                    run,
+                    child,
+                    occurred_at=occurred_at,
+                    recovery_reason="parent_lease_expired",
+                )
+                continue
+            if (
+                child.lease_expires_at is None
+                or child.lease_expires_at > occurred_at
+            ):
+                raise InvalidStateTransition(
+                    "expired Agent parent retains a live Tool invocation"
+                )
+            _stored, run = self._expire_agent_tool_tx(
+                conn,
+                run,
+                child,
+                occurred_at=occurred_at,
+                recovery_reason="parent_lease_expired",
+            )
+            child_outcome_unknown = True
+        return run, child_outcome_unknown
+
+    def get_agent_tool_invocation(
+        self,
+        invocation_id: str,
+    ) -> AgentToolInvocationRecord | None:
+        invocation_id = _agent_tool_text(
+            invocation_id,
+            "invocation_id",
+        )
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM agent_tool_invocations "
+                "WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else self._agent_tool_invocation_from_row(row)
+        )
+
     def get_activity_policy_event(
         self,
         run_id: str,
@@ -5585,6 +6852,7 @@ class DurableRunStore:
     ) -> "ToolReceipt | None":
         """Read and fully verify the latest durable Tool terminal receipt."""
 
+        dynamic_row = None
         with closing(self._connect()) as conn:
             row = conn.execute(
                 """
@@ -5603,8 +6871,31 @@ class DurableRunStore:
                 """,
                 (run_id, attempt_id),
             ).fetchone()
+            if row is None:
+                dynamic_row = conn.execute(
+                    """
+                    SELECT * FROM agent_tool_invocations
+                    WHERE run_id = ? AND child_attempt_id = ?
+                    """,
+                    (run_id, attempt_id),
+                ).fetchone()
         if row is None:
-            return None
+            if dynamic_row is None:
+                return None
+            record = self._agent_tool_invocation_from_row(dynamic_row)
+            if not record.is_terminal:
+                return None
+            receipt = self._agent_tool_receipt_from_row(dynamic_row)
+            if receipt is None:
+                if (
+                    record.status is AttemptStatus.ABANDONED
+                    and record.action_digest is None
+                ):
+                    return None
+                raise StoreSchemaError(
+                    "durable Agent Tool receipt is missing"
+                )
+            return receipt
         event = self._event_from_row(row)
         raw_receipt = event.payload.get("tool_receipt")
         raw_digest = event.payload.get("tool_receipt_digest")
@@ -7979,8 +9270,26 @@ class DurableRunStore:
                         "Activity deadline changed or has not elapsed"
                     )
 
-            effective_resolution = resolution
-            if expiry_reason == "lease" and run.status is RunStatus.CANCELLING:
+            child_outcome_unknown = False
+            if attempt.activity_kind == "agent":
+                run, child_outcome_unknown = (
+                    self._resolve_agent_tool_children_for_parent_recovery_tx(
+                        conn,
+                        run,
+                        attempt.attempt_id,
+                        occurred_at=current_time,
+                    )
+                )
+            effective_resolution = (
+                "waiting_recovery"
+                if child_outcome_unknown
+                else resolution
+            )
+            if (
+                not child_outcome_unknown
+                and expiry_reason == "lease"
+                and run.status is RunStatus.CANCELLING
+            ):
                 effective_resolution = "cancelled"
             if effective_resolution in {
                 "abandon_ready",
@@ -9041,6 +10350,28 @@ class DurableRunStore:
                 raise ProjectionConflictError(
                     "deadline transition does not match persisted active state"
                 )
+        if (
+            attempt_projection is not None
+            and attempt_projection.activity_kind == "agent"
+            and attempt_projection.status.is_terminal
+        ):
+            active_child = conn.execute(
+                """
+                SELECT 1 FROM agent_tool_invocations
+                WHERE run_id = ? AND parent_attempt_id = ?
+                  AND status IN ('scheduled', 'running')
+                LIMIT 1
+                """,
+                (
+                    current_run.run_id,
+                    attempt_projection.attempt_id,
+                ),
+            ).fetchone()
+            if active_child is not None:
+                raise InvalidStateTransition(
+                    "terminal Agent Attempt cannot retain an active "
+                    "Tool invocation"
+                )
         self._validate_event_projection_binding(
             event_type,
             run_projection,
@@ -9237,6 +10568,23 @@ class DurableRunStore:
         if active_attempts:
             raise InvalidStateTransition(
                 f"terminal Run cannot retain {len(active_attempts)} active Attempt(s)"
+            )
+        active_agent_tools = conn.execute(
+            """
+            SELECT COUNT(*) AS active_count
+            FROM agent_tool_invocations
+            WHERE run_id = ? AND status IN ('scheduled', 'running')
+            """,
+            (run.run_id,),
+        ).fetchone()
+        assert active_agent_tools is not None
+        active_agent_tool_count = int(
+            active_agent_tools["active_count"]
+        )
+        if active_agent_tool_count:
+            raise InvalidStateTransition(
+                "terminal Run cannot retain "
+                f"{active_agent_tool_count} active Agent Tool invocation(s)"
             )
         nonterminal_nodes = [node for node in nodes.values() if not node.status.is_terminal]
         if nonterminal_nodes:
@@ -9636,6 +10984,173 @@ class DurableRunStore:
         )
 
     @staticmethod
+    def _validate_agent_tool_parent_tx(
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        node_id: str,
+        attempt_id: str,
+        request_digest: str,
+    ) -> RunRecord:
+        row = conn.execute(
+            """
+            SELECT
+                run.*,
+                node.status AS parent_node_status,
+                node.node_type AS parent_node_type,
+                attempt.status AS parent_attempt_status,
+                attempt.activity_kind AS parent_activity_kind,
+                attempt.node_id AS parent_attempt_node_id,
+                attempt.metadata_json AS parent_attempt_metadata
+            FROM runs AS run
+            LEFT JOIN node_runs AS node
+              ON node.run_id = run.run_id AND node.node_id = ?
+            LEFT JOIN attempts AS attempt
+              ON attempt.run_id = run.run_id
+             AND attempt.attempt_id = ?
+            WHERE run.run_id = ?
+            """,
+            (node_id, attempt_id, run_id),
+        ).fetchone()
+        if row is None:
+            raise AgentToolInvocationConflict(
+                "agent_tool_parent_inactive"
+            )
+        try:
+            metadata = _json_load(row["parent_attempt_metadata"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise AgentToolInvocationConflict(
+                "agent_tool_parent_inactive"
+            ) from None
+        if (
+            row["status"] != RunStatus.RUNNING.value
+            or row["parent_node_status"] != NodeStatus.RUNNING.value
+            or row["parent_node_type"] != "agent"
+            or row["parent_attempt_status"]
+            != AttemptStatus.RUNNING.value
+            or row["parent_activity_kind"] != "agent"
+            or row["parent_attempt_node_id"] != node_id
+            or not isinstance(metadata, dict)
+            or metadata.get("request_hash") != request_digest
+        ):
+            raise AgentToolInvocationConflict(
+                "agent_tool_parent_inactive"
+            )
+        return DurableRunStore._run_from_row(row)
+
+    @staticmethod
+    def _agent_tool_invocation_from_row(
+        row: sqlite3.Row,
+    ) -> AgentToolInvocationRecord:
+        try:
+            raw_ref = row["result_artifact_ref_json"]
+            ref = (
+                None
+                if raw_ref is None
+                else ArtifactRef.from_dict(_json_load(raw_ref))
+            )
+            if ref is not None and _json_dump(ref.to_dict()) != raw_ref:
+                raise ValueError("noncanonical result ArtifactRef")
+            record = AgentToolInvocationRecord(
+                schema_version=row["schema_version"],
+                invocation_id=row["invocation_id"],
+                run_id=row["run_id"],
+                parent_node_id=row["parent_node_id"],
+                parent_attempt_id=row["parent_attempt_id"],
+                sequence=row["sequence"],
+                turn=row["turn"],
+                child_node_id=row["child_node_id"],
+                child_attempt_id=row["child_attempt_id"],
+                tool_name=row["tool_name"],
+                tool_call_id_digest=row["tool_call_id_digest"],
+                request_digest=row["request_digest"],
+                request_artifact_digest=(
+                    row["request_artifact_digest"]
+                ),
+                invocation_digest=row["invocation_digest"],
+                args_digest=row["args_digest"],
+                operation_key_digest=row["operation_key_digest"],
+                sensitivity=row["sensitivity"],
+                status=row["status"],
+                owner_id=row["owner_id"],
+                claim_token_digest=row["claim_token_digest"],
+                action_digest=row["action_digest"],
+                execution_binding_digest=(
+                    row["execution_binding_digest"]
+                ),
+                effect_class=row["effect_class"],
+                policy_outcome=row["policy_outcome"],
+                policy_version=row["policy_version"],
+                policy_digest=row["policy_digest"],
+                profile_id=row["profile_id"],
+                profile_digest=row["profile_digest"],
+                decision_digest=row["decision_digest"],
+                lease_expires_at=row["lease_expires_at"],
+                receipt_digest=row["receipt_digest"],
+                result_artifact_ref=ref,
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+            _validate_agent_tool_record(record)
+            receipt = DurableRunStore._agent_tool_receipt_from_row(row)
+            if record.is_terminal:
+                unstarted_abandonment = (
+                    record.status is AttemptStatus.ABANDONED
+                    and record.action_digest is None
+                )
+                if receipt is None and not unstarted_abandonment:
+                    raise ValueError("terminal invocation has no receipt")
+                if receipt is not None:
+                    _validate_agent_tool_terminal_binding(
+                        record,
+                        receipt,
+                        ref,
+                    )
+            elif receipt is not None:
+                raise ValueError("active invocation has a receipt")
+            return record
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise StoreSchemaError(
+                "Agent Tool invocation projection is malformed"
+            ) from exc
+
+    @staticmethod
+    def _agent_tool_receipt_from_row(
+        row: sqlite3.Row,
+    ) -> "ToolReceipt | None":
+        raw_receipt = row["tool_receipt_json"]
+        raw_digest = row["receipt_digest"]
+        if raw_receipt is None and raw_digest is None:
+            return None
+        if not isinstance(raw_receipt, str):
+            raise StoreSchemaError(
+                "Agent Tool invocation receipt is malformed"
+            )
+        try:
+            from .executor import ToolReceipt
+
+            payload = _json_load(raw_receipt)
+            if not isinstance(payload, dict):
+                raise ValueError("receipt is not an object")
+            receipt = ToolReceipt.from_dict(payload)
+            if (
+                _json_dump(receipt.to_dict()) != raw_receipt
+                or receipt.receipt_digest
+                != _sha256_digest(raw_digest, "receipt_digest")
+            ):
+                raise ValueError("receipt binding mismatch")
+            return receipt
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise StoreSchemaError(
+                "Agent Tool invocation receipt is malformed"
+            ) from exc
+
+    @staticmethod
     def _event_from_row(row: sqlite3.Row) -> EventRecord:
         payload = _json_load(row["payload_json"])
         if row["content_digest"] != _content_digest(payload):
@@ -9753,6 +11268,349 @@ class DurableRunStore:
             completed_at=row["completed_at"],
             schema_version=row["schema_version"],
         )
+
+
+def _agent_tool_text(value: Any, field_name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 255
+        or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in value
+        )
+    ):
+        raise AgentToolInvocationConflict(
+            "agent_tool_binding_mismatch"
+        )
+    return value
+
+
+def _agent_tool_effect_class(value: Any) -> str:
+    if value not in {
+        "read_only",
+        "idempotent_write",
+        "non_idempotent_write",
+        "destructive",
+    }:
+        raise AgentToolInvocationConflict(
+            "agent_tool_binding_mismatch"
+        )
+    return str(value)
+
+
+def _agent_tool_lease_seconds(value: Any) -> float:
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        raise AgentToolInvocationConflict(
+            "agent_tool_binding_mismatch"
+        ) from None
+    if (
+        not math.isfinite(duration)
+        or duration <= 0
+        or duration > MAX_AGENT_TOOL_LEASE_SECONDS
+    ):
+        raise AgentToolInvocationConflict(
+            "agent_tool_binding_mismatch"
+        )
+    return duration
+
+
+def _agent_tool_request_matches_record(
+    request: object,
+    record: AgentToolInvocationRecord,
+    *,
+    operation_key_digest: str,
+) -> bool:
+    return (
+        request.run_id == record.run_id
+        and request.node_id == record.parent_node_id
+        and request.attempt_id == record.parent_attempt_id
+        and request.sequence == record.sequence
+        and request.turn == record.turn
+        and request.tool_name == record.tool_name
+        and request.tool_call_id_digest
+        == record.tool_call_id_digest
+        and request.request_digest == record.request_digest
+        and request.request_artifact_digest
+        == record.request_artifact_digest
+        and request.invocation_digest == record.invocation_digest
+        and request.args_digest == record.args_digest
+        and operation_key_digest == record.operation_key_digest
+        and request.sensitivity is record.sensitivity
+    )
+
+
+def _validate_agent_tool_record(
+    record: AgentToolInvocationRecord,
+) -> None:
+    if (
+        record.schema_version
+        != AGENT_TOOL_INVOCATION_SCHEMA_VERSION
+        or any(
+            _agent_tool_text(value, field_name) != value
+            for field_name, value in (
+                ("invocation_id", record.invocation_id),
+                ("run_id", record.run_id),
+                ("parent_node_id", record.parent_node_id),
+                ("parent_attempt_id", record.parent_attempt_id),
+                ("child_node_id", record.child_node_id),
+                ("child_attempt_id", record.child_attempt_id),
+                ("tool_name", record.tool_name),
+            )
+        )
+        or isinstance(record.sequence, bool)
+        or not isinstance(record.sequence, int)
+        or not 1
+        <= record.sequence
+        <= MAX_AGENT_TOOL_INVOCATIONS_PER_ATTEMPT
+        or isinstance(record.turn, bool)
+        or not isinstance(record.turn, int)
+        or not 1 <= record.turn <= 1_000_000
+    ):
+        raise ValueError("invalid Agent Tool identity")
+    for field_name in (
+        "tool_call_id_digest",
+        "request_digest",
+        "request_artifact_digest",
+        "invocation_digest",
+        "args_digest",
+        "operation_key_digest",
+    ):
+        _sha256_digest(getattr(record, field_name), field_name)
+    try:
+        sensitivity = ArtifactSensitivity(record.sensitivity)
+        status = AttemptStatus(record.status)
+    except ValueError as exc:
+        raise ValueError("invalid Agent Tool state") from exc
+    if (
+        sensitivity
+        not in {
+            ArtifactSensitivity.SENSITIVE,
+            ArtifactSensitivity.SECRET,
+        }
+        or status
+        not in {
+            AttemptStatus.SCHEDULED,
+            AttemptStatus.RUNNING,
+            AttemptStatus.SUCCEEDED,
+            AttemptStatus.FAILED,
+            AttemptStatus.TIMED_OUT,
+            AttemptStatus.CANCELLED,
+            AttemptStatus.ABANDONED,
+            AttemptStatus.OUTCOME_UNKNOWN,
+        }
+    ):
+        raise ValueError("invalid Agent Tool state")
+    created_at = _finite_timestamp(record.created_at, "created_at")
+    updated_at = _finite_timestamp(record.updated_at, "updated_at")
+    if updated_at < created_at:
+        raise ValueError("Agent Tool timestamp order is invalid")
+
+    execution_binding = (
+        record.action_digest,
+        record.execution_binding_digest,
+        record.effect_class,
+        record.policy_outcome,
+        record.policy_version,
+        record.policy_digest,
+        record.profile_id,
+        record.profile_digest,
+        record.decision_digest,
+    )
+    if status is AttemptStatus.SCHEDULED:
+        if any(value is not None for value in execution_binding) or any(
+            value is not None
+            for value in (
+                record.owner_id,
+                record.claim_token_digest,
+                record.lease_expires_at,
+                record.receipt_digest,
+                record.result_artifact_ref,
+            )
+        ):
+            raise ValueError("scheduled Agent Tool has authority")
+        return
+    if (
+        status is AttemptStatus.ABANDONED
+        and all(value is None for value in execution_binding)
+    ):
+        if any(
+            value is not None
+            for value in (
+                record.owner_id,
+                record.claim_token_digest,
+                record.lease_expires_at,
+                record.receipt_digest,
+                record.result_artifact_ref,
+            )
+        ):
+            raise ValueError("unstarted Agent Tool abandonment is invalid")
+        return
+    if any(value is None for value in execution_binding):
+        raise ValueError("resolved Agent Tool lacks an execution binding")
+    _sha256_digest(record.action_digest, "action_digest")
+    _sha256_digest(
+        record.execution_binding_digest,
+        "execution_binding_digest",
+    )
+    _agent_tool_effect_class(record.effect_class)
+    policy_digest = _sha256_digest(
+        record.policy_digest,
+        "policy_digest",
+    )
+    if record.policy_version != f"sha256:{policy_digest}":
+        raise ValueError("Agent Tool policy binding is invalid")
+    _agent_tool_text(record.profile_id, "profile_id")
+    _sha256_digest(record.profile_digest, "profile_digest")
+    _sha256_digest(record.decision_digest, "decision_digest")
+
+    if record.policy_outcome in {"deny", "require_approval"}:
+        if (
+            status is not AttemptStatus.FAILED
+            or record.owner_id is not None
+            or record.claim_token_digest is not None
+            or record.lease_expires_at is not None
+            or record.result_artifact_ref is not None
+        ):
+            raise ValueError("rejected Agent Tool has invalid authority")
+        _sha256_digest(record.receipt_digest, "receipt_digest")
+        return
+    if record.policy_outcome != "allow":
+        raise ValueError("started Agent Tool is not allowed")
+    _agent_tool_text(record.owner_id, "owner_id")
+    _sha256_digest(record.claim_token_digest, "claim_token_digest")
+    lease_expires_at = _finite_timestamp(
+        record.lease_expires_at,
+        "lease_expires_at",
+    )
+    if lease_expires_at <= record.created_at:
+        raise ValueError("Agent Tool lease is invalid")
+    if status is AttemptStatus.RUNNING:
+        if (
+            record.receipt_digest is not None
+            or record.result_artifact_ref is not None
+        ):
+            raise ValueError("running Agent Tool has terminal result")
+        return
+    _sha256_digest(record.receipt_digest, "receipt_digest")
+    if (status is AttemptStatus.SUCCEEDED) != (
+        record.result_artifact_ref is not None
+    ):
+        raise ValueError("Agent Tool terminal result presence is invalid")
+
+
+def _canonical_agent_tool_result_ref(
+    value: ArtifactRef | None,
+) -> ArtifactRef | None:
+    if value is None:
+        return None
+    try:
+        if type(value) is not ArtifactRef:
+            raise ValueError
+        return ArtifactRef.from_dict(value.to_dict())
+    except (TypeError, ValueError):
+        raise AgentToolInvocationConflict(
+            "agent_tool_receipt_invalid"
+        ) from None
+
+
+def _validate_agent_tool_terminal_binding(
+    record: AgentToolInvocationRecord,
+    receipt: object,
+    result_ref: ArtifactRef | None,
+) -> None:
+    from .agent_tool_result import (
+        AgentToolResultArtifactStore,
+        AgentToolResultError,
+    )
+    from .executor import ToolReceipt
+
+    if type(receipt) is not ToolReceipt:
+        raise AgentToolInvocationConflict(
+            "agent_tool_receipt_invalid"
+        )
+    expected_status = (
+        record.status
+        if record.status.is_terminal
+        else receipt.attempt_status
+    )
+    if (
+        receipt.run_id != record.run_id
+        or receipt.node_id != record.child_node_id
+        or receipt.attempt_id != record.child_attempt_id
+        or receipt.tool_name != record.tool_name
+        or receipt.args_digest != record.args_digest
+        or receipt.operation_key_digest
+        != record.operation_key_digest
+        or receipt.idempotency_key_digest
+        != record.operation_key_digest
+        or receipt.action_digest != record.action_digest
+        or receipt.execution_binding_digest
+        != record.execution_binding_digest
+        or receipt.effect_class.value != record.effect_class
+        or receipt.policy_version != record.policy_version
+        or receipt.policy_digest != record.policy_digest
+        or receipt.profile_id != record.profile_id
+        or receipt.profile_digest != record.profile_digest
+        or receipt.attempt_status is not expected_status
+    ):
+        raise AgentToolInvocationConflict(
+            "agent_tool_receipt_invalid"
+        )
+    if receipt.attempt_status is AttemptStatus.SUCCEEDED:
+        try:
+            if result_ref is None:
+                raise AgentToolResultError(
+                    "agent_tool_result_artifact_invalid"
+                )
+            AgentToolResultArtifactStore.validate_ref(result_ref)
+        except AgentToolResultError:
+            raise AgentToolInvocationConflict(
+                "agent_tool_receipt_invalid"
+            ) from None
+        if (
+            result_ref.producer_run_id != record.run_id
+            or result_ref.producer_node_id != record.child_node_id
+            or result_ref.producer_attempt_id
+            != record.child_attempt_id
+            or _artifact_sensitivity_rank(result_ref.sensitivity)
+            < _artifact_sensitivity_rank(record.sensitivity)
+            or receipt.sandbox_receipt is None
+        ):
+            raise AgentToolInvocationConflict(
+                "agent_tool_receipt_invalid"
+            )
+        identity = {
+            "artifact_id": result_ref.artifact_id,
+            "sha256": result_ref.sha256,
+            "size": result_ref.size,
+            "kind": result_ref.kind.value,
+        }
+        output_refs = receipt.sandbox_receipt.get(
+            "output_artifact_refs"
+        )
+        if (
+            not isinstance(output_refs, list)
+            or output_refs.count(identity) != 1
+        ):
+            raise AgentToolInvocationConflict(
+                "agent_tool_receipt_invalid"
+            )
+    elif result_ref is not None:
+        raise AgentToolInvocationConflict(
+            "agent_tool_receipt_invalid"
+        )
+
+
+def _artifact_sensitivity_rank(value: ArtifactSensitivity) -> int:
+    return {
+        ArtifactSensitivity.PUBLIC: 0,
+        ArtifactSensitivity.INTERNAL: 1,
+        ArtifactSensitivity.SENSITIVE: 2,
+        ArtifactSensitivity.SECRET: 3,
+    }[ArtifactSensitivity(value)]
 
 
 def _bounded_limit(value: int, *, maximum: int) -> int:

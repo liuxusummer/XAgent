@@ -228,8 +228,8 @@ prompt、bearer、provider credential 或证据原文；每个 invocation 最多
   的 invoker。
 - typed provider receipt、Agent manifest v2、Core Loop observer 与 reference
   `DurableAgentProviderClient` 已完成 provider 子链组合；Tool 消费 Handler 已能接纳 durable
-  receipt/result，但动态 child authority、manifest/checkpoint staging、终态原子提交和生产
-  接纳状态机尚未完成。
+  receipt/result，本地 reference 动态 child authority 与 lease recovery 也已实现，但远程
+  Worker 组合、manifest/checkpoint staging、父终态原子提交和生产接纳状态机尚未完成。
 
 生产 remote Agent 仍必须提供经过验证的 upstream idempotency/operation ledger、
 经过 attestation 的 ProviderInvoker 和完整远程 Agent runtime。未完成前禁止把

@@ -37,7 +37,10 @@ from src.orchestration import (
     UnknownOutcomeResolution,
     WorkflowBindingConflictError,
 )
-from src.orchestration.store import ConcurrentProjectionUpdate
+from src.orchestration.store import (
+    ConcurrentProjectionUpdate,
+    STORE_SCHEMA_VERSION,
+)
 
 TEST_DEFINITION_DIGEST = "a" * 64
 
@@ -58,6 +61,7 @@ class DurableRunStoreTests(unittest.TestCase):
                 DROP TRIGGER attempts_fleet_route_insert;
                 DROP TRIGGER attempts_fleet_route_update;
                 DROP TABLE fleet_run_routes;
+                DROP TABLE agent_tool_invocations;
                 DROP TRIGGER attempts_fleet_ownership_insert;
                 DROP TRIGGER attempts_fleet_ownership_update;
                 DROP TABLE fleet_shard_owners;
@@ -2554,6 +2558,7 @@ class DurableRunStoreTests(unittest.TestCase):
                 DROP TRIGGER attempts_fleet_route_insert;
                 DROP TRIGGER attempts_fleet_route_update;
                 DROP TABLE fleet_run_routes;
+                DROP TABLE agent_tool_invocations;
                 DELETE FROM schema_migrations WHERE version >= 7;
                 PRAGMA user_version = 6;
                 """
@@ -2582,7 +2587,7 @@ class DurableRunStoreTests(unittest.TestCase):
                     """
                 )
             }
-        self.assertEqual(version, 8)
+        self.assertEqual(version, STORE_SCHEMA_VERSION)
         self.assertEqual(
             triggers,
             {
@@ -2619,6 +2624,7 @@ class DurableRunStoreTests(unittest.TestCase):
                 DROP TRIGGER attempts_fleet_route_insert;
                 DROP TRIGGER attempts_fleet_route_update;
                 DROP TABLE fleet_run_routes;
+                DROP TABLE agent_tool_invocations;
                 DELETE FROM schema_migrations WHERE version >= 3;
                 PRAGMA user_version = 2;
                 """
@@ -2642,7 +2648,7 @@ class DurableRunStoreTests(unittest.TestCase):
                 "SELECT first_run_id FROM artifact_references WHERE sha256 = ?",
                 (ref.sha256,),
             ).fetchone()
-        self.assertEqual(version, 8)
+        self.assertEqual(version, STORE_SCHEMA_VERSION)
         self.assertEqual(indexed[0], "migration-ref-run")
 
     def test_version_three_migration_rejects_legacy_raw_run_input(self) -> None:
@@ -2687,6 +2693,7 @@ class DurableRunStoreTests(unittest.TestCase):
                 DROP TRIGGER attempts_fleet_route_insert;
                 DROP TRIGGER attempts_fleet_route_update;
                 DROP TABLE fleet_run_routes;
+                DROP TABLE agent_tool_invocations;
                 DELETE FROM schema_migrations WHERE version >= 5;
                 PRAGMA user_version = 4;
                 """
@@ -2716,7 +2723,7 @@ class DurableRunStoreTests(unittest.TestCase):
                     """
                 )
             }
-        self.assertEqual(version, 8)
+        self.assertEqual(version, STORE_SCHEMA_VERSION)
         self.assertEqual(
             triggers,
             {
@@ -3197,7 +3204,7 @@ class DurableRunStoreTests(unittest.TestCase):
             indexes = {
                 row[1] for row in conn.execute("PRAGMA index_list(attempts)")
             }
-        self.assertEqual(version, 8)
+        self.assertEqual(version, STORE_SCHEMA_VERSION)
         self.assertIn("content_digest", event_columns)
         self.assertIn("intent_digest", event_columns)
         self.assertIn("schema_version", idempotency_columns)

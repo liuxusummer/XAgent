@@ -3,7 +3,8 @@
 > 审查对象：`DurableAgentToolHandler`、`AgentToolInvocationRequest`、
 > `AgentToolResult` Artifact 以及 Agent Loop/collector 组合边界。
 >
-> 结论：消费/组合边界通过三轮审查；动态 child authority issuer 和 Agent 终态事务尚未实现，
+> 结论：消费/组合边界通过三轮审查；后续 `DurableAgentToolExecutor` 已补齐本地 reference
+> 动态 child authority，但 Agent 终态事务与远程生产隔离尚未实现，
 > `production_security_ready=false`，remote `agent` capability 保持关闭。
 
 ## Round 1：父绑定、参数与调用顺序
@@ -116,8 +117,8 @@ Round 3：通过。
 ## 残余风险
 
 - 测试 `_ReceiptStore` 是 Store 消费边界 fixture，不是动态 authority 的替代实现。
-- operation key 唯一性已被 Handler/collector 验证，但 child claim 的生成和 policy grant 必须由
-  下一阶段 durable issuer 实现。
+- operation key 唯一性已被 Handler/collector 验证；child claim 与 policy grant 现由
+  `DurableAgentToolExecutor` 的 ledger 实现，发行侧残余风险见其独立对抗审查。
 - result envelope 由受信 adapter 生成的约束目前是接口/部署契约，尚无独立签名证明。
 - Agent terminal transaction 未完成前，进程可能留下完整 Tool/Provider 子结果但没有可接纳的
   父 Agent 终态；恢复端不得靠聊天文本或 `latest` 猜测。

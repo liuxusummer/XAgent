@@ -748,7 +748,8 @@ class RemoteHierarchyAdmissionTests(unittest.TestCase):
                 """
                 DROP TRIGGER attempts_hierarchy_admission_insert;
                 DROP TRIGGER attempts_hierarchy_admission_update;
-                DELETE FROM schema_migrations WHERE version = 8;
+                DROP TABLE agent_tool_invocations;
+                DELETE FROM schema_migrations WHERE version >= 8;
                 PRAGMA user_version = 7;
                 """
             )
