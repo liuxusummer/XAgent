@@ -1,0 +1,33 @@
+docs/architecture.md
+  s_72af05a5dabd4c::t_9531c7033ca892 122-125
+docs/distributed-execution-adr.md
+  s_72af05a5dabd4c::t_a2c44f7d292073 337,339,341-343
+docs/distributed-execution-quickstart.md
+  s_72af05a5dabd4c::t_0df33347fd2d09 113
+docs/durable-orchestration-spec.md
+  s_72af05a5dabd4c::t_63910abc8b0f14 1207-1208,1210
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_9f49e7b0ded51d 230
+src/orchestration/remote_scheduling.py
+  s_72af05a5dabd4c::t_59b1cefa913b9c 53,656,1174-1215,1261-1262
+tests/test_orchestration_remote_fleet.py
+  s_72af05a5dabd4c::t_46aa8b5b4ae179 31,195-237
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1c6f3a5d76cc6b3863ce6a59c5931c01851e1198",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
