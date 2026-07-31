@@ -119,7 +119,10 @@
   ref，但控制面绝不重新发送 assignment 或自行复活 bearer。Fleet claim 会把无密的
   task/tenant/pool、routing/quota policy digest 和生效配额写入 Attempt；共享同一
   Store 的控制进程在 claim 事务内原子执行 global/tenant/pool quota CAS。Fleet queue、
-  Worker registry 与公平游标仍为进程内 projection；fleet claim 准入后失败必须从
+  Worker registry 与公平游标仍为进程内 projection；多控制面部署可启用 Store 本地
+  `(tenant,pool)` shard 单写者，显式控制面 owner 和单调 epoch 在同一 claim 事务中
+  fencing 陈旧投影。它不使用 wall-clock leader lease，也不提供跨 Store 共识或自动
+  故障转移。fleet claim 准入后失败必须从
   Store 重新投影，不能把内存队列或 journal 当作 Domain 事实源。完整边界见
   `docs/distributed-execution-adr.md`、
   `docs/remote-execution-recovery.md` 和 `docs/remote-fleet-data-plane.md`。

@@ -1203,9 +1203,10 @@ gVisor 或持久 broker registry。其后新增了严格、有界的
 [HTTPS/ASGI transport](remote-worker-https-transport.md)、证书 pin identity 和 TLS
 客户端，以及由服务端 policy 驱动的
 [跨 Run Fleet 数据面](remote-fleet-data-plane.md)。同一 Store 内的 Fleet
-global/tenant/pool quota 已与 Attempt claim 原子持久化；生产化仍需验证
-TLS-extension server/PKI 部署、跨控制面共享 broker 或单写 shard ownership、跨
-Store quota，并在 fleet claim 失败后从 Store 重新投影。
+global/tenant/pool quota 已与 Attempt claim 原子持久化；可选 strict 模式还通过
+Store 本地 `(tenant,pool)` 单写 shard owner 和单调 fencing epoch 拒绝陈旧控制面。
+生产化仍需验证 TLS-extension server/PKI 部署、共享 broker 或显式接管控制循环、
+跨 Store quota 与公平游标持久化，并在 fleet claim 失败后从 Store 重新投影。
 
 ## 18. 故障注入矩阵
 

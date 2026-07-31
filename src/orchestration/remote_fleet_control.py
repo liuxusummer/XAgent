@@ -7,6 +7,7 @@ truth remain exclusively in ``RemoteControlPlane`` and ``DurableRunStore``.
 from __future__ import annotations
 
 import math
+import re
 import threading
 from dataclasses import dataclass
 from typing import Mapping, Protocol, runtime_checkable
@@ -41,12 +42,14 @@ from .scheduler import (
     ACTIVE_ATTEMPT_STATUSES,
     DurableScheduler,
 )
+from .store import FleetShardOwnership
 
 MAX_FLEET_WORKER_POLICIES = 4_096
 MAX_TRACKED_FLEET_ASSIGNMENTS = 1_000_000
 MAX_PROJECTED_FLEET_TASKS = 100_000
 MAX_PROJECTED_FLEET_ATTEMPTS = 1_000_000
 MAX_FLEET_TOOL_POLICIES = 4_096
+_FLEET_OWNER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 
 
 class RemoteFleetControlError(RuntimeError):
@@ -394,9 +397,34 @@ class DurableFleetProjector:
         *,
         tenant_id: str,
         pool_id: str,
+        shard_ownership: FleetShardOwnership | None = None,
     ) -> tuple[FleetTaskBinding, ...]:
         if not isinstance(scheduler, DurableScheduler):
             raise TypeError("scheduler must be a DurableScheduler")
+        if shard_ownership is not None:
+            if not isinstance(
+                shard_ownership,
+                FleetShardOwnership,
+            ):
+                raise TypeError(
+                    "shard_ownership must be FleetShardOwnership"
+                )
+            if (
+                scheduler.store.get_fleet_shard_ownership(
+                    shard_ownership.shard_id
+                )
+                != shard_ownership
+            ):
+                raise RemoteFleetControlConflict(
+                    "Fleet shard ownership is stale"
+                )
+            if (
+                shard_ownership.tenant_id != tenant_id
+                or shard_ownership.pool_id != pool_id
+            ):
+                raise RemoteFleetControlConflict(
+                    "Fleet shard ownership has another routing scope"
+                )
         run = scheduler.store.get_run(run_id)
         if run is None or run.status is not RunStatus.RUNNING:
             return ()
@@ -478,6 +506,7 @@ class DurableFleetProjector:
                 routing_policy_digest=(
                     routing_policy.policy_digest
                 ),
+                shard_ownership=shard_ownership,
                 task=RemoteTask(
                     task_id=f"flt-{task_identity[:60]}",
                     tenant_id=tenant_id,
@@ -519,6 +548,7 @@ class RemoteControlFleetClaimer:
         control: RemoteControlPlane,
         *,
         lease_seconds: float = 60.0,
+        fleet_owner_id: str | None = None,
     ) -> None:
         if not isinstance(control, RemoteControlPlane):
             raise TypeError("control must be a RemoteControlPlane")
@@ -533,12 +563,24 @@ class RemoteControlFleetClaimer:
             raise RemoteFleetControlConfigurationError(
                 "Fleet lease_seconds is invalid"
             )
+        if fleet_owner_id is not None and (
+            not isinstance(fleet_owner_id, str)
+            or _FLEET_OWNER_ID.fullmatch(fleet_owner_id) is None
+        ):
+            raise RemoteFleetControlConfigurationError(
+                "fleet_owner_id must be a bounded Fleet identifier"
+            )
         self._control = control
         self.lease_seconds = float(lease_seconds)
+        self.fleet_owner_id = fleet_owner_id
 
     @property
     def production_security_ready(self) -> bool:
         return self._control.production_security_ready
+
+    @property
+    def durable_fleet_ownership_ready(self) -> bool:
+        return self.fleet_owner_id is not None
 
     def __call__(
         self,
@@ -546,6 +588,7 @@ class RemoteControlFleetClaimer:
         worker_id: str,
         worker_session_id: str,
         admission_scope: FleetAdmissionScope,
+        shard_ownership: FleetShardOwnership | None = None,
     ) -> WorkAssignment:
         if (
             not isinstance(binding, FleetTaskBinding)
@@ -558,6 +601,11 @@ class RemoteControlFleetClaimer:
             or admission_scope.pool_id != binding.task.pool_id
             or admission_scope.routing_policy_digest
             != binding.routing_policy_digest
+            or binding.shard_ownership != shard_ownership
+            or (
+                shard_ownership is not None
+                and shard_ownership.owner_id != self.fleet_owner_id
+            )
         ):
             raise RemoteFleetControlConflict(
                 "Fleet claim requires an exact durable candidate binding"
@@ -570,6 +618,11 @@ class RemoteControlFleetClaimer:
             activity_config_digest=binding.activity_config_digest,
             expected_session_binding_digest=worker_session_id,
             fleet_admission=admission_scope.to_metadata(),
+            fleet_shard_ownership=(
+                None
+                if shard_ownership is None
+                else shard_ownership.to_metadata()
+            ),
         )
 
     def is_terminal(self, claim: ClaimBinding) -> bool:

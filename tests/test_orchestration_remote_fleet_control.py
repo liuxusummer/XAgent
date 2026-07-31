@@ -150,14 +150,21 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
         resolver=None,
         terminal_probe=None,
         max_active_assignments: int = 16,
+        require_durable_ownership: bool = False,
+        fleet_owner_id: str | None = None,
     ) -> tuple[RemoteFleetCoordinator, SecureRemoteFleetPoller]:
+        if require_durable_ownership and fleet_owner_id is None:
+            fleet_owner_id = "control-a"
         claimer = RemoteControlFleetClaimer(
             self.harness.control,
             lease_seconds=30.0,
+            fleet_owner_id=fleet_owner_id,
         )
         fleet = RemoteFleetCoordinator(
             lambda: DeterministicRemoteScheduler(),
             claimer,
+            require_durable_ownership=require_durable_ownership,
+            fleet_owner_id=fleet_owner_id,
         )
         worker_resolver = resolver or StaticFleetWorkerResolver(
             [
@@ -955,6 +962,337 @@ class SecureRemoteFleetControlTests(unittest.TestCase):
                 admission_scope,
             )
 
+        self.assertEqual(
+            self.harness.store.list_attempts("run-remote"),
+            [],
+        )
+
+    def test_strict_multi_control_claim_persists_shard_fencing(self) -> None:
+        ownership = self.harness.store.claim_fleet_shard(
+            "pool-a-shard",
+            "control-a",
+            "a" * 64,
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            now=10,
+        )
+        binding = self._projector().project_ready(
+            self.harness.scheduler,
+            "run-remote",
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            shard_ownership=ownership,
+        )[0]
+        fleet, _poller = self._compose(
+            require_durable_ownership=True,
+        )
+        fleet.admit(binding)
+
+        self.assertTrue(fleet.production_multi_control_ready)
+        assignment = self.client.poll_fleet()
+        assert assignment is not None
+        attempt = self.harness.store.get_attempt(
+            assignment.claim.attempt_id
+        )
+        assert attempt is not None
+        self.assertEqual(
+            attempt.metadata["fleet_shard_ownership"],
+            ownership.to_metadata(),
+        )
+
+    def test_shard_transfer_fences_claimed_but_not_started_work(
+        self,
+    ) -> None:
+        ownership = self.harness.store.claim_fleet_shard(
+            "claim-start-shard",
+            "control-a",
+            "a" * 64,
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            now=10,
+        )
+        binding = self._projector().project_ready(
+            self.harness.scheduler,
+            "run-remote",
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            shard_ownership=ownership,
+        )[0]
+        fleet, _poller = self._compose(
+            require_durable_ownership=True,
+        )
+        fleet.admit(binding)
+        assignment = self.client.poll_fleet()
+        assert assignment is not None
+        self.harness.store.transfer_fleet_shard(
+            ownership,
+            new_owner_id="control-b",
+            new_policy_digest="a" * 64,
+            now=9,
+        )
+
+        with self.assertRaises(RemoteWorkerError):
+            self.client.start(assignment.claim)
+        attempt = self.harness.store.get_attempt(
+            assignment.claim.attempt_id
+        )
+        assert attempt is not None
+        self.assertEqual(attempt.status.value, "claimed")
+
+    def test_running_work_can_finish_after_shard_transfer(self) -> None:
+        ownership = self.harness.store.claim_fleet_shard(
+            "running-transfer-shard",
+            "control-a",
+            "a" * 64,
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            now=10,
+        )
+        binding = self._projector().project_ready(
+            self.harness.scheduler,
+            "run-remote",
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            shard_ownership=ownership,
+        )[0]
+        fleet, _poller = self._compose(
+            require_durable_ownership=True,
+        )
+        fleet.admit(binding)
+        assignment = self.client.poll_fleet()
+        assert assignment is not None
+        self.client.start(assignment.claim)
+        self.harness.store.transfer_fleet_shard(
+            ownership,
+            new_owner_id="control-b",
+            new_policy_digest="a" * 64,
+            now=9,
+        )
+
+        self.client.complete(
+            assignment.claim,
+            self.harness._success_outcome(assignment),
+        )
+
+        attempt = self.harness.store.get_attempt(
+            assignment.claim.attempt_id
+        )
+        assert attempt is not None
+        self.assertEqual(attempt.status.value, "succeeded")
+
+    def test_projector_rejects_ownership_for_another_scope(self) -> None:
+        ownership = self.harness.store.claim_fleet_shard(
+            "other-scope-shard",
+            "control-a",
+            "a" * 64,
+            tenant_id="tenant-other",
+            pool_id="pool-a",
+            now=10,
+        )
+
+        with self.assertRaisesRegex(
+            RemoteFleetControlConflict,
+            "another routing scope",
+        ):
+            self._projector().project_ready(
+                self.harness.scheduler,
+                "run-remote",
+                tenant_id="tenant-1",
+                pool_id="pool-a",
+                shard_ownership=ownership,
+            )
+
+    def test_store_rejects_valid_ownership_for_another_scope(self) -> None:
+        binding = self._binding()
+        ownership = self.harness.store.claim_fleet_shard(
+            "other-tenant-shard",
+            "control-a",
+            "a" * 64,
+            tenant_id="tenant-other",
+            pool_id="pool-a",
+            now=10,
+        )
+        registration = self.harness.control.get_registration("worker-1")
+        assert registration is not None
+        scope = DeterministicRemoteScheduler().durable_admission_scope(
+            binding.task,
+            routing_policy_digest=binding.routing_policy_digest,
+        )
+
+        with self.assertRaisesRegex(
+            RemoteControlError,
+            "claim_conflict",
+        ):
+            self.harness.control.claim_for_fleet(
+                binding.run_id,
+                "worker-1",
+                lease_seconds=30.0,
+                node_id=binding.node_id,
+                activity_config_digest=binding.activity_config_digest,
+                expected_session_binding_digest=(
+                    registration.session_binding_digest
+                ),
+                fleet_admission=scope.to_metadata(),
+                fleet_shard_ownership=ownership.to_metadata(),
+            )
+
+        self.assertEqual(
+            self.harness.store.list_attempts("run-remote"),
+            [],
+        )
+
+    def test_shard_transfer_fences_stale_queue_then_new_epoch_claims(
+        self,
+    ) -> None:
+        first = self.harness.store.claim_fleet_shard(
+            "pool-a-failover",
+            "control-a",
+            "b" * 64,
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            now=10,
+        )
+        old_binding = self._projector().project_ready(
+            self.harness.scheduler,
+            "run-remote",
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            shard_ownership=first,
+        )[0]
+        fleet, _poller = self._compose(
+            require_durable_ownership=True,
+        )
+        fleet.admit(old_binding)
+        second = self.harness.store.transfer_fleet_shard(
+            first,
+            new_owner_id="control-a",
+            new_policy_digest="b" * 64,
+            now=11,
+        )
+
+        with self.assertRaisesRegex(
+            RemoteWorkerError,
+            "control_unavailable",
+        ):
+            self.client.poll_fleet()
+        self.assertEqual(
+            self.harness.store.list_attempts("run-remote"),
+            [],
+        )
+        with self.assertRaisesRegex(
+            RemoteFleetControlConflict,
+            "ownership is stale",
+        ):
+            self._projector().project_ready(
+                self.harness.scheduler,
+                "run-remote",
+                tenant_id="tenant-1",
+                pool_id="pool-a",
+                shard_ownership=first,
+            )
+
+        new_binding = self._projector().project_ready(
+            self.harness.scheduler,
+            "run-remote",
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            shard_ownership=second,
+        )[0]
+        fleet.admit(new_binding)
+        assignment = self.client.poll_fleet()
+        assert assignment is not None
+        stored = self.harness.store.get_attempt(
+            assignment.claim.attempt_id
+        )
+        assert stored is not None
+        self.assertEqual(
+            stored.metadata["fleet_shard_ownership"],
+            second.to_metadata(),
+        )
+
+    def test_strict_control_rejects_another_owners_binding(self) -> None:
+        ownership = self.harness.store.claim_fleet_shard(
+            "control-b-shard",
+            "control-b",
+            "b" * 64,
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            now=10,
+        )
+        binding = self._projector().project_ready(
+            self.harness.scheduler,
+            "run-remote",
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            shard_ownership=ownership,
+        )[0]
+        fleet, _poller = self._compose(
+            require_durable_ownership=True,
+            fleet_owner_id="control-a",
+        )
+        fleet.admit(binding)
+
+        self.assertFalse(fleet.production_security_ready)
+        with self.assertRaisesRegex(
+            RemoteWorkerError,
+            "security_not_ready",
+        ):
+            self.client.poll_fleet()
+        self.assertEqual(
+            self.harness.store.list_attempts("run-remote"),
+            [],
+        )
+
+    def test_strict_control_requires_an_explicit_owner_identity(self) -> None:
+        claimer = RemoteControlFleetClaimer(self.harness.control)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires fleet_owner_id",
+        ):
+            RemoteFleetCoordinator(
+                lambda: DeterministicRemoteScheduler(),
+                claimer,
+                require_durable_ownership=True,
+            )
+
+    def test_owned_scope_blocks_legacy_control_claims(self) -> None:
+        self.harness.store.claim_fleet_shard(
+            "upgraded-shard",
+            "control-a",
+            "b" * 64,
+            tenant_id="tenant-1",
+            pool_id="pool-a",
+            now=10,
+        )
+        fleet, _poller = self._compose()
+        fleet.admit(self._binding())
+
+        with self.assertRaisesRegex(
+            RemoteWorkerError,
+            "control_unavailable",
+        ):
+            self.client.poll_fleet()
+        self.assertEqual(
+            self.harness.store.list_attempts("run-remote"),
+            [],
+        )
+
+    def test_strict_multi_control_readiness_rejects_unowned_binding(
+        self,
+    ) -> None:
+        fleet, _poller = self._compose(
+            require_durable_ownership=True,
+        )
+        fleet.admit(self._binding())
+
+        self.assertFalse(fleet.production_security_ready)
+        self.assertFalse(fleet.production_multi_control_ready)
+        with self.assertRaisesRegex(
+            RemoteWorkerError,
+            "security_not_ready",
+        ):
+            self.client.poll_fleet()
         self.assertEqual(
             self.harness.store.list_attempts("run-remote"),
             [],

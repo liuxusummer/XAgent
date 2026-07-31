@@ -53,7 +53,7 @@ from .recovery import UnknownOutcomeDecision, UnknownOutcomeResolution
 if TYPE_CHECKING:
     from .executor import ToolReceipt
 
-STORE_SCHEMA_VERSION = 4
+STORE_SCHEMA_VERSION = 5
 DEFAULT_BUSY_TIMEOUT_MS = 10_000
 DEFAULT_EVENT_LIMIT = 1_000
 MAX_EVENT_LIMIT = 10_000
@@ -62,6 +62,9 @@ MAX_PROJECTION_REPLAY_PAYLOAD_BYTES = 64 * 1024 * 1024
 MAX_PROJECTION_REPLAY_SECONDS = 30.0
 MAX_PROJECTION_REPLAY_PAGE = 1_000
 MAX_ACTIVITY_LEASE_SECONDS = 24 * 60 * 60
+MAX_FLEET_SHARD_OWNERS = 4_096
+MAX_FLEET_FENCING_EPOCH = (1 << 63) - 1
+FLEET_SHARD_OWNERSHIP_SCHEMA_VERSION = 1
 _SAFE_RECEIPT_CODE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
 _SHA256_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _FLEET_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
@@ -298,6 +301,14 @@ class WorkflowBindingConflictError(OrchestrationStoreError):
     """A workflow identity/version is already bound to different content."""
 
 
+class FleetShardOwnershipConflict(OrchestrationStoreError):
+    """A Fleet shard owner or fencing compare-and-swap is stale."""
+
+
+class FleetShardOwnershipCapacityError(OrchestrationStoreError):
+    """The bounded Fleet shard ownership registry is full."""
+
+
 class ActivityAdmissionDenied(OrchestrationStoreError):
     """A scheduled Activity did not acquire bounded execution capacity."""
 
@@ -336,6 +347,91 @@ class WorkflowBindingRecord:
             ),
             "created_at": self.created_at,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class FleetShardOwnership:
+    """Store-local, clock-free single-writer fencing authority."""
+
+    shard_id: str
+    tenant_id: str
+    pool_id: str
+    owner_id: str
+    fencing_epoch: int
+    policy_digest: str
+    schema_version: int = FLEET_SHARD_OWNERSHIP_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != FLEET_SHARD_OWNERSHIP_SCHEMA_VERSION:
+            raise ValueError(
+                "unsupported Fleet shard ownership schema version"
+            )
+        for field_name in (
+            "shard_id",
+            "tenant_id",
+            "pool_id",
+            "owner_id",
+        ):
+            value = getattr(self, field_name)
+            if (
+                not isinstance(value, str)
+                or _FLEET_IDENTIFIER.fullmatch(value) is None
+            ):
+                raise ValueError(
+                    f"{field_name} must be a bounded Fleet identifier"
+                )
+        if (
+            isinstance(self.fencing_epoch, bool)
+            or not isinstance(self.fencing_epoch, int)
+            or not 1
+            <= self.fencing_epoch
+            <= MAX_FLEET_FENCING_EPOCH
+        ):
+            raise ValueError("Fleet fencing_epoch is invalid")
+        if (
+            not isinstance(self.policy_digest, str)
+            or _SHA256_DIGEST.fullmatch(self.policy_digest) is None
+        ):
+            raise ValueError(
+                "Fleet ownership policy_digest must be a SHA-256 digest"
+            )
+
+    def to_metadata(self) -> dict[str, JsonValue]:
+        return {
+            "schema_version": self.schema_version,
+            "shard_id": self.shard_id,
+            "tenant_id": self.tenant_id,
+            "pool_id": self.pool_id,
+            "owner_id": self.owner_id,
+            "fencing_epoch": self.fencing_epoch,
+            "policy_digest": self.policy_digest,
+        }
+
+    @classmethod
+    def from_metadata(
+        cls,
+        value: Mapping[str, object],
+    ) -> "FleetShardOwnership":
+        required = {
+            "schema_version",
+            "shard_id",
+            "tenant_id",
+            "pool_id",
+            "owner_id",
+            "fencing_epoch",
+            "policy_digest",
+        }
+        if not isinstance(value, Mapping) or set(value) != required:
+            raise ValueError("Fleet shard ownership fields are invalid")
+        return cls(
+            schema_version=value["schema_version"],
+            shard_id=value["shard_id"],
+            tenant_id=value["tenant_id"],
+            pool_id=value["pool_id"],
+            owner_id=value["owner_id"],
+            fencing_epoch=value["fencing_epoch"],
+            policy_digest=value["policy_digest"],
+        )
 
 
 def _json_dump(value: JsonValue) -> str:
@@ -511,6 +607,19 @@ def _fleet_admission_metadata(
             )
         normalized[field_name] = item
     return normalized
+
+
+def _fleet_shard_ownership_metadata(
+    value: Mapping[str, object] | None,
+) -> dict[str, JsonValue] | None:
+    if value is None:
+        return None
+    try:
+        return FleetShardOwnership.from_metadata(value).to_metadata()
+    except (TypeError, ValueError) as exc:
+        raise ProjectionConflictError(
+            "Fleet shard ownership binding is invalid"
+        ) from exc
 
 
 def _earliest_deadline(
@@ -1439,6 +1548,119 @@ class DurableRunStore:
                 ) from exc
 
     @staticmethod
+    def _migrate_4_to_5(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE fleet_shard_owners (
+                shard_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                pool_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                fencing_epoch INTEGER NOT NULL
+                    CHECK(fencing_epoch >= 1),
+                policy_digest TEXT NOT NULL
+                    CHECK(length(policy_digest) = 64),
+                assigned_at REAL NOT NULL,
+                UNIQUE(tenant_id, pool_id)
+            )
+            """
+        )
+        ownership_guard = """
+            NEW.status IN ('claimed', 'running')
+            AND (
+                (
+                    json_type(
+                        NEW.metadata_json,
+                        '$.fleet_admission'
+                    ) IS NOT NULL
+                    AND json_type(
+                        NEW.metadata_json,
+                        '$.fleet_admission'
+                    ) IS NOT 'object'
+                    AND EXISTS (
+                        SELECT 1 FROM fleet_shard_owners
+                    )
+                )
+                OR (
+                    json_type(
+                        NEW.metadata_json,
+                        '$.fleet_admission'
+                    ) = 'object'
+                    AND EXISTS (
+                        SELECT 1
+                        FROM fleet_shard_owners AS scoped_owner
+                        WHERE scoped_owner.tenant_id = json_extract(
+                            NEW.metadata_json,
+                            '$.fleet_admission.tenant_id'
+                        )
+                          AND scoped_owner.pool_id = json_extract(
+                            NEW.metadata_json,
+                            '$.fleet_admission.pool_id'
+                        )
+                    )
+                    AND (
+                        json_type(
+                            NEW.metadata_json,
+                            '$.fleet_shard_ownership'
+                        ) IS NOT 'object'
+                        OR NOT EXISTS (
+                            SELECT 1
+                            FROM fleet_shard_owners AS exact_owner
+                            WHERE exact_owner.shard_id = json_extract(
+                                NEW.metadata_json,
+                                '$.fleet_shard_ownership.shard_id'
+                            )
+                              AND exact_owner.tenant_id = json_extract(
+                                NEW.metadata_json,
+                                '$.fleet_shard_ownership.tenant_id'
+                            )
+                              AND exact_owner.pool_id = json_extract(
+                                NEW.metadata_json,
+                                '$.fleet_shard_ownership.pool_id'
+                            )
+                              AND exact_owner.owner_id = json_extract(
+                                NEW.metadata_json,
+                                '$.fleet_shard_ownership.owner_id'
+                            )
+                              AND exact_owner.fencing_epoch = json_extract(
+                                NEW.metadata_json,
+                                '$.fleet_shard_ownership.fencing_epoch'
+                            )
+                              AND exact_owner.policy_digest = json_extract(
+                                NEW.metadata_json,
+                                '$.fleet_shard_ownership.policy_digest'
+                            )
+                        )
+                    )
+                )
+                OR (
+                    NEW.worker_id LIKE 'remote-session:%'
+                    AND json_type(
+                        NEW.metadata_json,
+                        '$.fleet_admission'
+                    ) IS NULL
+                    AND EXISTS (
+                        SELECT 1 FROM fleet_shard_owners
+                    )
+                )
+            )
+        """
+        for operation in ("INSERT", "UPDATE"):
+            conn.execute(
+                f"""
+                CREATE TRIGGER attempts_fleet_ownership_{operation.lower()}
+                BEFORE {operation} ON attempts
+                WHEN {ownership_guard}
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'Fleet shard ownership is required or stale'
+                    );
+                END
+                """
+            )
+
+    @staticmethod
     def _prepare_new_run(
         run: RunRecord,
     ) -> tuple[RunRecord, EventRecord, str]:
@@ -1738,6 +1960,192 @@ class DurableRunStore:
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         return self._run_from_row(row) if row is not None else None
+
+    def claim_fleet_shard(
+        self,
+        shard_id: str,
+        owner_id: str,
+        policy_digest: str,
+        *,
+        tenant_id: str,
+        pool_id: str,
+        now: float | None = None,
+    ) -> FleetShardOwnership:
+        """Create or idempotently recover one explicit shard owner."""
+
+        requested = FleetShardOwnership(
+            shard_id=shard_id,
+            tenant_id=tenant_id,
+            pool_id=pool_id,
+            owner_id=owner_id,
+            fencing_epoch=1,
+            policy_digest=policy_digest,
+        )
+        assigned_at = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        with self._write_transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT shard_id, tenant_id, pool_id, owner_id,
+                       fencing_epoch, policy_digest
+                FROM fleet_shard_owners
+                WHERE shard_id = ?
+                """,
+                (requested.shard_id,),
+            ).fetchone()
+            if row is not None:
+                current = self._fleet_shard_ownership_from_row(row)
+                if (
+                    current.owner_id != requested.owner_id
+                    or current.tenant_id != requested.tenant_id
+                    or current.pool_id != requested.pool_id
+                    or current.policy_digest != requested.policy_digest
+                ):
+                    raise FleetShardOwnershipConflict(
+                        "Fleet shard already has another owner or policy"
+                    )
+                return current
+            scope_row = conn.execute(
+                """
+                SELECT shard_id
+                FROM fleet_shard_owners
+                WHERE tenant_id = ? AND pool_id = ?
+                """,
+                (requested.tenant_id, requested.pool_id),
+            ).fetchone()
+            if scope_row is not None:
+                raise FleetShardOwnershipConflict(
+                    "Fleet routing scope already has another shard"
+                )
+            count_row = conn.execute(
+                "SELECT COUNT(*) AS owner_count FROM fleet_shard_owners"
+            ).fetchone()
+            if int(count_row["owner_count"]) >= MAX_FLEET_SHARD_OWNERS:
+                raise FleetShardOwnershipCapacityError(
+                    "Fleet shard ownership registry is full"
+                )
+            conn.execute(
+                """
+                INSERT INTO fleet_shard_owners(
+                    shard_id, tenant_id, pool_id, owner_id, fencing_epoch,
+                    policy_digest, assigned_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    requested.shard_id,
+                    requested.tenant_id,
+                    requested.pool_id,
+                    requested.owner_id,
+                    requested.fencing_epoch,
+                    requested.policy_digest,
+                    assigned_at,
+                ),
+            )
+            self._fault("fleet_owner.after_insert")
+        return requested
+
+    def transfer_fleet_shard(
+        self,
+        current: FleetShardOwnership,
+        *,
+        new_owner_id: str,
+        new_policy_digest: str,
+        now: float | None = None,
+    ) -> FleetShardOwnership:
+        """CAS-transfer a shard and monotonically fence every prior owner."""
+
+        if not isinstance(current, FleetShardOwnership):
+            raise TypeError("current must be FleetShardOwnership")
+        if current.fencing_epoch >= MAX_FLEET_FENCING_EPOCH:
+            raise FleetShardOwnershipConflict(
+                "Fleet shard fencing epoch space is exhausted"
+            )
+        replacement = FleetShardOwnership(
+            shard_id=current.shard_id,
+            tenant_id=current.tenant_id,
+            pool_id=current.pool_id,
+            owner_id=new_owner_id,
+            fencing_epoch=current.fencing_epoch + 1,
+            policy_digest=new_policy_digest,
+        )
+        assigned_at = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        with self._write_transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT shard_id, tenant_id, pool_id, owner_id, fencing_epoch,
+                       policy_digest, assigned_at
+                FROM fleet_shard_owners
+                WHERE shard_id = ?
+                """,
+                (current.shard_id,),
+            ).fetchone()
+            if row is None:
+                raise FleetShardOwnershipConflict(
+                    "Fleet shard ownership disappeared"
+                )
+            observed = self._fleet_shard_ownership_from_row(row)
+            if observed != current:
+                raise FleetShardOwnershipConflict(
+                    "Fleet shard ownership changed concurrently"
+                )
+            changed = conn.execute(
+                """
+                UPDATE fleet_shard_owners
+                SET owner_id = ?, fencing_epoch = ?,
+                    policy_digest = ?, assigned_at = ?
+                WHERE shard_id = ? AND tenant_id = ? AND pool_id = ?
+                  AND owner_id = ?
+                  AND fencing_epoch = ? AND policy_digest = ?
+                """,
+                (
+                    replacement.owner_id,
+                    replacement.fencing_epoch,
+                    replacement.policy_digest,
+                    assigned_at,
+                    current.shard_id,
+                    current.tenant_id,
+                    current.pool_id,
+                    current.owner_id,
+                    current.fencing_epoch,
+                    current.policy_digest,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise FleetShardOwnershipConflict(
+                    "Fleet shard ownership changed concurrently"
+                )
+            self._fault("fleet_owner.after_transfer")
+        return replacement
+
+    def get_fleet_shard_ownership(
+        self,
+        shard_id: str,
+    ) -> FleetShardOwnership | None:
+        if (
+            not isinstance(shard_id, str)
+            or _FLEET_IDENTIFIER.fullmatch(shard_id) is None
+        ):
+            raise ValueError("shard_id must be a bounded Fleet identifier")
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT shard_id, tenant_id, pool_id, owner_id,
+                       fencing_epoch, policy_digest
+                FROM fleet_shard_owners
+                WHERE shard_id = ?
+                """,
+                (shard_id,),
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else self._fleet_shard_ownership_from_row(row)
+        )
 
     def bind_workflow(
         self,
@@ -4380,6 +4788,7 @@ class DurableRunStore:
         max_active_attempts: int | None,
         worker_capacity: int | None,
         fleet_admission: Mapping[str, object] | None = None,
+        fleet_shard_ownership: Mapping[str, object] | None = None,
     ) -> None:
         """Reserve execution capacity by deriving reservations from active Attempts."""
 
@@ -4405,10 +4814,39 @@ class DurableRunStore:
                 raise ProjectionConflictError(
                     "Attempt Fleet admission binding changed"
                 )
+        existing_fleet_shard_ownership = attempt.metadata.get(
+            "fleet_shard_ownership"
+        )
+        if (
+            "fleet_shard_ownership" in attempt.metadata
+            and fleet_shard_ownership is None
+        ):
+            raise ProjectionConflictError(
+                "Fleet-owned Attempt requires shard ownership"
+            )
+        if fleet_shard_ownership is not None:
+            if fleet_admission is None:
+                raise ProjectionConflictError(
+                    "Fleet shard ownership requires Fleet admission"
+                )
+            normalized_fleet_shard_ownership = (
+                _fleet_shard_ownership_metadata(
+                    fleet_shard_ownership
+                )
+            )
+            if (
+                existing_fleet_shard_ownership is not None
+                and existing_fleet_shard_ownership
+                != normalized_fleet_shard_ownership
+            ):
+                raise ProjectionConflictError(
+                    "Attempt Fleet shard ownership changed"
+                )
         if (
             max_active_attempts is None
             and worker_capacity is None
             and fleet_admission is None
+            and fleet_shard_ownership is None
         ):
             return
         if max_active_attempts is not None:
@@ -4483,6 +4921,29 @@ class DurableRunStore:
                 raise ActivityAdmissionDenied("resource_conflict")
 
         if fleet_admission is not None:
+            if fleet_shard_ownership is None:
+                owner_row = conn.execute(
+                    """
+                    SELECT 1
+                    FROM fleet_shard_owners
+                    WHERE tenant_id = ? AND pool_id = ?
+                    LIMIT 1
+                    """,
+                    (
+                        normalized_fleet_admission["tenant_id"],
+                        normalized_fleet_admission["pool_id"],
+                    ),
+                ).fetchone()
+                if owner_row is not None:
+                    raise ActivityAdmissionDenied(
+                        "fleet_shard_ownership_required"
+                    )
+            else:
+                DurableRunStore._validate_fleet_shard_owner_tx(
+                    conn,
+                    normalized_fleet_shard_ownership,
+                    normalized_fleet_admission,
+                )
             DurableRunStore._admit_fleet_tx(
                 conn,
                 normalized_fleet_admission,
@@ -4575,6 +5036,35 @@ class DurableRunStore:
         for reason_code, active_count, limit in limits:
             if active_count >= limit:
                 raise ActivityAdmissionDenied(reason_code)
+
+    @staticmethod
+    def _validate_fleet_shard_owner_tx(
+        conn: sqlite3.Connection,
+        ownership: dict[str, JsonValue] | None,
+        scope: dict[str, JsonValue] | None,
+    ) -> None:
+        assert ownership is not None
+        assert scope is not None
+        row = conn.execute(
+            """
+            SELECT tenant_id, pool_id, owner_id,
+                   fencing_epoch, policy_digest
+            FROM fleet_shard_owners
+            WHERE shard_id = ?
+            """,
+            (ownership["shard_id"],),
+        ).fetchone()
+        if (
+            row is None
+            or ownership["tenant_id"] != scope["tenant_id"]
+            or ownership["pool_id"] != scope["pool_id"]
+            or row["tenant_id"] != ownership["tenant_id"]
+            or row["pool_id"] != ownership["pool_id"]
+            or row["owner_id"] != ownership["owner_id"]
+            or row["fencing_epoch"] != ownership["fencing_epoch"]
+            or row["policy_digest"] != ownership["policy_digest"]
+        ):
+            raise ActivityAdmissionDenied("fleet_shard_fenced")
 
     def claim_activity(
         self,
@@ -4713,6 +5203,7 @@ class DurableRunStore:
         max_active_attempts: int | None = None,
         worker_capacity: int | None = None,
         fleet_admission: Mapping[str, object] | None = None,
+        fleet_shard_ownership: Mapping[str, object] | None = None,
     ) -> tuple[
         IdempotencyClaim | None,
         EventRecord | None,
@@ -4806,6 +5297,11 @@ class DurableRunStore:
             raise ValueError("worker_capacity must be positive")
         normalized_fleet_admission = _fleet_admission_metadata(
             fleet_admission
+        )
+        normalized_fleet_shard_ownership = (
+            _fleet_shard_ownership_metadata(
+                fleet_shard_ownership
+            )
         )
 
         with self._write_transaction() as conn:
@@ -5020,6 +5516,9 @@ class DurableRunStore:
                 max_active_attempts=max_active_attempts,
                 worker_capacity=worker_capacity,
                 fleet_admission=normalized_fleet_admission,
+                fleet_shard_ownership=(
+                    normalized_fleet_shard_ownership
+                ),
             )
             schedule_deadline = _attempt_deadline(run, attempt)
             if (
@@ -5071,6 +5570,10 @@ class DurableRunStore:
             if normalized_fleet_admission is not None:
                 claimed_metadata["fleet_admission"] = (
                     normalized_fleet_admission
+                )
+            if normalized_fleet_shard_ownership is not None:
+                claimed_metadata["fleet_shard_ownership"] = (
+                    normalized_fleet_shard_ownership
                 )
             if start_deadline is not None:
                 claimed_metadata["start_deadline_at"] = min(
@@ -7271,6 +7774,24 @@ class DurableRunStore:
             )
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise StoreSchemaError("workflow binding is malformed") from exc
+
+    @staticmethod
+    def _fleet_shard_ownership_from_row(
+        row: sqlite3.Row,
+    ) -> FleetShardOwnership:
+        try:
+            return FleetShardOwnership(
+                shard_id=row["shard_id"],
+                tenant_id=row["tenant_id"],
+                pool_id=row["pool_id"],
+                owner_id=row["owner_id"],
+                fencing_epoch=row["fencing_epoch"],
+                policy_digest=row["policy_digest"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise StoreSchemaError(
+                "Fleet shard ownership is malformed"
+            ) from exc
 
     @staticmethod
     def _idempotency_from_row(row: sqlite3.Row) -> IdempotencyRecord:

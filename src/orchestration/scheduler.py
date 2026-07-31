@@ -831,6 +831,7 @@ class DurableScheduler:
         admission_expires_at: float,
         policy_binding: Mapping[str, str | None],
         fleet_admission: Mapping[str, object] | None = None,
+        fleet_shard_ownership: Mapping[str, object] | None = None,
         linearization_guard: Callable[[], Any] | None = None,
         linearization_validator: Callable[[], bool] | None = None,
     ) -> tuple[ActivityClaim | None, EventRecord]:
@@ -909,6 +910,7 @@ class DurableScheduler:
                     max_active_attempts=self.max_active_attempts,
                     worker_capacity=capacity,
                     fleet_admission=fleet_admission,
+                    fleet_shard_ownership=fleet_shard_ownership,
                 )
             )
             if policy_binding.get("outcome") == "require_approval":

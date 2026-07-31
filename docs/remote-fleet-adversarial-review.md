@@ -1,4 +1,4 @@
-# Remote Fleet 数据面五轮对抗审查
+# Remote Fleet 数据面六轮对抗审查
 
 审查对象：
 
@@ -149,11 +149,83 @@ Attempt；终态历史不会增加 admission 扫描集合。
 结论：同一 Store 的 quota P0/P1=0；共享 queue/fairness 和跨 Store quota 仍是明确残余
 边界。
 
+## 第六轮：多控制器队列单写者与 fencing
+
+### 第一遍：双活、scope alias 与最终线性化
+
+只把 queue 保存在各进程内，即使 durable quota 不超限，两个控制器仍可能选择同一
+ready task。初始所有权方案还存在两个绕过：持有任意 shard 可以给另一
+tenant/pool 投影，或者两个不同 shard 指向同一 routing scope。
+
+修复后 `fleet_shard_owners` 对 `(tenant_id, pool_id)` 建唯一约束；ownership envelope
+同时包含 shard、scope、owner、policy digest 和单调 epoch。Projector 先检查 scope，
+但安全线性化点仍在 `claim_activity_with_policy()` 的 `BEGIN IMMEDIATE` 内：Store
+重新读取当前 owner row 并与 exact envelope 比较。陈旧队列在 schedule/claim/policy
+Event 提交前整体回滚。
+
+### 第二遍：owner 身份、ABA、崩溃与时钟
+
+owner ID 不是秘密，因此只校验 Store row 不足以防另一个可信控制进程误用读到的记录。
+strict coordinator 与 claimer 都必须配置同一个 `fleet_owner_id`，且 binding owner
+必须等于该实例身份。计划接管使用 exact current-value CAS，每次都增加 epoch；并发
+transfer 只能有一个成功，A→B→A 不能使 A 的旧 envelope 再次有效。
+
+部署必须为每个存活控制进程世代配置唯一 owner ID；两个副本复用同一个 owner 名称
+会破坏单写假设。相同 owner 的幂等恢复仅在外部已经 fencing/确认旧进程死亡时使用，
+否则接管必须换新 owner 并 transfer。
+
+epoch 是唯一顺序依据。wall clock 回拨不会阻止 transfer，也不会恢复旧 authority；
+`assigned_at` 只供审计。insert/transfer 的注入故障随事务回滚。4096 条硬上限拒绝新
+scope 而不驱逐旧 owner，避免通过容量压力重置 epoch。
+
+### 第三遍：就绪门、敏感信息与恢复
+
+strict 模式缺少 owner 配置会在构造时拒绝；binding 缩减为无 ownership、scope
+不匹配、callback 未声明 durable ownership 或 owner 不一致时，网络 poll 的动态
+production-ready 门关闭。成功 claim 只持久化无密标识、摘要和 `fencing_epoch`；
+曾使用的 `fencing_token` 命名会触发现有 credential-shaped metadata 防线，现已改为
+准确的非秘密 epoch，而没有放宽敏感键规则。
+
+仅靠新进程的 readiness 不能约束滚动升级中的旧二进制。ownership row 因此也是
+Store 级 scope 开关：记录存在后，不带 ownership 的旧 Fleet claim 在同一事务中以
+`fleet_shard_ownership_required` 拒绝。启用前已经 active 的无 scope claim 不会被
+伪造终态，但 quota 升级门会要求它们先 drain。为覆盖迁移前已经构造、不会重新执行
+版本检查的旧 Store 实例，schema v5 还在 active Attempt INSERT/UPDATE 上安装
+ownership trigger；缺失或陈旧 envelope 由 SQLite 自身拒绝。
+
+同 owner 重启可幂等读取当前 epoch；策略或 owner 变更必须显式 transfer。旧 owner
+已经 `RUNNING` 的 Attempt 仍由原 Activity lease/fencing 收敛，但不能领取新任务；
+尚处于 `CLAIMED` 的旧 epoch 不能再转为 `RUNNING`，由 lease recovery 接管。自动
+故障检测不在 Store 内用超时推断，避免暂停或时钟异常触发双主。
+
+证据：
+
+- `test_fleet_shard_transfer_is_clock_free_monotonic_and_aba_safe`
+- `test_concurrent_fleet_shard_transfer_has_one_winner`
+- `test_concurrent_shard_aliases_cannot_share_a_routing_scope`
+- `test_schema_trigger_fences_already_running_legacy_processes`
+- `test_fleet_shard_faults_roll_back_and_capacity_never_evicts`
+- `test_strict_multi_control_claim_persists_shard_fencing`
+- `test_shard_transfer_fences_claimed_but_not_started_work`
+- `test_running_work_can_finish_after_shard_transfer`
+- `test_store_rejects_valid_ownership_for_another_scope`
+- `test_shard_transfer_fences_stale_queue_then_new_epoch_claims`
+- `test_strict_control_rejects_another_owners_binding`
+- `test_owned_scope_blocks_legacy_control_claims`
+- `test_strict_multi_control_readiness_rejects_unowned_binding`
+
+结论：共享同一 Store、按 `(tenant,pool)` 分配的 strict Fleet 单写者 P0/P1=0。共享
+broker、跨 Store 共识、自动接管和公平游标持久化仍是明确残余边界。
+
 ## 残余边界
 
 - Fleet queue、Worker registry、active routing 和公平游标是单进程 projection，
-  不是跨控制面共识队列。同一 Store 的 quota 已原子化，但多控制面仍须增加共享
-  broker 或按 shard 保证单写者；不同 Store shard 的 quota 不会自动合并。
+  不是共享 broker。同一 Store 的 quota 已原子化，strict `(tenant,pool)` shard
+  ownership 可保证可信控制器单写；不同 Store shard 的 quota 与 ownership 不会自动
+  合并。
+- 自动 failure detector、接管编排、跨进程公平游标和在线无损 queue handoff 尚未
+  实现。所有权记录不自动删除，以免 epoch 重置产生 ABA；部署必须规划 4096-scope
+  上限。
 - 升级前存在的无 scope 远程 active claim 会阻塞新 Fleet admission；必须 drain 或
   隔离 Store，不能绕过该安全门。
 - Store claim 已提交、assignment 返回前进程崩溃时，Worker 不获得执行权；lease

@@ -34,12 +34,14 @@ from .remote_scheduling import (
     WorkerSnapshot,
     WorkerSweepReport,
 )
+from .store import FleetShardOwnership
 
 MAX_FLEET_TASK_BINDINGS = 1_000_000
 MAX_FLEET_WORKERS = 4096
 MAX_RUN_ID_CHARS = 255
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,254}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_FLEET_OWNER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 
 ClaimRun = Callable[..., WorkAssignment]
 SchedulerFactory = Callable[[], DeterministicRemoteScheduler]
@@ -74,6 +76,7 @@ class FleetTaskBinding:
     node_id: str | None = None
     activity_config_digest: str | None = None
     routing_policy_digest: str | None = None
+    shard_ownership: FleetShardOwnership | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_id", _run_id(self.run_id))
@@ -104,6 +107,16 @@ class FleetTaskBinding:
             raise RemoteFleetValidationError(
                 "routing_policy_digest must be a SHA-256 digest"
             )
+        if (
+            self.shard_ownership is not None
+            and not isinstance(
+                self.shard_ownership,
+                FleetShardOwnership,
+            )
+        ):
+            raise RemoteFleetValidationError(
+                "shard_ownership must be durable Fleet authority"
+            )
 
     @property
     def exact_for_production(self) -> bool:
@@ -111,6 +124,15 @@ class FleetTaskBinding:
             self.node_id is not None
             and self.activity_config_digest is not None
             and self.routing_policy_digest is not None
+        )
+
+    @property
+    def exact_for_multi_control(self) -> bool:
+        return (
+            self.exact_for_production
+            and self.shard_ownership is not None
+            and self.shard_ownership.tenant_id == self.task.tenant_id
+            and self.shard_ownership.pool_id == self.task.pool_id
         )
 
 
@@ -159,6 +181,8 @@ class RemoteFleetCoordinator:
         *,
         max_task_bindings: int = 4096,
         observability: BoundedRemoteObservability | object | None = None,
+        require_durable_ownership: bool = False,
+        fleet_owner_id: str | None = None,
     ) -> None:
         if not callable(scheduler_factory):
             raise RemoteFleetValidationError("scheduler_factory must be callable")
@@ -180,6 +204,23 @@ class RemoteFleetCoordinator:
         self._scheduler_factory = scheduler_factory
         self._claim_run = claim_run
         self.max_task_bindings = max_task_bindings
+        if not isinstance(require_durable_ownership, bool):
+            raise RemoteFleetValidationError(
+                "require_durable_ownership must be a bool"
+            )
+        if fleet_owner_id is not None and (
+            not isinstance(fleet_owner_id, str)
+            or _FLEET_OWNER_ID.fullmatch(fleet_owner_id) is None
+        ):
+            raise RemoteFleetValidationError(
+                "fleet_owner_id must be a bounded Fleet identifier"
+            )
+        if require_durable_ownership and fleet_owner_id is None:
+            raise RemoteFleetValidationError(
+                "strict multi-control Fleet requires fleet_owner_id"
+            )
+        self.require_durable_ownership = require_durable_ownership
+        self.fleet_owner_id = fleet_owner_id
         self._observability = observability
         self._lock = threading.RLock()
         self._scheduler = scheduler
@@ -206,8 +247,46 @@ class RemoteFleetCoordinator:
                 is True
             )
             with self._lock:
+                uses_ownership = (
+                    self.require_durable_ownership
+                    or any(
+                        binding.shard_ownership is not None
+                        for binding in self._task_bindings.values()
+                    )
+                )
+                if uses_ownership:
+                    callback_ready = (
+                        callback_ready
+                        and getattr(
+                            self._claim_run,
+                            "durable_fleet_ownership_ready",
+                            None,
+                        )
+                        is True
+                        and getattr(
+                            self._claim_run,
+                            "fleet_owner_id",
+                            None,
+                        )
+                        == self.fleet_owner_id
+                    )
                 bindings_ready = all(
-                    binding.exact_for_production
+                    (
+                        binding.exact_for_production
+                        and (
+                            (
+                                binding.shard_ownership is not None
+                                and binding.exact_for_multi_control
+                                and binding.shard_ownership.owner_id
+                                == self.fleet_owner_id
+                            )
+                            if (
+                                self.require_durable_ownership
+                                or binding.shard_ownership is not None
+                            )
+                            else True
+                        )
+                    )
                     for binding in self._task_bindings.values()
                 )
             return callback_ready and bindings_ready
@@ -215,6 +294,13 @@ class RemoteFleetCoordinator:
             raise
         except BaseException:
             return False
+
+    @property
+    def production_multi_control_ready(self) -> bool:
+        return (
+            self.require_durable_ownership
+            and self.production_security_ready
+        )
 
     def register_worker(self, descriptor: WorkerDescriptor) -> WorkerSnapshot:
         with self._lock:
@@ -365,6 +451,15 @@ class RemoteFleetCoordinator:
                     else None
                 )
                 run_id = binding.run_id
+                shard_ownership = binding.shard_ownership
+                if (
+                    shard_ownership is not None
+                    and shard_ownership.owner_id != self.fleet_owner_id
+                ):
+                    self._rollback_routing(scheduler, routing)
+                    raise RemoteFleetConflict(
+                        "Fleet shard belongs to another control owner"
+                    )
                 self._inflight_durable_claims += 1
         self._observe("record_poll", pool_id, decision.outcome)
         if routing is None:
@@ -399,12 +494,39 @@ class RemoteFleetCoordinator:
                         raise RemoteFleetConflict(
                             "production Fleet claim lacks durable admission scope"
                         )
-                    durable = self._claim_run(
-                        binding,
-                        worker_id,
-                        routing.worker_session_id,
-                        admission_scope,
-                    )
+                    if (
+                        self.require_durable_ownership
+                        and shard_ownership is None
+                    ):
+                        raise RemoteFleetConflict(
+                            "multi-control Fleet claim lacks shard ownership"
+                        )
+                    if shard_ownership is None:
+                        durable = self._claim_run(
+                            binding,
+                            worker_id,
+                            routing.worker_session_id,
+                            admission_scope,
+                        )
+                    else:
+                        if (
+                            getattr(
+                                self._claim_run,
+                                "durable_fleet_ownership_ready",
+                                None,
+                            )
+                            is not True
+                        ):
+                            raise RemoteFleetConflict(
+                                "claim callback lacks Fleet ownership fencing"
+                            )
+                        durable = self._claim_run(
+                            binding,
+                            worker_id,
+                            routing.worker_session_id,
+                            admission_scope,
+                            shard_ownership,
+                        )
                 else:
                     durable = self._claim_run(run_id, worker_id)
             except BaseException as exc:

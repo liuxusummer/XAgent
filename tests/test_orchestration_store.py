@@ -16,6 +16,8 @@ from src.orchestration import (
     ArtifactGCReferenceConflictError,
     ClaimDisposition,
     DurableRunStore,
+    FleetShardOwnershipCapacityError,
+    FleetShardOwnershipConflict,
     IdempotencyConflictError,
     InvalidStateTransition,
     LocalArtifactStore,
@@ -1875,6 +1877,298 @@ class DurableRunStoreTests(unittest.TestCase):
         self.assertEqual(reopened.get_run(run.run_id), run)
         self.assertTrue(reopened.verify_projections(run.run_id))
 
+    def test_fleet_shard_transfer_is_clock_free_monotonic_and_aba_safe(
+        self,
+    ) -> None:
+        policy = "b" * 64
+        first = self.store.claim_fleet_shard(
+            "shard-a",
+            "control-a",
+            policy,
+            tenant_id="tenant-a",
+            pool_id="pool-a",
+            now=10,
+        )
+        recovered = DurableRunStore(self.db_path).claim_fleet_shard(
+            "shard-a",
+            "control-a",
+            policy,
+            tenant_id="tenant-a",
+            pool_id="pool-a",
+            now=11,
+        )
+        self.assertEqual(recovered, first)
+
+        second = self.store.transfer_fleet_shard(
+            first,
+            new_owner_id="control-b",
+            new_policy_digest=policy,
+            now=12,
+        )
+        self.assertEqual(second.fencing_epoch, 2)
+        with self.assertRaises(FleetShardOwnershipConflict):
+            self.store.transfer_fleet_shard(
+                first,
+                new_owner_id="control-stale",
+                new_policy_digest=policy,
+                now=13,
+            )
+        third = self.store.transfer_fleet_shard(
+            second,
+            new_owner_id="control-a",
+            new_policy_digest=policy,
+            now=9,
+        )
+
+        self.assertEqual(third.fencing_epoch, 3)
+        self.assertNotEqual(third, first)
+        self.assertEqual(
+            DurableRunStore(self.db_path).claim_fleet_shard(
+                "shard-a",
+                "control-a",
+                policy,
+                tenant_id="tenant-a",
+                pool_id="pool-a",
+                now=8,
+            ),
+            third,
+        )
+        self.assertEqual(
+            DurableRunStore(self.db_path).get_fleet_shard_ownership(
+                "shard-a"
+            ),
+            third,
+        )
+        with self.assertRaises(FleetShardOwnershipConflict):
+            self.store.claim_fleet_shard(
+                "shard-alias",
+                "control-a",
+                policy,
+                tenant_id="tenant-a",
+                pool_id="pool-a",
+                now=15,
+            )
+
+    def test_concurrent_shard_aliases_cannot_share_a_routing_scope(
+        self,
+    ) -> None:
+        barrier = threading.Barrier(2)
+
+        def claim(shard_id: str):
+            contender = DurableRunStore(self.db_path)
+            barrier.wait(timeout=5)
+            try:
+                return contender.claim_fleet_shard(
+                    shard_id,
+                    f"owner-{shard_id}",
+                    "b" * 64,
+                    tenant_id="tenant-shared",
+                    pool_id="pool-shared",
+                    now=10,
+                )
+            except FleetShardOwnershipConflict:
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(
+                pool.map(claim, ("shard-left", "shard-right"))
+            )
+
+        self.assertEqual(
+            sum(outcome is not None for outcome in outcomes),
+            1,
+        )
+
+    def test_concurrent_fleet_shard_transfer_has_one_winner(self) -> None:
+        current = self.store.claim_fleet_shard(
+            "shard-race",
+            "control-a",
+            "c" * 64,
+            tenant_id="tenant-a",
+            pool_id="pool-a",
+            now=10,
+        )
+        barrier = threading.Barrier(2)
+
+        def transfer(owner_id: str):
+            contender = DurableRunStore(self.db_path)
+            barrier.wait(timeout=5)
+            try:
+                return contender.transfer_fleet_shard(
+                    current,
+                    new_owner_id=owner_id,
+                    new_policy_digest="c" * 64,
+                    now=11,
+                )
+            except FleetShardOwnershipConflict:
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(
+                pool.map(transfer, ("control-b", "control-c"))
+            )
+
+        self.assertEqual(
+            sum(outcome is not None for outcome in outcomes),
+            1,
+        )
+        winner = next(
+            outcome for outcome in outcomes if outcome is not None
+        )
+        self.assertEqual(
+            self.store.get_fleet_shard_ownership("shard-race"),
+            winner,
+        )
+
+    def test_schema_trigger_fences_already_running_legacy_processes(
+        self,
+    ) -> None:
+        _run, _node, attempt = self._schedule_attempt(
+            "fleet-trigger-guard"
+        )
+        first = self.store.claim_fleet_shard(
+            "trigger-shard",
+            "control-a",
+            "c" * 64,
+            tenant_id="tenant-a",
+            pool_id="pool-a",
+            now=10,
+        )
+        scope = {
+            "schema_version": 1,
+            "task_id": "trigger-task",
+            "tenant_id": "tenant-a",
+            "pool_id": "pool-a",
+            "routing_policy_digest": "a" * 64,
+            "quota_policy_digest": "b" * 64,
+            "max_active_tasks": 8,
+            "tenant_concurrency": 4,
+            "pool_concurrency": 4,
+        }
+
+        def legacy_claim(metadata: dict) -> None:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE attempts
+                    SET status = 'claimed', worker_id = ?, metadata_json = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (
+                        "remote-session:" + ("d" * 64),
+                        json.dumps(metadata),
+                        attempt.attempt_id,
+                    ),
+                )
+
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "ownership is required or stale",
+        ):
+            legacy_claim(dict(attempt.metadata))
+        missing = dict(attempt.metadata)
+        missing["fleet_admission"] = scope
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "ownership is required or stale",
+        ):
+            legacy_claim(missing)
+
+        second = self.store.transfer_fleet_shard(
+            first,
+            new_owner_id="control-a",
+            new_policy_digest="c" * 64,
+            now=9,
+        )
+        stale = dict(missing)
+        stale["fleet_shard_ownership"] = first.to_metadata()
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "ownership is required or stale",
+        ):
+            legacy_claim(stale)
+        self.assertEqual(second.fencing_epoch, 2)
+        self.assertEqual(
+            self.store.get_attempt(attempt.attempt_id).status,
+            AttemptStatus.SCHEDULED,
+        )
+
+    def test_fleet_shard_faults_roll_back_and_capacity_never_evicts(
+        self,
+    ) -> None:
+        def fail(stage: str) -> None:
+            if stage == "fleet_owner.after_insert":
+                raise RuntimeError("injected Fleet owner failure")
+
+        self.store._fault = fail
+        with self.assertRaisesRegex(RuntimeError, "injected"):
+            self.store.claim_fleet_shard(
+                "shard-fault",
+                "control-a",
+                "d" * 64,
+                tenant_id="tenant-a",
+                pool_id="pool-a",
+                now=10,
+            )
+        self.store._fault = lambda _stage: None
+        self.assertIsNone(
+            self.store.get_fleet_shard_ownership("shard-fault")
+        )
+        transferable = self.store.claim_fleet_shard(
+            "shard-transfer-fault",
+            "control-a",
+            "d" * 64,
+            tenant_id="tenant-transfer",
+            pool_id="pool-transfer",
+            now=10,
+        )
+
+        def fail_transfer(stage: str) -> None:
+            if stage == "fleet_owner.after_transfer":
+                raise RuntimeError("injected Fleet transfer failure")
+
+        self.store._fault = fail_transfer
+        with self.assertRaisesRegex(RuntimeError, "transfer failure"):
+            self.store.transfer_fleet_shard(
+                transferable,
+                new_owner_id="control-b",
+                new_policy_digest="d" * 64,
+                now=11,
+            )
+        self.store._fault = lambda _stage: None
+        self.assertEqual(
+            self.store.get_fleet_shard_ownership(
+                "shard-transfer-fault"
+            ),
+            transferable,
+        )
+
+        with mock.patch(
+            "src.orchestration.store.MAX_FLEET_SHARD_OWNERS",
+            2,
+        ):
+            retained = self.store.claim_fleet_shard(
+                "shard-retained",
+                "control-a",
+                "d" * 64,
+                tenant_id="tenant-a",
+                pool_id="pool-a",
+                now=11,
+            )
+            with self.assertRaises(FleetShardOwnershipCapacityError):
+                self.store.claim_fleet_shard(
+                    "shard-overflow",
+                    "control-b",
+                    "d" * 64,
+                    tenant_id="tenant-b",
+                    pool_id="pool-b",
+                    now=12,
+                )
+        self.assertEqual(
+            self.store.get_fleet_shard_ownership("shard-retained"),
+            retained,
+        )
+
     def test_newer_schema_is_rejected(self) -> None:
         other = Path(self.temp_dir.name) / "newer.sqlite3"
         with sqlite3.connect(other) as conn:
@@ -1905,6 +2199,9 @@ class DurableRunStoreTests(unittest.TestCase):
             conn.executescript(
                 """
                 DROP TABLE workflow_bindings;
+                DROP TRIGGER attempts_fleet_ownership_insert;
+                DROP TRIGGER attempts_fleet_ownership_update;
+                DROP TABLE fleet_shard_owners;
                 DROP TABLE artifact_references;
                 DROP TABLE artifact_gc_claims;
                 DELETE FROM schema_migrations WHERE version >= 3;
@@ -1930,7 +2227,7 @@ class DurableRunStoreTests(unittest.TestCase):
                 "SELECT first_run_id FROM artifact_references WHERE sha256 = ?",
                 (ref.sha256,),
             ).fetchone()
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
         self.assertEqual(indexed[0], "migration-ref-run")
 
     def test_version_three_migration_rejects_legacy_raw_run_input(self) -> None:
@@ -1947,7 +2244,7 @@ class DurableRunStoreTests(unittest.TestCase):
             conn.executescript(
                 """
                 DROP TABLE workflow_bindings;
-                DELETE FROM schema_migrations WHERE version = 4;
+                DELETE FROM schema_migrations WHERE version >= 4;
                 PRAGMA user_version = 3;
                 """
             )
@@ -1964,6 +2261,52 @@ class DurableRunStoreTests(unittest.TestCase):
             "Run input violates the Artifact input boundary",
         ):
             DurableRunStore(old)
+
+    def test_version_four_database_adds_fleet_shard_ownership(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executescript(
+                """
+                DROP TRIGGER attempts_fleet_ownership_insert;
+                DROP TRIGGER attempts_fleet_ownership_update;
+                DROP TABLE fleet_shard_owners;
+                DELETE FROM schema_migrations WHERE version = 5;
+                PRAGMA user_version = 4;
+                """
+            )
+
+        migrated = DurableRunStore(self.db_path)
+        ownership = migrated.claim_fleet_shard(
+            "shard-migrated",
+            "control-a",
+            "e" * 64,
+            tenant_id="tenant-a",
+            pool_id="pool-a",
+            now=10,
+        )
+
+        self.assertEqual(ownership.fencing_epoch, 1)
+        with sqlite3.connect(self.db_path) as conn:
+            version = conn.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()[0]
+            triggers = {
+                row[0]
+                for row in conn.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'trigger'
+                      AND name LIKE 'attempts_fleet_ownership_%'
+                    """
+                )
+            }
+        self.assertEqual(version, 5)
+        self.assertEqual(
+            triggers,
+            {
+                "attempts_fleet_ownership_insert",
+                "attempts_fleet_ownership_update",
+            },
+        )
 
     def test_workflow_binding_is_idempotent_and_conflicts_fail_closed(self) -> None:
         artifacts = LocalArtifactStore(
@@ -2282,7 +2625,7 @@ class DurableRunStoreTests(unittest.TestCase):
             indexes = {
                 row[1] for row in conn.execute("PRAGMA index_list(attempts)")
             }
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
         self.assertIn("content_digest", event_columns)
         self.assertIn("intent_digest", event_columns)
         self.assertIn("schema_version", idempotency_columns)

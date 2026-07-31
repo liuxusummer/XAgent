@@ -335,10 +335,13 @@ pool 配额；成功时将 scope 写回 Attempt metadata。因而共享一个 St
 从 quota 统计中消失。
 
 Fleet queue、Worker registry、active routing 和公平游标仍是单进程、可重建
-projection，不是共享消息 broker 或跨控制面共识；不同 Store shard 的配额也彼此独立。
-ready Run 发现、周期投影、策略变更后的 rebuild 和 terminal reconcile 由部署控制循环
-显式驱动。claim callback 失败后 binding 可丢弃，并由 Store reconciler 重新投影、
-重新准入。完整组合与审查证据见
+projection，不是共享消息 broker 或跨 Store 共识。共享同一 Store 的多控制面可启用
+strict shard ownership：一个 `(tenant,pool)` 只允许一个 shard，控制器配置的
+`fleet_owner_id` 必须匹配 owner，Store 在 claim 事务内比较 exact scope、policy 和
+单调 `fencing_epoch`。接管是显式 CAS，不依赖 wall clock；A→B→A 也不会复活旧 epoch。
+不同 Store shard 的配额和所有权仍彼此独立。ready Run 发现、周期投影、策略变更后的
+rebuild、显式所有权接管和 terminal reconcile 由部署控制循环驱动。claim callback
+失败后 binding 可丢弃，并由 Store reconciler 重新投影、重新准入。完整组合与审查证据见
 [remote-fleet-data-plane.md](remote-fleet-data-plane.md) 和
 [remote-fleet-adversarial-review.md](remote-fleet-adversarial-review.md)。
 

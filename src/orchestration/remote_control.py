@@ -943,6 +943,7 @@ class RemoteControlPlane:
         activity_config_digest: str,
         expected_session_binding_digest: str,
         fleet_admission: Mapping[str, object],
+        fleet_shard_ownership: Mapping[str, object] | None = None,
     ) -> WorkAssignment:
         """Trusted Fleet callback that preserves current session authority."""
 
@@ -983,6 +984,7 @@ class RemoteControlPlane:
             expected_node_id=node_id,
             expected_config_digest=activity_config_digest,
             fleet_admission=fleet_admission,
+            fleet_shard_ownership=fleet_shard_ownership,
         )
         if assignment is None:
             raise RemoteControlError("claim_conflict")
@@ -1015,6 +1017,7 @@ class RemoteControlPlane:
         expected_node_id: str | None = None,
         expected_config_digest: str | None = None,
         fleet_admission: Mapping[str, object] | None = None,
+        fleet_shard_ownership: Mapping[str, object] | None = None,
     ) -> WorkAssignment | None:
         if not self._authorize_run(identity, run_id):
             raise RemoteControlError("forbidden")
@@ -1169,6 +1172,7 @@ class RemoteControlPlane:
                     admission_expires_at=admission_expires_at,
                     policy_binding=admission.policy_binding,
                     fleet_admission=fleet_admission,
+                    fleet_shard_ownership=fleet_shard_ownership,
                     linearization_guard=lambda: (
                         self._worker_session_guard(identity.worker_id)
                     ),
