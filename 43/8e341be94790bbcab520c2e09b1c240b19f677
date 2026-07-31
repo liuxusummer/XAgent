@@ -1,0 +1,35 @@
+docs/agent-activity-executor.md
+  s_72af05a5dabd4c::t_bbdd44ba42ae7f 11-14,35-38,83,85-112,116-118,127-128
+docs/agent-provider-client.md
+  s_72af05a5dabd4c::t_31143eadf624cd 132-137,145-147
+docs/agent-turn-takeover-adversarial-review.md
+  s_72af05a5dabd4c::t_c39a803705c2f8 1-109
+docs/architecture.md
+  s_72af05a5dabd4c::t_97f1adcd61f433 107-111
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_2fa43f1a7e2bc3 329
+src/orchestration/event_types.py
+  s_72af05a5dabd4c::t_3ed22110824b72 37
+src/orchestration/scheduler.py
+  s_72af05a5dabd4c::t_b02c135d8d2d8a 1161-1225,3225-3229
+src/orchestration/store.py
+  s_72af05a5dabd4c::t_1f20db1861bddd 79,90-101,398-419,4471-5120,12593-12606
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "438e341be94790bbcab520c2e09b1c240b19f677",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
