@@ -20,6 +20,7 @@ from src.orchestration.policy import (
     PolicyValidationError,
     ToolTimeoutBehavior,
     ToolPolicy,
+    canonical_action_args_digest,
     sensitive_argument_bytes,
 )
 
@@ -119,6 +120,45 @@ def grant_for(
 
 
 class PolicyEngineTests(unittest.TestCase):
+    def test_public_action_args_digest_matches_action_request(self) -> None:
+        arguments = {
+            "path": "report.txt",
+            "api_key": "must-not-be-hashed",
+            "private": "also-redacted",
+        }
+        request = ActionRequest.from_args(
+            run_id="run-1",
+            node_id="node-1",
+            attempt_id="attempt-1",
+            tool_name="file_read",
+            args=arguments,
+            execution_binding_digest="e" * 64,
+            operation_key="operation-1",
+            idempotency_key="operation-1",
+            effect_class=EffectClass.READ_ONLY,
+            capabilities=(READ,),
+            resource_locks=("workspace:/project",),
+            sensitive_keys=("private",),
+        )
+
+        self.assertEqual(
+            request.args_digest,
+            canonical_action_args_digest(
+                arguments,
+                sensitive_keys=("private",),
+            ),
+        )
+        changed = dict(arguments)
+        changed["api_key"] = "different-secret"
+        changed["private"] = "different-private-secret"
+        self.assertEqual(
+            request.args_digest,
+            canonical_action_args_digest(
+                changed,
+                sensitive_keys=("private",),
+            ),
+        )
+
     def test_action_argument_trees_have_depth_node_and_secret_byte_bounds(self) -> None:
         nested: object = "leaf"
         for _index in range(34):

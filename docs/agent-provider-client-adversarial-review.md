@@ -3,8 +3,9 @@
 > 审查对象：`DurableAgentProviderClient`、provider wire、
 > `ProviderAccessBroker.describe_route()` 与 collector 父绑定。
 >
-> 结论：provider 子链通过三轮审查；Tool adapter、crash-consistent staging 和终态原子
-> 提交仍未完成，`production_security_ready=false`，remote `agent` capability 保持关闭。
+> 结论：provider 子链通过三轮审查；Tool 消费 Handler 已单独完成，但动态 child authority、
+> crash-consistent staging 和终态原子提交仍未完成，`production_security_ready=false`，
+> remote `agent` capability 保持关闭。
 
 ## Round 1：授权、调用顺序与秘密泄露
 
@@ -127,7 +128,8 @@ Round 3：通过。
 - grant 签发成功后进程崩溃，新的进程无法重取 bearer；禁止通过普通持久化泄露 token。
 - client history 与 checkpoint 尚未 crash-consistent；恢复 Attempt 不能仅凭聊天文本决定
   下一 invocation。
-- provider 子链完整不等于 Tool lineage 完整，也不等于 Agent terminal transaction 完整。
+- provider 子链完整不等于 Tool lineage 完整；即使 Tool 消费 Handler 也完整，动态 authority
+  与 Agent terminal transaction 未完成前仍不能开放远程 Agent。
 - reference Broker/Invoker 不证明生产 gateway attestation、外部 ledger 或网络隔离。
 - reference ProviderInvoker 接口尚未证明有界网络 deadline 或 cooperative cancellation；
   client 不用不可终止的后台线程伪造 timeout，超时后的外部结果必须保持 unknown。

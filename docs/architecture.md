@@ -114,6 +114,11 @@
   client 维护 Session-compatible history，但自身 readiness 仍固定 false；durable Tool
   handler 与 Agent 终态事务完成前不得开放 remote Agent。见
   `docs/agent-provider-client.md`
+- `DurableAgentToolHandler` 已将 collector 的动态 Tool observation、父 request Artifact、
+  durable `ToolReceipt` 与 canonical result Artifact 接到 Core `ActionResult`；它只消费已
+  持久终态，不签发 child authority。现有 Workflow executor 不能安全创建运行时动态 Tool
+  Node，因此 readiness 固定 false，remote Agent 继续关闭。见
+  `docs/agent-tool-handler.md`
 - Durable Store、Artifact、GC 和锁必须放在 Agent workspace 外，由独立控制面
   service/OS identity 持有，且不挂载给 legacy 文件、代码或浏览器工具。默认 Web UI 不会
   自动发现数据库；投影服务必须显式注入受信 tenant→database 映射。同 UID 隐藏路径不构成

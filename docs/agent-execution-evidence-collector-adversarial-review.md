@@ -4,9 +4,9 @@
 > `ChatResponse.provider_receipt`、`ActionResult.tool_receipt` 和
 > `AgentExecutionEvidenceCollector`。
 >
-> 结论：真实 Loop 的 fail-closed 观察接线通过；reference provider client 已补齐，
-> durable Tool handler、manifest staging 与终态原子提交仍未完成，因此 remote
-> `agent` capability 保持关闭。
+> 结论：真实 Loop 的 fail-closed 观察接线通过；reference provider client 与 Tool 消费
+> Handler 已分别补齐，但动态 Tool authority、manifest staging 与终态原子提交仍未完成，
+> 因此 remote `agent` capability 保持关闭。
 
 ## Round 1：观察时序与副作用窗口
 

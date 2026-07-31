@@ -47,6 +47,12 @@ class AgentContext:
 - `AgentContext` 是状态的唯一入口，grep `self.ctx` 即可定位所有状态访问
 - `ctx` 只在 Handler 的 `exec_*` 方法中使用，不传入 `tools/` 下的纯函数
 
+Durable Orchestration 的参考 Handler 是一个额外的消费边界：它不直接调用上述本地工具，
+而是把 collector 当前 observation 交给 deployment-owned executor，只接受已经写入 Store
+的 `ToolReceipt` 与 canonical `AgentToolResult` Artifact。成功结果的控制 envelope 必须由
+受信 adapter 生成，sandbox/stdout 仍是不可信 `data`。该边界不包含动态 child authority
+issuer，不能单独声明 production-ready；见 [Durable Agent Tool Handler 契约](agent-tool-handler.md)。
+
 ### 执行在隔离区，结果要截断
 
 代码执行和浏览器操作都有不可控的一面。隔离原则：

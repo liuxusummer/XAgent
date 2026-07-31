@@ -485,11 +485,13 @@ response ArtifactRef digest 的 receipt 才能进入 Agent manifest v2。
 普通 invoker 和无法验证的状态仍 fail closed；参考实现也不能证明外部 gateway 的线性
 一致幂等账本或 attestation，因此 `production_security_ready=false`。reference
 `DurableAgentProviderClient` 已完成 canonical Chat wire、同 lineage 授权、durable
-result preflight 和 Provider receipt 接线。生产 remote Agent 仍必须补齐
+result preflight 和 Provider receipt 接线；`DurableAgentToolHandler` 已完成动态 observation
+到已持久 Tool receipt/result Artifact 的 fail-closed 消费接线。生产 remote Agent 仍必须补齐
 mTLS/attestation、egress policy、secret-manager backed invoker、跨主机一致性，以及
-durable Tool handler、manifest/checkpoint staging 与终态原子提交的完整 adapter。
+动态 Tool child authority issuer、manifest/checkpoint staging 与终态原子提交的完整 adapter。
 完整约束见
-[Provider Credential 与模型网关边界](provider-credential-boundary.md)。
+[Provider Credential 与模型网关边界](provider-credential-boundary.md)和
+[Durable Agent Tool Handler 契约](agent-tool-handler.md)。
 
 ### 5.13 Lease
 

@@ -141,6 +141,11 @@ manifest；它不会从 `ActionResult.data`、Event 或日志猜测执行证明�
 Handler 可在 dispatch 内读取 active Tool sequence 和父派生 operation key。这样执行者与
 collector 使用同一个计数事实源，不需要复制易漂移的本地计数器。
 
+参考 `DurableAgentToolHandler` 已实现 allowlist、父 request Artifact 重读、参数深冻结、
+durable receipt 重读与 result Artifact 校验，并把合法 receipt 放入 `ActionResult` 的
+out-of-band 槽。它仍不签发动态 child authority，readiness 固定 false；完整边界见
+[Durable Agent Tool Handler 契约](agent-tool-handler.md)。
+
 ## 4. Handler 分发机制
 
 ### 约定优于反射

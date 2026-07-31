@@ -129,7 +129,8 @@ client 的重试始终复用同一个 grant、同一 authorization 和完全相�
 
 ## 7. 尚未完成
 
-- durable Tool Handler 还不能把真实 `ToolReceipt` 接到 `ActionResult`；
+- reference Durable Tool Handler 已能把经 Store 重读的真实 `ToolReceipt` 接到
+  `ActionResult`，但动态 child authority issuer 尚未实现；
 - provider client 的 history、collector manifest staging 和 checkpoint 尚未组成同一
   crash-consistent transaction；
 - manifest、NodeResult、AgentActivityReceipt 和 Attempt terminal Event 尚未原子提交；

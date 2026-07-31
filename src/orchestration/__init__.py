@@ -38,6 +38,18 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "AgentProviderClientError",
         "DurableAgentProviderClient",
     ),
+    ".agent_tool_handler": (
+        "AgentToolHandlerError",
+        "AgentToolInvocationRequest",
+        "AgentToolInvocationResult",
+        "AgentToolSpec",
+        "DurableAgentToolHandler",
+    ),
+    ".agent_tool_result": (
+        "AgentToolResult",
+        "AgentToolResultArtifactStore",
+        "AgentToolResultError",
+    ),
     ".agent_request": (
         "AgentActivityRequest",
         "AgentActivityRequestArtifactStore",

@@ -162,6 +162,47 @@ def _redact_sensitive(value: Any, explicit: frozenset[str]) -> Any:
     return value
 
 
+def canonical_action_args_digest(
+    args: Mapping[str, Any],
+    *,
+    sensitive_keys: Iterable[str] = (),
+) -> str:
+    """Return the bounded redacted digest used by ``ActionRequest``.
+
+    Raw sensitive values are intentionally replaced rather than directly
+    hashed, so callers can validate a receipt binding without creating an
+    offline-verifiable secret digest.
+    """
+
+    if not isinstance(args, Mapping):
+        raise PolicyValidationError("args must be a JSON object")
+    raw_encoded = _canonical_json(
+        dict(args),
+        field_name="args",
+        size_limit=MAX_ACTION_ARGS_BYTES,
+    )
+    normalized = json.loads(raw_encoded.decode("utf-8"))
+    _validate_bounded_json_tree(normalized, "args")
+    explicit_keys = frozenset(
+        canonical_metadata_key(
+            _bounded_text(key, "sensitive_key", max_chars=128)
+        )
+        for key in _bounded_iterable(
+            sensitive_keys,
+            MAX_SENSITIVE_KEYS,
+            "sensitive_keys",
+        )
+    )
+    redacted = _redact_sensitive(normalized, explicit_keys)
+    return hashlib.sha256(
+        _canonical_json(
+            redacted,
+            field_name="redacted args",
+            size_limit=MAX_ACTION_ARGS_BYTES,
+        )
+    ).hexdigest()
+
+
 def sensitive_argument_bytes(
     args: Mapping[str, Any],
     sensitive_keys: Iterable[str],
@@ -391,33 +432,10 @@ class ActionRequest:
         resource_locks: Iterable[str] = (),
         sensitive_keys: Iterable[str] = (),
     ) -> "ActionRequest":
-        if not isinstance(args, Mapping):
-            raise PolicyValidationError("args must be a JSON object")
-        raw_encoded = _canonical_json(
-            dict(args),
-            field_name="args",
-            size_limit=MAX_ACTION_ARGS_BYTES,
+        args_digest = canonical_action_args_digest(
+            args,
+            sensitive_keys=sensitive_keys,
         )
-        normalized = json.loads(raw_encoded.decode("utf-8"))
-        _validate_bounded_json_tree(normalized, "args")
-        explicit_keys = frozenset(
-            canonical_metadata_key(
-                _bounded_text(key, "sensitive_key", max_chars=128)
-            )
-            for key in _bounded_iterable(
-                sensitive_keys,
-                MAX_SENSITIVE_KEYS,
-                "sensitive_keys",
-            )
-        )
-        redacted = _redact_sensitive(normalized, explicit_keys)
-        args_digest = hashlib.sha256(
-            _canonical_json(
-                redacted,
-                field_name="redacted args",
-                size_limit=MAX_ACTION_ARGS_BYTES,
-            )
-        ).hexdigest()
         return cls(
             run_id=run_id,
             node_id=node_id,
