@@ -153,6 +153,23 @@ SECRET 必须由返回 `deployment_managed` encryption 的部署 Store 处理。
 `LocalArtifactStore` 同时存在时为 true；自定义 ArtifactStore 不会被参考实现自动声明
 为 durable。
 
+Broker 的每个成功结果同时携带 canonical、payload-free 的
+`ProviderInvocationReceipt`。它绑定 grant/父 Agent/request/request Artifact、实际
+request payload SHA-256、route/grant binding、response SHA-256、可选 response
+ArtifactRef 的 canonical digest、分类和有序 recovery evidence。它不包含 bearer、
+prompt、response bytes、credential、endpoint、路径或异常文本。
+
+receipt 的 completion mode 区分正常调用完成与可信 COMPLETED evidence 恢复。
+NOT_STARTED evidence 可以出现在正常完成 receipt 的前缀中；COMPLETED evidence 只能是
+恢复 receipt 的最后一项。Broker 从 durable journal 重放时重新构造完全相同的 receipt
+和 digest；反序列化后的等价 receipt 可以重验同一 grant/result，不依赖 Python 对象
+身份。可覆写语义的 receipt/evidence 子类会被拒绝。
+
+只有带非空 response ArtifactRef digest 的 receipt 才能进入
+`AgentActivityExecutionManifest` v2；无 result store 的首次返回不能被提升为 durable
+Agent provider lineage。完整组合见
+[Agent Activity Execution Manifest 契约](agent-execution-manifest.md)。
+
 ## 8. 可验证 operation 恢复
 
 schema v5 增加有界、append-only 的恢复证据表：
@@ -205,6 +222,8 @@ prompt、bearer、provider credential 或证据原文；每个 invocation 最多
 - `production_security_ready` 仍固定为 false；
 - 参考实现不提供 mTLS、provider egress allowlist、secret manager、经过 attestation
   的 invoker。
+- typed provider receipt 与 Agent manifest v2 已提供组合契约，但真实远程 Agent Loop
+  尚未逐调用接线，也未完成生产接纳状态机。
 
 生产 remote Agent 仍必须提供经过验证的 upstream idempotency/operation ledger、
 经过 attestation 的 ProviderInvoker 和完整远程 Agent runtime。未完成前禁止把
@@ -218,4 +237,6 @@ durable journal 审查见
 invocation result 审查见
 [Provider Invocation Receipt 三轮对抗性审查](provider-invocation-receipt-adversarial-review.md)，
 operation 恢复审查见
-[Provider Operation Recovery 三轮对抗性审查](provider-operation-recovery-adversarial-review.md)。
+[Provider Operation Recovery 三轮对抗性审查](provider-operation-recovery-adversarial-review.md)，
+provider/Agent 组合审查见
+[Provider Receipt 与 Agent Lineage 三轮对抗性审查](provider-agent-lineage-adversarial-review.md)。

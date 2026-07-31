@@ -82,8 +82,10 @@
   Artifact digest；它只证明运行时观察到整个 Loop 边界，不会把内部未回执的工具副作用
   提升为 verified 或 exactly-once。完整契约见 `docs/agent-activity-receipt.md`
 - `AgentActivityExecutionManifest` 进一步用父 Attempt 派生的确定性 child operation key
-  绑定有序 ToolReceipt、精确 request Artifact/definition 和分类；只有 v2 receipt
-  实际加载并验证该 manifest 后，才具备远程 Agent 所需的工具 lineage 前置证据。见
+  绑定有序 ToolReceipt、精确 request Artifact/definition 和分类；schema v2 还绑定
+  有序、payload-free 的 ProviderInvocationReceipt 与 response Artifact ref digest。
+  只有 v2 receipt 实际加载并验证该 manifest，且显式要求完整 provider lineage 后，
+  才具备远程 Agent 所需的工具/provider lineage 前置证据。见
   `docs/agent-execution-manifest.md`
 - Agent Activity 的 task/context 可由 `AgentActivityRequest` 物化为至少 sensitive
   （并继承 context 最高分类）的 content-addressed Artifact，绑定稳定
@@ -95,9 +97,10 @@
   Broker 可将 token digest、逻辑调用唯一键和消费墓碑写入隔离的
   `RemoteExecutionJournal`，跨进程原子发放/消费；completed invocation 可经
   MODEL_RESPONSE Artifact 重放；部署侧 `RecoverableProviderInvoker` 还可用稳定
-  operation ID 的 NOT_STARTED/COMPLETED 证据收敛部分 unknown 窗口，但参考实现不能
-  证明外部幂等账本或 attestation，`production_security_ready` 固定 false，不能据此
-  开放 remote Agent；见
+  operation ID 的 NOT_STARTED/COMPLETED 证据收敛部分 unknown 窗口。成功调用返回
+  canonical `ProviderInvocationReceipt`，正常完成、恢复与 durable replay 共享稳定
+  digest；但参考实现不能证明外部幂等账本或 attestation，
+  `production_security_ready` 固定 false，不能据此开放 remote Agent；见
   `docs/provider-credential-boundary.md`
 - Durable Store、Artifact、GC 和锁必须放在 Agent workspace 外，由独立控制面
   service/OS identity 持有，且不挂载给 legacy 文件、代码或浏览器工具。默认 Web UI 不会

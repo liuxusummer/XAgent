@@ -80,6 +80,11 @@ manifest、request Artifact 和逐个 ToolReceipt 后，才能把
 receipt 已绑定 digest，不说明 Artifact bytes 已加载。调度器仍必须逐个判断 ToolReceipt
 的 verification、effect class 和外部操作身份，不能把覆盖完整等同于副作用 verified。
 
+manifest schema v2 还可绑定逐次 `ProviderInvocationReceipt`。远程接纳方必须加载
+manifest、验证实际 provider receipt 集合，并设置 `require_complete=True`；仅有
+`execution_manifest_digest` 不代表 provider lineage 完整，也不证明外部 gateway 的
+operation ledger 或 attestation。
+
 v1 保持 exact-field 历史兼容；其中 `internal_tool_receipts_complete=true` 仍是旧的
 count-only 语义，不能用于新远程 Agent。
 

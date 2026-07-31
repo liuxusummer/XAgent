@@ -12,6 +12,7 @@ from src.orchestration.agent_execution_manifest import (
     AgentActivityExecutionManifest,
     AgentExecutionManifestArtifactStore,
     AgentExecutionManifestError,
+    AgentProviderReceiptBinding,
     AgentToolReceiptBinding,
     agent_tool_operation_key,
     canonical_tool_call_digest,
@@ -38,6 +39,10 @@ from src.orchestration.executor import (
 )
 from src.orchestration.models import AttemptStatus
 from src.orchestration.policy import EffectClass
+from src.orchestration.provider_access import (
+    ProviderInvocationCompletionMode,
+    ProviderInvocationReceipt,
+)
 from src.orchestration.store import (
     _validate_agent_execution_manifest_ref,
 )
@@ -79,6 +84,48 @@ def _tool_receipt(index: int) -> ToolReceipt:
         sandbox_receipt=None,
         sandbox_receipt_absence_reason="dispatch_denied_before_backend",
         error_code="no_qualified_backend",
+    )
+
+
+def _provider_receipt(
+    index: int,
+    **overrides,
+) -> ProviderInvocationReceipt:
+    values = {
+        "grant_id": f"provider-grant-{index}",
+        "run_id": "run-1",
+        "node_id": "agent-node",
+        "attempt_id": "agent-attempt",
+        "action_digest": _digest("agent-action"),
+        "authorization_digest": _digest("authorization"),
+        "request_digest": _digest("request"),
+        "request_artifact_digest": _digest("request-artifact"),
+        "request_payload_digest": _digest(f"provider-payload-{index}"),
+        "invocation_index": index,
+        "route_id": "primary-route",
+        "route_digest": _digest("primary-route"),
+        "grant_binding_digest": _digest(f"provider-grant-{index}"),
+        "response_digest": _digest(f"provider-response-{index}"),
+        "response_artifact_ref_digest": _digest(
+            f"provider-response-ref-{index}"
+        ),
+        "response_sensitivity": ArtifactSensitivity.SENSITIVE,
+        "completion_mode": ProviderInvocationCompletionMode.INVOKED,
+    }
+    values.update(overrides)
+    return ProviderInvocationReceipt(**values)
+
+
+def _provider_bindings(
+    receipts: tuple[ProviderInvocationReceipt, ...],
+) -> tuple[AgentProviderReceiptBinding, ...]:
+    return tuple(
+        AgentProviderReceiptBinding(
+            sequence=index,
+            turn=index,
+            receipt=receipt,
+        )
+        for index, receipt in enumerate(receipts, start=1)
     )
 
 
@@ -376,6 +423,218 @@ class AgentExecutionManifestContractTests(unittest.TestCase):
                 artifact_sensitivity=ArtifactSensitivity.INTERNAL,
             )
 
+    def test_v2_binds_ordered_provider_receipts_canonically(self) -> None:
+        receipts = (_provider_receipt(1), _provider_receipt(2))
+        manifest = _manifest(
+            observed_provider_invocations=2,
+            provider_receipts_complete=True,
+            provider_receipts=_provider_bindings(receipts),
+        )
+        restored = AgentActivityExecutionManifest.from_bytes(
+            manifest.to_bytes()
+        )
+
+        self.assertEqual(restored, manifest)
+        self.assertEqual(
+            restored.provider_receipt_digests,
+            tuple(item.receipt_digest for item in receipts),
+        )
+        self.assertTrue(
+            restored.has_complete_provider_receipt_lineage
+        )
+        restored.validate_provider_receipts(
+            receipts,
+            require_complete=True,
+        )
+        serialized = manifest.to_bytes().decode("utf-8")
+        for forbidden in (
+            "provider request body",
+            "provider response body",
+            "api_key",
+            "bearer",
+            "claim_token",
+        ):
+            self.assertNotIn(forbidden, serialized)
+        self.assertNotIn("provider response body", repr(manifest))
+
+    def test_provider_reorder_duplicate_and_substitution_fail_closed(
+        self,
+    ) -> None:
+        first = _provider_receipt(1)
+        second = _provider_receipt(2)
+        manifest = _manifest(
+            observed_provider_invocations=2,
+            provider_receipts_complete=True,
+            provider_receipts=_provider_bindings((first, second)),
+        )
+
+        with self.assertRaisesRegex(
+            AgentExecutionManifestError,
+            "binding_mismatch",
+        ):
+            manifest.validate_provider_receipts((second, first))
+        duplicate_grant = replace(
+            second,
+            grant_id=first.grant_id,
+        )
+        with self.assertRaisesRegex(
+            AgentExecutionManifestError,
+            "invalid_ordered",
+        ):
+            replace(
+                manifest,
+                provider_receipts=_provider_bindings(
+                    (first, duplicate_grant)
+                ),
+            )
+        substituted = replace(
+            second,
+            response_digest=_digest("substituted-response"),
+        )
+        with self.assertRaisesRegex(
+            AgentExecutionManifestError,
+            "binding_mismatch",
+        ):
+            manifest.validate_provider_receipts(
+                (first, substituted)
+            )
+
+    def test_provider_parent_artifact_and_sensitivity_are_exact(
+        self,
+    ) -> None:
+        receipt = _provider_receipt(1)
+        binding = _provider_bindings((receipt,))
+        values = {
+            "observed_provider_invocations": 1,
+            "provider_receipts_complete": True,
+            "provider_receipts": binding,
+        }
+
+        _manifest(**values)
+        for changed in (
+            replace(receipt, node_id="other-node"),
+            replace(
+                receipt,
+                request_artifact_digest=_digest(
+                    "other-request-artifact"
+                ),
+            ),
+            replace(
+                receipt,
+                response_artifact_ref_digest=None,
+            ),
+            replace(
+                receipt,
+                response_sensitivity=ArtifactSensitivity.SECRET,
+            ),
+        ):
+            with self.subTest(changed=changed):
+                with self.assertRaisesRegex(
+                    AgentExecutionManifestError,
+                    "parent_binding_mismatch",
+                ):
+                    _manifest(
+                        observed_provider_invocations=1,
+                        provider_receipts_complete=True,
+                        provider_receipts=_provider_bindings(
+                            (changed,)
+                        ),
+                    )
+
+        secret = replace(
+            receipt,
+            response_sensitivity=ArtifactSensitivity.SECRET,
+        )
+        _manifest(
+            artifact_sensitivity=ArtifactSensitivity.SECRET,
+            observed_provider_invocations=1,
+            provider_receipts_complete=True,
+            provider_receipts=_provider_bindings((secret,)),
+        )
+
+    def test_provider_completeness_requires_exact_coverage(self) -> None:
+        receipt = _provider_receipt(1)
+        binding = _provider_bindings((receipt,))
+
+        with self.assertRaisesRegex(
+            AgentExecutionManifestError,
+            "exact_coverage",
+        ):
+            _manifest(
+                observed_provider_invocations=2,
+                provider_receipts_complete=True,
+                provider_receipts=binding,
+            )
+        with self.assertRaisesRegex(
+            AgentExecutionManifestError,
+            "exceed_observed",
+        ):
+            _manifest(
+                observed_provider_invocations=0,
+                provider_receipts_complete=False,
+                provider_receipts=binding,
+            )
+        partial = _manifest(
+            observed_provider_invocations=2,
+            provider_receipts_complete=False,
+            provider_receipts=binding,
+        )
+        self.assertFalse(partial.provider_receipts_complete)
+        self.assertFalse(
+            partial.has_complete_provider_receipt_lineage
+        )
+        with self.assertRaisesRegex(
+            AgentExecutionManifestError,
+            "lineage_incomplete",
+        ):
+            partial.validate_provider_receipts(
+                (receipt,),
+                require_complete=True,
+            )
+
+    def test_v1_manifest_remains_exact_and_cannot_claim_providers(
+        self,
+    ) -> None:
+        manifest = replace(_manifest(), schema_version=1)
+        payload = manifest.to_dict()
+        restored = AgentActivityExecutionManifest.from_dict(payload)
+
+        self.assertEqual(restored, manifest)
+        self.assertNotIn("provider_receipts", payload)
+        with self.assertRaisesRegex(
+            AgentExecutionManifestError,
+            "legacy_manifest_cannot_bind",
+        ):
+            replace(
+                manifest,
+                observed_provider_invocations=1,
+            )
+        payload["provider_receipts"] = []
+        with self.assertRaisesRegex(
+            AgentExecutionManifestError,
+            "schema",
+        ):
+            AgentActivityExecutionManifest.from_dict(payload)
+
+    def test_malformed_nested_provider_receipt_is_sanitized(self) -> None:
+        receipt = _provider_receipt(1)
+        manifest = _manifest(
+            observed_provider_invocations=1,
+            provider_receipts_complete=True,
+            provider_receipts=_provider_bindings((receipt,)),
+        )
+        payload = manifest.to_dict()
+        payload["provider_receipts"][0]["receipt"][
+            "response_digest"
+        ] = "not-a-digest"
+
+        with self.assertRaisesRegex(
+            AgentExecutionManifestError,
+            "invalid_provider_receipt_binding",
+        ) as raised:
+            AgentActivityExecutionManifest.from_dict(payload)
+        self.assertIsNone(raised.exception.__cause__)
+
     def test_parent_operation_and_request_artifact_bindings_are_exact(
         self,
     ) -> None:
@@ -454,7 +713,18 @@ class AgentExecutionManifestArtifactTests(unittest.TestCase):
             store = LocalArtifactStore(Path(raw))
             artifacts = AgentExecutionManifestArtifactStore(store)
             receipts = (_tool_receipt(1), _tool_receipt(2))
-            manifest = _manifest(receipts)
+            provider_receipts = (
+                _provider_receipt(1),
+                _provider_receipt(2),
+            )
+            manifest = _manifest(
+                receipts,
+                observed_provider_invocations=2,
+                provider_receipts_complete=True,
+                provider_receipts=_provider_bindings(
+                    provider_receipts
+                ),
+            )
             agent_receipt = _agent_receipt(manifest)
 
             first = artifacts.stage(manifest)
@@ -463,6 +733,8 @@ class AgentExecutionManifestArtifactTests(unittest.TestCase):
                 first,
                 expected_receipt=agent_receipt,
                 tool_receipts=receipts,
+                provider_receipts=provider_receipts,
+                require_complete_provider_receipts=True,
             )
 
             self.assertEqual(restored, manifest)
@@ -482,7 +754,7 @@ class AgentExecutionManifestArtifactTests(unittest.TestCase):
             )
             self.assertEqual(
                 dict(first.metadata),
-                {"schema": "agent_execution_manifest_v1"},
+                {"schema": "agent_execution_manifest_v2"},
             )
             self.assertEqual(
                 (

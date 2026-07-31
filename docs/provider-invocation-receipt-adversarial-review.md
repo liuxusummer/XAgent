@@ -1,10 +1,12 @@
 # Provider Invocation Receipt 三轮对抗性审查
 
-> 审查对象：`RemoteExecutionJournal` schema v4、provider wire schema v2、
-> `ProviderAccessBroker` 的 invocation claim/result persistence/replay
+> 审查对象：`RemoteExecutionJournal` schema v5、provider wire schema v2、
+> `ProviderAccessBroker` 的 invocation claim/result persistence/replay 与
+> `ProviderInvocationReceipt`
 >
-> 结论：本机 completed-result replay 边界通过；upstream 调用与 receipt 提交之间仍有
-> 明确的 outcome-unknown 窗口，生产 remote Agent 仍未开放。
+> 结论：本机 completed-result replay 和 payload-free typed receipt 边界通过；
+> upstream 调用与 receipt 提交之间仍有明确的 outcome-unknown 窗口，生产 remote
+> Agent 仍未开放。
 
 ## Round 1：崩溃窗口与重复调用
 
@@ -79,6 +81,13 @@ Round 2：通过。
 
 - journal 只保存 request/response digest、状态和 canonical ArtifactRef，不保存正文；
   response bytes 只存在于按 sensitivity 隔离的 ArtifactStore；
+- 每个成功结果生成 exact-field `ProviderInvocationReceipt`，绑定 grant、父 Agent、
+  request/payload、route、response/ref、分类和有序 recovery evidence；receipt/result
+  repr 不暴露正文、bearer 或 ArtifactRef；
+- receipt 不使用时间戳等重放易变字段；completed Artifact replay 与 COMPLETED evidence
+  recovery 都能重构同一 receipt digest，反序列化等价值也能重验绑定；
+- receipt/evidence 的语义子类、重排/重复 evidence、错误 completion mode 和
+  result/ref 替换均 fail closed；
 - `ProviderInvocationResult` 同时隐藏 content 与 ArtifactRef repr；invoker/Store/parser
   异常转换为固定 reason code 且无 cause/context；
 - 当前 exact v1/v2 直接原子迁移到 v5，exact v3 增 receipt/evidence 表，exact v4
@@ -92,6 +101,8 @@ Round 2：通过。
 对应测试：
 
 - `test_grant_is_canonical_path_free_and_credential_free`
+- `test_invoke_consumes_once_and_hides_response_from_repr`
+- `test_completed_gateway_evidence_recovers_and_replays`
 - `test_result_store_failure_is_sanitized_and_becomes_unknown`
 - `test_exact_v3_schema_migrates_atomically_to_v5`
 - `test_orphan_provider_invocation_fails_at_startup`
@@ -109,5 +120,6 @@ Round 3：在声明的本机 completed-result replay 范围内通过。
 - outcome-unknown 的 operator resolution 与费用/外部效果 reconciliation；
 - secret-manager backed、mTLS、egress allowlist 与 attested ProviderInvoker；
 - 跨主机单写者 fencing 或线性一致存储；
-- 将 provider receipt 与 AgentActivityRequest、逐工具 receipt、AgentActivityReceipt
-  组合进真正的远程 Agent runtime 后重新做端到端状态机审查。
+- `AgentActivityExecutionManifest` v2 已能组合 AgentActivityRequest、逐工具 receipt、
+  有序 provider receipt 与 AgentActivityReceipt；仍需把真实远程 Agent Loop 的每次
+  provider 调用接入后重新做端到端状态机审查。

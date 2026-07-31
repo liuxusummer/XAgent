@@ -22,6 +22,7 @@ from .artifacts import (
     LocalArtifactStore,
 )
 from .remote_execution_journal import (
+    MAX_PROVIDER_RECOVERY_EVIDENCE_PER_INVOCATION,
     RemoteExecutionJournal,
     RemoteExecutionJournalCapacityError,
     RemoteExecutionJournalError,
@@ -32,6 +33,7 @@ from .remote_execution_journal import (
     RemoteProviderInvocationConflict,
     RemoteProviderInvocationRecord,
     RemoteProviderInvocationUnknown,
+    RemoteProviderRecoveryEvidenceRecord,
 )
 from .worker_security import (
     WorkerAuthorization,
@@ -40,6 +42,7 @@ from .worker_security import (
 
 PROVIDER_ACCESS_SCHEMA_VERSION = 2
 PROVIDER_OPERATION_RECOVERY_SCHEMA_VERSION = 1
+PROVIDER_INVOCATION_RECEIPT_SCHEMA_VERSION = 1
 MAX_PROVIDER_GRANT_TTL_SECONDS = 5 * 60.0
 MAX_PROVIDER_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_PROVIDER_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -84,6 +87,13 @@ class ProviderOperationState(StrEnum):
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     UNKNOWN = "unknown"
+
+
+class ProviderInvocationCompletionMode(StrEnum):
+    """How durable provider completion was established."""
+
+    INVOKED = "invoked"
+    RECOVERED_COMPLETED = "recovered_completed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,6 +421,387 @@ class ProviderAccessGrant:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderRecoveryEvidenceBinding:
+    """Payload-free recovery evidence included in a provider receipt."""
+
+    sequence: int
+    decision: str
+    evidence_digest: str
+    verifier_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.sequence, bool)
+            or not isinstance(self.sequence, int)
+            or not 1
+            <= self.sequence
+            <= MAX_PROVIDER_RECOVERY_EVIDENCE_PER_INVOCATION
+        ):
+            raise ProviderAccessDenied(
+                "invalid_provider_receipt_evidence"
+            )
+        if self.decision not in {"not_started", "completed"}:
+            raise ProviderAccessDenied(
+                "invalid_provider_receipt_evidence"
+            )
+        object.__setattr__(
+            self,
+            "evidence_digest",
+            _digest(
+                self.evidence_digest,
+                "invalid_provider_receipt_evidence",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "verifier_id",
+            _code(
+                self.verifier_id,
+                "invalid_provider_receipt_evidence",
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sequence": self.sequence,
+            "decision": self.decision,
+            "evidence_digest": self.evidence_digest,
+            "verifier_id": self.verifier_id,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: Mapping[str, Any],
+    ) -> "ProviderRecoveryEvidenceBinding":
+        required = {
+            "sequence",
+            "decision",
+            "evidence_digest",
+            "verifier_id",
+        }
+        if not isinstance(value, Mapping) or set(value) != required:
+            raise ProviderAccessDenied(
+                "invalid_provider_receipt_evidence"
+            )
+        return cls(
+            sequence=value["sequence"],
+            decision=value["decision"],
+            evidence_digest=value["evidence_digest"],
+            verifier_id=value["verifier_id"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderInvocationReceipt:
+    """Canonical, payload-free evidence for one completed provider call."""
+
+    grant_id: str
+    run_id: str
+    node_id: str
+    attempt_id: str
+    action_digest: str
+    authorization_digest: str
+    request_digest: str
+    request_artifact_digest: str
+    request_payload_digest: str
+    invocation_index: int
+    route_id: str
+    route_digest: str
+    grant_binding_digest: str
+    response_digest: str
+    response_artifact_ref_digest: str | None
+    response_sensitivity: ArtifactSensitivity
+    completion_mode: ProviderInvocationCompletionMode
+    recovery_evidence: tuple[
+        ProviderRecoveryEvidenceBinding,
+        ...,
+    ] = ()
+    schema_version: int = PROVIDER_INVOCATION_RECEIPT_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "grant_id",
+            _code(self.grant_id, "invalid_provider_receipt"),
+        )
+        for field_name in ("run_id", "node_id", "attempt_id"):
+            object.__setattr__(
+                self,
+                field_name,
+                _bounded_text(
+                    getattr(self, field_name),
+                    "invalid_provider_receipt",
+                ),
+            )
+        for field_name in (
+            "action_digest",
+            "authorization_digest",
+            "request_digest",
+            "request_artifact_digest",
+            "request_payload_digest",
+            "route_digest",
+            "grant_binding_digest",
+            "response_digest",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _digest(
+                    getattr(self, field_name),
+                    "invalid_provider_receipt",
+                ),
+            )
+        if self.response_artifact_ref_digest is not None:
+            object.__setattr__(
+                self,
+                "response_artifact_ref_digest",
+                _digest(
+                    self.response_artifact_ref_digest,
+                    "invalid_provider_receipt",
+                ),
+            )
+        if (
+            isinstance(self.invocation_index, bool)
+            or not isinstance(self.invocation_index, int)
+            or not 1
+            <= self.invocation_index
+            <= MAX_PROVIDER_INVOCATION_INDEX
+        ):
+            raise ProviderAccessDenied(
+                "invalid_provider_receipt"
+            )
+        object.__setattr__(
+            self,
+            "route_id",
+            _code(self.route_id, "invalid_provider_receipt"),
+        )
+        try:
+            sensitivity = ArtifactSensitivity(
+                self.response_sensitivity
+            )
+            completion_mode = ProviderInvocationCompletionMode(
+                self.completion_mode
+            )
+        except (TypeError, ValueError):
+            raise ProviderAccessDenied(
+                "invalid_provider_receipt"
+            ) from None
+        object.__setattr__(
+            self,
+            "response_sensitivity",
+            sensitivity,
+        )
+        object.__setattr__(
+            self,
+            "completion_mode",
+            completion_mode,
+        )
+        evidence = tuple(self.recovery_evidence)
+        if (
+            len(evidence)
+            > MAX_PROVIDER_RECOVERY_EVIDENCE_PER_INVOCATION
+            or not all(
+                type(item) is ProviderRecoveryEvidenceBinding
+                for item in evidence
+            )
+            or tuple(item.sequence for item in evidence)
+            != tuple(range(1, len(evidence) + 1))
+            or len({item.evidence_digest for item in evidence})
+            != len(evidence)
+        ):
+            raise ProviderAccessDenied(
+                "invalid_provider_receipt_evidence"
+            )
+        completed_indexes = tuple(
+            index
+            for index, item in enumerate(evidence)
+            if item.decision == "completed"
+        )
+        if (
+            completion_mode
+            is ProviderInvocationCompletionMode.RECOVERED_COMPLETED
+            and completed_indexes != (len(evidence) - 1,)
+        ) or (
+            completion_mode
+            is ProviderInvocationCompletionMode.INVOKED
+            and completed_indexes
+        ):
+            raise ProviderAccessDenied(
+                "invalid_provider_receipt_completion"
+            )
+        object.__setattr__(self, "recovery_evidence", evidence)
+        if (
+            isinstance(self.schema_version, bool)
+            or self.schema_version
+            != PROVIDER_INVOCATION_RECEIPT_SCHEMA_VERSION
+        ):
+            raise ProviderAccessDenied(
+                "unsupported_provider_receipt_schema"
+            )
+
+    @property
+    def receipt_digest(self) -> str:
+        return _canonical_digest(self.to_dict())
+
+    def validate_binding(
+        self,
+        grant: ProviderAccessGrant,
+        *,
+        request_payload_digest: str,
+        result: "ProviderInvocationResult",
+    ) -> None:
+        if (
+            type(self) is not ProviderInvocationReceipt
+            or type(grant) is not ProviderAccessGrant
+            or type(result) is not ProviderInvocationResult
+        ):
+            raise ProviderAccessDenied(
+                "provider_receipt_binding_mismatch"
+            )
+        expected_artifact_digest = (
+            None
+            if result.artifact_ref is None
+            else _canonical_digest(result.artifact_ref.to_dict())
+        )
+        if (
+            self.grant_id != grant.grant_id
+            or self.run_id != grant.run_id
+            or self.node_id != grant.node_id
+            or self.attempt_id != grant.attempt_id
+            or self.action_digest != grant.action_digest
+            or self.authorization_digest
+            != grant.authorization_digest
+            or self.request_digest != grant.request_digest
+            or self.request_artifact_digest
+            != grant.request_artifact_digest
+            or self.request_payload_digest
+            != _digest(
+                request_payload_digest,
+                "provider_receipt_binding_mismatch",
+            )
+            or self.invocation_index != grant.invocation_index
+            or self.route_id != grant.route.route_id
+            or self.route_digest != grant.route.route_digest
+            or self.grant_binding_digest != grant.binding_digest
+            or self.response_digest != result.response_digest
+            or self.response_artifact_ref_digest
+            != expected_artifact_digest
+            or self.response_sensitivity
+            is not grant.response_sensitivity
+            or result.receipt != self
+        ):
+            raise ProviderAccessDenied(
+                "provider_receipt_binding_mismatch"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": "provider_invocation_receipt",
+            "grant_id": self.grant_id,
+            "run_id": self.run_id,
+            "node_id": self.node_id,
+            "attempt_id": self.attempt_id,
+            "action_digest": self.action_digest,
+            "authorization_digest": self.authorization_digest,
+            "request_digest": self.request_digest,
+            "request_artifact_digest": (
+                self.request_artifact_digest
+            ),
+            "request_payload_digest": self.request_payload_digest,
+            "invocation_index": self.invocation_index,
+            "route_id": self.route_id,
+            "route_digest": self.route_digest,
+            "grant_binding_digest": self.grant_binding_digest,
+            "response_digest": self.response_digest,
+            "response_artifact_ref_digest": (
+                self.response_artifact_ref_digest
+            ),
+            "response_sensitivity": self.response_sensitivity.value,
+            "completion_mode": self.completion_mode.value,
+            "recovery_evidence": [
+                item.to_dict() for item in self.recovery_evidence
+            ],
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: Mapping[str, Any],
+    ) -> "ProviderInvocationReceipt":
+        required = {
+            "schema_version",
+            "kind",
+            "grant_id",
+            "run_id",
+            "node_id",
+            "attempt_id",
+            "action_digest",
+            "authorization_digest",
+            "request_digest",
+            "request_artifact_digest",
+            "request_payload_digest",
+            "invocation_index",
+            "route_id",
+            "route_digest",
+            "grant_binding_digest",
+            "response_digest",
+            "response_artifact_ref_digest",
+            "response_sensitivity",
+            "completion_mode",
+            "recovery_evidence",
+        }
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != required
+            or value.get("kind")
+            != "provider_invocation_receipt"
+            or not isinstance(
+                value.get("recovery_evidence"),
+                list,
+            )
+        ):
+            raise ProviderAccessDenied(
+                "invalid_provider_receipt"
+            )
+        return cls(
+            schema_version=value["schema_version"],
+            grant_id=value["grant_id"],
+            run_id=value["run_id"],
+            node_id=value["node_id"],
+            attempt_id=value["attempt_id"],
+            action_digest=value["action_digest"],
+            authorization_digest=value["authorization_digest"],
+            request_digest=value["request_digest"],
+            request_artifact_digest=value[
+                "request_artifact_digest"
+            ],
+            request_payload_digest=value[
+                "request_payload_digest"
+            ],
+            invocation_index=value["invocation_index"],
+            route_id=value["route_id"],
+            route_digest=value["route_digest"],
+            grant_binding_digest=value[
+                "grant_binding_digest"
+            ],
+            response_digest=value["response_digest"],
+            response_artifact_ref_digest=value[
+                "response_artifact_ref_digest"
+            ],
+            response_sensitivity=value[
+                "response_sensitivity"
+            ],
+            completion_mode=value["completion_mode"],
+            recovery_evidence=tuple(
+                ProviderRecoveryEvidenceBinding.from_dict(item)
+                for item in value["recovery_evidence"]
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderInvocationResult:
     """Bounded ephemeral gateway response with a payload-safe repr."""
 
@@ -418,6 +809,7 @@ class ProviderInvocationResult:
     route_id: str
     response_digest: str
     content: bytes = field(repr=False)
+    receipt: ProviderInvocationReceipt = field(repr=False)
     artifact_ref: ArtifactRef | None = field(
         default=None,
         repr=False,
@@ -458,6 +850,21 @@ class ProviderInvocationResult:
                 raise ProviderAccessDenied(
                     "invalid_provider_result"
                 )
+        if (
+            type(self.receipt) is not ProviderInvocationReceipt
+            or self.receipt.grant_id != self.grant_id
+            or self.receipt.route_id != self.route_id
+            or self.receipt.response_digest != self.response_digest
+            or self.receipt.response_artifact_ref_digest
+            != (
+                None
+                if self.artifact_ref is None
+                else _canonical_digest(
+                    self.artifact_ref.to_dict()
+                )
+            )
+        ):
+            raise ProviderAccessDenied("invalid_provider_result")
 
 
 @dataclass(frozen=True, slots=True)
@@ -986,11 +1393,11 @@ class ProviderAccessBroker:
             raise ProviderAccessDenied(
                 "provider_grant_registry_unavailable"
             )
-        return ProviderInvocationResult(
-            grant_id=grant.grant_id,
-            route_id=route.route_id,
-            response_digest=response_digest,
-            content=response,
+        return self._invocation_result(
+            grant,
+            route,
+            request_payload_digest=request_payload_digest,
+            response=response,
             artifact_ref=artifact_ref,
         )
 
@@ -1201,13 +1608,123 @@ class ProviderAccessBroker:
             raise ProviderAccessDenied(
                 "provider_grant_registry_unavailable"
             )
-        return ProviderInvocationResult(
+        return self._invocation_result(
+            grant,
+            route,
+            request_payload_digest=request_payload_digest,
+            response=response,
+            artifact_ref=artifact_ref,
+        )
+
+    def _invocation_result(
+        self,
+        grant: ProviderAccessGrant,
+        route: ProviderRouteDescriptor,
+        *,
+        request_payload_digest: str,
+        response: bytes,
+        artifact_ref: ArtifactRef | None,
+    ) -> ProviderInvocationResult:
+        try:
+            invocation = (
+                self._recovery_journal.get_provider_invocation(
+                    grant.grant_id
+                )
+            )
+            evidence_records = (
+                self._recovery_journal
+                .list_provider_recovery_evidence(
+                    grant.grant_id
+                )
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            raise ProviderAccessDenied(
+                "provider_invocation_receipt_unavailable"
+            ) from None
+        response_digest = hashlib.sha256(response).hexdigest()
+        expected_artifact_ref = (
+            None
+            if artifact_ref is None
+            else _provider_result_ref_json(artifact_ref)
+        )
+        if (
+            type(invocation) is not RemoteProviderInvocationRecord
+            or invocation.grant_id != grant.grant_id
+            or invocation.state != "completed"
+            or invocation.request_payload_digest
+            != request_payload_digest
+            or invocation.response_digest != response_digest
+            or invocation.response_artifact_ref
+            != expected_artifact_ref
+            or not isinstance(evidence_records, tuple)
+            or any(
+                type(item)
+                is not RemoteProviderRecoveryEvidenceRecord
+                or item.grant_id != grant.grant_id
+                or item.request_payload_digest
+                != request_payload_digest
+                for item in evidence_records
+            )
+        ):
+            raise ProviderAccessDenied(
+                "provider_invocation_receipt_unavailable"
+            )
+        evidence = tuple(
+            ProviderRecoveryEvidenceBinding(
+                sequence=item.sequence,
+                decision=item.decision,
+                evidence_digest=item.evidence_digest,
+                verifier_id=item.verifier_id,
+            )
+            for item in evidence_records
+        )
+        completion_mode = (
+            ProviderInvocationCompletionMode.RECOVERED_COMPLETED
+            if evidence and evidence[-1].decision == "completed"
+            else ProviderInvocationCompletionMode.INVOKED
+        )
+        receipt = ProviderInvocationReceipt(
+            grant_id=grant.grant_id,
+            run_id=grant.run_id,
+            node_id=grant.node_id,
+            attempt_id=grant.attempt_id,
+            action_digest=grant.action_digest,
+            authorization_digest=grant.authorization_digest,
+            request_digest=grant.request_digest,
+            request_artifact_digest=(
+                grant.request_artifact_digest
+            ),
+            request_payload_digest=request_payload_digest,
+            invocation_index=grant.invocation_index,
+            route_id=route.route_id,
+            route_digest=route.route_digest,
+            grant_binding_digest=grant.binding_digest,
+            response_digest=response_digest,
+            response_artifact_ref_digest=(
+                None
+                if artifact_ref is None
+                else _canonical_digest(artifact_ref.to_dict())
+            ),
+            response_sensitivity=grant.response_sensitivity,
+            completion_mode=completion_mode,
+            recovery_evidence=evidence,
+        )
+        result = ProviderInvocationResult(
             grant_id=grant.grant_id,
             route_id=route.route_id,
             response_digest=response_digest,
             content=response,
+            receipt=receipt,
             artifact_ref=artifact_ref,
         )
+        receipt.validate_binding(
+            grant,
+            request_payload_digest=request_payload_digest,
+            result=result,
+        )
+        return result
 
     def _persist_provider_result(
         self,
@@ -1310,11 +1827,13 @@ class ProviderAccessBroker:
             raise ProviderAccessDenied(
                 "provider_result_integrity_failed"
             )
-        return ProviderInvocationResult(
-            grant_id=grant.grant_id,
-            route_id=route.route_id,
-            response_digest=invocation.response_digest,
-            content=content,
+        return self._invocation_result(
+            grant,
+            route,
+            request_payload_digest=(
+                invocation.request_payload_digest
+            ),
+            response=content,
             artifact_ref=ref,
         )
 
@@ -1570,14 +2089,18 @@ __all__ = [
     "MAX_PROVIDER_REQUEST_BYTES",
     "MAX_PROVIDER_RESPONSE_BYTES",
     "PROVIDER_ACCESS_SCHEMA_VERSION",
+    "PROVIDER_INVOCATION_RECEIPT_SCHEMA_VERSION",
     "PROVIDER_OPERATION_RECOVERY_SCHEMA_VERSION",
     "ProviderAccessBroker",
     "ProviderAccessDenied",
     "ProviderAccessGrant",
+    "ProviderInvocationCompletionMode",
+    "ProviderInvocationReceipt",
     "ProviderInvocationResult",
     "ProviderInvoker",
     "ProviderOperationRecovery",
     "ProviderOperationState",
+    "ProviderRecoveryEvidenceBinding",
     "ProviderRouteDescriptor",
     "RecoverableProviderInvoker",
 ]

@@ -12,8 +12,8 @@
 
 `AgentActivityExecutionManifest` 是后续远程 Agent runtime 的最小证据前置。它把一个父
 Agent Attempt、精确 request Artifact、Workflow definition、终止观察，以及有序子
-ToolReceipt 链绑定为 canonical、payload-free Artifact。当前生产远程能力仍保持
-Tool-only；manifest 存在不自动开放 `agent` capability。
+ToolReceipt/ProviderInvocationReceipt 链绑定为 canonical、payload-free Artifact。
+当前生产远程能力仍保持 Tool-only；manifest 存在不自动开放 `agent` capability。
 
 ## 2. 证据链
 
@@ -27,6 +27,8 @@ Agent runtime -> deterministic child operation key per sequence
                     v
 ordered ToolReceipt bindings
   child identity + action + operation/idempotency + receipt digest
+ordered ProviderInvocationReceipt bindings
+  grant + route + request payload + result Artifact + recovery evidence
                     |
                     v
 AgentActivityExecutionManifest Artifact
@@ -61,9 +63,9 @@ manifest 校验 ToolReceipt 中两者的 digest 均等于该确定性 key 的 SH
 当前 manifest 只允许同一 Run 的子 ToolReceipt。跨 child Run 的 Agent 工具编排必须先
 增加独立的 durable hierarchy proof，不能用弱化本约束的方式兼容。
 
-## 4. Schema v1
+## 4. Schema v1/v2
 
-顶层字段：
+v1 顶层字段：
 
 | 字段 | 约束 |
 |---|---|
@@ -90,6 +92,29 @@ receipt digest、logical call digest和 child Attempt 身份均不得重复。�
 canonical UTF-8 JSON 和 Artifact 均不得超过 256 KiB。解析采用 exact-field schema，
 拒绝 bool-as-int、NaN、未知/缺失字段、非规范编码、控制字符和无界集合。
 
+v2 保留所有 v1 字段，并增加：
+
+| 字段 | 约束 |
+|---|---|
+| `observed_provider_invocations` | runtime 观察到的 provider 调用数，最多 64 |
+| `provider_receipts_complete` | 是否逐项完整覆盖 |
+| `provider_receipts[]` | 有序 `AgentProviderReceiptBinding` |
+
+每个绑定包含连续 `sequence`、非递减且不越界的 `turn`，以及完整的
+`ProviderInvocationReceipt`。receipt 必须同时绑定父 Run/Node/Attempt、request 与
+request Artifact digest；`invocation_index` 必须等于 sequence。grant ID 和 receipt
+digest 不得重复。
+
+只有已持久化 response Artifact 的 provider 调用才能进入 manifest：
+`response_artifact_ref_digest` 不得为空。manifest 分类必须不低于所有 provider response
+的分类，因此 sensitive request 在产生 secret response 后可以合法升级为 secret；
+不得降级。`has_complete_provider_receipt_lineage` 只有在 v2、完整标志为真且 receipt 数
+精确覆盖 observed count 时为真。接收端应调用
+`validate_provider_receipts(..., require_complete=True)`，不能把 partial manifest 当作
+完整证明。
+
+v1 继续 exact-field 解析，但没有 provider 字段，也不能声明 provider 完整性。
+
 ## 5. AgentActivityReceipt v2
 
 v2 增加 `execution_manifest_digest`：
@@ -100,7 +125,7 @@ v2 增加 `execution_manifest_digest`：
 - `has_manifest_bound_tool_receipt_lineage` 只表示 receipt 已绑定 manifest digest，
   不表示 manifest bytes 已加载或外部副作用已验证；
 - runtime/control 必须实际加载 manifest，验证 request/ref、全部 ToolReceipt 和
-  `AgentActivityReceipt` 后，才可接纳新远程 Agent 终态。
+  ProviderInvocationReceipt、`AgentActivityReceipt` 后，才可接纳新远程 Agent 终态。
 
 Store 的 receipt 查询会额外要求 NodeResult 中存在唯一、canonical、
 `kind=agent_execution_manifest` 的 ref，并校验 schema metadata、sensitivity 和精确
@@ -117,13 +142,16 @@ manifest Artifact：
 - `kind=agent_execution_manifest`；
 - media type 为
   `application/vnd.xagent.agent-execution-manifest+json`；
-- metadata 仅 `{"schema":"agent_execution_manifest_v1"}`；
+- metadata 按内容版本精确为
+  `{"schema":"agent_execution_manifest_v1"}` 或
+  `{"schema":"agent_execution_manifest_v2"}`；
 - producer 精确绑定父 Agent Run/Node/Attempt；
 - 分类继承 request Artifact，只允许 `sensitive/secret`；
 - content address 保证并发 staging 和响应丢失后的重试收敛到同一内容身份。
 
 load 顺序是 ref 结构校验、Store verify、读取 bytes、size/SHA 校验、canonical 解析、
-request/receipt/ToolReceipt 绑定校验。verify 失败时不得继续读取内容。
+request/receipt/ToolReceipt/ProviderInvocationReceipt 绑定校验。远程接纳路径必须设置
+`require_complete_provider_receipts=True`。verify 失败时不得继续读取内容。
 
 ## 7. 仍未承诺
 
@@ -132,9 +160,12 @@ request/receipt/ToolReceipt 绑定校验。verify 失败时不得继续读取内
 - manifest 不证明 sandbox 禁止了绕过 Tool/Provider gateway 的直接网络或文件副作用；
   远程 Agent runtime 必须由 attested sandbox 和 egress policy 独立证明。
 - `ToolReceipt.verification` 强度必须逐项判断。manifest 完整不等于 write exactly-once。
-- provider invocation 需要独立的有序 receipt/operation evidence，不能伪装成 ToolReceipt。
+- v2 已绑定 provider invocation receipt/operation evidence，但真实 Agent Loop 还未把每次
+  provider 调用接到该清单；不能仅靠数据类型声称端到端能力已完成。
 - Artifact digest 不是抗 ArtifactStore/数据库管理员的数字签名；生产仍需独立 OS 身份、
   ACL、加密和可选透明日志。
 
 三轮攻击复现、修复与测试见
-[Agent Execution Manifest 三轮对抗性审查](agent-execution-manifest-adversarial-review.md)。
+[Agent Execution Manifest 三轮对抗性审查](agent-execution-manifest-adversarial-review.md)
+与
+[Provider Receipt 与 Agent Lineage 三轮对抗性审查](provider-agent-lineage-adversarial-review.md)。

@@ -13,8 +13,11 @@ from src.orchestration.provider_access import (
     ProviderAccessBroker,
     ProviderAccessDenied,
     ProviderAccessGrant,
+    ProviderInvocationCompletionMode,
+    ProviderInvocationReceipt,
     ProviderOperationRecovery,
     ProviderOperationState,
+    ProviderRecoveryEvidenceBinding,
     ProviderRouteDescriptor,
 )
 from src.orchestration.remote_execution_journal import (
@@ -348,6 +351,88 @@ class ProviderAccessBrokerTests(unittest.TestCase):
         self.assertEqual(result.content, b'{"status":"ok"}')
         self.assertNotIn('{"status":"ok"}', repr(result))
         self.assertEqual(
+            result.receipt.completion_mode,
+            ProviderInvocationCompletionMode.INVOKED,
+        )
+        self.assertEqual(result.receipt.recovery_evidence, ())
+        self.assertEqual(
+            result.receipt.request_payload_digest,
+            hashlib.sha256(payload).hexdigest(),
+        )
+        self.assertIsNone(
+            result.receipt.response_artifact_ref_digest
+        )
+        restored_receipt = ProviderInvocationReceipt.from_dict(
+            result.receipt.to_dict()
+        )
+        self.assertEqual(restored_receipt, result.receipt)
+        restored_receipt.validate_binding(
+            grant,
+            request_payload_digest=hashlib.sha256(payload).hexdigest(),
+            result=result,
+        )
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "provider_receipt_binding_mismatch",
+        ):
+            replace(
+                restored_receipt,
+                response_digest="0" * 64,
+            ).validate_binding(
+                grant,
+                request_payload_digest=hashlib.sha256(
+                    payload
+                ).hexdigest(),
+                result=result,
+            )
+
+        class ForgedReceipt(ProviderInvocationReceipt):
+            pass
+
+        forged_values = result.receipt.to_dict()
+        forged_values.pop("kind")
+        forged_values["recovery_evidence"] = ()
+        forged = ForgedReceipt(**forged_values)
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "invalid_provider_result",
+        ):
+            replace(result, receipt=forged)
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "provider_receipt_binding_mismatch",
+        ):
+            forged.validate_binding(
+                grant,
+                request_payload_digest=hashlib.sha256(
+                    payload
+                ).hexdigest(),
+                result=result,
+            )
+        serialized_receipt = json.dumps(
+            result.receipt.to_dict(),
+            sort_keys=True,
+        )
+        for forbidden in (
+            _UPSTREAM_SECRET,
+            grant.token,
+            payload.decode(),
+            result.content.decode(),
+            "api_key",
+        ):
+            self.assertNotIn(forbidden, serialized_receipt)
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "provider_invocation_receipt_unavailable",
+        ):
+            self.broker._invocation_result(
+                grant,
+                grant.route,
+                request_payload_digest="0" * 64,
+                response=result.content,
+                artifact_ref=result.artifact_ref,
+            )
+        self.assertEqual(
             self.invoker.calls,
             [("primary-route", payload, grant.grant_id)],
         )
@@ -360,6 +445,98 @@ class ProviderAccessBrokerTests(unittest.TestCase):
                 self.authorization,
                 payload,
             )
+
+    def test_receipt_schema_completion_and_grant_tampering_fail_closed(
+        self,
+    ) -> None:
+        grant = self.issue()
+        payload = b"receipt-binding-payload"
+        payload_digest = hashlib.sha256(payload).hexdigest()
+        result = self.broker.invoke(
+            grant,
+            self.authorization,
+            payload,
+        )
+        receipt = result.receipt
+
+        unknown = receipt.to_dict()
+        unknown["token"] = grant.token
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "invalid_provider_receipt",
+        ):
+            ProviderInvocationReceipt.from_dict(unknown)
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "invalid_provider_receipt_completion",
+        ):
+            replace(
+                receipt,
+                completion_mode=(
+                    ProviderInvocationCompletionMode.RECOVERED_COMPLETED
+                ),
+            )
+        completed = ProviderRecoveryEvidenceBinding(
+            sequence=1,
+            decision="completed",
+            evidence_digest="9" * 64,
+            verifier_id="trusted-verifier",
+        )
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "invalid_provider_receipt_completion",
+        ):
+            replace(
+                receipt,
+                recovery_evidence=(completed,),
+            )
+        noncontiguous = replace(completed, sequence=2)
+        with self.assertRaisesRegex(
+            ProviderAccessDenied,
+            "invalid_provider_receipt_evidence",
+        ):
+            replace(
+                receipt,
+                completion_mode=(
+                    ProviderInvocationCompletionMode.RECOVERED_COMPLETED
+                ),
+                recovery_evidence=(noncontiguous,),
+            )
+
+        mutations = (
+            {"run_id": "other-run"},
+            {"node_id": "other-node"},
+            {"attempt_id": "other-attempt"},
+            {"action_digest": "1" * 64},
+            {"authorization_digest": "2" * 64},
+            {"request_digest": "3" * 64},
+            {"request_artifact_digest": "4" * 64},
+            {"request_payload_digest": "5" * 64},
+            {"invocation_index": 2},
+            {"route_digest": "6" * 64},
+            {"grant_binding_digest": "7" * 64},
+            {
+                "response_sensitivity": (
+                    ArtifactSensitivity.INTERNAL
+                )
+            },
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                changed = replace(receipt, **mutation)
+                changed_result = replace(
+                    result,
+                    receipt=changed,
+                )
+                with self.assertRaisesRegex(
+                    ProviderAccessDenied,
+                    "provider_receipt_binding_mismatch",
+                ):
+                    changed.validate_binding(
+                        grant,
+                        request_payload_digest=payload_digest,
+                        result=changed_result,
+                    )
         self.assertEqual(len(self.invoker.calls), 1)
 
     def test_wrong_authorization_and_tampering_do_not_consume(
@@ -716,6 +893,17 @@ class ProviderAccessBrokerTests(unittest.TestCase):
                 payload,
             )
             self.assertEqual(recovered.content, response)
+            self.assertEqual(
+                recovered.receipt.completion_mode,
+                ProviderInvocationCompletionMode.RECOVERED_COMPLETED,
+            )
+            self.assertEqual(
+                tuple(
+                    item.decision
+                    for item in recovered.receipt.recovery_evidence
+                ),
+                ("completed",),
+            )
             self.assertEqual(invoker.calls, [])
             self.assertEqual(len(invoker.recovery_calls), 1)
             evidence = (
@@ -743,6 +931,14 @@ class ProviderAccessBrokerTests(unittest.TestCase):
                 payload,
             )
             self.assertEqual(replayed.content, response)
+            self.assertEqual(
+                replayed.receipt,
+                recovered.receipt,
+            )
+            self.assertEqual(
+                replayed.receipt.receipt_digest,
+                recovered.receipt.receipt_digest,
+            )
             self.assertEqual(third_invoker.calls, [])
             third_journal.close()
 
@@ -1326,6 +1522,10 @@ class ProviderAccessBrokerTests(unittest.TestCase):
             self.assertEqual(
                 replayed.artifact_ref,
                 result.artifact_ref,
+            )
+            self.assertEqual(
+                replayed.receipt,
+                result.receipt,
             )
             with self.assertRaisesRegex(
                 ProviderAccessDenied,

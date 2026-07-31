@@ -416,8 +416,12 @@ verification          runtime_observed | unverified
 `internal_tool_receipts_complete=false`。v2 有 ToolReceipt 或声明完整时还必须绑定
 唯一 `AgentActivityExecutionManifest` result Artifact；manifest 使用父
 run/node/attempt/request/sequence 派生的 child operation/idempotency key digest，阻止
-无关 receipt 替换和重排。即使 lineage 完整，各 ToolReceipt 的 verification 强度仍须
-逐个判断，禁止据此宣称通用 exactly-once。v1 的完整标志仅为历史 count-only 语义。
+无关 receipt 替换和重排。manifest schema v2 还按 invocation index/turn 绑定
+payload-free `ProviderInvocationReceipt`、response ArtifactRef digest 和 operation
+recovery evidence；远程接纳必须显式要求 provider receipt 精确覆盖 observed count。
+即使 lineage 完整，各 ToolReceipt 的 verification 强度和外部 provider gateway
+attestation 仍须分别判断，禁止据此宣称通用 exactly-once。v1 的完整标志仅为历史
+count-only 语义。
 
 成功 Attempt 必须是 `runtime_observed`；`OUTCOME_UNKNOWN` 和 `ABANDONED` 必须是
 `unverified`。Store 查询必须在同一 SQLite read transaction 中校验终态 Event、
@@ -466,11 +470,15 @@ token-free binding digest。同一逻辑 invocation 在墓碑窗口内只能签�
 
 当前 `ProviderAccessBroker` 可注入隔离的磁盘 `RemoteExecutionJournal`，跨进程原子
 消费 grant、恢复 completed result，并可接受部署侧
-`RecoverableProviderInvoker` 的 NOT_STARTED/COMPLETED operation evidence。普通
-invoker 和无法验证的状态仍 fail closed；参考实现也不能证明外部 gateway 的线性一致
-幂等账本或 attestation，因此 `production_security_ready=false`。生产 remote Agent
-仍必须补齐 mTLS/attestation、egress policy、secret-manager backed invoker、跨主机
-一致性和完整 Agent receipt 组合。
+`RecoverableProviderInvoker` 的 NOT_STARTED/COMPLETED operation evidence。成功结果
+携带 canonical `ProviderInvocationReceipt`，绑定 grant、实际 payload digest、route、
+response/ref、分类与有序 recovery evidence；durable replay 重构相同 digest。只有带
+response ArtifactRef digest 的 receipt 才能进入 Agent manifest v2。
+
+普通 invoker 和无法验证的状态仍 fail closed；参考实现也不能证明外部 gateway 的线性
+一致幂等账本或 attestation，因此 `production_security_ready=false`。生产 remote
+Agent 仍必须补齐 mTLS/attestation、egress policy、secret-manager backed invoker、
+跨主机一致性和真实 Loop 接线后的完整 Agent receipt 组合。
 完整约束见
 [Provider Credential 与模型网关边界](provider-credential-boundary.md)。
 

@@ -125,5 +125,6 @@ Round 3：参考边界通过，生产能力声明仍拒绝提升。
 - 使用 secret manager、mTLS、gateway egress allowlist 与跨主机线性一致存储；
 - 验证 upstream/gateway 对稳定 operation ID 的去重、保留期和灾备语义；
 - 为永久 UNKNOWN 提供受权 operator reconciliation、费用核对与审计工作流；
-- 把 provider recovery receipt 与远程 Agent 的逐工具 receipt、整体
-  `AgentActivityReceipt` 组合后，再做端到端三轮审查。
+- provider recovery receipt 已可由 `AgentActivityExecutionManifest` v2 与逐工具
+  receipt、整体 `AgentActivityReceipt` 组合；仍需在真实远程 Agent Loop 接线后再做
+  端到端三轮审查。

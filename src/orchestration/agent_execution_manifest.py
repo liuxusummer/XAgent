@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from .artifacts import (
@@ -16,20 +16,33 @@ from .artifacts import (
     canonical_json_bytes,
 )
 from .executor import ToolReceipt
+from .provider_access import (
+    ProviderAccessDenied,
+    ProviderInvocationReceipt,
+)
 
 if TYPE_CHECKING:
     from .agent_request import AgentActivityRequest
     from .agent_receipt import AgentActivityReceipt
 
 
-AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION = 1
+AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION = 2
+LEGACY_AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION = 1
 AGENT_EXECUTION_MANIFEST_MEDIA_TYPE = (
     "application/vnd.xagent.agent-execution-manifest+json"
 )
 MAX_AGENT_EXECUTION_MANIFEST_BYTES = 256 * 1024
 MAX_AGENT_EXECUTION_TOOL_RECEIPTS = 64
+MAX_AGENT_EXECUTION_PROVIDER_RECEIPTS = 64
 MAX_AGENT_EXECUTION_TURNS = 1_000_000
-_SCHEMA_NAME = "agent_execution_manifest_v1"
+_SCHEMA_NAMES = {
+    LEGACY_AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION: (
+        "agent_execution_manifest_v1"
+    ),
+    AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION: (
+        "agent_execution_manifest_v2"
+    ),
+}
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,254}$")
 _SAFE_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -216,6 +229,95 @@ class AgentToolReceiptBinding:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class AgentProviderReceiptBinding:
+    """One ordered provider invocation observed by the Agent runtime."""
+
+    sequence: int
+    turn: int
+    receipt: ProviderInvocationReceipt = field(repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "sequence",
+            _count(
+                self.sequence,
+                "invalid_provider_sequence",
+                minimum=1,
+                maximum=MAX_AGENT_EXECUTION_PROVIDER_RECEIPTS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "turn",
+            _count(
+                self.turn,
+                "invalid_provider_turn",
+                minimum=1,
+                maximum=MAX_AGENT_EXECUTION_TURNS,
+            ),
+        )
+        if (
+            type(self.receipt) is not ProviderInvocationReceipt
+            or self.receipt.invocation_index != self.sequence
+        ):
+            raise AgentExecutionManifestError(
+                "invalid_provider_receipt_binding"
+            )
+
+    @property
+    def receipt_digest(self) -> str:
+        return self.receipt.receipt_digest
+
+    def validate_receipt(
+        self,
+        receipt: ProviderInvocationReceipt,
+    ) -> None:
+        if (
+            type(receipt) is not ProviderInvocationReceipt
+            or receipt != self.receipt
+            or receipt.receipt_digest != self.receipt_digest
+        ):
+            raise AgentExecutionManifestError(
+                "provider_receipt_binding_mismatch"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sequence": self.sequence,
+            "turn": self.turn,
+            "receipt": self.receipt.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> "AgentProviderReceiptBinding":
+        if (
+            not isinstance(payload, Mapping)
+            or set(payload) != {"sequence", "turn", "receipt"}
+            or not isinstance(payload.get("receipt"), Mapping)
+        ):
+            raise AgentExecutionManifestError(
+                "invalid_provider_receipt_binding"
+            )
+        try:
+            receipt = ProviderInvocationReceipt.from_dict(
+                payload["receipt"]
+            )
+        except ProviderAccessDenied:
+            raise AgentExecutionManifestError(
+                "invalid_provider_receipt_binding"
+            ) from None
+        return cls(
+            sequence=payload["sequence"],
+            turn=payload["turn"],
+            receipt=receipt,
+        )
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class AgentActivityExecutionManifest:
     """Immutable evidence joining an Agent request to ordered ToolReceipts."""
@@ -232,6 +334,9 @@ class AgentActivityExecutionManifest:
     observed_tool_results: int
     tool_receipts_complete: bool
     tool_receipts: tuple[AgentToolReceiptBinding, ...] = ()
+    observed_provider_invocations: int = 0
+    provider_receipts_complete: bool = False
+    provider_receipts: tuple[AgentProviderReceiptBinding, ...] = ()
     schema_version: int = AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -383,11 +488,125 @@ class AgentActivityExecutionManifest:
             isinstance(self.schema_version, bool)
             or not isinstance(self.schema_version, int)
             or self.schema_version
-            != AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION
+            not in {
+                LEGACY_AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION,
+                AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION,
+            }
         ):
             raise AgentExecutionManifestError(
                 "unsupported_agent_execution_manifest_schema"
             )
+        observed_provider_invocations = _count(
+            self.observed_provider_invocations,
+            "invalid_observed_provider_invocation_count",
+            minimum=0,
+            maximum=MAX_AGENT_EXECUTION_PROVIDER_RECEIPTS,
+        )
+        object.__setattr__(
+            self,
+            "observed_provider_invocations",
+            observed_provider_invocations,
+        )
+        if not isinstance(self.provider_receipts_complete, bool):
+            raise AgentExecutionManifestError(
+                "invalid_provider_receipt_completeness"
+            )
+        provider_receipts = tuple(self.provider_receipts)
+        if (
+            len(provider_receipts)
+            > MAX_AGENT_EXECUTION_PROVIDER_RECEIPTS
+            or not all(
+                type(item) is AgentProviderReceiptBinding
+                for item in provider_receipts
+            )
+            or tuple(item.sequence for item in provider_receipts)
+            != tuple(range(1, len(provider_receipts) + 1))
+            or tuple(item.turn for item in provider_receipts)
+            != tuple(
+                sorted(item.turn for item in provider_receipts)
+            )
+            or len(
+                {
+                    item.receipt.grant_id
+                    for item in provider_receipts
+                }
+            )
+            != len(provider_receipts)
+            or len(
+                {
+                    item.receipt_digest
+                    for item in provider_receipts
+                }
+            )
+            != len(provider_receipts)
+        ):
+            raise AgentExecutionManifestError(
+                "invalid_ordered_provider_receipts"
+            )
+        if (
+            self.schema_version
+            == LEGACY_AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION
+            and (
+                observed_provider_invocations != 0
+                or self.provider_receipts_complete
+                or provider_receipts
+            )
+        ):
+            raise AgentExecutionManifestError(
+                "legacy_manifest_cannot_bind_provider_receipts"
+            )
+        for item in provider_receipts:
+            receipt = item.receipt
+            if (
+                receipt.run_id != self.run_id
+                or receipt.node_id != self.node_id
+                or receipt.attempt_id != self.attempt_id
+                or receipt.request_digest != self.request_digest
+                or receipt.request_artifact_digest
+                != self.request_artifact_digest
+                or receipt.response_artifact_ref_digest is None
+                or _sensitivity_rank(sensitivity)
+                < _sensitivity_rank(
+                    receipt.response_sensitivity
+                )
+            ):
+                raise AgentExecutionManifestError(
+                    "provider_receipt_parent_binding_mismatch"
+                )
+        if self.turns is None and provider_receipts:
+            raise AgentExecutionManifestError(
+                "provider_receipts_require_turn_count"
+            )
+        if (
+            self.turns is not None
+            and any(
+                item.turn > self.turns
+                for item in provider_receipts
+            )
+        ):
+            raise AgentExecutionManifestError(
+                "provider_receipt_turn_out_of_range"
+            )
+        if (
+            len(provider_receipts)
+            > observed_provider_invocations
+        ):
+            raise AgentExecutionManifestError(
+                "provider_receipts_exceed_observed_invocations"
+            )
+        if (
+            self.provider_receipts_complete
+            and len(provider_receipts)
+            != observed_provider_invocations
+        ):
+            raise AgentExecutionManifestError(
+                "complete_provider_receipts_require_exact_coverage"
+            )
+        object.__setattr__(
+            self,
+            "provider_receipts",
+            provider_receipts,
+        )
         self.to_bytes()
 
     def __repr__(self) -> str:
@@ -396,7 +615,9 @@ class AgentActivityExecutionManifest:
             f"run_id={self.run_id!r}, node_id={self.node_id!r}, "
             f"attempt_id={self.attempt_id!r}, "
             f"request_digest={self.request_digest!r}, "
-            f"tool_receipt_count={len(self.tool_receipts)})"
+            f"tool_receipt_count={len(self.tool_receipts)}, "
+            "provider_receipt_count="
+            f"{len(self.provider_receipts)})"
         )
 
     @property
@@ -406,6 +627,22 @@ class AgentActivityExecutionManifest:
     @property
     def tool_receipt_digests(self) -> tuple[str, ...]:
         return tuple(item.receipt_digest for item in self.tool_receipts)
+
+    @property
+    def provider_receipt_digests(self) -> tuple[str, ...]:
+        return tuple(
+            item.receipt_digest for item in self.provider_receipts
+        )
+
+    @property
+    def has_complete_provider_receipt_lineage(self) -> bool:
+        return (
+            self.schema_version
+            == AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION
+            and self.provider_receipts_complete
+            and len(self.provider_receipts)
+            == self.observed_provider_invocations
+        )
 
     def validate_tool_receipts(
         self,
@@ -420,6 +657,36 @@ class AgentActivityExecutionManifest:
             )
         for binding, receipt in zip(
             self.tool_receipts,
+            receipts,
+            strict=True,
+        ):
+            binding.validate_receipt(receipt)
+
+    def validate_provider_receipts(
+        self,
+        receipts: Sequence[ProviderInvocationReceipt],
+        *,
+        require_complete: bool = False,
+    ) -> None:
+        if (
+            not isinstance(require_complete, bool)
+            or (
+                require_complete
+                and not self.has_complete_provider_receipt_lineage
+            )
+        ):
+            raise AgentExecutionManifestError(
+                "provider_receipt_lineage_incomplete"
+            )
+        if (
+            not isinstance(receipts, (tuple, list))
+            or len(receipts) != len(self.provider_receipts)
+        ):
+            raise AgentExecutionManifestError(
+                "provider_receipt_set_mismatch"
+            )
+        for binding, receipt in zip(
+            self.provider_receipts,
             receipts,
             strict=True,
         ):
@@ -456,8 +723,14 @@ class AgentActivityExecutionManifest:
             or self.request_artifact_digest
             != request.artifact_digest
             or self.definition_digest != request.definition_digest
-            or self.artifact_sensitivity
-            is not request_ref.sensitivity
+            or _sensitivity_rank(self.artifact_sensitivity)
+            < _sensitivity_rank(request_ref.sensitivity)
+            or (
+                self.schema_version
+                == LEGACY_AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION
+                and self.artifact_sensitivity
+                is not request_ref.sensitivity
+            )
         ):
             raise AgentExecutionManifestError(
                 "agent_request_manifest_binding_mismatch"
@@ -491,7 +764,7 @@ class AgentActivityExecutionManifest:
             )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "kind": "agent_activity_execution_manifest",
             "run_id": self.run_id,
@@ -509,6 +782,22 @@ class AgentActivityExecutionManifest:
                 item.to_dict() for item in self.tool_receipts
             ],
         }
+        if self.schema_version == AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION:
+            payload.update(
+                {
+                    "observed_provider_invocations": (
+                        self.observed_provider_invocations
+                    ),
+                    "provider_receipts_complete": (
+                        self.provider_receipts_complete
+                    ),
+                    "provider_receipts": [
+                        item.to_dict()
+                        for item in self.provider_receipts
+                    ],
+                }
+            )
+        return payload
 
     def to_bytes(self) -> bytes:
         try:
@@ -533,6 +822,23 @@ class AgentActivityExecutionManifest:
         cls,
         payload: Mapping[str, Any],
     ) -> "AgentActivityExecutionManifest":
+        if not isinstance(payload, Mapping):
+            raise AgentExecutionManifestError(
+                "invalid_agent_execution_manifest_schema"
+            )
+        version = payload.get("schema_version")
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version
+            not in {
+                LEGACY_AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION,
+                AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION,
+            }
+        ):
+            raise AgentExecutionManifestError(
+                "unsupported_agent_execution_manifest_schema"
+            )
         required = {
             "schema_version",
             "kind",
@@ -549,14 +855,32 @@ class AgentActivityExecutionManifest:
             "tool_receipts_complete",
             "tool_receipts",
         }
+        if version == AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION:
+            required.update(
+                {
+                    "observed_provider_invocations",
+                    "provider_receipts_complete",
+                    "provider_receipts",
+                }
+            )
         if (
-            not isinstance(payload, Mapping)
-            or set(payload) != required
+            set(payload) != required
             or payload.get("kind")
             != "agent_activity_execution_manifest"
             or not isinstance(payload.get("tool_receipts"), list)
             or len(payload["tool_receipts"])
             > MAX_AGENT_EXECUTION_TOOL_RECEIPTS
+            or (
+                version == AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION
+                and (
+                    not isinstance(
+                        payload.get("provider_receipts"),
+                        list,
+                    )
+                    or len(payload["provider_receipts"])
+                    > MAX_AGENT_EXECUTION_PROVIDER_RECEIPTS
+                )
+            )
         ):
             raise AgentExecutionManifestError(
                 "invalid_agent_execution_manifest_schema"
@@ -583,6 +907,18 @@ class AgentActivityExecutionManifest:
             tool_receipts=tuple(
                 AgentToolReceiptBinding.from_dict(item)
                 for item in payload["tool_receipts"]
+            ),
+            observed_provider_invocations=payload.get(
+                "observed_provider_invocations",
+                0,
+            ),
+            provider_receipts_complete=payload.get(
+                "provider_receipts_complete",
+                False,
+            ),
+            provider_receipts=tuple(
+                AgentProviderReceiptBinding.from_dict(item)
+                for item in payload.get("provider_receipts", ())
             ),
         )
 
@@ -648,7 +984,11 @@ class AgentExecutionManifestArtifactStore:
                 producer_run_id=manifest.run_id,
                 producer_node_id=manifest.node_id,
                 producer_attempt_id=manifest.attempt_id,
-                metadata={"schema": _SCHEMA_NAME},
+                metadata={
+                    "schema": _SCHEMA_NAMES[
+                        manifest.schema_version
+                    ]
+                },
             )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -677,7 +1017,19 @@ class AgentExecutionManifestArtifactStore:
         *,
         expected_receipt: "AgentActivityReceipt | None" = None,
         tool_receipts: Sequence[ToolReceipt] | None = None,
+        provider_receipts: Sequence[
+            ProviderInvocationReceipt
+        ]
+        | None = None,
+        require_complete_provider_receipts: bool = False,
     ) -> AgentActivityExecutionManifest:
+        if not isinstance(
+            require_complete_provider_receipts,
+            bool,
+        ):
+            raise AgentExecutionManifestError(
+                "invalid_provider_receipt_completeness_requirement"
+            )
         self.validate_ref(ref)
         try:
             verified = self._store.verify(ref)
@@ -713,6 +1065,17 @@ class AgentExecutionManifestArtifactStore:
             manifest.validate_agent_receipt(expected_receipt)
         if tool_receipts is not None:
             manifest.validate_tool_receipts(tool_receipts)
+        if provider_receipts is not None:
+            manifest.validate_provider_receipts(
+                provider_receipts,
+                require_complete=(
+                    require_complete_provider_receipts
+                ),
+            )
+        elif require_complete_provider_receipts:
+            raise AgentExecutionManifestError(
+                "provider_receipt_set_mismatch"
+            )
         return manifest
 
     @staticmethod
@@ -732,7 +1095,11 @@ class AgentExecutionManifestArtifactStore:
                 ArtifactSensitivity.SECRET,
             }
             or not 0 < ref.size <= MAX_AGENT_EXECUTION_MANIFEST_BYTES
-            or dict(ref.metadata) != {"schema": _SCHEMA_NAME}
+            or dict(ref.metadata)
+            not in (
+                {"schema": schema}
+                for schema in _SCHEMA_NAMES.values()
+            )
         ):
             raise AgentExecutionManifestError(
                 "invalid_agent_execution_manifest_artifact"
@@ -741,6 +1108,12 @@ class AgentExecutionManifestArtifactStore:
             ref.sha256 != manifest.manifest_digest
             or ref.size != len(manifest.to_bytes())
             or ref.sensitivity is not manifest.artifact_sensitivity
+            or dict(ref.metadata)
+            != {
+                "schema": _SCHEMA_NAMES[
+                    manifest.schema_version
+                ]
+            }
             or ref.producer_run_id != manifest.run_id
             or ref.producer_node_id != manifest.node_id
             or ref.producer_attempt_id != manifest.attempt_id
@@ -857,12 +1230,22 @@ def _reject_json_constant(_value: str) -> object:
     raise ValueError("non-finite JSON constant")
 
 
+def _sensitivity_rank(value: ArtifactSensitivity) -> int:
+    return {
+        ArtifactSensitivity.PUBLIC: 0,
+        ArtifactSensitivity.INTERNAL: 1,
+        ArtifactSensitivity.SENSITIVE: 2,
+        ArtifactSensitivity.SECRET: 3,
+    }[value]
+
+
 __all__ = [
     "AGENT_EXECUTION_MANIFEST_MEDIA_TYPE",
     "AGENT_EXECUTION_MANIFEST_SCHEMA_VERSION",
     "AgentActivityExecutionManifest",
     "AgentExecutionManifestArtifactStore",
     "AgentExecutionManifestError",
+    "AgentProviderReceiptBinding",
     "AgentToolReceiptBinding",
     "agent_tool_operation_key",
     "canonical_tool_call_digest",
