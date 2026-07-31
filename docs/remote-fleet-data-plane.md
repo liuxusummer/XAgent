@@ -129,7 +129,7 @@ fleet_reconciler.run_once()
 two-phase admission 和 reference fallback 禁用要求。`DurableFleetReconciler` 也不会
 启动线程、扫描任意 Store 或推进 Domain Run；部署显式周期调用 `run_once()`，并通过
 `FleetRunSource` 与 scheduler resolver 注入已经授权的 Run/tenant/pool 路由。示例的
-`DurableStoreFleetRunSource` 动态读取 Store schema v7 的持久路由注册表。
+`DurableStoreFleetRunSource` 动态读取当前 Store schema v8 的持久路由注册表。
 `StaticFleetRunSource` 只用于开发和确定性测试，必须显式设置
 `allow_reference_source=True`，且永远不会让 reconciler 报告 production-ready。
 独立 durable reconciler 仍负责先把 Run/Node 推进到 `RUNNING/READY`。
@@ -206,6 +206,13 @@ claim 的 `BEGIN IMMEDIATE` 事务内先于容量、资源、ownership、quota �
 trigger 再次检查。已经 `RUNNING` 的合法 Activity 可凭原 lease/fencing 完成。
 迁移同时安装 INSERT/UPDATE trigger，因此迁移前已打开数据库的旧进程也不能在已注册
 Run 上继续写入 schema v1 或陈旧 route；滚动启用路由前应先 drain 旧版 active claim。
+
+当前 schema v8 在此基础上增加 remote child hierarchy admission fencing。Fleet route
+可以直接指向 child Run，也可以由 run-scoped poll 从祖先递归命中 child；两种情况都
+必须使用能恢复实际 child Workflow 的 scheduler resolver、授权完整 root-to-child
+Run 链，并在 Attempt 中持久化 `hierarchy_admission`。v7→v8 会逐条验证 active
+`remote-session:` child authority；任一 unscoped、畸形或已失效记录都会拒绝迁移并
+要求先 drain。
 
 ## 路由信封
 

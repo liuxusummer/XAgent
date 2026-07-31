@@ -154,8 +154,9 @@ The three-round authorization/concurrency/compatibility review is recorded in
 Exit evidence: a multi-process demo survives the fault matrix without duplicate
 side effects or authority being delegated to workers.
 
-Foundation delivered: the Store schema v7 Fleet Run registry persists immutable
-tenant/pool identity and generation-fenced enable/withdraw authority. A
+Foundation delivered: the current Store schema v8 retains the Fleet Run registry
+introduced in v7, persisting immutable tenant/pool identity and
+generation-fenced enable/withdraw authority. A
 control-plane-isolated durable source rehydrates only enabled running routes,
 binds their physical Store identity, and admission schema v2 validates the route
 inside the claim transaction and start trigger. Static routing is explicitly

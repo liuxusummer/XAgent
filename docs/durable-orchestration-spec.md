@@ -998,6 +998,17 @@ Workflow 编译和调度只能依赖：
 subworkflow 创建 child Run，并记录 `parent_run_id / parent_node_id`。父 Node 只有在
 child Run 终态后才能完成。pause、cancel、deadline 和 sensitivity 默认向下传播。
 
+安全 remote admission 不能把 child 当成独立根 Run。只读选路必须返回完整
+root-to-child scope，并逐跳验证父 Run/控制 Node 仍为 RUNNING、持久 link、定义、
+depth、ancestry 和 input receipt 完整；远程身份必须同时通过每个 Run 的 authorizer。
+claim 事务对父 Run/Node projection version 做 CAS 并持久化 scope，start/complete
+再次检查祖先状态；remote cancellation probe 也读取一致的祖先快照，祖先撤销后
+heartbeat 不得续租。Store schema v8 拒绝无 scope 的 active `remote-session:` child
+Attempt；v7→v8 发现既有 unscoped、畸形或已失效 authority 时要求先 drain。祖先撤销
+后只允许 exact claim 提交 `CANCELLED` 安全回执，成功或其他终态结果继续 fail closed。
+local worker 的既有 `claim_next_child` 路径保持兼容，但不能用于生产 remote
+preauthorization。
+
 ## 14. 旧系统迁移
 
 ### 14.1 Agent Loop
@@ -1208,8 +1219,10 @@ Store 本地 pool 单写 shard owner、单调 fencing epoch 和事务性 tenant 
 陈旧控制面，并在重启/接管后延续轮转位置。
 显式 `DurableFleetReconciler` 已把受信 Run route/scheduler 解析、terminal cleanup、
 policy 变更后的 queued withdrawal 与 READY re-admission 组成有界幂等控制轮次，不启动
-隐式线程，也不推进 Domain Run。schema v7 的持久 Run route registry、隔离控制面
-source 和 admission v2 generation fencing 已关闭重启后 route 丢失与撤销竞态；
+隐式线程，也不推进 Domain Run。当前 schema v8 保留 v7 引入的持久 Run route
+registry、隔离控制面 source 和 admission v2 generation fencing，并增加 remote
+child hierarchy admission fencing；这些约束已关闭重启后 route 丢失、撤销竞态和
+父子 authority 脱节；
 生产化仍需验证 TLS-extension server/PKI 部署、共享 broker、自动 route 生命周期与
 接管，跨 Store quota/ownership/cursor 仍不合并。
 

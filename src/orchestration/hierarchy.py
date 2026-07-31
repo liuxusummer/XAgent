@@ -22,6 +22,7 @@ from .artifacts import (
 from .models import NodeRecord, NodeStatus, RunRecord, RunStatus
 from .scheduler import (
     ACTIVITY_KINDS,
+    ActivityAdmissionTarget,
     ActivityClaim,
     ActivityReceipt,
     DurableScheduler,
@@ -30,6 +31,8 @@ from .scheduler import (
 from .store import (
     ConcurrentProjectionUpdate,
     DurableRunStore,
+    HierarchyAdmissionHop,
+    HierarchyAdmissionScope,
     RunAlreadyExistsError,
     RunHierarchyLimitError,
     WorkflowBindingConflictError,
@@ -343,6 +346,9 @@ class DurableHierarchy:
         self,
         workflow: CompiledWorkflow,
     ) -> frozenset[str]:
+        # Every scheduler definition participating in a hierarchy must be
+        # durably resolvable when traversal later crosses back from a child.
+        self.registry.register(workflow)
         cached = self._template_ids.get(workflow.definition_digest)
         if cached is not None:
             return cached
@@ -505,6 +511,186 @@ class DurableHierarchy:
             if claim is not None:
                 return claim
         return None
+
+    def prepare_next_child_admission(
+        self,
+        scheduler: DurableScheduler,
+        run_id: str,
+        worker_id: str,
+        *,
+        resource_keys: Sequence[str] | None,
+    ) -> ActivityAdmissionTarget | None:
+        """Select one descendant candidate without reconciling or claiming."""
+
+        children = sorted(
+            self._direct_children(scheduler.store, run_id),
+            key=self._child_sort_key,
+        )
+        for child in children:
+            if child.status is not RunStatus.RUNNING:
+                continue
+            child_scheduler = self.scheduler_for_run(
+                scheduler,
+                child.run_id,
+            )
+            target = child_scheduler.prepare_next_admission_target(
+                child.run_id,
+                worker_id,
+                resource_keys=resource_keys,
+            )
+            if target is not None:
+                return target
+        return None
+
+    def hierarchy_admission_scope(
+        self,
+        scheduler: DurableScheduler,
+        run_id: str,
+    ) -> HierarchyAdmissionScope | None:
+        """Reconstruct and verify one exact root-to-child authority chain."""
+
+        child = self._require_run(scheduler, run_id)
+        if not isinstance(
+            child.metadata.get("hierarchy_link"),
+            dict,
+        ):
+            return None
+        reverse_hops: list[HierarchyAdmissionHop] = []
+        seen = {child.run_id}
+        for _depth in range(self.max_depth):
+            link = child.metadata.get("hierarchy_link")
+            if not isinstance(link, dict):
+                break
+            parent_run_id = link.get("parent_run_id")
+            parent_node_id = link.get("parent_node_id")
+            if (
+                not isinstance(parent_run_id, str)
+                or not isinstance(parent_node_id, str)
+                or parent_run_id in seen
+            ):
+                raise HierarchyIntegrityError(
+                    "hierarchy admission chain is damaged"
+                )
+            parent = self._require_run(scheduler, parent_run_id)
+            parent_scheduler = self.scheduler_for_run(
+                scheduler,
+                parent.run_id,
+            )
+            control = parent_scheduler.store.get_node(
+                parent.run_id,
+                parent_node_id,
+            )
+            if (
+                parent.status is not RunStatus.RUNNING
+                or control is None
+                or control.status is not NodeStatus.RUNNING
+            ):
+                raise HierarchyIntegrityError(
+                    "hierarchy admission parent is inactive"
+                )
+            try:
+                definition = parent_scheduler.workflow.get_node(
+                    parent_node_id
+                )
+            except KeyError as exc:
+                raise HierarchyIntegrityError(
+                    "hierarchy admission control is unknown"
+                ) from exc
+
+            relation = link.get("relation")
+            index = link.get("child_index")
+            if relation == "subworkflow":
+                if definition.kind != "subworkflow" or index is not None:
+                    raise HierarchyIntegrityError(
+                        "subworkflow hierarchy admission is damaged"
+                    )
+                child_workflow = self.registry.resolve(
+                    str(definition.config["workflow_id"]),
+                    int(definition.config["workflow_version"]),
+                )
+                expected_child_id = self._child_run_id(
+                    parent.run_id,
+                    parent_node_id,
+                    child_workflow.definition_digest,
+                )
+            elif relation == "map_item":
+                if (
+                    definition.kind != "map"
+                    or isinstance(index, bool)
+                    or not isinstance(index, int)
+                    or index < 0
+                ):
+                    raise HierarchyIntegrityError(
+                        "map hierarchy admission is damaged"
+                    )
+                child_workflow = self._map_workflow(
+                    parent_scheduler.workflow,
+                    definition,
+                )
+                expected_child_id = self._map_child_run_id(
+                    parent.run_id,
+                    parent_node_id,
+                    index,
+                    child_workflow.definition_digest,
+                )
+            else:
+                raise HierarchyIntegrityError(
+                    "hierarchy admission relation is damaged"
+                )
+            if child.run_id != expected_child_id:
+                raise HierarchyIntegrityError(
+                    "hierarchy admission child identity is damaged"
+                )
+            context = self._child_context(parent, child_workflow)
+            self._validate_child(
+                child,
+                parent,
+                parent_node_id,
+                child_workflow,
+                relation=relation,
+                index=index,
+                context=context,
+            )
+            receipt_digest = hashlib.sha256(
+                _canonical_json(child.input)
+            ).hexdigest()
+            if link.get("input_receipt_digest") != receipt_digest:
+                raise HierarchyIntegrityError(
+                    "hierarchy admission input binding is damaged"
+                )
+            self._input_refs(child)
+            reverse_hops.append(
+                HierarchyAdmissionHop(
+                    parent_run_id=parent.run_id,
+                    parent_node_id=parent_node_id,
+                    child_run_id=child.run_id,
+                    parent_run_version=parent.projection_version,
+                    parent_node_version=control.projection_version,
+                )
+            )
+            seen.add(parent.run_id)
+            child = parent
+            if child.metadata.get("hierarchy_link") is None:
+                break
+        else:
+            raise HierarchyLimitError(
+                "hierarchy admission depth exceeds hard limit"
+            )
+
+        root_link = child.metadata.get("hierarchy_link")
+        if root_link is not None:
+            raise HierarchyIntegrityError(
+                "hierarchy admission does not terminate at a root Run"
+            )
+        hops = tuple(reversed(reverse_hops))
+        if not hops:
+            raise HierarchyIntegrityError(
+                "hierarchy admission chain is empty"
+            )
+        return HierarchyAdmissionScope(
+            root_run_id=child.run_id,
+            hops=hops,
+        )
 
     def scheduler_for_run(
         self,

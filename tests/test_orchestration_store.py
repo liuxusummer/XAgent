@@ -2582,7 +2582,7 @@ class DurableRunStoreTests(unittest.TestCase):
                     """
                 )
             }
-        self.assertEqual(version, 7)
+        self.assertEqual(version, 8)
         self.assertEqual(
             triggers,
             {
@@ -2642,7 +2642,7 @@ class DurableRunStoreTests(unittest.TestCase):
                 "SELECT first_run_id FROM artifact_references WHERE sha256 = ?",
                 (ref.sha256,),
             ).fetchone()
-        self.assertEqual(version, 7)
+        self.assertEqual(version, 8)
         self.assertEqual(indexed[0], "migration-ref-run")
 
     def test_version_three_migration_rejects_legacy_raw_run_input(self) -> None:
@@ -2716,7 +2716,7 @@ class DurableRunStoreTests(unittest.TestCase):
                     """
                 )
             }
-        self.assertEqual(version, 7)
+        self.assertEqual(version, 8)
         self.assertEqual(
             triggers,
             {
@@ -3197,7 +3197,7 @@ class DurableRunStoreTests(unittest.TestCase):
             indexes = {
                 row[1] for row in conn.execute("PRAGMA index_list(attempts)")
             }
-        self.assertEqual(version, 7)
+        self.assertEqual(version, 8)
         self.assertIn("content_digest", event_columns)
         self.assertIn("intent_digest", event_columns)
         self.assertIn("schema_version", idempotency_columns)

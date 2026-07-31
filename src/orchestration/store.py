@@ -53,7 +53,7 @@ from .recovery import UnknownOutcomeDecision, UnknownOutcomeResolution
 if TYPE_CHECKING:
     from .executor import ToolReceipt
 
-STORE_SCHEMA_VERSION = 7
+STORE_SCHEMA_VERSION = 8
 DEFAULT_BUSY_TIMEOUT_MS = 10_000
 DEFAULT_EVENT_LIMIT = 1_000
 MAX_EVENT_LIMIT = 10_000
@@ -70,6 +70,8 @@ MAX_FLEET_RUN_ROUTE_GENERATION = (1 << 63) - 1
 FLEET_SHARD_OWNERSHIP_SCHEMA_VERSION = 2
 FLEET_FAIRNESS_CURSOR_SCHEMA_VERSION = 1
 FLEET_RUN_ROUTE_SCHEMA_VERSION = 1
+HIERARCHY_ADMISSION_SCHEMA_VERSION = 1
+MAX_HIERARCHY_ADMISSION_DEPTH = 64
 _SAFE_RECEIPT_CODE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
 _SHA256_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _FLEET_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
@@ -579,6 +581,146 @@ def _fleet_run_route_digest(
     return hashlib.sha256(payload).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class HierarchyAdmissionHop:
+    """One exact parent-control edge authorizing a child Activity."""
+
+    parent_run_id: str
+    parent_node_id: str
+    child_run_id: str
+    parent_run_version: int
+    parent_node_version: int
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "parent_run_id",
+            "parent_node_id",
+            "child_run_id",
+        ):
+            value = getattr(self, field_name)
+            if (
+                not isinstance(value, str)
+                or _FLEET_RUN_ID.fullmatch(value) is None
+            ):
+                raise ValueError(
+                    f"{field_name} must be a bounded hierarchy identifier"
+                )
+        for field_name in (
+            "parent_run_version",
+            "parent_node_version",
+        ):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                or value > MAX_FLEET_RUN_ROUTE_GENERATION
+            ):
+                raise ValueError(
+                    f"{field_name} must be a bounded projection version"
+                )
+        if self.parent_run_id == self.child_run_id:
+            raise ValueError("hierarchy admission hop contains a cycle")
+
+    def to_metadata(self) -> dict[str, JsonValue]:
+        return {
+            "parent_run_id": self.parent_run_id,
+            "parent_node_id": self.parent_node_id,
+            "child_run_id": self.child_run_id,
+            "parent_run_version": self.parent_run_version,
+            "parent_node_version": self.parent_node_version,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class HierarchyAdmissionScope:
+    """Bounded root-to-child authority captured before remote admission."""
+
+    root_run_id: str
+    hops: tuple[HierarchyAdmissionHop, ...]
+    schema_version: int = HIERARCHY_ADMISSION_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != HIERARCHY_ADMISSION_SCHEMA_VERSION:
+            raise ValueError(
+                "unsupported hierarchy admission schema version"
+            )
+        if (
+            not isinstance(self.root_run_id, str)
+            or _FLEET_RUN_ID.fullmatch(self.root_run_id) is None
+        ):
+            raise ValueError(
+                "root_run_id must be a bounded hierarchy identifier"
+            )
+        if (
+            not isinstance(self.hops, tuple)
+            or not 1
+            <= len(self.hops)
+            <= MAX_HIERARCHY_ADMISSION_DEPTH
+            or any(
+                not isinstance(hop, HierarchyAdmissionHop)
+                for hop in self.hops
+            )
+        ):
+            raise ValueError("hierarchy admission hops are invalid")
+        if self.hops[0].parent_run_id != self.root_run_id:
+            raise ValueError(
+                "hierarchy admission root does not match its first hop"
+            )
+        seen = {self.root_run_id}
+        for index, hop in enumerate(self.hops):
+            if (
+                index > 0
+                and self.hops[index - 1].child_run_id
+                != hop.parent_run_id
+            ):
+                raise ValueError(
+                    "hierarchy admission hops are not contiguous"
+                )
+            if hop.child_run_id in seen:
+                raise ValueError(
+                    "hierarchy admission scope contains a cycle"
+                )
+            seen.add(hop.child_run_id)
+
+    @property
+    def target_run_id(self) -> str:
+        return self.hops[-1].child_run_id
+
+    @property
+    def chain_digest(self) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "schema": "hierarchy_admission_v1",
+                    "root_run_id": self.root_run_id,
+                    "hops": [
+                        hop.to_metadata() for hop in self.hops
+                    ],
+                },
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+        ).hexdigest()
+
+    @property
+    def run_ids(self) -> tuple[str, ...]:
+        return (
+            self.root_run_id,
+            *(hop.child_run_id for hop in self.hops),
+        )
+
+    def to_metadata(self) -> dict[str, JsonValue]:
+        return {
+            "schema_version": self.schema_version,
+            "root_run_id": self.root_run_id,
+            "hops": [hop.to_metadata() for hop in self.hops],
+            "chain_digest": self.chain_digest,
+        }
+
+
 def _json_dump(value: JsonValue) -> str:
     normalized = normalize_json(value)
     return json.dumps(
@@ -789,6 +931,78 @@ def _fleet_shard_ownership_metadata(
         raise ProjectionConflictError(
             "Fleet shard ownership binding is invalid"
         ) from exc
+
+
+def _hierarchy_admission_scope(
+    value: Mapping[str, object] | None,
+) -> HierarchyAdmissionScope | None:
+    if value is None:
+        return None
+    required = {
+        "schema_version",
+        "root_run_id",
+        "hops",
+        "chain_digest",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise ProjectionConflictError(
+            "Hierarchy admission fields are invalid"
+        )
+    raw_hops = value["hops"]
+    if (
+        not isinstance(raw_hops, list)
+        or not 1 <= len(raw_hops) <= MAX_HIERARCHY_ADMISSION_DEPTH
+    ):
+        raise ProjectionConflictError(
+            "Hierarchy admission hops are invalid"
+        )
+    hop_fields = {
+        "parent_run_id",
+        "parent_node_id",
+        "child_run_id",
+        "parent_run_version",
+        "parent_node_version",
+    }
+    try:
+        normalized_hops: list[HierarchyAdmissionHop] = []
+        for raw in raw_hops:
+            if not isinstance(raw, Mapping) or set(raw) != hop_fields:
+                raise ValueError(
+                    "Hierarchy admission hop fields are invalid"
+                )
+            normalized_hops.append(
+                HierarchyAdmissionHop(
+                    parent_run_id=raw["parent_run_id"],
+                    parent_node_id=raw["parent_node_id"],
+                    child_run_id=raw["child_run_id"],
+                    parent_run_version=raw["parent_run_version"],
+                    parent_node_version=raw["parent_node_version"],
+                )
+            )
+        scope = HierarchyAdmissionScope(
+            root_run_id=value["root_run_id"],
+            hops=tuple(normalized_hops),
+            schema_version=value["schema_version"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProjectionConflictError(
+            "Hierarchy admission fields are invalid"
+        ) from exc
+    if (
+        not isinstance(value["chain_digest"], str)
+        or value["chain_digest"] != scope.chain_digest
+    ):
+        raise ProjectionConflictError(
+            "Hierarchy admission digest is invalid"
+        )
+    return scope
+
+
+def _hierarchy_admission_metadata(
+    value: Mapping[str, object] | None,
+) -> dict[str, JsonValue] | None:
+    scope = _hierarchy_admission_scope(value)
+    return None if scope is None else scope.to_metadata()
 
 
 def _earliest_deadline(
@@ -2107,6 +2321,222 @@ class DurableRunStore:
                     SELECT RAISE(
                         ABORT,
                         'Fleet Run route is required or stale'
+                    );
+                END
+                """
+            )
+
+    @staticmethod
+    def _migrate_7_to_8(conn: sqlite3.Connection) -> None:
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        attempt_columns = (
+            {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(attempts)"
+                ).fetchall()
+            }
+            if "attempts" in tables
+            else set()
+        )
+        run_columns = (
+            {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(runs)"
+                ).fetchall()
+            }
+            if "runs" in tables
+            else set()
+        )
+        node_columns = (
+            {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(node_runs)"
+                ).fetchall()
+            }
+            if "node_runs" in tables
+            else set()
+        )
+        complete_schema = (
+            "node_runs" in tables
+            and {
+                "run_id",
+                "status",
+                "worker_id",
+                "metadata_json",
+            }.issubset(attempt_columns)
+            and {
+                "run_id",
+                "status",
+                "metadata_json",
+            }.issubset(run_columns)
+            and {"run_id", "node_id", "status"}.issubset(
+                node_columns
+            )
+        )
+        if not complete_schema:
+            return
+        active_remote_children = conn.execute(
+            """
+            SELECT attempt.run_id, attempt.metadata_json
+            FROM attempts AS attempt
+            JOIN runs AS child ON child.run_id = attempt.run_id
+            WHERE attempt.status IN ('claimed', 'running')
+              AND attempt.worker_id LIKE 'remote-session:%'
+              AND json_type(
+                  child.metadata_json,
+                  '$.hierarchy_link'
+              ) = 'object'
+            """
+        )
+        for row in active_remote_children:
+            try:
+                metadata = _json_load(row["metadata_json"])
+                scope = _hierarchy_admission_scope(
+                    metadata.get("hierarchy_admission")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+                denial = (
+                    DurableRunStore._validate_hierarchy_admission_tx(
+                        conn,
+                        row["run_id"],
+                        scope,
+                        check_versions=False,
+                    )
+                )
+            except (
+                ProjectionConflictError,
+                TypeError,
+                ValueError,
+            ):
+                denial = "hierarchy_admission_invalid"
+            if denial is not None:
+                raise StoreSchemaError(
+                    "schema 8 requires draining unsafe remote child Attempts"
+                )
+        hierarchy_guard = f"""
+            NEW.status IN ('claimed', 'running')
+            AND NEW.worker_id LIKE 'remote-session:%'
+            AND EXISTS (
+                SELECT 1
+                FROM runs AS routed_child
+                WHERE routed_child.run_id = NEW.run_id
+                  AND json_type(
+                      routed_child.metadata_json,
+                      '$.hierarchy_link'
+                  ) = 'object'
+            )
+            AND (
+                json_type(
+                    NEW.metadata_json,
+                    '$.hierarchy_admission'
+                ) IS NOT 'object'
+                OR json_extract(
+                    NEW.metadata_json,
+                    '$.hierarchy_admission.schema_version'
+                ) IS NOT {HIERARCHY_ADMISSION_SCHEMA_VERSION}
+                OR json_type(
+                    NEW.metadata_json,
+                    '$.hierarchy_admission.hops'
+                ) IS NOT 'array'
+                OR json_array_length(
+                    NEW.metadata_json,
+                    '$.hierarchy_admission.hops'
+                ) NOT BETWEEN 1 AND {MAX_HIERARCHY_ADMISSION_DEPTH}
+                OR json_extract(
+                    NEW.metadata_json,
+                    '$.hierarchy_admission.root_run_id'
+                ) IS NOT json_extract(
+                    NEW.metadata_json,
+                    '$.hierarchy_admission.hops[0].parent_run_id'
+                )
+                OR json_extract(
+                    NEW.metadata_json,
+                    '$.hierarchy_admission.hops['
+                    || (
+                        json_array_length(
+                            NEW.metadata_json,
+                            '$.hierarchy_admission.hops'
+                        ) - 1
+                    )
+                    || '].child_run_id'
+                ) IS NOT NEW.run_id
+                OR EXISTS (
+                    SELECT 1
+                    FROM json_each(
+                        NEW.metadata_json,
+                        '$.hierarchy_admission.hops'
+                    ) AS hop
+                    LEFT JOIN runs AS parent
+                      ON parent.run_id = json_extract(
+                          hop.value,
+                          '$.parent_run_id'
+                      )
+                    LEFT JOIN node_runs AS control
+                      ON control.run_id = parent.run_id
+                     AND control.node_id = json_extract(
+                         hop.value,
+                         '$.parent_node_id'
+                     )
+                    LEFT JOIN runs AS child
+                      ON child.run_id = json_extract(
+                          hop.value,
+                          '$.child_run_id'
+                      )
+                    WHERE parent.status IS NOT 'running'
+                       OR control.status IS NOT 'running'
+                       OR json_type(
+                           child.metadata_json,
+                           '$.hierarchy_link'
+                       ) IS NOT 'object'
+                       OR json_extract(
+                           child.metadata_json,
+                           '$.hierarchy_link.root_run_id'
+                       ) IS NOT json_extract(
+                           NEW.metadata_json,
+                           '$.hierarchy_admission.root_run_id'
+                       )
+                       OR json_extract(
+                           child.metadata_json,
+                           '$.hierarchy_link.parent_run_id'
+                       ) IS NOT json_extract(
+                           hop.value,
+                           '$.parent_run_id'
+                       )
+                       OR json_extract(
+                           child.metadata_json,
+                           '$.hierarchy_link.parent_node_id'
+                       ) IS NOT json_extract(
+                           hop.value,
+                           '$.parent_node_id'
+                       )
+                )
+            )
+        """
+        for operation in ("INSERT", "UPDATE"):
+            conn.execute(
+                "DROP TRIGGER IF EXISTS "
+                f"attempts_hierarchy_admission_{operation.lower()}"
+            )
+            conn.execute(
+                f"""
+                CREATE TRIGGER attempts_hierarchy_admission_{
+                    operation.lower()
+                }
+                BEFORE {operation} ON attempts
+                WHEN {hierarchy_guard}
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'Hierarchy admission is required or stale'
                     );
                 END
                 """
@@ -4082,6 +4512,53 @@ class DurableRunStore:
                 self._idempotency_from_row(row),
             )
 
+    def hierarchy_authority_is_active(
+        self,
+        attempt_id: str,
+    ) -> bool:
+        """Read one consistent ancestor-authority snapshot for a Worker."""
+
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN")
+            try:
+                row = conn.execute(
+                    """
+                    SELECT run_id, metadata_json
+                    FROM attempts
+                    WHERE attempt_id = ?
+                    """,
+                    (attempt_id,),
+                ).fetchone()
+                if row is None:
+                    conn.commit()
+                    return False
+                try:
+                    metadata = _json_load(row["metadata_json"])
+                    scope = _hierarchy_admission_scope(
+                        metadata.get("hierarchy_admission")
+                        if isinstance(metadata, dict)
+                        else None
+                    )
+                except (
+                    ProjectionConflictError,
+                    TypeError,
+                    ValueError,
+                ):
+                    conn.commit()
+                    return False
+                denial = self._validate_hierarchy_admission_tx(
+                    conn,
+                    row["run_id"],
+                    scope,
+                    check_versions=False,
+                )
+            except BaseException:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+        return denial is None
+
     def get_idempotency(self, run_id: str, key: str) -> IdempotencyRecord | None:
         with closing(self._connect()) as conn:
             row = conn.execute(
@@ -4597,6 +5074,11 @@ class DurableRunStore:
                 run_id,
                 node_id,
                 attempt_id,
+            )
+            self._require_remote_activity_authority_tx(
+                conn,
+                attempt,
+                owner_id,
             )
             record = self._get_idempotency_tx(conn, run_id, attempt.idempotency_key)
             if record is None:
@@ -5803,6 +6285,168 @@ class DurableRunStore:
             )
 
     @staticmethod
+    def _validate_hierarchy_admission_tx(
+        conn: sqlite3.Connection,
+        run_id: str,
+        scope: HierarchyAdmissionScope | None,
+        *,
+        check_versions: bool,
+        require_active: bool = True,
+    ) -> str | None:
+        target = conn.execute(
+            "SELECT status, metadata_json FROM runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if target is None:
+            return "hierarchy_target_missing"
+        metadata = _json_load(target["metadata_json"])
+        link = (
+            metadata.get("hierarchy_link")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if not isinstance(link, dict):
+            if scope is not None:
+                return "hierarchy_admission_unexpected"
+            if (
+                require_active
+                and target["status"] != RunStatus.RUNNING.value
+            ):
+                return "hierarchy_admission_inactive"
+            return None
+        if scope is None:
+            return "hierarchy_admission_required"
+        if scope.target_run_id != run_id:
+            return "hierarchy_admission_target_mismatch"
+
+        expected_ancestry: list[str] = []
+        for depth, hop in enumerate(scope.hops, start=1):
+            row = conn.execute(
+                """
+                SELECT parent.status AS parent_status,
+                       parent.projection_version AS parent_run_version,
+                       parent.definition_digest AS parent_definition_digest,
+                       control.status AS control_status,
+                       control.projection_version AS parent_node_version,
+                       child.definition_digest AS child_definition_digest,
+                       child.input_json AS child_input_json,
+                       child.metadata_json AS child_metadata_json
+                FROM runs AS parent
+                LEFT JOIN node_runs AS control
+                  ON control.run_id = parent.run_id
+                 AND control.node_id = ?
+                LEFT JOIN runs AS child
+                  ON child.run_id = ?
+                WHERE parent.run_id = ?
+                """,
+                (
+                    hop.parent_node_id,
+                    hop.child_run_id,
+                    hop.parent_run_id,
+                ),
+            ).fetchone()
+            if (
+                row is None
+                or row["control_status"] is None
+                or row["child_metadata_json"] is None
+            ):
+                return "hierarchy_admission_inactive"
+            if require_active and (
+                row["parent_status"] != RunStatus.RUNNING.value
+                or row["control_status"] != NodeStatus.RUNNING.value
+            ):
+                return "hierarchy_admission_inactive"
+            if check_versions and (
+                int(row["parent_run_version"])
+                != hop.parent_run_version
+                or int(row["parent_node_version"])
+                != hop.parent_node_version
+            ):
+                return "hierarchy_admission_stale"
+            child_metadata = _json_load(row["child_metadata_json"])
+            child_link = (
+                child_metadata.get("hierarchy_link")
+                if isinstance(child_metadata, dict)
+                else None
+            )
+            ancestry = (
+                child_link.get("ancestry_digests")
+                if isinstance(child_link, dict)
+                else None
+            )
+            if depth == 1:
+                expected_ancestry.append(
+                    row["parent_definition_digest"]
+                )
+            elif (
+                not expected_ancestry
+                or expected_ancestry[-1]
+                != row["parent_definition_digest"]
+            ):
+                return "hierarchy_admission_link_mismatch"
+            expected_ancestry.append(
+                row["child_definition_digest"]
+            )
+            child_input_digest = hashlib.sha256(
+                _json_dump(
+                    _json_load(row["child_input_json"])
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                not isinstance(child_link, dict)
+                or child_link.get("schema_version")
+                != HIERARCHY_ADMISSION_SCHEMA_VERSION
+                or child_link.get("root_run_id") != scope.root_run_id
+                or child_link.get("parent_run_id")
+                != hop.parent_run_id
+                or child_link.get("parent_node_id")
+                != hop.parent_node_id
+                or child_link.get("depth") != depth
+                or child_link.get("definition_digest")
+                != row["child_definition_digest"]
+                or ancestry != expected_ancestry
+                or not isinstance(
+                    child_link.get("input_receipt_digest"),
+                    str,
+                )
+                or _SHA256_DIGEST.fullmatch(
+                    child_link["input_receipt_digest"]
+                )
+                is None
+                or child_link["input_receipt_digest"]
+                != child_input_digest
+            ):
+                return "hierarchy_admission_link_mismatch"
+        return None
+
+    @staticmethod
+    def _require_remote_activity_authority_tx(
+        conn: sqlite3.Connection,
+        attempt: AttemptRecord,
+        owner_id: str,
+        *,
+        require_active: bool = True,
+    ) -> None:
+        hierarchy_scope = _hierarchy_admission_scope(
+            attempt.metadata.get("hierarchy_admission")
+        )
+        remote_owner = (
+            isinstance(owner_id, str)
+            and owner_id.startswith("remote-session:")
+        )
+        if not remote_owner and hierarchy_scope is None:
+            return
+        denial = DurableRunStore._validate_hierarchy_admission_tx(
+            conn,
+            attempt.run_id,
+            hierarchy_scope,
+            check_versions=False,
+            require_active=require_active,
+        )
+        if denial is not None:
+            raise InvalidStateTransition(denial)
+
+    @staticmethod
     def _admit_fleet_tx(
         conn: sqlite3.Connection,
         scope: dict[str, JsonValue] | None,
@@ -6083,6 +6727,7 @@ class DurableRunStore:
         worker_capacity: int | None = None,
         fleet_admission: Mapping[str, object] | None = None,
         fleet_shard_ownership: Mapping[str, object] | None = None,
+        hierarchy_admission: Mapping[str, object] | None = None,
     ) -> tuple[
         IdempotencyClaim | None,
         EventRecord | None,
@@ -6182,6 +6827,12 @@ class DurableRunStore:
                 fleet_shard_ownership
             )
         )
+        normalized_hierarchy_admission = (
+            _hierarchy_admission_metadata(hierarchy_admission)
+        )
+        hierarchy_scope = _hierarchy_admission_scope(
+            normalized_hierarchy_admission
+        )
 
         with self._write_transaction() as conn:
             # This check must run after BEGIN IMMEDIATE acquires the writer
@@ -6195,6 +6846,14 @@ class DurableRunStore:
                 raise IdempotencyConflictError(
                     "remote admission authority expired before claim"
                 )
+            hierarchy_denial = self._validate_hierarchy_admission_tx(
+                conn,
+                run_id,
+                hierarchy_scope,
+                check_versions=True,
+            )
+            if hierarchy_denial is not None:
+                raise ActivityAdmissionDenied(hierarchy_denial)
             run_row = conn.execute(
                 "SELECT * FROM runs WHERE run_id = ?",
                 (run_id,),
@@ -6208,7 +6867,8 @@ class DurableRunStore:
             run = self._run_from_row(run_row)
             node = self._node_from_row(node_row)
             if (
-                node.projection_version != expected_node_version
+                run.projection_version != expected_run_version
+                or node.projection_version != expected_node_version
                 or run.status is not RunStatus.RUNNING
                 or node.status is not NodeStatus.READY
                 or run.definition_digest != definition_digest
@@ -6454,6 +7114,10 @@ class DurableRunStore:
                 claimed_metadata["fleet_shard_ownership"] = (
                     normalized_fleet_shard_ownership
                 )
+            if normalized_hierarchy_admission is not None:
+                claimed_metadata["hierarchy_admission"] = (
+                    normalized_hierarchy_admission
+                )
             if start_deadline is not None:
                 claimed_metadata["start_deadline_at"] = min(
                     start_deadline,
@@ -6597,6 +7261,14 @@ class DurableRunStore:
         event_id = _claim_bound_event_id("complete", attempt_id, claim_token)
         with self._write_transaction() as conn:
             run, node, attempt = self._load_activity_tx(conn, run_id, node_id, attempt_id)
+            self._require_remote_activity_authority_tx(
+                conn,
+                attempt,
+                owner_id,
+                require_active=(
+                    attempt_status is not AttemptStatus.CANCELLED
+                ),
+            )
             record = self._get_idempotency_tx(conn, run_id, attempt.idempotency_key)
             if record is None:
                 raise IdempotencyConflictError("activity idempotency key was not claimed")
@@ -7418,6 +8090,11 @@ class DurableRunStore:
         now = _finite_timestamp(now if now is not None else utc_timestamp(), "now")
         with self._write_transaction() as conn:
             run, node, attempt = self._load_activity_tx(conn, run_id, node_id, attempt_id)
+            self._require_remote_activity_authority_tx(
+                conn,
+                attempt,
+                owner_id,
+            )
             record = self._get_idempotency_tx(conn, run_id, attempt.idempotency_key)
             if record is None:
                 raise IdempotencyConflictError("Activity has no idempotency claim")

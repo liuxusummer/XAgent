@@ -48,6 +48,7 @@ from .remote_protocol import (
 )
 from .scheduler import (
     ACTIVITY_KINDS,
+    ActivityAdmissionTarget,
     ActivityClaim,
     DurableScheduler,
     SchedulerError,
@@ -1074,14 +1075,38 @@ class RemoteControlPlane:
                 self._allow_reference_admission and reference_only
             ):
                 raise RemoteControlError("security_not_ready")
-        candidate = scheduler.prepare_next_admission(
+        target = scheduler.prepare_next_admission_target(
             run_id,
             registration.session_owner_id,
             resource_keys=registration.resource_keys,
             target_node_id=expected_node_id,
         )
-        if candidate is None:
+        if target is None:
             return None
+        if not isinstance(target, ActivityAdmissionTarget):
+            raise RemoteControlError("internal_error")
+        if target.scheduler.store is not scheduler.store:
+            raise RemoteControlError("authorization_conflict")
+        hierarchy_admission = target.hierarchy_admission
+        if hierarchy_admission is not None:
+            if not secure_two_phase:
+                raise RemoteControlError("security_not_ready")
+            if run_id not in hierarchy_admission.run_ids:
+                raise RemoteControlError("authorization_conflict")
+            for scoped_run_id in hierarchy_admission.run_ids:
+                if not self._authorize_run(identity, scoped_run_id):
+                    raise RemoteControlError("forbidden")
+        scheduler = target.scheduler
+        candidate = target.candidate
+        if (
+            candidate.claim.activity_kind
+            not in registration.activity_kinds
+            or f"activity.{candidate.claim.activity_kind}"
+            not in registration.capabilities
+        ):
+            raise RemoteControlError("unsupported_activity")
+        if contains_sensitive_key(dict(candidate.claim.config)):
+            raise RemoteControlError("invalid_assignment")
         candidate_config_digest = canonical_digest(
             dict(candidate.claim.config)
         )
@@ -1173,6 +1198,7 @@ class RemoteControlPlane:
                     policy_binding=admission.policy_binding,
                     fleet_admission=fleet_admission,
                     fleet_shard_ownership=fleet_shard_ownership,
+                    hierarchy_admission=hierarchy_admission,
                     linearization_guard=lambda: (
                         self._worker_session_guard(identity.worker_id)
                     ),
@@ -1286,6 +1312,10 @@ class RemoteControlPlane:
         scheduler: DurableScheduler,
         claim: ActivityClaim,
     ) -> dict[str, Any]:
+        if not scheduler.store.hierarchy_authority_is_active(
+            claim.attempt_id
+        ):
+            raise RemoteControlError("claim_conflict")
         record = scheduler.renew_claim(
             claim,
             lease_seconds=float(request.body["lease_seconds"]),
@@ -1318,6 +1348,9 @@ class RemoteControlPlane:
             run.status in {RunStatus.CANCELLING, RunStatus.CANCELLED}
             or node.status is NodeStatus.CANCELLED
             or attempt.status is AttemptStatus.CANCELLED
+            or not scheduler.store.hierarchy_authority_is_active(
+                attempt.attempt_id
+            )
         )
         return make_response(
             request,

@@ -396,7 +396,7 @@ Store 的规范物理路径绑定到 route。scheduler resolver 必须回到同�
 
 ### 第二遍：claim、撤销、ABA 与旧进程
 
-Store schema v7 持久化不可变 Run/tenant/pool 和单调 generation。Fleet admission
+当前 Store schema v8 保留 v7 引入的不可变 Run/tenant/pool 和单调 generation。Fleet admission
 schema v2 携带 route digest，并在创建 Attempt 的同一 `BEGIN IMMEDIATE` 事务内先于
 quota/fairness 校验。撤销先赢则 claim 无 mutation；claim 先赢后撤销，则
 `CLAIMED -> RUNNING` 的数据库 trigger fencing 旧 digest。已经 RUNNING 的 Attempt
@@ -447,7 +447,7 @@ OS 权限、自动注册/撤销编排和跨 Store 全局共识仍由部署层负
   隔离 Store，不能绕过该安全门。
 - Store claim 已提交、assignment 返回前进程崩溃时，Worker 不获得执行权；lease
   recovery 会收敛该 claim。该窗口不能伪装成零 mutation。
-- ready Run route、tenant/pool 归属由 Store schema v7 的
+- ready Run route、tenant/pool 归属由当前 Store schema v8 的
   `DurableStoreFleetRunSource` 持久化恢复；注册/撤销、调用周期和 Domain scheduler
   reconcile 仍由部署显式驱动，不隐式启动后台线程。`StaticFleetRunSource` 仅是
   reference-only 测试目录。

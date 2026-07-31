@@ -157,6 +157,78 @@ P2：部分冻结模型只冻结顶层 Mapping；wire parser 会深拷贝，当�
 最终 postfix 又复攻了 make/parse 与公开构造器的嵌套容器 alias、构造后 mutation、
 伪造 digest、错误 shape 和 repr redaction；未再发现 P0/P1/P2。
 
+## Remote child hierarchy admission：三轮专项审查
+
+### 第 1 轮：authority substitution 与越权
+
+攻击面覆盖从 root/middle/leaf 任意 Run 发起 poll、用 root 授权代替 child 授权、
+替换 scheduler/Store、伪造 parent/child/root/depth/definition/input binding、map index
+与嵌套链顺序。审查发现原 candidate 的 Run projection version 虽已记录，但 Store
+claim 路径只实质比较 Node version；已改为 Scheduler 和 Store 两层都比较 exact Run
+version。最终实现要求请求 Run 位于 scope，authorizer 对 scope 中每个 Run 都返回 true，
+目标 Scheduler 与入口 Scheduler 共享同一个 Store 实例，并在 Store 内从持久行重验完整
+ancestry 与 child input receipt digest。
+
+证据：
+
+- `test_every_ancestor_and_target_require_authorization`
+- `test_direct_child_poll_cannot_bypass_root_authorization`
+- `test_nested_poll_carries_every_ancestor_hop`
+- `test_map_poll_uses_deterministic_child_and_exact_scope`
+- `test_corrupt_child_link_fails_closed_without_attempt`
+
+结论：未保留 P0/P1；损坏或越权均在 Attempt 创建前 fail closed。
+
+### 第 2 轮：TOCTOU、取消与租约存活
+
+攻击面固定在 candidate 已授权但 Store 尚未 claim、claim 已提交但 Activity 尚未 start、
+以及 Activity 已运行并持续 heartbeat 三个窗口。父 Run 的任意 projection 变化都会使
+scope CAS 失效；父状态撤销或 hierarchy link 在 ticket 期间被修改会在
+`BEGIN IMMEDIATE` 内重验并回滚 child schedule/claim。
+
+本轮发现父取消已提交、向 child 的 reconcile 尚未执行时，remote cancellation probe
+原本只看 child projection，恶意 Worker 还能继续续租。修复后 probe 从同一 SQLite
+read snapshot 验证持久 ancestor authority；失效立即报告 cancellation，heartbeat
+在自身写事务内再次拒绝续租，start 和非取消 completion 也拒绝越界。精确绑定的
+`CANCELLED` 回执只校验链路完整性而不要求祖先仍 RUNNING，使撤销后的在线 Worker
+可以安全确认终止并让父 Run 收敛。
+
+证据：
+
+- `test_parent_projection_change_between_prepare_and_claim_is_stale`
+- `test_child_link_damage_during_admission_is_rechecked_in_store`
+- `test_parent_cancellation_between_prepare_and_claim_rolls_back_child`
+- `test_parent_cancellation_after_claim_blocks_start_gate`
+- `test_heartbeat_rechecks_parent_after_read_probe_race`
+- `test_parent_cancel_allows_exact_child_cancel_acknowledgement`
+- `test_root_remote_cancellation_also_fences_lease_renewal`
+
+结论：未保留 P0/P1；父 authority 撤销不依赖异步传播才能阻止新副作用或无限续租。
+
+### 第 3 轮：重启、滚动升级与边界耗尽
+
+攻击面覆盖空内存 Workflow registry 重启、旧 schema 进程继续写库、v7 中已有
+unscoped/malformed/inactive remote child authority、trigger 被旧连接绕过、深层递归、
+环和 child fan-out。根、subworkflow 和 derived map Workflow 都进入 immutable durable
+binding，重启后 resolver 按 child Run identity 恢复实际 Scheduler。选路沿用
+`max_depth`、每控制节点 child 上限和 total descendant 上限，scope 自身再限制 64 hops
+并拒绝环、不连续链和非规范字段。
+
+本轮把迁移门禁从“只查无 scope”加强为逐条解析并验证所有 active remote child
+authority；任一 unsafe 记录使 v7→v8 整体回滚。成功迁移后 active INSERT/UPDATE trigger
+拒绝旧进程写入缺失或陈旧 scope，local hierarchy worker 保持兼容。
+
+证据：
+
+- `test_restart_recovers_child_scheduler_and_claim_authority`
+- `test_schema_eight_fences_legacy_unscoped_remote_child_claim`
+- `test_schema_eight_migration_requires_legacy_child_drain`
+- `tests.test_orchestration_hierarchy` 的 depth/cycle/child/descendant hard-limit 用例
+
+结论：三轮专项审查后未保留 P0/P1/P2。生产升级必须先 drain 被迁移门禁报告的 unsafe
+remote child Attempt；不得删除 trigger、手工补 scope 或把所有 child 映射到 root
+Workflow 来绕过恢复校验。
+
 ## 第 3 轮：故障恢复与运维
 
 ### 范围与方法

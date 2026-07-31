@@ -284,8 +284,30 @@ assignment，且不创建 Attempt。
 `WAITING_APPROVAL + approval.requested`；不得产生 `attempt.claimed`、active
 idempotency owner/lease、WorkerAuthorization 或 Artifact grant。可信 grant 将同一
 Attempt 恢复为 `SCHEDULED`，下一次 poll 重新授权并在 claim/policy 事务中原子消费。
-层级 child Run 尚未接入这条精确 ticket 路径，因此 remote poll 对 child routing
-fail closed，不调用可能 reconcile/mutate 的旧 `claim_next_child`。
+层级 child Run 使用同一条精确 ticket 路径。Scheduler 先在不 reconcile、不 schedule、
+不 claim 的前提下，按确定性 child 顺序递归选择一个后代 Activity，并返回实际 child
+Scheduler、精确 candidate 和有界的 root-to-child `HierarchyAdmissionScope`。scope
+逐跳绑定 parent Run、控制 Node、child Run 以及候选时的 parent Run/Node projection
+version；递归深度、child 数、环和定义恢复都沿用 hierarchy 的硬上限。
+
+远程控制面必须同时授权请求 Run、scope 中每个祖先 Run 和目标 child Run，且目标
+Scheduler 必须共享请求 Scheduler 的同一个 Store 实例。Policy、capability、敏感配置、
+runtime compatibility 和 ticket 都针对最终 Activity 再校验，不能用父 Workflow 的
+授权代替 child 授权。Store 在 claim 的 `BEGIN IMMEDIATE` 事务内验证整条父链仍为
+`RUNNING/RUNNING`、projection version 未变、每条持久 hierarchy link 的 root/parent/
+control/depth/definition/input receipt 仍一致，然后才原子 schedule/claim/policy，并把
+scope 写入 Attempt metadata。`CLAIMED -> RUNNING`、heartbeat 和非取消 completion
+还会在各自写事务内重新验证祖先状态，所以父取消/暂停不能在 claim 后让 child 越过
+副作用门禁或无限续租。精确绑定的 `CANCELLED` 回执仍可在链路完整时提交，以便安全
+终止向父 Run 收敛。
+
+Store schema v8 为 remote child Attempt 安装 active INSERT/UPDATE trigger。旧进程即使
+已经打开数据库，也不能写入不带 scope 的 `remote-session:` child claim。v7→v8 迁移
+会逐条验证既有 active remote child authority；unscoped、畸形、链路失效或祖先已撤销
+的记录都会使迁移原子失败。部署必须先 drain，不能把未知的既有 authority 猜成合法
+scope。local hierarchy worker 不受该 trigger 影响。生产 scheduler resolver 必须能从
+持久 Workflow binding 为任意 child Run 恢复正确 Scheduler；只把所有 Run 映射到 root
+Workflow 会 fail closed。
 
 ### 7.2 公平性
 
@@ -343,7 +365,7 @@ strict shard ownership：一个 `pool` 只允许一个 shard，控制器配置�
 重启或接管先恢复持久 cursor 再接纳队列，避免长驻 tenant 总从默认排序位置重新开始。
 不同 Store shard 的配额和所有权仍彼此独立。ready Run 发现、周期投影、策略变更后的
 queue 收敛和 terminal reconcile 已由显式 `DurableFleetReconciler.run_once()` 组合；
-Store schema v7 的 `DurableStoreFleetRunSource` 从隔离控制面恢复 enabled/running
+当前 Store schema v8 的 `DurableStoreFleetRunSource` 从隔离控制面恢复 enabled/running
 Run route，并把物理 Store identity 和单调 route generation 绑定到 admission；
 `StaticFleetRunSource` 仅允许显式 reference opt-in。Domain reconcile、route 生命周期、
 调用周期和显式所有权接管仍由部署驱动。控制循环先撤销陈旧 queued binding，再加入新 policy projection；

@@ -38,6 +38,7 @@ from .store import (
     ActivityAdmissionDenied,
     ConcurrentProjectionUpdate,
     DurableRunStore,
+    HierarchyAdmissionScope,
     ProjectionConflictError,
     RunAlreadyExistsError,
     RunNotFoundError,
@@ -144,6 +145,21 @@ class HierarchyController(Protocol):
         lease_seconds: float,
     ) -> ActivityClaim | None: ...
 
+    def prepare_next_child_admission(
+        self,
+        scheduler: "DurableScheduler",
+        run_id: str,
+        worker_id: str,
+        *,
+        resource_keys: Sequence[str] | None,
+    ) -> "ActivityAdmissionTarget | None": ...
+
+    def hierarchy_admission_scope(
+        self,
+        scheduler: "DurableScheduler",
+        run_id: str,
+    ) -> HierarchyAdmissionScope | None: ...
+
     def scheduler_for_run(
         self,
         scheduler: "DurableScheduler",
@@ -242,6 +258,54 @@ class ActivityAdmissionCandidate:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityAdmissionTarget:
+    """Exact scheduler/candidate plus optional root-to-child authority."""
+
+    scheduler: "DurableScheduler"
+    candidate: ActivityAdmissionCandidate
+    hierarchy_admission: HierarchyAdmissionScope | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.scheduler, DurableScheduler):
+            raise TypeError("scheduler must be a DurableScheduler")
+        if not isinstance(
+            self.candidate,
+            ActivityAdmissionCandidate,
+        ):
+            raise TypeError(
+                "candidate must be an ActivityAdmissionCandidate"
+            )
+        run = self.scheduler.store.get_run(
+            self.candidate.claim.run_id
+        )
+        if (
+            run is None
+            or run.definition_digest
+            != self.scheduler.workflow.definition_digest
+            or self.candidate.definition_digest
+            != self.scheduler.workflow.definition_digest
+        ):
+            raise SchedulerStateError(
+                "Activity admission target scheduler is inconsistent"
+            )
+        linked = isinstance(
+            run.metadata.get("hierarchy_link"),
+            dict,
+        )
+        if linked != (self.hierarchy_admission is not None):
+            raise SchedulerStateError(
+                "Activity admission target hierarchy authority is missing"
+            )
+        if (
+            self.hierarchy_admission is not None
+            and self.hierarchy_admission.target_run_id != run.run_id
+        ):
+            raise SchedulerStateError(
+                "Activity admission target hierarchy is inconsistent"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -822,6 +886,48 @@ class DurableScheduler:
         # claim_next_child path because that path may reconcile and mutate.
         return None
 
+    def prepare_next_admission_target(
+        self,
+        run_id: str,
+        worker_id: str,
+        *,
+        resource_keys: Sequence[str] | None = None,
+        target_node_id: str | None = None,
+    ) -> ActivityAdmissionTarget | None:
+        """Resolve one exact local or descendant Activity without mutation."""
+
+        candidate = self.prepare_next_admission(
+            run_id,
+            worker_id,
+            resource_keys=resource_keys,
+            target_node_id=target_node_id,
+        )
+        if candidate is not None:
+            hierarchy_admission = (
+                None
+                if self._hierarchy_controller is None
+                else self._hierarchy_controller.hierarchy_admission_scope(
+                    self,
+                    run_id,
+                )
+            )
+            return ActivityAdmissionTarget(
+                scheduler=self,
+                candidate=candidate,
+                hierarchy_admission=hierarchy_admission,
+            )
+        if (
+            target_node_id is not None
+            or self._hierarchy_controller is None
+        ):
+            return None
+        return self._hierarchy_controller.prepare_next_child_admission(
+            self,
+            run_id,
+            worker_id,
+            resource_keys=resource_keys,
+        )
+
     def claim_admitted(
         self,
         candidate: ActivityAdmissionCandidate,
@@ -832,6 +938,7 @@ class DurableScheduler:
         policy_binding: Mapping[str, str | None],
         fleet_admission: Mapping[str, object] | None = None,
         fleet_shard_ownership: Mapping[str, object] | None = None,
+        hierarchy_admission: HierarchyAdmissionScope | None = None,
         linearization_guard: Callable[[], Any] | None = None,
         linearization_validator: Callable[[], bool] | None = None,
     ) -> tuple[ActivityClaim | None, EventRecord]:
@@ -845,6 +952,20 @@ class DurableScheduler:
             or capacity < 1
         ):
             raise SchedulerStateError("invalid Activity admission candidate")
+        if (
+            hierarchy_admission is not None
+            and (
+                not isinstance(
+                    hierarchy_admission,
+                    HierarchyAdmissionScope,
+                )
+                or hierarchy_admission.target_run_id
+                != candidate.claim.run_id
+            )
+        ):
+            raise SchedulerStateError(
+                "invalid hierarchy admission authority"
+            )
         if (linearization_guard is None) != (
             linearization_validator is None
         ):
@@ -888,6 +1009,10 @@ class DurableScheduler:
                 raise SchedulerStateError(
                     "Activity admission Node projection changed"
                 )
+            if run.projection_version != candidate.expected_run_version:
+                raise SchedulerStateError(
+                    "Activity admission Run projection changed"
+                )
             claim, _claimed_event, policy_event = (
                 self.store.claim_activity_with_policy(
                     candidate.claim.run_id,
@@ -897,7 +1022,7 @@ class DurableScheduler:
                     candidate.claim.worker_id,
                     definition_digest=candidate.definition_digest,
                     schedule_new=candidate.new_attempt,
-                    expected_run_version=run.projection_version,
+                    expected_run_version=candidate.expected_run_version,
                     expected_node_version=node.projection_version,
                     expected_attempt_version=(
                         candidate.expected_attempt_version
@@ -911,6 +1036,11 @@ class DurableScheduler:
                     worker_capacity=capacity,
                     fleet_admission=fleet_admission,
                     fleet_shard_ownership=fleet_shard_ownership,
+                    hierarchy_admission=(
+                        None
+                        if hierarchy_admission is None
+                        else hierarchy_admission.to_metadata()
+                    ),
                 )
             )
             if policy_binding.get("outcome") == "require_approval":

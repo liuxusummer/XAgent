@@ -108,6 +108,11 @@
   journal；journal 路径不得挂载给 Worker，内存 journal 的 secure path fail closed。
   durable journal 首次建库经临时库完整提交后原子发布；既有库必须通过 schema/FK/
   integrity 校验，禁止缺表时自动重建。
+  若精确 Activity 位于 child Run，read-only routing 同时生成有界 root-to-child
+  authority scope；控制面授权每个祖先和目标 Run，Store 在 claim 事务内 CAS 父
+  Run/控制 Node 并验证持久 hierarchy link。scope 随 Attempt 持久化，start/complete
+  再检查祖先仍 active。schema v8 trigger 拒绝旧进程写入无 scope 的 remote child
+  active Attempt，升级前必须 drain 此类既有 authority。
   Fleet routing 使用服务端版本化 Tool/Worker policy，并把 capabilities、resource
   keys、runtime 和精确节点/config 纳入匹配；Worker register 声明只能缩小权限。
   assignment 返回前还会写入独立的 digest-only `RemoteExecutionJournal`；它不保存
@@ -125,7 +130,7 @@
   前恢复该 pool 游标。显式 `DurableFleetReconciler` 从受信 Run route source 解析
   scheduler/tenant/pool，先收敛 terminal projection，再以撤销优先的锁内差量替换
   READY queue；policy 变化后旧 queued binding 不再等待 Worker 触发失败，active
-  durable authority 则只延期到 terminal。生产 source 从 Store schema v7 恢复
+  durable authority 则只延期到 terminal。生产 source 从当前 Store schema v8 恢复
   enabled/running route，绑定隔离控制面物理 Store identity，并以 admission v2
   generation digest 在 claim 事务和 `CLAIMED -> RUNNING` trigger 中 fencing 撤销与
   ABA；静态 source 仅是显式 opt-in 的测试实现。它不使用 wall-clock leader lease，也不
