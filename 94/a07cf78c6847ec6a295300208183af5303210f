@@ -1,0 +1,41 @@
+docs/architecture.md
+  s_72af05a5dabd4c::t_c7ec9a0e684832 92-94,138-140
+docs/distributed-execution-adr.md
+  s_72af05a5dabd4c::t_d6ab9cb9001b28 392-395,424-430
+docs/provider-credential-adversarial-review.md
+  s_72af05a5dabd4c::t_4b3852f6f8f702 97-99
+docs/provider-credential-boundary.md
+  s_72af05a5dabd4c::t_f9990e037b9dd8 65-66,84-85,88-91,122-152,155-158,164-165,172-174
+docs/provider-grant-journal-adversarial-review.md
+  s_72af05a5dabd4c::t_aa2df8420c35a8 6-8,51-53,59-60,85-86,100-101
+docs/provider-invocation-receipt-adversarial-review.md
+  s_72af05a5dabd4c::t_cf3ae95d6f95c5 1-109
+docs/remote-execution-recovery.md
+  s_72af05a5dabd4c::t_66e218e0c5d36a 4,47-51,71-76,120-122,146-149
+src/orchestration/provider_access.py
+  s_72af05a5dabd4c::t_08f1ba488ee32a 15-22,30-32,39,48-66,211-213,271-280,330,355,380,409-412,440-448,479,538-545,549,557-563,572-574,605-634,651,738,740,742,748,753-756,761-770,784-788,797-801,805-840,844,846-955,958-1015,1133-1202
+src/orchestration/remote_execution_journal.py
+  s_72af05a5dabd4c::t_79aa5c718beb0e 4-7,26,97,114,127-138,243-263,266-267,271-273,304-311,475-538,542-545,1285-1580,1653-1663,1705-1733,1794-1812,1906-1933,2132-2141,2235-2256,2431-2446,2530-2533
+tests/test_orchestration_provider_access.py
+  s_72af05a5dabd4c::t_d3cf3fa5105060 3,21-24,87-99,186-192,220,276-285,345,384,548-550,558,576,579-580,587-596,606-616,622-626,643-915,984-993
+tests/test_orchestration_remote_execution_journal.py
+  s_72af05a5dabd4c::t_261369d6cb776a 26,421,480,485,487,503,543,546-607,673-723
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "94a07cf78c6847ec6a295300208183af5303210f",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
