@@ -76,6 +76,7 @@ HIERARCHY_ADMISSION_SCHEMA_VERSION = 1
 MAX_HIERARCHY_ADMISSION_DEPTH = 64
 AGENT_TOOL_INVOCATION_SCHEMA_VERSION = 1
 AGENT_TURN_CHECKPOINT_RECORD_SCHEMA_VERSION = 1
+AGENT_TURN_TAKEOVER_SCHEMA_VERSION = 1
 MAX_AGENT_TURN_CHECKPOINTS_PER_ATTEMPT = 64
 MAX_AGENT_TOOL_INVOCATIONS_PER_ATTEMPT = 64
 MAX_AGENT_TOOL_LEASE_SECONDS = 24 * 60 * 60
@@ -86,6 +87,18 @@ _FLEET_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 _FLEET_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,254}$")
 _GC_QUARANTINE_ID = re.compile(r"^q[0-9]{20}_[0-9a-f]{32}$")
 _ARTIFACT_REF_FIELDS = frozenset(ArtifactRef.__dataclass_fields__)
+_AGENT_TURN_TAKEOVER_METADATA_FIELDS = frozenset(
+    {
+        "schema_version",
+        "binding_digest",
+        "takeover_identity_digest",
+        "checkpoint_digest",
+        "completed_turn",
+        "checkpoint_fence",
+        "expired_fence",
+        "takeover_fence",
+    }
+)
 _DEADLINE_KINDS = frozenset(
     {"run", "schedule", "start", "execution", "heartbeat"}
 )
@@ -378,6 +391,28 @@ class AgentTurnCheckpointConflict(OrchestrationStoreError, ValueError):
     def __init__(self, reason_code: str) -> None:
         if reason_code not in self._REASON_CODES:
             raise ValueError("invalid Agent turn checkpoint reason code")
+        self.reason_code = reason_code
+        super().__init__(reason_code)
+
+
+class AgentTurnTakeoverConflict(OrchestrationStoreError, ValueError):
+    """An expired Agent Claim cannot be safely adopted from a checkpoint."""
+
+    _REASON_CODES = frozenset(
+        {
+            "agent_turn_takeover_binding_mismatch",
+            "agent_turn_takeover_checkpoint_unavailable",
+            "agent_turn_takeover_child_active",
+            "agent_turn_takeover_claim_mismatch",
+            "agent_turn_takeover_deadline_elapsed",
+            "agent_turn_takeover_not_expired",
+            "agent_turn_takeover_state_conflict",
+        }
+    )
+
+    def __init__(self, reason_code: str) -> None:
+        if reason_code not in self._REASON_CODES:
+            raise ValueError("invalid Agent turn takeover reason code")
         self.reason_code = reason_code
         super().__init__(reason_code)
 
@@ -4432,6 +4467,656 @@ class DurableRunStore:
             if row is None
             else self._agent_turn_checkpoint_from_row(row)
         )
+
+    def takeover_expired_agent_activity(
+        self,
+        run_id: str,
+        node_id: str,
+        attempt_id: str,
+        request_hash: str,
+        expected_owner_id: str,
+        new_owner_id: str,
+        *,
+        claim_token: str,
+        fencing_token: int,
+        takeover_id: str,
+        lease_seconds: float = 60.0,
+        worker_capacity: int | None = None,
+        now: float | None = None,
+    ) -> tuple[IdempotencyClaim, EventRecord]:
+        """Fence an expired Agent owner and adopt its latest safe checkpoint.
+
+        The caller is a trusted recovery controller. ``takeover_id`` is its
+        stable idempotency identity: retries may recover the newly issued
+        bearer while that Claim remains live, but a different binding fails
+        closed.  No model or Tool work runs inside this transaction.
+        """
+
+        current_time = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        try:
+            request_digest = _sha256_digest(
+                request_hash,
+                "request_hash",
+            )
+            old_owner = _agent_turn_takeover_text(
+                expected_owner_id,
+                "expected_owner_id",
+            )
+            new_owner = _agent_turn_takeover_text(
+                new_owner_id,
+                "new_owner_id",
+            )
+            old_claim_token = _agent_turn_takeover_text(
+                claim_token,
+                "claim_token",
+            )
+            recovery_id = _agent_turn_takeover_text(
+                takeover_id,
+                "takeover_id",
+            )
+            if (
+                isinstance(fencing_token, bool)
+                or not isinstance(fencing_token, int)
+                or fencing_token < 1
+                or fencing_token >= (1 << 63) - 1
+                or old_owner == new_owner
+            ):
+                raise ValueError
+            expected_fencing = fencing_token
+            lease_duration = _lease_duration(lease_seconds)
+            if (
+                worker_capacity is not None
+                and (
+                    isinstance(worker_capacity, bool)
+                    or not isinstance(worker_capacity, int)
+                    or worker_capacity < 1
+                )
+            ):
+                raise ValueError
+        except (TypeError, ValueError, ModelValidationError):
+            raise AgentTurnTakeoverConflict(
+                "agent_turn_takeover_binding_mismatch"
+            ) from None
+
+        takeover_id_digest = hashlib.sha256(
+            recovery_id.encode("utf-8")
+        ).hexdigest()
+        target_fencing = expected_fencing + 1
+        event_id = (
+            f"evt_agent_turn_takeover_{attempt_id}_{target_fencing}"
+        )
+
+        def binding_digest(
+            *,
+            checkpoint_digest: str,
+            completed_turn: int,
+            checkpoint_fencing_token: int,
+        ) -> str:
+            return hashlib.sha256(
+                _json_dump(
+                    {
+                        "schema": "agent_turn_takeover_binding_v1",
+                        "run_id": run_id,
+                        "node_id": node_id,
+                        "attempt_id": attempt_id,
+                        "request_digest": request_digest,
+                        "expired_owner_id": old_owner,
+                        "expired_claim_token": old_claim_token,
+                        "expired_fencing_token": expected_fencing,
+                        "new_owner_id": new_owner,
+                        "takeover_fencing_token": target_fencing,
+                        "takeover_id_digest": takeover_id_digest,
+                        "checkpoint_digest": checkpoint_digest,
+                        "completed_turn": completed_turn,
+                        "checkpoint_fencing_token": (
+                            checkpoint_fencing_token
+                        ),
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+
+        with self._write_transaction() as conn:
+            run, node, attempt = self._load_activity_tx(
+                conn,
+                run_id,
+                node_id,
+                attempt_id,
+            )
+            record = self._get_idempotency_tx(
+                conn,
+                run_id,
+                attempt.idempotency_key,
+            )
+            if record is None:
+                raise AgentTurnTakeoverConflict(
+                    "agent_turn_takeover_claim_mismatch"
+                )
+
+            raw_takeover = attempt.metadata.get("agent_turn_takeover")
+            if (
+                isinstance(raw_takeover, dict)
+                and set(raw_takeover)
+                == _AGENT_TURN_TAKEOVER_METADATA_FIELDS
+                and raw_takeover.get("schema_version")
+                == AGENT_TURN_TAKEOVER_SCHEMA_VERSION
+                and raw_takeover.get("takeover_identity_digest")
+                == takeover_id_digest
+                and raw_takeover.get("expired_fence")
+                == expected_fencing
+                and raw_takeover.get("takeover_fence")
+                == target_fencing
+                and attempt.worker_id == new_owner
+                and attempt.fencing_token == target_fencing
+            ):
+                checkpoint_digest = raw_takeover.get(
+                    "checkpoint_digest"
+                )
+                completed_turn = raw_takeover.get("completed_turn")
+                checkpoint_fencing = raw_takeover.get(
+                    "checkpoint_fence"
+                )
+                expected_binding = (
+                    binding_digest(
+                        checkpoint_digest=checkpoint_digest,
+                        completed_turn=completed_turn,
+                        checkpoint_fencing_token=checkpoint_fencing,
+                    )
+                    if (
+                        isinstance(checkpoint_digest, str)
+                        and _SHA256_DIGEST.fullmatch(
+                            checkpoint_digest
+                        )
+                        is not None
+                        and type(completed_turn) is int
+                        and 1
+                        <= completed_turn
+                        <= MAX_AGENT_TURN_CHECKPOINTS_PER_ATTEMPT
+                        and type(checkpoint_fencing) is int
+                        and 1
+                        <= checkpoint_fencing
+                        <= expected_fencing
+                    )
+                    else None
+                )
+                event_row = conn.execute(
+                    "SELECT * FROM domain_events WHERE event_id = ?",
+                    (event_id,),
+                ).fetchone()
+                if (
+                    expected_binding is not None
+                    and raw_takeover.get("binding_digest")
+                    == expected_binding
+                    and run.status is RunStatus.RUNNING
+                    and node.status is NodeStatus.RUNNING
+                    and attempt.activity_kind == "agent"
+                    and attempt.status is AttemptStatus.RUNNING
+                    and attempt.metadata.get("request_hash")
+                    == request_digest
+                    and attempt.lease_id == record.claim_token
+                    and record.status is IdempotencyStatus.IN_PROGRESS
+                    and record.request_hash == request_digest
+                    and record.owner_id == new_owner
+                    and record.claim_count == target_fencing
+                    and record.lease_expires_at > current_time
+                    and event_row is not None
+                ):
+                    event = self._event_from_row(event_row)
+                    if (
+                        event.run_id == run_id
+                        and event.node_id == node_id
+                        and event.attempt_id == attempt_id
+                        and event.event_type
+                        == "attempt.claim_taken_over"
+                        and event.payload.get("binding_digest")
+                        == expected_binding
+                    ):
+                        return (
+                            IdempotencyClaim(
+                                ClaimDisposition.ACQUIRED,
+                                record,
+                            ),
+                            event,
+                        )
+                raise AgentTurnTakeoverConflict(
+                    "agent_turn_takeover_state_conflict"
+                )
+
+            try:
+                self._validate_claim_owner(
+                    record,
+                    request_hash=request_digest,
+                    owner_id=old_owner,
+                    claim_token=old_claim_token,
+                )
+            except IdempotencyConflictError:
+                raise AgentTurnTakeoverConflict(
+                    "agent_turn_takeover_claim_mismatch"
+                ) from None
+            if (
+                run.status is not RunStatus.RUNNING
+                or node.status is not NodeStatus.RUNNING
+                or attempt.activity_kind != "agent"
+                or attempt.status is not AttemptStatus.RUNNING
+                or attempt.metadata.get("request_hash")
+                != request_digest
+            ):
+                raise AgentTurnTakeoverConflict(
+                    "agent_turn_takeover_state_conflict"
+                )
+            if (
+                record.status is not IdempotencyStatus.IN_PROGRESS
+                or record.claim_count != expected_fencing
+                or attempt.worker_id != old_owner
+                or attempt.lease_id != old_claim_token
+                or attempt.fencing_token != expected_fencing
+            ):
+                raise AgentTurnTakeoverConflict(
+                    "agent_turn_takeover_claim_mismatch"
+                )
+            if record.lease_expires_at > current_time:
+                raise AgentTurnTakeoverConflict(
+                    "agent_turn_takeover_not_expired"
+                )
+
+            persisted_deadline = _attempt_deadline(
+                run,
+                attempt,
+                heartbeat_deadline_at=_heartbeat_deadline(
+                    attempt,
+                    record,
+                ),
+            )
+            if (
+                persisted_deadline is not None
+                and persisted_deadline[1] <= current_time
+            ):
+                raise AgentTurnTakeoverConflict(
+                    "agent_turn_takeover_deadline_elapsed"
+                )
+            self._require_remote_activity_authority_tx(
+                conn,
+                attempt,
+                new_owner,
+            )
+
+            fleet_scope = _fleet_admission_metadata(
+                attempt.metadata.get("fleet_admission")
+            )
+            shard_scope = _fleet_shard_ownership_metadata(
+                attempt.metadata.get("fleet_shard_ownership")
+            )
+            if fleet_scope is not None:
+                self._validate_fleet_run_route_tx(
+                    conn,
+                    run_id,
+                    fleet_scope,
+                )
+                if shard_scope is None:
+                    owner_row = conn.execute(
+                        "SELECT 1 FROM fleet_shard_owners "
+                        "WHERE pool_id = ? LIMIT 1",
+                        (fleet_scope["pool_id"],),
+                    ).fetchone()
+                    if owner_row is not None:
+                        raise ActivityAdmissionDenied(
+                            "fleet_shard_ownership_required"
+                        )
+                else:
+                    self._validate_fleet_shard_owner_tx(
+                        conn,
+                        shard_scope,
+                        fleet_scope,
+                    )
+            elif shard_scope is not None:
+                raise AgentTurnTakeoverConflict(
+                    "agent_turn_takeover_state_conflict"
+                )
+
+            if worker_capacity is not None:
+                active_row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS active_count
+                    FROM attempts INDEXED BY attempts_admission_status_idx
+                    WHERE status IN ('claimed', 'running')
+                      AND worker_id = ? AND attempt_id <> ?
+                    """,
+                    (new_owner, attempt_id),
+                ).fetchone()
+                assert active_row is not None
+                if int(active_row["active_count"]) >= worker_capacity:
+                    raise ActivityAdmissionDenied("worker_capacity")
+
+            active_child = conn.execute(
+                """
+                SELECT 1 FROM agent_tool_invocations
+                WHERE run_id = ? AND parent_attempt_id = ?
+                  AND status IN ('scheduled', 'running')
+                LIMIT 1
+                """,
+                (run_id, attempt_id),
+            ).fetchone()
+            if active_child is not None:
+                raise AgentTurnTakeoverConflict(
+                    "agent_turn_takeover_child_active"
+                )
+
+            checkpoint_row = conn.execute(
+                """
+                SELECT * FROM agent_turn_checkpoints
+                WHERE run_id = ? AND node_id = ? AND attempt_id = ?
+                ORDER BY completed_turn DESC
+                LIMIT 1
+                """,
+                (run_id, node_id, attempt_id),
+            ).fetchone()
+            checkpoint = (
+                None
+                if checkpoint_row is None
+                else self._agent_turn_checkpoint_from_row(
+                    checkpoint_row
+                )
+            )
+            if (
+                checkpoint is None
+                or checkpoint.request_digest != request_digest
+                or checkpoint.fencing_token > expected_fencing
+                or checkpoint.created_at > current_time
+            ):
+                raise AgentTurnTakeoverConflict(
+                    "agent_turn_takeover_checkpoint_unavailable"
+                )
+
+            heartbeat_timeout = _timeout_milliseconds(
+                attempt,
+                "heartbeat_timeout_ms",
+            )
+            new_heartbeat_deadline = (
+                None
+                if heartbeat_timeout is None
+                else current_time + heartbeat_timeout / 1_000
+            )
+            new_deadline = _attempt_deadline(
+                run,
+                attempt,
+                heartbeat_deadline_at=new_heartbeat_deadline,
+            )
+            if new_deadline is not None and new_deadline[1] <= current_time:
+                raise AgentTurnTakeoverConflict(
+                    "agent_turn_takeover_deadline_elapsed"
+                )
+            lease_expires_at = current_time + lease_duration
+            if new_deadline is not None:
+                lease_expires_at = min(
+                    lease_expires_at,
+                    new_deadline[1],
+                )
+
+            takeover_binding_digest = binding_digest(
+                checkpoint_digest=checkpoint.checkpoint_digest,
+                completed_turn=checkpoint.completed_turn,
+                checkpoint_fencing_token=checkpoint.fencing_token,
+            )
+            takeover_metadata: dict[str, JsonValue] = {
+                "schema_version": AGENT_TURN_TAKEOVER_SCHEMA_VERSION,
+                "binding_digest": takeover_binding_digest,
+                "takeover_identity_digest": takeover_id_digest,
+                "checkpoint_digest": checkpoint.checkpoint_digest,
+                "completed_turn": checkpoint.completed_turn,
+                "checkpoint_fence": checkpoint.fencing_token,
+                "expired_fence": expected_fencing,
+                "takeover_fence": target_fencing,
+            }
+            target_metadata = dict(attempt.metadata)
+            target_metadata["agent_turn_takeover"] = takeover_metadata
+            new_claim_token = new_id("claim")
+            target_attempt = replace(
+                attempt,
+                worker_id=new_owner,
+                lease_id=new_claim_token,
+                fencing_token=target_fencing,
+                metadata=target_metadata,
+            )
+
+            updated = conn.execute(
+                """
+                UPDATE idempotency_records SET
+                    owner_id = ?, claim_token = ?, lease_expires_at = ?,
+                    claim_count = ?, updated_at = ?, completed_at = NULL
+                WHERE run_id = ? AND key = ? AND status = ?
+                  AND request_hash = ? AND owner_id = ?
+                  AND claim_token = ? AND claim_count = ?
+                  AND lease_expires_at <= ?
+                """,
+                (
+                    new_owner,
+                    new_claim_token,
+                    lease_expires_at,
+                    target_fencing,
+                    current_time,
+                    run_id,
+                    attempt.idempotency_key,
+                    IdempotencyStatus.IN_PROGRESS.value,
+                    request_digest,
+                    old_owner,
+                    old_claim_token,
+                    expected_fencing,
+                    current_time,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise AgentTurnTakeoverConflict(
+                    "agent_turn_takeover_claim_mismatch"
+                )
+            self._fault("agent_turn_takeover.after_idempotency")
+            event = self._commit_event_tx(
+                conn,
+                run,
+                "attempt.claim_taken_over",
+                payload={
+                    "reason": "safe_turn_checkpoint_recovery",
+                    "binding_digest": takeover_binding_digest,
+                    "checkpoint_digest": checkpoint.checkpoint_digest,
+                    "completed_turn": checkpoint.completed_turn,
+                    "checkpoint_fencing_token": (
+                        checkpoint.fencing_token
+                    ),
+                    "expired_fencing_token": expected_fencing,
+                    "takeover_fencing_token": target_fencing,
+                },
+                event_id=event_id,
+                occurred_at=current_time,
+                node_id=node_id,
+                attempt_id=attempt_id,
+                run_projection=run,
+                node_projection=None,
+                attempt_projection=target_attempt,
+            )
+            claimed = self._get_idempotency_tx(
+                conn,
+                run_id,
+                attempt.idempotency_key,
+            )
+            assert claimed is not None
+            return (
+                IdempotencyClaim(ClaimDisposition.ACQUIRED, claimed),
+                event,
+            )
+
+    def agent_turn_checkpoint_is_adopted(
+        self,
+        run_id: str,
+        node_id: str,
+        attempt_id: str,
+        request_hash: str,
+        owner_id: str,
+        *,
+        claim_token: str,
+        fencing_token: int,
+        checkpoint_digest: str,
+        completed_turn: int,
+        checkpoint_fencing_token: int,
+        now: float | None = None,
+    ) -> bool:
+        """Verify a prior-fence checkpoint was adopted by the live Claim."""
+
+        current_time = _finite_timestamp(
+            utc_timestamp() if now is None else now,
+            "now",
+        )
+        try:
+            request_digest = _sha256_digest(
+                request_hash,
+                "request_hash",
+            )
+            checkpoint_sha256 = _sha256_digest(
+                checkpoint_digest,
+                "checkpoint_digest",
+            )
+            expected_owner = _agent_turn_takeover_text(
+                owner_id,
+                "owner_id",
+            )
+            expected_claim = _agent_turn_takeover_text(
+                claim_token,
+                "claim_token",
+            )
+            if (
+                type(fencing_token) is not int
+                or type(completed_turn) is not int
+                or type(checkpoint_fencing_token) is not int
+                or fencing_token < 2
+                or not 1
+                <= completed_turn
+                <= MAX_AGENT_TURN_CHECKPOINTS_PER_ATTEMPT
+                or not 1
+                <= checkpoint_fencing_token
+                < fencing_token
+            ):
+                return False
+        except (TypeError, ValueError):
+            return False
+
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN")
+            run, node, attempt = self._load_activity_tx(
+                conn,
+                run_id,
+                node_id,
+                attempt_id,
+            )
+            record = self._get_idempotency_tx(
+                conn,
+                run_id,
+                attempt.idempotency_key,
+            )
+            checkpoint_row = conn.execute(
+                """
+                SELECT * FROM agent_turn_checkpoints
+                WHERE attempt_id = ? AND completed_turn = ?
+                """,
+                (attempt_id, completed_turn),
+            ).fetchone()
+            event_row = conn.execute(
+                "SELECT * FROM domain_events WHERE event_id = ?",
+                (
+                    f"evt_agent_turn_takeover_"
+                    f"{attempt_id}_{fencing_token}",
+                ),
+            ).fetchone()
+            if (
+                record is None
+                or checkpoint_row is None
+                or event_row is None
+            ):
+                return False
+            checkpoint = self._agent_turn_checkpoint_from_row(
+                checkpoint_row
+            )
+            event = self._event_from_row(event_row)
+            raw = attempt.metadata.get("agent_turn_takeover")
+            if (
+                not isinstance(raw, dict)
+                or set(raw)
+                != _AGENT_TURN_TAKEOVER_METADATA_FIELDS
+            ):
+                return False
+            expired_fence = raw.get("expired_fence")
+            binding = raw.get("binding_digest")
+            takeover_identity = raw.get(
+                "takeover_identity_digest"
+            )
+            projection = event.payload.get("projection")
+            projected_attempt = (
+                projection.get("attempt")
+                if isinstance(projection, dict)
+                else None
+            )
+            projected_metadata = (
+                projected_attempt.get("metadata")
+                if isinstance(projected_attempt, dict)
+                else None
+            )
+            return (
+                run.status is RunStatus.RUNNING
+                and node.status is NodeStatus.RUNNING
+                and attempt.activity_kind == "agent"
+                and attempt.status is AttemptStatus.RUNNING
+                and attempt.metadata.get("request_hash")
+                == request_digest
+                and attempt.worker_id == expected_owner
+                and attempt.lease_id == expected_claim
+                and attempt.fencing_token == fencing_token
+                and record.status is IdempotencyStatus.IN_PROGRESS
+                and record.request_hash == request_digest
+                and record.owner_id == expected_owner
+                and record.claim_token == expected_claim
+                and record.claim_count == fencing_token
+                and record.lease_expires_at > current_time
+                and checkpoint.run_id == run_id
+                and checkpoint.node_id == node_id
+                and checkpoint.request_digest == request_digest
+                and checkpoint.checkpoint_digest
+                == checkpoint_sha256
+                and checkpoint.fencing_token
+                == checkpoint_fencing_token
+                and type(expired_fence) is int
+                and checkpoint_fencing_token <= expired_fence
+                and fencing_token == expired_fence + 1
+                and raw.get("schema_version")
+                == AGENT_TURN_TAKEOVER_SCHEMA_VERSION
+                and isinstance(binding, str)
+                and _SHA256_DIGEST.fullmatch(binding) is not None
+                and isinstance(takeover_identity, str)
+                and _SHA256_DIGEST.fullmatch(takeover_identity)
+                is not None
+                and raw.get("checkpoint_digest")
+                == checkpoint_sha256
+                and raw.get("completed_turn") == completed_turn
+                and raw.get("checkpoint_fence")
+                == checkpoint_fencing_token
+                and raw.get("takeover_fence") == fencing_token
+                and event.run_id == run_id
+                and event.node_id == node_id
+                and event.attempt_id == attempt_id
+                and event.event_type == "attempt.claim_taken_over"
+                and event.payload.get("binding_digest") == binding
+                and event.payload.get("checkpoint_digest")
+                == checkpoint_sha256
+                and event.payload.get("completed_turn")
+                == completed_turn
+                and event.payload.get("checkpoint_fencing_token")
+                == checkpoint_fencing_token
+                and event.payload.get("expired_fencing_token")
+                == expired_fence
+                and event.payload.get("takeover_fencing_token")
+                == fencing_token
+                and isinstance(projected_metadata, dict)
+                and projected_metadata.get("agent_turn_takeover")
+                == raw
+            )
 
     def claim_artifact_gc_candidate(
         self,
@@ -11903,6 +12588,20 @@ def _validate_agent_turn_checkpoint_record(
         )
     ):
         raise ValueError("invalid Agent turn checkpoint binding")
+
+
+def _agent_turn_takeover_text(value: Any, field_name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 255
+        or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in value
+        )
+    ):
+        raise ValueError(f"{field_name} is invalid")
+    return value
 
 
 def _agent_tool_effect_class(value: Any) -> str:

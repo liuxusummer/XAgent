@@ -326,6 +326,7 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "AgentToolExecutionClaim",
         "AgentToolInvocationConflict",
         "AgentToolInvocationRecord",
+        "AgentTurnTakeoverConflict",
         "ArtifactGCReferenceConflictError",
         "DurableRunStore",
         "FleetFairnessCursor",

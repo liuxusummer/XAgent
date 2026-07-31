@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,7 +18,13 @@ from src.orchestration.agent_activity_executor import (
 from src.orchestration.agent_provider_client import (
     DurableAgentProviderClient,
 )
-from src.orchestration.agent_tool_handler import AgentToolSpec
+from src.orchestration.agent_tool_handler import (
+    AgentToolInvocationRequest,
+    AgentToolSpec,
+)
+from src.orchestration.agent_execution_manifest import (
+    agent_tool_operation_key,
+)
 from src.orchestration.agent_turn_checkpoint import (
     AgentTurnCheckpointArtifactStore,
 )
@@ -33,13 +41,19 @@ from src.orchestration.provider_access import (
 from src.orchestration.remote_execution_journal import (
     RemoteExecutionJournal,
 )
-from src.orchestration.scheduler import DurableScheduler, RunInputReceipt
+from src.orchestration.scheduler import (
+    DurableScheduler,
+    RunInputReceipt,
+    SchedulerStateError,
+)
 from src.orchestration.store import (
     AgentTurnCheckpointConflict,
+    AgentTurnTakeoverConflict,
     DurableRunStore,
 )
 from src.orchestration.worker_security import WorkerAuthorization
 from src.orchestration.workflow import compile_workflow
+from src.orchestration.policy import canonical_action_args_digest
 
 
 _LEAK = "provider-secret-that-must-not-reach-durable-state"
@@ -162,6 +176,7 @@ class _Fixture:
         heartbeat_interval_seconds: float = 20.0,
         lease_renewal_seconds: float = 60.0,
         input_sensitivity: ArtifactSensitivity | None = None,
+        timeout: dict[str, int] | None = None,
     ) -> None:
         self.root = root
         self.clock = _Clock()
@@ -181,6 +196,8 @@ class _Fixture:
             node["input_mapping"] = {
                 "evidence": {"source": "run_input"}
             }
+        if timeout is not None:
+            node["timeout"] = timeout
         self._input_sensitivity = input_sensitivity
         self.workflow = compile_workflow(
             {
@@ -264,9 +281,11 @@ class _Fixture:
         return RunInputReceipt((ref,))
 
     def _authorization(self, request) -> WorkerAuthorization:
+        attempt = self.store.get_attempt(request.attempt_id)
+        assert attempt is not None and attempt.worker_id is not None
         return WorkerAuthorization(
             authorization_id="auth-1",
-            worker_id="worker-1",
+            worker_id=attempt.worker_id,
             tenant_id=self.route.tenant_id,
             pool_id=self.route.pool_id,
             run_id=request.run_id,
@@ -279,8 +298,8 @@ class _Fixture:
             maximum_artifact_sensitivity=(
                 ArtifactSensitivity.SENSITIVE
             ),
-            issued_at=90.0,
-            expires_at=200.0,
+            issued_at=max(0.0, self.clock.now - 10.0),
+            expires_at=self.clock.now + 100.0,
         )
 
     def _provider_client(self, request, request_ref, collector):
@@ -483,6 +502,512 @@ class DurableAgentActivityExecutorTests(unittest.TestCase):
             )
             self.assertEqual(payload["response"], "resumed final answer")
             self.assertEqual(payload["turns"], 2)
+
+    def test_expired_claim_takeover_resumes_with_new_owner_and_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            invoker = _SequenceInvoker(
+                [
+                    _response_bytes(""),
+                    _response_bytes("resumed final answer"),
+                ]
+            )
+            fixture = _Fixture(Path(directory), invoker=invoker)
+            claim, request_ref = fixture.claim()
+            _leave_safe_turn_checkpoint(fixture, claim, request_ref)
+            fixture.clock.now = fixture.store.get_idempotency(
+                claim.run_id,
+                claim.claim_key,
+            ).lease_expires_at
+
+            adopted, event = (
+                fixture.scheduler.takeover_expired_agent_claim(
+                    claim,
+                    "worker-2",
+                    takeover_id="recovery-controller-1",
+                    lease_seconds=30.0,
+                    capacity=1,
+                )
+            )
+
+            self.assertEqual(adopted.worker_id, "worker-2")
+            self.assertEqual(
+                adopted.fencing_token,
+                claim.fencing_token + 1,
+            )
+            self.assertNotEqual(adopted.claim_token, claim.claim_token)
+            self.assertEqual(event.event_type, "attempt.claim_taken_over")
+            self.assertNotIn(claim.claim_token, repr(adopted))
+            with self.assertRaises(SchedulerStateError):
+                fixture.scheduler.renew_claim(claim)
+
+            fixture.executor._context_factory = (
+                lambda _request: AgentContext(
+                    display_fn=lambda _message: None
+                )
+            )
+            result = fixture.executor.resume(adopted, request_ref)
+
+            self.assertEqual(invoker.calls, 2)
+            self.assertIs(
+                fixture.store.get_attempt(claim.attempt_id).status,
+                AttemptStatus.SUCCEEDED,
+            )
+            self.assertEqual(
+                json.loads(
+                    fixture.artifacts.read(
+                        result.result_artifact_ref
+                    ).decode("utf-8")
+                )["response"],
+                "resumed final answer",
+            )
+
+    def test_takeover_retry_returns_same_live_claim_and_event(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = _Fixture(
+                Path(directory),
+                invoker=_SequenceInvoker(
+                    [_response_bytes(""), _response_bytes("final")]
+                ),
+            )
+            claim, request_ref = fixture.claim()
+            _leave_safe_turn_checkpoint(fixture, claim, request_ref)
+            fixture.clock.now = fixture.store.get_idempotency(
+                claim.run_id,
+                claim.claim_key,
+            ).lease_expires_at
+
+            first, first_event = (
+                fixture.scheduler.takeover_expired_agent_claim(
+                    claim,
+                    "worker-2",
+                    takeover_id="lost-response-retry",
+                )
+            )
+            second, second_event = (
+                fixture.scheduler.takeover_expired_agent_claim(
+                    claim,
+                    "worker-2",
+                    takeover_id="lost-response-retry",
+                )
+            )
+
+            self.assertEqual(first, second)
+            self.assertEqual(first_event, second_event)
+            self.assertNotIn(
+                b"lost-response-retry",
+                fixture.durable_database_bytes(),
+            )
+            self.assertEqual(
+                len(
+                    [
+                        event
+                        for event in fixture.store.list_events(
+                            claim.run_id
+                        )
+                        if event.event_type
+                        == "attempt.claim_taken_over"
+                    ]
+                ),
+                1,
+            )
+
+    def test_repeated_takeovers_preserve_provider_lineage_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = _Fixture(
+                Path(directory),
+                invoker=_SequenceInvoker(
+                    [
+                        _response_bytes(""),
+                        _response_bytes(""),
+                        _response_bytes("final after two takeovers"),
+                    ]
+                ),
+            )
+            original, request_ref = fixture.claim()
+            _leave_safe_turn_checkpoint(
+                fixture,
+                original,
+                request_ref,
+            )
+            first_record = fixture.store.get_idempotency(
+                original.run_id,
+                original.claim_key,
+            )
+            assert first_record is not None
+            fixture.clock.now = first_record.lease_expires_at
+            second, _event = (
+                fixture.scheduler.takeover_expired_agent_claim(
+                    original,
+                    "worker-2",
+                    takeover_id="first-hop",
+                )
+            )
+
+            def crash_before_third_provider(message: str) -> None:
+                if message == "[Turn 3]":
+                    raise RuntimeError("second worker stopped")
+
+            fixture.executor._context_factory = (
+                lambda _request: AgentContext(
+                    display_fn=crash_before_third_provider
+                )
+            )
+            with self.assertRaises(AgentActivityExecutionError):
+                fixture.executor.resume(second, request_ref)
+
+            second_checkpoint = (
+                fixture.store.get_latest_agent_turn_checkpoint(
+                    original.run_id,
+                    original.node_id,
+                    original.attempt_id,
+                )
+            )
+            assert second_checkpoint is not None
+            self.assertEqual(second_checkpoint.completed_turn, 2)
+            self.assertEqual(
+                second_checkpoint.fencing_token,
+                second.fencing_token,
+            )
+            checkpoint_payload = AgentTurnCheckpointArtifactStore(
+                fixture.artifacts
+            ).load(second_checkpoint.checkpoint_ref)
+            self.assertEqual(
+                checkpoint_payload.provider_state[
+                    "authorization_lineage_start_index"
+                ],
+                1,
+            )
+            authorization_digests = [
+                binding.receipt.authorization_digest
+                for binding in checkpoint_payload.evidence_manifest.provider_receipts
+            ]
+            self.assertEqual(len(set(authorization_digests)), 2)
+
+            second_record = fixture.store.get_idempotency(
+                second.run_id,
+                second.claim_key,
+            )
+            assert second_record is not None
+            fixture.clock.now = second_record.lease_expires_at
+            third, _event = (
+                fixture.scheduler.takeover_expired_agent_claim(
+                    second,
+                    "worker-3",
+                    takeover_id="second-hop",
+                )
+            )
+            fixture.executor._context_factory = (
+                lambda _request: AgentContext(
+                    display_fn=lambda _message: None
+                )
+            )
+
+            result = fixture.executor.resume(third, request_ref)
+
+            self.assertEqual(fixture.invoker.calls, 3)
+            self.assertEqual(
+                json.loads(
+                    fixture.artifacts.read(
+                        result.result_artifact_ref
+                    ).decode("utf-8")
+                )["response"],
+                "final after two takeovers",
+            )
+
+    def test_live_or_checkpointless_claim_cannot_be_taken_over(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = _Fixture(
+                Path(directory),
+                invoker=_SequenceInvoker(
+                    [_response_bytes(""), _response_bytes("final")]
+                ),
+            )
+            claim, request_ref = fixture.claim()
+            _leave_safe_turn_checkpoint(fixture, claim, request_ref)
+            with self.assertRaisesRegex(
+                AgentTurnTakeoverConflict,
+                "agent_turn_takeover_not_expired",
+            ):
+                fixture.scheduler.takeover_expired_agent_claim(
+                    claim,
+                    "worker-2",
+                    takeover_id="too-early",
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = _Fixture(
+                Path(directory),
+                invoker=_Invoker(_response_bytes()),
+            )
+            claim, _request_ref = fixture.claim()
+            fixture.scheduler.start_claim(claim)
+            fixture.clock.now = claim.lease_expires_at
+            with self.assertRaisesRegex(
+                AgentTurnTakeoverConflict,
+                "agent_turn_takeover_checkpoint_unavailable",
+            ):
+                fixture.scheduler.takeover_expired_agent_claim(
+                    claim,
+                    "worker-2",
+                    takeover_id="no-checkpoint",
+                )
+
+    def test_elapsed_execution_deadline_blocks_checkpoint_takeover(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = _Fixture(
+                Path(directory),
+                invoker=_SequenceInvoker(
+                    [_response_bytes(""), _response_bytes("final")]
+                ),
+                timeout={"execution_timeout_ms": 30_000},
+            )
+            claim, request_ref = fixture.claim()
+            _leave_safe_turn_checkpoint(fixture, claim, request_ref)
+            record = fixture.store.get_idempotency(
+                claim.run_id,
+                claim.claim_key,
+            )
+            assert record is not None
+            fixture.clock.now = record.lease_expires_at
+
+            with self.assertRaisesRegex(
+                AgentTurnTakeoverConflict,
+                "agent_turn_takeover_deadline_elapsed",
+            ):
+                fixture.scheduler.takeover_expired_agent_claim(
+                    claim,
+                    "worker-2",
+                    takeover_id="deadline-wins",
+                )
+
+    def test_active_tool_tail_blocks_checkpoint_takeover(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = _Fixture(
+                Path(directory),
+                invoker=_SequenceInvoker(
+                    [_response_bytes(""), _response_bytes("final")]
+                ),
+            )
+            claim, request_ref = fixture.claim()
+            _leave_safe_turn_checkpoint(fixture, claim, request_ref)
+            args = {"value": "tail"}
+            operation_key = agent_tool_operation_key(
+                run_id=claim.run_id,
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+                request_digest=claim.request_hash,
+                sequence=1,
+            )
+            child = AgentToolInvocationRequest(
+                run_id=claim.run_id,
+                node_id=claim.node_id,
+                attempt_id=claim.attempt_id,
+                request_digest=claim.request_hash,
+                request_artifact_digest=request_ref.sha256,
+                sequence=1,
+                turn=2,
+                tool_name="echo",
+                tool_call_id_digest=_digest("tail-call"),
+                args_digest=canonical_action_args_digest(
+                    args,
+                    sensitive_keys=(),
+                ),
+                sensitivity=request_ref.sensitivity,
+                sensitive_keys=(),
+                operation_key=operation_key,
+                args=args,
+            )
+            fixture.store.reserve_agent_tool_invocation(
+                child,
+                now=fixture.clock.now,
+            )
+            record = fixture.store.get_idempotency(
+                claim.run_id,
+                claim.claim_key,
+            )
+            assert record is not None
+            fixture.clock.now = record.lease_expires_at
+
+            with self.assertRaisesRegex(
+                AgentTurnTakeoverConflict,
+                "agent_turn_takeover_child_active",
+            ):
+                fixture.scheduler.takeover_expired_agent_claim(
+                    claim,
+                    "worker-2",
+                    takeover_id="child-tail",
+                )
+
+    def test_concurrent_takeovers_have_one_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = _Fixture(
+                Path(directory),
+                invoker=_SequenceInvoker(
+                    [_response_bytes(""), _response_bytes("final")]
+                ),
+            )
+            claim, request_ref = fixture.claim()
+            _leave_safe_turn_checkpoint(fixture, claim, request_ref)
+            record = fixture.store.get_idempotency(
+                claim.run_id,
+                claim.claim_key,
+            )
+            assert record is not None
+            fixture.clock.now = record.lease_expires_at
+            barrier = threading.Barrier(2)
+            winners = []
+            failures = []
+
+            def compete(index: int) -> None:
+                barrier.wait()
+                try:
+                    winners.append(
+                        fixture.scheduler.takeover_expired_agent_claim(
+                            claim,
+                            f"worker-{index + 2}",
+                            takeover_id=f"race-{index}",
+                        )[0]
+                    )
+                except AgentTurnTakeoverConflict as exc:
+                    failures.append(exc.reason_code)
+
+            threads = [
+                threading.Thread(target=compete, args=(index,))
+                for index in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5.0)
+
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(len(failures), 1)
+            self.assertEqual(
+                winners[0].fencing_token,
+                claim.fencing_token + 1,
+            )
+            self.assertEqual(
+                len(
+                    [
+                        event
+                        for event in fixture.store.list_events(
+                            claim.run_id
+                        )
+                        if event.event_type
+                        == "attempt.claim_taken_over"
+                    ]
+                ),
+                1,
+            )
+
+    def test_takeover_fault_rolls_back_claim_and_event(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = _Fixture(
+                Path(directory),
+                invoker=_SequenceInvoker(
+                    [_response_bytes(""), _response_bytes("final")]
+                ),
+            )
+            claim, request_ref = fixture.claim()
+            _leave_safe_turn_checkpoint(fixture, claim, request_ref)
+            record = fixture.store.get_idempotency(
+                claim.run_id,
+                claim.claim_key,
+            )
+            assert record is not None
+            fixture.clock.now = record.lease_expires_at
+
+            def fail(stage: str) -> None:
+                if stage == "agent_turn_takeover.after_idempotency":
+                    raise RuntimeError("injected takeover fault")
+
+            fixture.store._fault = fail
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "injected takeover fault",
+            ):
+                fixture.scheduler.takeover_expired_agent_claim(
+                    claim,
+                    "worker-2",
+                    takeover_id="rollback",
+                )
+            fixture.store._fault = lambda _stage: None
+
+            stored_attempt = fixture.store.get_attempt(
+                claim.attempt_id
+            )
+            stored_claim = fixture.store.get_idempotency(
+                claim.run_id,
+                claim.claim_key,
+            )
+            assert stored_attempt is not None and stored_claim is not None
+            self.assertEqual(stored_attempt.worker_id, claim.worker_id)
+            self.assertEqual(stored_attempt.lease_id, claim.claim_token)
+            self.assertEqual(stored_claim.owner_id, claim.worker_id)
+            self.assertEqual(stored_claim.claim_token, claim.claim_token)
+            self.assertFalse(
+                any(
+                    event.event_type == "attempt.claim_taken_over"
+                    for event in fixture.store.list_events(
+                        claim.run_id
+                    )
+                )
+            )
+
+    def test_tampered_takeover_binding_cannot_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = _Fixture(
+                Path(directory),
+                invoker=_SequenceInvoker(
+                    [_response_bytes(""), _response_bytes("final")]
+                ),
+            )
+            claim, request_ref = fixture.claim()
+            _leave_safe_turn_checkpoint(fixture, claim, request_ref)
+            record = fixture.store.get_idempotency(
+                claim.run_id,
+                claim.claim_key,
+            )
+            assert record is not None
+            fixture.clock.now = record.lease_expires_at
+            adopted, _event = (
+                fixture.scheduler.takeover_expired_agent_claim(
+                    claim,
+                    "worker-2",
+                    takeover_id="tamper-test",
+                )
+            )
+            attempt = fixture.store.get_attempt(claim.attempt_id)
+            assert attempt is not None
+            metadata = dict(attempt.metadata)
+            takeover = dict(metadata["agent_turn_takeover"])
+            takeover["binding_digest"] = "0" * 64
+            metadata["agent_turn_takeover"] = takeover
+            with closing(sqlite3.connect(fixture.store.path)) as conn:
+                conn.execute(
+                    "UPDATE attempts SET metadata_json = ? "
+                    "WHERE attempt_id = ?",
+                    (
+                        json.dumps(
+                            metadata,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        claim.attempt_id,
+                    ),
+                )
+                conn.commit()
+
+            with self.assertRaisesRegex(
+                AgentActivityExecutionError,
+                "agent_activity_recovery_unavailable",
+            ):
+                fixture.executor.resume(adopted, request_ref)
+
+            self.assertEqual(fixture.invoker.calls, 1)
 
     def test_resume_rejects_runtime_configuration_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

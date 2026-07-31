@@ -282,7 +282,7 @@ class DurableAgentActivityExecutor:
 
     @property
     def durable_result_recovery_ready(self) -> bool:
-        """Safe-turn state can be restored with the current Claim authority."""
+        """Safe-turn state supports live-Claim restart or fenced takeover."""
 
         return True
 
@@ -389,11 +389,16 @@ class DurableAgentActivityExecutor:
                 request_ref,
                 allow_running=True,
             )
-            checkpoint = self._load_checkpoint(claim, request_ref)
+            checkpoint, reset_authorization_lineage = (
+                self._load_checkpoint(claim, request_ref)
+            )
             return self._execute_once(
                 claim,
                 request_ref,
                 checkpoint=checkpoint,
+                reset_authorization_lineage=(
+                    reset_authorization_lineage
+                ),
             )
         finally:
             with self._active_lock:
@@ -405,6 +410,7 @@ class DurableAgentActivityExecutor:
         request_ref: ArtifactRef,
         *,
         checkpoint: AgentTurnCheckpoint | None = None,
+        reset_authorization_lineage: bool = False,
     ) -> AgentActivityExecutionResult:
         """Execute after acquiring this process's Attempt slot."""
 
@@ -471,6 +477,9 @@ class DurableAgentActivityExecutor:
                 client.restore_checkpoint_state(
                     checkpoint.provider_state,
                     evidence_manifest=checkpoint.evidence_manifest,
+                    reset_authorization_lineage=(
+                        reset_authorization_lineage
+                    ),
                 )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -682,7 +691,7 @@ class DurableAgentActivityExecutor:
         self,
         claim: ActivityClaim,
         request_ref: ArtifactRef,
-    ) -> AgentTurnCheckpoint:
+    ) -> tuple[AgentTurnCheckpoint, bool]:
         failed = False
         try:
             record = self.store.get_latest_agent_turn_checkpoint(
@@ -690,6 +699,7 @@ class DurableAgentActivityExecutor:
                 claim.node_id,
                 claim.attempt_id,
             )
+            attempt = self.store.get_attempt(claim.attempt_id)
             checkpoint = (
                 None
                 if record is None
@@ -702,16 +712,39 @@ class DurableAgentActivityExecutor:
         except BaseException:
             failed = True
             record = None
+            attempt = None
             checkpoint = None
+        checkpoint_adopted = (
+            record is not None
+            and attempt is not None
+            and record.fencing_token != claim.fencing_token
+            and self.store.agent_turn_checkpoint_is_adopted(
+                claim.run_id,
+                claim.node_id,
+                claim.attempt_id,
+                claim.request_hash,
+                claim.worker_id,
+                claim_token=claim.claim_token,
+                fencing_token=claim.fencing_token,
+                checkpoint_digest=record.checkpoint_digest,
+                completed_turn=record.completed_turn,
+                checkpoint_fencing_token=record.fencing_token,
+                now=self.scheduler.current_time(),
+            )
+        )
         if (
             failed
             or record is None
+            or attempt is None
             or checkpoint is None
             or record.run_id != claim.run_id
             or record.node_id != claim.node_id
             or record.attempt_id != claim.attempt_id
             or record.request_digest != claim.request_hash
-            or record.fencing_token != claim.fencing_token
+            or (
+                record.fencing_token != claim.fencing_token
+                and not checkpoint_adopted
+            )
             or record.completed_turn != checkpoint.completed_turn
             or record.checkpoint_digest
             != checkpoint.checkpoint_digest
@@ -735,7 +768,7 @@ class DurableAgentActivityExecutor:
             raise AgentActivityExecutionError(
                 "agent_activity_recovery_unavailable"
             )
-        return checkpoint
+        return checkpoint, checkpoint_adopted
 
     def _checkpoint_callback(
         self,

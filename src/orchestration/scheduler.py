@@ -1158,6 +1158,71 @@ class DurableScheduler:
         self._validate_claim_handle(claim)
         return claim
 
+    def takeover_expired_agent_claim(
+        self,
+        expired_claim: ActivityClaim,
+        new_worker_id: str,
+        *,
+        takeover_id: str,
+        lease_seconds: float = 60.0,
+        capacity: int | None = None,
+    ) -> tuple[ActivityClaim, EventRecord]:
+        """Adopt a safe-turn checkpoint under a newly fenced Claim."""
+
+        if type(expired_claim) is not ActivityClaim:
+            raise SchedulerStateError("expired claim handle is invalid")
+        routed = self._scheduler_for_claim(expired_claim)
+        if routed is not self:
+            return routed.takeover_expired_agent_claim(
+                expired_claim,
+                new_worker_id,
+                takeover_id=takeover_id,
+                lease_seconds=lease_seconds,
+                capacity=capacity,
+            )
+        try:
+            definition = self.workflow.get_node(
+                expired_claim.node_id
+            )
+        except KeyError as exc:
+            raise SchedulerStateError(
+                "claim node is not in the Workflow"
+            ) from exc
+        if (
+            definition.kind != "agent"
+            or expired_claim.activity_kind != "agent"
+        ):
+            raise SchedulerStateError(
+                "only an Agent claim supports checkpoint takeover"
+            )
+        claimed, event = self.store.takeover_expired_agent_activity(
+            expired_claim.run_id,
+            expired_claim.node_id,
+            expired_claim.attempt_id,
+            expired_claim.request_hash,
+            expired_claim.worker_id,
+            new_worker_id,
+            claim_token=expired_claim.claim_token,
+            fencing_token=expired_claim.fencing_token,
+            takeover_id=takeover_id,
+            lease_seconds=lease_seconds,
+            worker_capacity=capacity,
+            now=self._now(),
+        )
+        attempt = self.store.get_attempt(expired_claim.attempt_id)
+        if attempt is None:
+            raise SchedulerStateError(
+                "taken-over Attempt was not persisted"
+            )
+        active_claim = self._claim_handle(
+            definition,
+            attempt,
+            claimed,
+            new_worker_id,
+        )
+        self._validate_claim_handle(active_claim)
+        return active_claim, event
+
     def renew_claim(
         self,
         claim: ActivityClaim,
@@ -3156,6 +3221,11 @@ class DurableScheduler:
         if value < 0:
             raise ValueError("clock must return a non-negative timestamp")
         return value
+
+    def current_time(self) -> float:
+        """Expose the Scheduler's trusted clock to composed adapters."""
+
+        return self._now()
 
 
 def _canonical_json(value: Any) -> bytes:

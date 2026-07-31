@@ -129,10 +129,12 @@ client 的重试始终复用同一个 grant、同一 authorization 和完全相�
 可恢复性把 bearer 写进 Event、manifest、checkpoint 或普通日志。
 
 在一次调用已经返回完整 receipt 后，`checkpoint_state()` 可导出 detached system/history、
-compaction、authorization digest、request count 和有序 response refs；它同时绑定 route、
-generation、context 和 retry 配置 digest。`restore_checkpoint_state()` 只接受与安全轮次
-manifest 完全一致的 provider receipt/ref prefix，并要求新 client 仍为空。该机制只恢复下一次
-尚未开始的调用，不恢复或猜测 in-flight grant。
+compaction、当前 authorization digest/lineage 起点、request count 和有序 response refs；它同时
+绑定 route、generation、context 和 retry 配置 digest。v2 状态允许不同 Claim owner 形成多个
+authorization receipt 段，旧 v1 状态按“全部属于第一段”兼容读取。只有 Store 已验证
+checkpoint adoption 时，executor 才令 `restore_checkpoint_state(...,
+reset_authorization_lineage=True)` 从当前 request count 开始新段；旧 receipts 仍逐条校验，不能
+被新 owner 的授权摘要覆盖。该机制只恢复下一次尚未开始的调用，不恢复或猜测 in-flight grant。
 
 ## 7. 尚未完成
 
@@ -140,8 +142,9 @@ manifest 完全一致的 provider receipt/ref prefix，并要求新 client 仍�
   `DurableAgentActivityExecutor` 已形成显式组合，但远程 Worker adapter 仍未接入；
 - 本地组合已把 client state、collector receipt prefix 和 Loop state 组成安全轮次 checkpoint，
   并由主 Store 原子登记 checkpoint/request/provider response Artifact 引用；
-- 跨进程恢复仍要求控制面安全提供当前未过期 Claim bearer；过期 Claim 的换 owner/fencing
-  接管尚未实现；
+- 当前未过期 Claim 可直接跨进程恢复；过期 Claim 可由受信控制器在主 Store 中换
+  owner/fencing 并采用闭合 checkpoint。已经签发但未进入该 checkpoint 的 provider grant 仍
+  不可跨 owner 取回 bearer，只能由部署 gateway 的 operation ledger 收敛；
 - Broker 的参考 `ProviderInvoker` readiness 不能证明 mTLS、attestation、egress 或外部
   operation ledger；
 - reference client 不在进程内线程上伪造可中断 timeout；部署侧 invoker 必须实施有界网络

@@ -104,9 +104,11 @@
   所有配置在 RUNNING 前预检，执行中续租父 Claim，并把真实 provider refs、动态 Tool receipts
   和最终 response Artifact 交给上述终态边界。每个闭合非终态轮次还会在下一 provider 调用前
   原子提交 checkpoint 指针及 request/provider Artifact GC 引用；持有当前 Claim bearer 的重启
-  进程可恢复 history、receipt prefix、上下文和 usage。它不改默认 CLI/Web；
-  `durable_result_recovery_ready` 为 true，但远程 ownership/attestation 与过期 Claim 接管尚未
-  完成，`production_security_ready` 仍为 false。见
+  进程可恢复 history、receipt prefix、上下文和 usage。受信恢复控制器还可在租约过期、deadline
+  未到且没有活跃 Tool 尾部时，原子换 owner/fencing 并采用 checkpoint；旧 worker 的续租、
+  checkpoint 与父终态提交随即被 fence。它不改默认 CLI/Web；
+  `durable_result_recovery_ready` 为 true，但远程 ownership/attestation 与 in-flight provider
+  grant 接管尚未完成，`production_security_ready` 仍为 false。见
   `docs/agent-activity-executor.md`。
 - Agent Activity 的 task/context 可由 `AgentActivityRequest` 物化为至少 sensitive
   （并继承 context 最高分类）的 content-addressed Artifact，绑定稳定

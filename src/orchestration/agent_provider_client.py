@@ -92,12 +92,14 @@ class DurableAgentProviderClient:
     The client is scoped to one Agent request/Attempt. It maintains the
     protocol-neutral chat history expected by Agent Loop, but it never holds
     an upstream provider credential. A fresh WorkerAuthorization may be
-    supplied for every call; all successful calls must retain the first
-    authorization lineage.
+    supplied for every call. Calls made by one Claim owner retain one
+    authorization lineage; an explicitly validated Claim takeover starts a
+    new lineage segment without rewriting prior receipts.
     """
 
     __slots__ = (
         "_authorization_digest",
+        "_authorization_lineage_start_index",
         "_authorization_source",
         "_broker",
         "_chat_lock",
@@ -232,6 +234,7 @@ class DurableAgentProviderClient:
         )
         self._maximum_broker_attempts = maximum_broker_attempts
         self._authorization_digest: str | None = None
+        self._authorization_lineage_start_index = 0
         self._system_messages: list[dict[str, Any]] = []
         self._chat_lock = threading.Lock()
         self._lock = threading.RLock()
@@ -297,11 +300,35 @@ class DurableAgentProviderClient:
         """Return detached sensitive state for a safe-turn Artifact."""
 
         with self._lock:
+            if (
+                not 1
+                <= self.request_count
+                <= MAX_AGENT_EXECUTION_PROVIDER_RECEIPTS
+                or type(self._authorization_digest) is not str
+                or len(self._authorization_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in self._authorization_digest
+                )
+                or type(self._authorization_lineage_start_index)
+                is not int
+                or not 0
+                <= self._authorization_lineage_start_index
+                < self.request_count
+                or len(self._result_artifact_refs)
+                != self.request_count
+            ):
+                raise AgentProviderClientError(
+                    "agent_provider_checkpoint_invalid"
+                )
             payload = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "configuration_digest": self.checkpoint_configuration_digest,
                 "request_count": self.request_count,
                 "authorization_digest": self._authorization_digest,
+                "authorization_lineage_start_index": (
+                    self._authorization_lineage_start_index
+                ),
                 "system_messages": self._system_messages,
                 "history": self.history,
                 "history_compaction": self.history_compaction,
@@ -327,15 +354,19 @@ class DurableAgentProviderClient:
         state: Any,
         *,
         evidence_manifest: AgentActivityExecutionManifest,
+        reset_authorization_lineage: bool = False,
     ) -> None:
         """Restore a validated closed provider prefix before the next call."""
 
         invalid = False
         try:
+            if type(reset_authorization_lineage) is not bool:
+                raise ValueError
             detached = json.loads(
                 canonical_json_bytes(state).decode("utf-8")
             )
-            required = {
+            schema_version = detached["schema_version"]
+            common_fields = {
                 "schema_version",
                 "configuration_digest",
                 "request_count",
@@ -345,6 +376,18 @@ class DurableAgentProviderClient:
                 "history_compaction",
                 "result_artifact_refs",
             }
+            if schema_version == 1:
+                required = common_fields
+                lineage_start = 0
+            elif schema_version == 2:
+                required = common_fields | {
+                    "authorization_lineage_start_index"
+                }
+                lineage_start = detached[
+                    "authorization_lineage_start_index"
+                ]
+            else:
+                raise ValueError
             request_count = detached["request_count"]
             configuration_digest = detached["configuration_digest"]
             authorization_digest = detached["authorization_digest"]
@@ -371,7 +414,6 @@ class DurableAgentProviderClient:
             if (
                 type(detached) is not dict
                 or set(detached) != required
-                or detached["schema_version"] != 1
                 or configuration_digest
                 != self.checkpoint_configuration_digest
                 or type(evidence_manifest)
@@ -396,6 +438,8 @@ class DurableAgentProviderClient:
                     character not in "0123456789abcdef"
                     for character in authorization_digest
                 )
+                or type(lineage_start) is not int
+                or not 0 <= lineage_start < request_count
                 or type(system_messages) is not list
                 or any(
                     message.get("role") != "system"
@@ -416,9 +460,7 @@ class DurableAgentProviderClient:
                     for ref in refs
                 )
                 or any(
-                    receipt.authorization_digest
-                    != authorization_digest
-                    or receipt.response_digest != ref.sha256
+                    receipt.response_digest != ref.sha256
                     or receipt.response_sensitivity
                     is not ref.sensitivity
                     or receipt.response_artifact_ref_digest
@@ -431,6 +473,11 @@ class DurableAgentProviderClient:
                         strict=True,
                     )
                 )
+                or any(
+                    receipt.authorization_digest
+                    != authorization_digest
+                    for receipt in receipts[lineage_start:]
+                )
             ):
                 raise ValueError
         except (KeyboardInterrupt, SystemExit):
@@ -439,6 +486,7 @@ class DurableAgentProviderClient:
             invalid = True
             request_count = 0
             authorization_digest = None
+            lineage_start = 0
             system_messages = []
             history = []
             compaction = []
@@ -451,6 +499,7 @@ class DurableAgentProviderClient:
             if (
                 self.request_count != 0
                 or self._authorization_digest is not None
+                or self._authorization_lineage_start_index != 0
                 or self._system_messages
                 or self.history
                 or self.history_compaction
@@ -460,7 +509,16 @@ class DurableAgentProviderClient:
                     "agent_provider_checkpoint_invalid"
                 )
             self.request_count = request_count
-            self._authorization_digest = authorization_digest
+            self._authorization_digest = (
+                None
+                if reset_authorization_lineage
+                else authorization_digest
+            )
+            self._authorization_lineage_start_index = (
+                request_count
+                if reset_authorization_lineage
+                else lineage_start
+            )
             self._system_messages = system_messages
             self.history = history
             self.history_compaction = compaction

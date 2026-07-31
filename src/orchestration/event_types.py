@@ -34,6 +34,7 @@ DURABLE_EVENT_TYPES = frozenset(
         "node.skipped",
         "attempt.scheduled",
         "attempt.claimed",
+        "attempt.claim_taken_over",
         "attempt.started",
         "attempt.running",
         "attempt.succeeded",

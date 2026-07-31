@@ -8,9 +8,10 @@ evidence collector 和原子终态提交器，不改变默认 CLI/Web，也不�
 远程 Worker。
 
 该实现是本地参考组合，不是生产远程 runtime。`durable_result_recovery_ready` 为 true：持有
-当前未过期 Claim bearer 的重启进程可以从最近一个安全轮次精确恢复；
-`production_security_ready` 仍固定为 false，因为过期 Claim 的自动接管、远程 assignment
-attestation 和 SECRET 加密 Store 尚未完成。
+当前未过期 Claim bearer 的重启进程可以恢复；受信恢复控制器也可在原 Claim 过期后，通过
+`takeover_expired_agent_claim()` 原子换 owner/fencing，并从最近安全轮继续。
+`production_security_ready` 仍固定为 false，因为远程 assignment attestation、跨数据库的
+in-flight provider grant 接管和 SECRET 加密 Store 尚未完成。
 
 ## 2. 顺序与边界
 
@@ -31,9 +32,10 @@ execute(claim, request_ref):
 ```
 
 `resume(claim, request_ref)` 只接受当前 Store 中同 owner/token/fencing 的 `RUNNING` Attempt。
-它先加载 append-only 的最新 checkpoint，再恢复 provider history、authorization lineage、
-collector receipt prefix、Tool 去重集合、下一轮 messages、累计 usage 和有界 Context 状态；恢复
-完成并同步续租后，才允许下一次 provider 调用。
+普通重启要求 checkpoint 与 Claim 使用相同 fencing；经接管的 Claim 则要求 Attempt metadata、
+append-only takeover Event 和 checkpoint ledger 三方精确一致。它随后恢复 provider history、
+分段 authorization lineage、collector receipt prefix、Tool 去重集合、下一轮 messages、累计
+usage 和有界 Context 状态；恢复完成并同步续租后，才允许下一次 provider 调用。
 
 request 必须在 admission Claim 前 stage，因此敏感 task/context 不进入 Event、Attempt metadata
 或远程控制消息。执行前重读 Artifact，并要求 Run/Node/Attempt/attempt number/request digest/
@@ -78,13 +80,42 @@ checkpoint Artifact、request Artifact 和此前每个 provider response Artifac
 调用之前时，可以精确继续；崩溃发生在 provider/Tool 调用中或 checkpoint 提交前时，仍按
 unknown outcome 处理，不能猜测重试。
 
-## 5. 明确不承诺
+## 5. 过期 Claim 接管
 
-- 不会从 Store 导出 bearer；新进程必须由控制面安全取得当前 claim token，并通过
-  `restore_claim()` 重建句柄；过期 Claim 不会因存在 checkpoint 而自动换 owner/fencing；
+`takeover_expired_agent_claim(expired_claim, new_worker_id, takeover_id=...)` 是受信控制面 API，
+不是 Worker RPC。单个 `BEGIN IMMEDIATE` 事务必须同时满足：
+
+- Run/Node/Attempt 仍为 `RUNNING`，Activity kind 为 `agent`；
+- 调用方给出的旧 owner、claim bearer、request digest 和 fencing 与当前投影完全相同，且租约
+  已过期；
+- run/execution/heartbeat deadline 均未到期；deadline 到期必须由 timeout scanner 处理；
+- 最新 checkpoint 属于同一 Attempt/request，且其 fencing 不晚于旧 Claim；
+- checkpoint 后没有 `scheduled`/`running` Tool 子调用；存在尾部子调用时拒绝接管，由保守
+  Tool/父任务恢复协议收敛；
+- hierarchy、Fleet route/shard 和新 worker capacity 仍有效。
+
+成功时事务保持 Attempt/Node/Run 为 `RUNNING`，换发随机 claim bearer，将 fencing 加一，写入
+digest-only takeover binding，并追加 `attempt.claim_taken_over` Event。旧 worker 随后的续租、
+checkpoint 和父终态提交都会因 owner/token/fencing 不匹配被拒绝。同一 `takeover_id` 与完全相同
+旧/新绑定在新 Claim 仍有效时返回同一 bearer/Event，覆盖“事务已提交但响应丢失”的窗口；不同
+绑定一律冲突。
+
+checkpoint 可以来自更早 fencing：如果一次接管后尚未产生新 checkpoint 就再次宕机，下一次
+接管仍可采用同一安全轮。Provider checkpoint v2 用
+`authorization_lineage_start_index` 标记当前 owner 的 receipt 段；新 owner 清空当前授权摘要，
+但保留并逐条验证旧段 receipts，不伪造为同一 worker lineage。
+
+## 6. 明确不承诺
+
+- 不会把 bearer 写入 checkpoint、普通日志或独立 takeover payload；主 Store 仍是受信控制面，
+  按现有 Claim 契约保存当前 bearer。接管不会自动扫描，控制器必须显式提供旧 Claim 和稳定
+  `takeover_id`；
 - 不阻止两个错误配置的独立进程同时持有同一 Claim bearer；Store checkpoint CAS、provider
   operation ledger 和 Tool operation key 会阻止已提交边界分叉，但生产控制面仍必须保证单一
   assignment owner；
+- checkpoint 之后若旧进程已经签发 provider grant，新的 owner 不会取得旧 bearer，也不会签发
+  第二个相同逻辑 invocation；reference Broker 会失败关闭。生产 gateway 仍需提供稳定 operation
+  ID 的可验证接管/查询协议；
 - reference LocalArtifactStore 不支持 deployment-managed SECRET 加密；
 - provider request payload 目前只有 digest/receipt，没有独立可审计的 request Artifact；
 - reference Broker/Invoker 不证明 mTLS、runtime attestation、网络 deadline、egress policy 或
@@ -93,4 +124,5 @@ unknown outcome 处理，不能猜测重试。
 
 因此该执行器适合验证本地组合与精确安全轮恢复，不应作为开放 remote Agent capability 的
 依据。对抗证据见
-[本地 Durable Agent Activity 执行器三轮审查](agent-activity-executor-adversarial-review.md)。
+[本地 Durable Agent Activity 执行器三轮审查](agent-activity-executor-adversarial-review.md) 和
+[Agent 安全轮接管三轮审查](agent-turn-takeover-adversarial-review.md)。
