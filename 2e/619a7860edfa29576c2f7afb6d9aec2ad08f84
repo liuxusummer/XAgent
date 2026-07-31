@@ -1,0 +1,43 @@
+docs/architecture.md
+  s_72af05a5dabd4c::t_dd7a3aa61dfda7 125-129
+docs/distributed-execution-adr.md
+  s_72af05a5dabd4c::t_c1a60d098f3293 345-349
+docs/distributed-execution-quickstart.md
+  s_72af05a5dabd4c::t_2df220ac3d6399 113
+docs/durable-orchestration-spec.md
+  s_72af05a5dabd4c::t_1f8f6a680bc0a7 1209-1212
+docs/remote-fleet-adversarial-review.md
+  s_72af05a5dabd4c::t_1524c644b2a899 293-375,389-391
+docs/remote-fleet-data-plane.md
+  s_72af05a5dabd4c::t_d19a5d8261f175 40,42,49,57,109-119,123-142,153-158,251-253,261-266,269,288
+src/orchestration/__init__.py
+  s_72af05a5dabd4c::t_a29b3617015209 177-180,194-200
+src/orchestration/remote_fleet.py
+  s_72af05a5dabd4c::t_01623005aecf05 30,37,165-176,338-345,358-376,378,767-889,906-918,1063
+src/orchestration/remote_fleet_reconcile.py
+  s_72af05a5dabd4c::t_abcdfde9e9ee24 1-381
+tests/test_orchestration_remote_fleet.py
+  s_72af05a5dabd4c::t_c71f83802decaa 551-738
+tests/test_orchestration_remote_fleet_control.py
+  s_72af05a5dabd4c::t_654dc60ae943ce 1192-1200
+tests/test_orchestration_remote_fleet_reconcile.py
+  s_72af05a5dabd4c::t_db6fcbe8a33ea5 1-537
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2e619a7860edfa29576c2f7afb6d9aec2ad08f84",
+  "prompts": {},
+  "sessions": {
+    "s_72af05a5dabd4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f82cd-f332-7e80-9ce7-4dcb050b3aa1",
+        "model": "unknown"
+      },
+      "human_author": "codex <codex@users.noreply.github.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
